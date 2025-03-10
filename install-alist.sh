@@ -73,13 +73,7 @@ install_dependencies() {
 clean_legacy() {
     if docker ps -a --format '{{.Names}}' | grep -q "^$DOCKER_NAME$"; then
         yellow "发现已存在容器 $DOCKER_NAME"
-        confirm_operation "是否卸载当前版本？" && {
-            docker stop "$DOCKER_NAME" || true
-            docker rm "$DOCKER_NAME" || true
-            docker rmi "$DOCKER_IMAGE" || true
-            rm -rf "$CONFIG_DIR"
-            green "旧版本已清理"
-        }
+        confirm_operation "是否卸载当前版本？" && uninstall_alist
     fi
 }
 
@@ -174,30 +168,93 @@ confirm_operation() {
     done
 }
 
-# 主流程
+# 卸载 Alist 函数
+uninstall_alist() {
+    yellow "开始卸载 Alist..."
+    if docker ps -q -f name="$DOCKER_NAME" > /dev/null 2>&1; then
+        docker stop "$DOCKER_NAME" || true
+        docker rm "$DOCKER_NAME" || true
+    fi
+    docker rmi "$DOCKER_IMAGE" || true
+    rm -rf "$CONFIG_DIR"
+    green "Alist 已卸载。"
+}
+
+# 设置 Alist 密码函数
+reset_password() {
+    if ! docker ps -q -f name="$DOCKER_NAME" > /dev/null 2>&1; then
+        red "Alist 容器未运行，请先部署。"
+        return 1
+    fi
+    read -rp "请输入新的管理员密码: " new_password
+    docker exec -it "$DOCKER_NAME" ./alist admin set "$new_password"
+    if [[ $? -eq 0 ]]; then
+        green "Alist 管理员密码已成功设置为：$new_password"
+    else
+        red "设置密码失败，请检查 Docker 日志。"
+    fi
+}
+
+# 显示菜单
+show_menu() {
+    clear
+    echo "========================================"
+    echo "          Alist 管理菜单"
+    echo "========================================"
+    echo "请选择操作："
+    echo "  1. 部署 Alist"
+    echo "  2. 卸载清理 Alist"
+    echo "  3. 设置管理员密码"
+    echo "  4. 退出"
+    echo "----------------------------------------"
+}
+
+# 主流程 (菜单循环)
 main() {
     init_log
-    confirm_operation "是否执行 Alist 部署？" || exit
 
-    # 检查 Docker 是否安装
+    # 检查 Docker 是否安装 (只在主菜单显示前检查一次)
     if ! command -v docker &>/dev/null; then
         install_dependencies
     fi
 
-    clean_legacy
-    pull_image
+    while true; do
+        show_menu
+        read -rp "请输入选项编号: " choice
+        case "$choice" in
+            1)  # 部署
+                clean_legacy # 部署前清理旧版本
+                pull_image
 
-    # 自定义端口
-    read -p "请输入 Alist 服务监听端口（默认 $DEFAULT_PORT，直接回车使用默认）：" port
-    port=${port:-$DEFAULT_PORT}
-    check_port "$port"
+                # 自定义端口
+                read -p "请输入 Alist 服务监听端口（默认 $DEFAULT_PORT，直接回车使用默认）：" port
+                port=${port:-$DEFAULT_PORT}
+                check_port "$port"
 
-    # 询问挂载目录
-    yellow "请添加需要挂载到容器的目录（宿主机路径:容器路径）"
-    mount_dirs=$(ask_mount_directories)
+                # 询问挂载目录
+                yellow "请添加需要挂载到容器的目录（宿主机路径:容器路径）"
+                mount_dirs=$(ask_mount_directories)
 
-    start_container "$port" "$mount_dirs"
-    verify_deployment
+                start_container "$port" "$mount_dirs"
+                verify_deployment
+                ;;
+            2)  # 卸载清理
+                confirm_operation "是否确认卸载并清理 Alist？(数据目录 $CONFIG_DIR 也会被删除)" && uninstall_alist
+                ;;
+            3)  # 设置密码
+                reset_password
+                ;;
+            4)  # 退出
+                echo "退出 Alist 管理菜单。"
+                exit 0
+                ;;
+            *)
+                red "无效选项，请重新输入。"
+                sleep 1
+                ;;
+        esac
+        echo "" # 菜单操作后添加空行分隔
+    done
 }
 
 main
