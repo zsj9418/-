@@ -123,6 +123,24 @@ function run_script() {
     fi
 }
 
+# 快捷键设置
+function enable_hotkey() {
+    echo "是否启用快捷键功能？(y/n)"
+    read -r hotkey_choice
+    if [[ "$hotkey_choice" == "y" || "$hotkey_choice" == "Y" ]]; then
+        echo "快捷键功能已启用。在 SSH 界面输入 'a' 即可启动主脚本。" | tee -a "$LOG_FILE"
+        while true; do
+            read -r input
+            if [[ "$input" == "a" ]]; then
+                echo "快捷键 'a' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
+                main
+            fi
+        done
+    else
+        echo "快捷键功能未启用。" | tee -a "$LOG_FILE"
+    fi
+}
+
 # 主函数
 function main() {
     while true; do
@@ -144,5 +162,5 @@ function main() {
     done
 }
 
-# 执行主函数
-main
+# 执行快捷键功能
+enable_hotkey
