@@ -7,7 +7,7 @@ LOG_MAX_SIZE=512000  # 日志文件最大大小（单位：字节，500KB）
 LOG_MAX_LINES=100     # 日志文件最大行数
 
 # 确保脚本目录存在且可写
-if [[ ! -w "$SCRIPT_DIR" ]]; then
+if [[ ! -d "$SCRIPT_DIR" ]]; then
     mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
 fi
 
@@ -136,6 +136,7 @@ function enable_hotkey() {
         echo "快捷键功能已启用。在 SSH 界面输入 '$hotkey' 即可启动主脚本。输入 'exit' 可退出快捷键模式。" | tee -a "$LOG_FILE"
 
         while true; do
+            echo -n "等待快捷键输入："
             read -r input
             if [[ "$input" == "$hotkey" ]]; then
                 echo "快捷键 '$hotkey' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
@@ -143,6 +144,8 @@ function enable_hotkey() {
             elif [[ "$input" == "exit" ]]; then
                 echo "退出快捷键监听模式。" | tee -a "$LOG_FILE"
                 break
+            else
+                echo "无效输入，请重新输入快捷键或 'exit' 退出。" | tee -a "$LOG_FILE"
             fi
         done
     else
