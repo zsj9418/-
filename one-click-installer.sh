@@ -5,6 +5,9 @@ SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
 mkdir -p "$SCRIPT_DIR"
 
+# GitHub 加速代理前缀（国内推荐使用）
+PROXY_PREFIX="https://ghproxy.com/"
+
 # 脚本列表（按顺序定义）
 OPTIONS=(
     "1. 清理系统（clean-system.sh）"
@@ -52,22 +55,31 @@ function print_menu() {
     done
 }
 
-# 下载脚本
+# 下载脚本（支持代理和重试）
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
+    local proxy_url="${PROXY_PREFIX}${url}"
     local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk '{print $NF}' | tr -d '（）()')
     local script_path="$SCRIPT_DIR/$script_name"
 
+    # 如果脚本已存在，跳过下载
     if [[ -f "$script_path" ]]; then
         echo "$script_name 已存在，跳过下载。"
     else
         echo "正在下载 $script_name..."
-        curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$script_path"
+
+        # 下载脚本（尝试使用代理）
+        curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"
         if [[ $? -ne 0 ]]; then
-            echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。"
-            exit 1
+            echo "使用代理下载失败，尝试直接下载..."
+            curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"
+            if [[ $? -ne 0 ]]; then
+                echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。"
+                exit 1
+            fi
         fi
+
         chmod +x "$script_path"
         echo "已下载脚本到 $script_path，并赋予执行权限。"
     fi
