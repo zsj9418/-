@@ -52,7 +52,6 @@ declare -A SCRIPTS=(
 
 # 管理日志大小和行数
 function manage_logs() {
-    # 检查日志文件大小
     if [[ -f "$LOG_FILE" ]]; then
         local log_size=$(stat --printf="%s" "$LOG_FILE")
         if [[ $log_size -ge $LOG_MAX_SIZE ]]; then
@@ -62,7 +61,6 @@ function manage_logs() {
             > "$LOG_FILE"
         fi
 
-        # 检查日志文件行数
         local log_lines=$(wc -l < "$LOG_FILE")
         if [[ $log_lines -ge $LOG_MAX_LINES ]]; then
             echo "日志文件超过 $LOG_MAX_LINES 行，正在清理..."
@@ -80,7 +78,7 @@ function print_menu() {
     done
 }
 
-# 下载脚本（支持代理和重试）
+# 下载脚本
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
@@ -88,13 +86,10 @@ function download_script() {
     local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
     local script_path="$SCRIPT_DIR/$script_name"
 
-    # 如果脚本已存在，跳过下载
     if [[ -f "$script_path" ]]; then
         echo "$script_name 已存在，跳过下载。" | tee -a "$LOG_FILE"
     else
         echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
-
-        # 下载脚本（尝试使用代理）
         curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"
         if [[ $? -ne 0 ]]; then
             echo "使用代理下载失败，尝试直接下载..." | tee -a "$LOG_FILE"
@@ -104,7 +99,6 @@ function download_script() {
                 exit 1
             fi
         fi
-
         chmod +x "$script_path"
         echo "已下载脚本到 $script_path，并赋予执行权限。" | tee -a "$LOG_FILE"
     fi
@@ -123,17 +117,25 @@ function run_script() {
     fi
 }
 
-# 快捷键设置
+# 快捷键功能
 function enable_hotkey() {
     echo "是否启用快捷键功能？(y/n)"
     read -r hotkey_choice
     if [[ "$hotkey_choice" == "y" || "$hotkey_choice" == "Y" ]]; then
-        echo "快捷键功能已启用。在 SSH 界面输入 'a' 即可启动主脚本。" | tee -a "$LOG_FILE"
+        echo "请输入快捷键（默认a）："
+        read -r hotkey
+        hotkey=${hotkey:-a}
+        echo "快捷键功能已启用。在 SSH 界面输入 '$hotkey' 即可启动主脚本。" | tee -a "$LOG_FILE"
+
         while true; do
+            echo "等待快捷键输入..."
             read -r input
-            if [[ "$input" == "a" ]]; then
-                echo "快捷键 'a' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
+            if [[ "$input" == "$hotkey" ]]; then
+                echo "快捷键 '$hotkey' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
                 main
+            elif [[ "$input" == "exit" ]]; then
+                echo "退出快捷键监听模式。" | tee -a "$LOG_FILE"
+                break
             fi
         done
     else
@@ -162,5 +164,5 @@ function main() {
     done
 }
 
-# 执行快捷键功能
+# 启用快捷键功能
 enable_hotkey
