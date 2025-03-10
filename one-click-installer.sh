@@ -119,10 +119,14 @@ function run_script() {
     local script_path="$1"
     if [[ -f "$script_path" ]]; then
         echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
-        if ! bash "$script_path" | tee -a "$LOG_FILE"; then
+        set -o pipefail
+        if ! bash "$script_path" 2>&1 | tee -a "$LOG_FILE"; then
             echo "运行脚本时发生错误，请检查日志或脚本内容。" | tee -a "$LOG_FILE"
+            set +o pipefail
             return 1
         fi
+        set +o pipefail
+        echo "脚本执行成功！" | tee -a "$LOG_FILE"
     else
         echo "脚本文件不存在：$script_path" | tee -a "$LOG_FILE"
         return 1
