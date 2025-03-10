@@ -148,7 +148,7 @@ verify_deployment() {
     local public_ip=$(curl -s --max-time 3 ifconfig.me || hostname -I | awk '{print $1}')
     if docker ps | grep -q "$DOCKER_NAME"; then
         green "部署成功！访问地址："
-        echo -e "http://${public_ip}:5244"
+        echo -e "http://${public_ip}:$DEFAULT_PORT"
         echo -e "默认账号：admin"
         echo -e "默认密码：通过以下命令获取："
         echo -e "docker exec -it $DOCKER_NAME ./alist admin random"
@@ -158,6 +158,20 @@ verify_deployment() {
         red "容器运行异常，查看日志：docker logs $DOCKER_NAME"
         exit 1
     fi
+}
+
+# 确认操作函数
+confirm_operation() {
+    local prompt="$1 (y/n): "
+    while true; do
+        read -rp "$prompt" -n 1 -r answer
+        echo    # Add a newline after reading -n 1
+        case "$answer" in
+            [Yy]) return 0 ;; # User confirmed
+            [Nn]) return 1 ;; # User denied
+            *) echo "请输入 y 或 n" ;;
+        esac
+    done
 }
 
 # 主流程
