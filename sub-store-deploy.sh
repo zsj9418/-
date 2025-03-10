@@ -12,7 +12,7 @@ WATCHTOWER_CONTAINER_NAME="watchtower"
 TIMEZONE="Asia/Shanghai"
 SUB_STORE_IMAGE_NAME="xream/sub-store"
 WATCHTOWER_IMAGE_NAME="containrrr/watchtower"
-SUB_STORE_FRONTEND_BACKEND_PATH="/zsj9418"
+DEFAULT_SUB_STORE_PATH="/12345678"  # 修改默认路径
 
 # 默认端口
 DEFAULT_FRONTEND_PORT=3000
@@ -33,6 +33,7 @@ SUB_STORE_BACKEND_SYNC_CRON=""
 NETWORK_MODE="bridge"  # 默认网络模式
 HOST_PORT_1=""
 HOST_PORT_2=""
+SUB_STORE_FRONTEND_BACKEND_PATH=""
 
 # 日志记录函数
 log() {
@@ -90,6 +91,16 @@ prompt_for_port() {
       log "WARN" "无效的端口号，请输入1到65535之间的数字"
     fi
   done
+}
+
+# 提示用户输入路径
+prompt_for_path() {
+  local default_path=$(basename "$DEFAULT_SUB_STORE_PATH")
+  local user_input=""
+  read -p "请输入 Sub-Store 前后端路径（只需输入路径名，不需加/） [$default_path]: " user_input
+  user_input=${user_input:-$default_path}
+  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input}"
+  log "INFO" "设置前后端路径为: $SUB_STORE_FRONTEND_BACKEND_PATH"
 }
 
 # 安装依赖（根据系统和架构）
@@ -162,6 +173,9 @@ install_substore() {
     fi
   done
 
+  # 提示用户输入路径
+  prompt_for_path
+
   log "INFO" "正在启动容器，网络模式: $NETWORK_MODE"
   if [[ "$NETWORK_MODE" == "host" ]]; then
     docker run -d \
@@ -201,14 +215,32 @@ install_substore() {
   log "INFO" "Sub-Store 部署成功"
 }
 
-# 卸载容器
+# 增强版卸载容器
 uninstall_container() {
   local container_name=$1
+  local image_name=$2
+
   if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
     log "INFO" "正在卸载容器 $container_name..."
     docker stop $container_name
     docker rm $container_name
-    log "INFO" "容器 $container_name 已卸载"
+    log "INFO" "容器 $container_name 已停止并移除"
+
+    # 询问是否删除镜像
+    read -p "是否删除镜像 $image_name? (y/n) [默认: n]: " remove_image
+    remove_image=${remove_image:-n}
+    if [[ "$remove_image" == "y" || "$remove_image" == "Y" ]]; then
+      docker rmi $image_name
+      log "INFO" "镜像 $image_name 已删除"
+    fi
+
+    # 询问是否清理卷
+    read -p "是否清理相关数据卷 $DATA_DIR? (y/n) [默认: n]: " remove_volume
+    remove_volume=${remove_volume:-n}
+    if [[ "$remove_volume" == "y" || "$remove_volume" == "Y" ]] && [ "$container_name" == "$CONTAINER_NAME" ]; then
+      rm -rf "$DATA_DIR"
+      log "INFO" "数据卷 $DATA_DIR 已清理"
+    fi
   else
     log "WARN" "容器 $container_name 未运行，跳过卸载"
   fi
@@ -267,8 +299,8 @@ interactive_menu() {
         echo "2. Watchtower"
         read -p "请输入选项编号: " uninstall_choice
         case $uninstall_choice in
-          1) uninstall_container $CONTAINER_NAME ;;
-          2) uninstall_container $WATCHTOWER_CONTAINER_NAME ;;
+          1) uninstall_container $CONTAINER_NAME $SUB_STORE_IMAGE_NAME ;;
+          2) uninstall_container $WATCHTOWER_CONTAINER_NAME $WATCHTOWER_IMAGE_NAME ;;
           *) log "WARN" "无效输入，返回主菜单" ;;
         esac
         ;;
