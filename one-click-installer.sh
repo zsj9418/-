@@ -3,8 +3,8 @@
 # 一键脚本存放目录
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
-LOG_MAX_SIZE=512000   # 日志文件最大大小（单位：字节，500KB）
-LOG_MAX_LINES=100      # 日志文件最大行数
+LOG_MAX_SIZE=512000  # 日志文件最大大小（单位：字节，500KB）
+LOG_MAX_LINES=100     # 日志文件最大行数
 
 mkdir -p "$SCRIPT_DIR"
 
@@ -78,7 +78,7 @@ function print_menu() {
     done
 }
 
-# 下载脚本
+# 下载脚本（支持代理和重试）
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
@@ -109,10 +109,15 @@ function download_script() {
 # 运行脚本
 function run_script() {
     local script_path="$1"
-    echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
-    bash "$script_path" | tee -a "$LOG_FILE"
-    if [[ $? -ne 0 ]]; then
-        echo "运行脚本时发生错误，请检查日志或脚本内容。" | tee -a "$LOG_FILE"
+    if [[ -f "$script_path" ]]; then
+        echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
+        bash "$script_path" | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            echo "运行脚本时发生错误，请检查日志或脚本内容。" | tee -a "$LOG_FILE"
+            exit 1
+        fi
+    else
+        echo "脚本文件不存在：$script_path" | tee -a "$LOG_FILE"
         exit 1
     fi
 }
@@ -125,10 +130,9 @@ function enable_hotkey() {
         echo "请输入快捷键（默认a）："
         read -r hotkey
         hotkey=${hotkey:-a}
-        echo "快捷键功能已启用。在 SSH 界面输入 '$hotkey' 即可启动主脚本。" | tee -a "$LOG_FILE"
+        echo "快捷键功能已启用。在 SSH 界面输入 '$hotkey' 即可启动主脚本。输入 'exit' 可退出快捷键模式。" | tee -a "$LOG_FILE"
 
         while true; do
-            echo "等待快捷键输入..."
             read -r input
             if [[ "$input" == "$hotkey" ]]; then
                 echo "快捷键 '$hotkey' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
@@ -148,13 +152,10 @@ function main() {
     while true; do
         print_menu
         read -p "请输入选项编号: " choice
-
         if [[ "$choice" == "0" ]]; then
             echo "退出脚本。" | tee -a "$LOG_FILE"
             exit 0
-        fi
-
-        if [[ -n "${SCRIPTS[$choice]}" ]]; then
+        elif [[ -n "${SCRIPTS[$choice]}" ]]; then
             manage_logs  # 在每次操作前管理日志文件
             script_path=$(download_script "$choice")
             run_script "$script_path"
