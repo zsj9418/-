@@ -12,7 +12,7 @@ if [[ ! -d "$SCRIPT_DIR" ]]; then
 fi
 
 # GitHub 加速代理前缀（国内推荐使用）
-PROXY_PREFIX="https://ghproxy.com/"
+PROXY_PREFIX="https://ghfast.top/"
 
 # 脚本列表（按顺序定义）
 OPTIONS=(
