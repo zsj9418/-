@@ -18,7 +18,7 @@ init_log() {
     fi
     touch "$LOG_FILE"
     exec > >(tee -a "$LOG_FILE") 2>&1
-    echo -e "${YELLOW}日志文件: $LOG_FILE${NC}"
+    yellow "日志文件: $LOG_FILE"
 }
 
 # 获取系统和架构类型
