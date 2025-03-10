@@ -1,16 +1,22 @@
 #!/bin/bash
-# Sub-Store Docker一键管理脚本
-# 功能：支持企业微信通知、交互式配置、自定义路径和完整管理功能
-# 网络模式：支持 host 模式和 bridge 模式（可指定端口）
-# 通知内容：个性化通知，包含前端和后端版本号
+# Docker管理脚本
+# 功能：支持 Watchtower 和 Sub-Store 的部署、通知、日志记录和数据备份/恢复
+# 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口。
 
 # 配置区（默认值）
 DATA_DIR="/opt/substore/data"
 BACKUP_DIR="/opt/substore/backup"
+LOG_FILE="/var/log/docker_management.log"
 CONTAINER_NAME="substore"
+WATCHTOWER_CONTAINER_NAME="watchtower"
 TIMEZONE="Asia/Shanghai"
-IMAGE_NAME="xream/sub-store"
+SUB_STORE_IMAGE_NAME="xream/sub-store"
+WATCHTOWER_IMAGE_NAME="containrrr/watchtower"
 SUB_STORE_FRONTEND_BACKEND_PATH="/zsj9418"
+
+# 默认端口
+DEFAULT_FRONTEND_PORT=3000
+DEFAULT_BACKEND_PORT=3001
 
 # 颜色定义
 RED='\033[0;31m'
@@ -19,9 +25,12 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 # 初始化变量
+ARCH=""
+OS=""
 WECHAT_WEBHOOK=""
+TELEGRAM_URL=""
 SUB_STORE_BACKEND_SYNC_CRON=""
-USE_HOST_NETWORK=true
+NETWORK_MODE="bridge"  # 默认网络模式
 HOST_PORT_1=""
 HOST_PORT_2=""
 
@@ -35,175 +44,126 @@ log() {
     "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" ;;
     "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" ;;
   esac
+  echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 }
 
-# 企业微信通知函数
-send_wechat() {
-  local message=$1
-  if [ -z "$WECHAT_WEBHOOK" ]; then
-    log "WARN" "未配置企业微信机器人地址"
-    return
-  fi
-
-  curl -s -H "Content-Type: application/json" \
-    -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"$message\"}}" \
-    "$WECHAT_WEBHOOK" >/dev/null
-}
-
-# 获取容器版本号
-get_container_version() {
-  docker exec $CONTAINER_NAME sh -c "cat /app/package.json | grep version" | awk -F '"' '{print $4}'
-}
-
-# 检查端口是否被占用
-check_port() {
-  local port=$1
-  if lsof -i :$port &>/dev/null; then
-    log "ERROR" "端口 $port 已被占用"
-    return 1
+# 检测设备架构和操作系统
+detect_system() {
+  log "INFO" "正在检测设备架构和操作系统..."
+  ARCH=$(uname -m)
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
   else
-    log "INFO" "端口 $port 可用"
-    return 0
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  fi
+  log "INFO" "设备架构: $ARCH, 操作系统: $OS"
+}
+
+# 检测端口是否可用
+check_port_available() {
+  local port=$1
+  if lsof -i:"$port" >/dev/null 2>&1; then
+    return 1  # 端口被占用
+  else
+    return 0  # 端口可用
   fi
 }
 
-# 交互式配置
-interactive_config() {
-  # 要求输入企业微信地址
+# 提示用户输入端口
+prompt_for_port() {
+  local prompt_message=$1
+  local default_port=$2
+  local port=""
+
   while true; do
-    read -p "请输入企业微信机器人地址: " WECHAT_WEBHOOK
-    if [[ "$WECHAT_WEBHOOK" =~ ^https://qyapi.weixin.qq.com/cgi-bin/webhook.* ]]; then
+    read -p "$prompt_message [$default_port]: " port
+    port=${port:-$default_port}  # 如果用户未输入，使用默认端口
+    if [[ $port =~ ^[0-9]+$ ]] && [ $port -ge 1 ] && [ $port -le 65535 ]; then
+      if check_port_available "$port"; then
+        echo "$port"
+        return
+      else
+        log "WARN" "端口 $port 已被占用，请选择其他端口"
+      fi
+    else
+      log "WARN" "无效的端口号，请输入1到65535之间的数字"
+    fi
+  done
+}
+
+# 安装依赖（根据系统和架构）
+install_dependencies() {
+  log "INFO" "正在安装依赖..."
+  if ! command -v docker &> /dev/null; then
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+      apt update && apt install -y curl lsof || {
+        log "ERROR" "依赖安装失败，请检查网络连接"
+        exit 1
+      }
+      curl -fsSL https://get.docker.com | sh || {
+        log "ERROR" "Docker安装失败"
+        exit 1
+      }
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" ]]; then
+      yum install -y curl lsof || {
+        log "ERROR" "依赖安装失败，请检查网络连接"
+        exit 1
+      }
+      curl -fsSL https://get.docker.com | sh || {
+        log "ERROR" "Docker安装失败"
+        exit 1
+      }
+    else
+      log "ERROR" "不支持的操作系统: $OS"
+      exit 1
+    fi
+    systemctl enable --now docker
+    log "INFO" "Docker 已成功安装"
+  else
+    log "INFO" "Docker 已存在，跳过安装"
+  fi
+}
+
+# 部署 Watchtower
+install_watchtower() {
+  log "INFO" "正在部署 Watchtower..."
+  docker run -d \
+    --name $WATCHTOWER_CONTAINER_NAME \
+    --restart=always \
+    --net=host \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    $WATCHTOWER_IMAGE_NAME \
+    --cleanup \
+    -i 3600 \
+    --warn-on-head-failure never \
+    --notification-url "$TELEGRAM_URL" \
+    --notification-title-tag "Watchtower" || {
+      log "ERROR" "Watchtower 部署失败"
+      exit 1
+    }
+  log "INFO" "Watchtower 部署成功"
+}
+
+# 部署 Sub-Store
+install_substore() {
+  log "INFO" "正在拉取最新镜像..."
+  docker pull $SUB_STORE_IMAGE_NAME
+
+  # 提示用户选择网络模式
+  while true; do
+    read -p "请选择网络模式 (bridge 或 host) [默认: bridge]: " network_mode
+    network_mode=${network_mode:-bridge}
+    if [[ "$network_mode" == "bridge" || "$network_mode" == "host" ]]; then
+      NETWORK_MODE="$network_mode"
       break
     else
-      log "ERROR" "地址格式错误，请重新输入"
+      log "WARN" "无效的网络模式，请重新输入"
     fi
   done
 
-  # 配置同步计划
-  read -p "请输入后端同步计划cron表达式（默认55 23 * * *）: " cron_input
-  SUB_STORE_BACKEND_SYNC_CRON=${cron_input:-"55 23 * * *"}
-
-  # 询问是否使用 host 网络模式
-  read -p "是否使用 host 网络模式？[Y/n] " USE_HOST_NETWORK_INPUT
-  if [[ "$USE_HOST_NETWORK_INPUT" =~ ^[Nn]$ ]]; then
-    USE_HOST_NETWORK=false
-    # 询问并检测端口
-    while true; do
-      read -p "请输入后端服务端口号（默认3000）: " HOST_PORT_1
-      HOST_PORT_1=${HOST_PORT_1:-3000}
-      if check_port $HOST_PORT_1; then
-        break
-      fi
-    done
-    while true; do
-      read -p "请输入前端服务端口号（默认3001）: " HOST_PORT_2
-      HOST_PORT_2=${HOST_PORT_2:-3001}
-      if check_port $HOST_PORT_2; then
-        break
-      fi
-    done
-  fi
-}
-
-# 安装依赖
-install_dependencies() {
-  if ! command -v docker &> /dev/null; then
-    log "INFO" "正在安装Docker..."
-    curl -fsSL https://get.docker.com | sh || {
-      log "ERROR" "Docker安装失败"
-      exit 1
-    }
-    systemctl enable --now docker
-  fi
-
-  if ! command -v docker-compose &> /dev/null; then
-    log "INFO" "正在安装Docker Compose..."
-    LATEST_COMPOSE=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f 4)
-    curl -L "https://github.com/docker/compose/releases/download/${LATEST_COMPOSE}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || {
-      log "ERROR" "Docker Compose安装失败"
-      exit 1
-    }
-    chmod +x /usr/local/bin/docker-compose
-  fi
-}
-
-# 检查容器状态
-check_container_status() {
-  if docker ps -a --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
-    CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' ${CONTAINER_NAME})
-    CONTAINER_RUNNING=$(docker inspect -f '{{.State.Running}}' ${CONTAINER_NAME})
-    return 0
-  else
-    return 1
-  fi
-}
-
-# 备份配置
-backup_config() {
-  if [ -d "$DATA_DIR" ]; then
-    log "INFO" "正在备份配置..."
-    TIMESTAMP=$(date +%Y%m%d%H%M%S)
-    BACKUP_FILE="$BACKUP_DIR/config_$TIMESTAMP.tar.gz"
-    mkdir -p "$BACKUP_DIR"
-    tar -czf "$BACKUP_FILE" -C "$DATA_DIR" .
-    log "INFO" "配置已备份到: $BACKUP_FILE"
-  else
-    log "WARN" "未找到配置目录，跳过备份"
-  fi
-}
-
-# 恢复配置
-restore_config() {
-  LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -1)
-  if [ -f "$LATEST_BACKUP" ]; then
-    log "INFO" "正在恢复配置..."
-    tar -xzf "$LATEST_BACKUP" -C "$DATA_DIR"
-    log "INFO" "配置已从 $LATEST_BACKUP 恢复"
-  else
-    log "WARN" "未找到备份文件，跳过恢复"
-  fi
-}
-
-# 卸载 Sub-Store
-uninstall_substore() {
-  if check_container_status; then
-    log "INFO" "正在卸载 Sub-Store..."
-    docker stop $CONTAINER_NAME
-    docker rm $CONTAINER_NAME
-    log "INFO" "容器已卸载"
-  fi
-
-  read -p "是否删除镜像？[y/N] " REMOVE_IMAGE
-  if [[ "$REMOVE_IMAGE" =~ ^[Yy]$ ]]; then
-    IMAGE_ID=$(docker images -q $IMAGE_NAME)
-    if [ -n "$IMAGE_ID" ]; then
-      docker rmi $IMAGE_ID
-      log "INFO" "镜像已删除"
-    fi
-  fi
-
-  read -p "是否删除数据目录？[y/N] " REMOVE_DATA
-  if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
-    rm -rf "$DATA_DIR"
-    log "INFO" "数据目录已删除"
-  fi
-
-  read -p "是否重新安装 Sub-Store？[y/N] " REINSTALL
-  if [[ "$REINSTALL" =~ ^[Yy]$ ]]; then
-    install_substore
-  else
-    log "INFO" "操作完成，退出脚本"
-    exit 0
-  fi
-}
-
-# 安装 Sub-Store
-install_substore() {
-  log "INFO" "正在拉取最新镜像..."
-  docker pull $IMAGE_NAME:latest
-
-  log "INFO" "正在启动容器..."
-  if $USE_HOST_NETWORK; then
+  log "INFO" "正在启动容器，网络模式: $NETWORK_MODE"
+  if [[ "$NETWORK_MODE" == "host" ]]; then
     docker run -d \
       --network host \
       --name $CONTAINER_NAME \
@@ -213,11 +173,15 @@ install_substore() {
       -e "SUB_STORE_BACKEND_SYNC_CRON=${SUB_STORE_BACKEND_SYNC_CRON}" \
       -e "SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH}" \
       -e TZ=${TIMEZONE} \
-      $IMAGE_NAME || {
+      $SUB_STORE_IMAGE_NAME || {
         log "ERROR" "容器启动失败"
         exit 1
       }
   else
+    log "INFO" "提示用户自定义端口..."
+    HOST_PORT_1=$(prompt_for_port "请输入前端端口 (Web UI)" $DEFAULT_FRONTEND_PORT)
+    HOST_PORT_2=$(prompt_for_port "请输入后端端口" $DEFAULT_BACKEND_PORT)
+
     docker run -d \
       --name $CONTAINER_NAME \
       --restart=always \
@@ -228,52 +192,108 @@ install_substore() {
       -e "SUB_STORE_BACKEND_SYNC_CRON=${SUB_STORE_BACKEND_SYNC_CRON}" \
       -e "SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH}" \
       -e TZ=${TIMEZONE} \
-      $IMAGE_NAME || {
+      $SUB_STORE_IMAGE_NAME || {
         log "ERROR" "容器启动失败"
         exit 1
       }
   fi
 
-  if check_container_status; then
-    # 获取版本号
-    VERSION=$(get_container_version)
-    # 发送通知
-    send_wechat "Sub-Store 部署成功\n服务器: $(hostname)\n时间: $(date +'%F %T')\n版本号: $VERSION"
-    log "INFO" "Sub-Store 已成功启动"
-    if $USE_HOST_NETWORK; then
-      log "INFO" "后端服务地址: http://<服务器IP>:3000${SUB_STORE_FRONTEND_BACKEND_PATH}"
-      log "INFO" "前端服务地址: http://<服务器IP>:3001${SUB_STORE_FRONTEND_BACKEND_PATH}"
-    else
-      log "INFO" "后端服务地址: http://<服务器IP>:${HOST_PORT_1}${SUB_STORE_FRONTEND_BACKEND_PATH}"
-      log "INFO" "前端服务地址: http://<服务器IP>:${HOST_PORT_2}${SUB_STORE_FRONTEND_BACKEND_PATH}"
-    fi
+  log "INFO" "Sub-Store 部署成功"
+}
+
+# 卸载容器
+uninstall_container() {
+  local container_name=$1
+  if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+    log "INFO" "正在卸载容器 $container_name..."
+    docker stop $container_name
+    docker rm $container_name
+    log "INFO" "容器 $container_name 已卸载"
   else
-    log "ERROR" "容器启动失败，请检查日志"
-    exit 1
+    log "WARN" "容器 $container_name 未运行，跳过卸载"
   fi
+}
+
+# 数据备份
+backup_data() {
+  if [ -d "$DATA_DIR" ]; then
+    log "INFO" "正在备份数据..."
+    TIMESTAMP=$(date +%Y%m%d%H%M%S)
+    BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
+    mkdir -p "$BACKUP_DIR"
+    tar -czf "$BACKUP_FILE" -C "$DATA_DIR" .
+    log "INFO" "数据已备份到: $BACKUP_FILE"
+  else
+    log "WARN" "未找到数据目录，跳过备份"
+  fi
+}
+
+# 数据恢复
+restore_data() {
+  local latest_backup=$(ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null | head -n 1)
+  if [ -z "$latest_backup" ]; then
+    log "WARN" "未找到备份文件，跳过恢复"
+    return
+  fi
+
+  log "INFO" "正在恢复数据..."
+  mkdir -p "$DATA_DIR"
+  tar -xzf "$latest_backup" -C "$DATA_DIR"
+  log "INFO" "数据已从 $latest_backup 恢复"
+}
+
+# 交互式菜单
+interactive_menu() {
+  while true; do
+    echo -e "\n选择操作："
+    echo "1. 部署 Sub-Store"
+    echo "2. 部署 Watchtower"
+    echo "3. 卸载容器（Sub-Store 或 Watchtower）"
+    echo "4. 数据备份"
+    echo "5. 数据恢复"
+    echo "6. 退出"
+    read -p "请输入选项编号: " choice
+
+    case $choice in
+      1)
+        install_substore
+        ;;
+      2)
+        install_watchtower
+        ;;
+      3)
+        echo -e "选择卸载的容器："
+        echo "1. Sub-Store"
+        echo "2. Watchtower"
+        read -p "请输入选项编号: " uninstall_choice
+        case $uninstall_choice in
+          1) uninstall_container $CONTAINER_NAME ;;
+          2) uninstall_container $WATCHTOWER_CONTAINER_NAME ;;
+          *) log "WARN" "无效输入，返回主菜单" ;;
+        esac
+        ;;
+      4)
+        backup_data
+        ;;
+      5)
+        restore_data
+        ;;
+      6)
+        log "INFO" "退出脚本"
+        exit 0
+        ;;
+      *)
+        log "WARN" "无效输入，请重新选择"
+        ;;
+    esac
+  done
 }
 
 # 主流程
 main() {
-  # 交互式配置
-  interactive_config
-
-  # 安装依赖
+  detect_system
   install_dependencies
-
-  # 检查现有容器
-  if check_container_status; then
-    read -p "检测到已有容器，是否卸载并重新安装？[y/N] " reinstall
-    if [[ "$reinstall" =~ [Yy] ]]; then
-      uninstall_substore
-    else
-      log "INFO" "操作已取消"
-      exit 0
-    fi
-  fi
-
-  # 启动容器
-  install_substore
+  interactive_menu
 }
 
 # 执行入口
