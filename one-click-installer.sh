@@ -136,8 +136,13 @@ function create_symlink() {
 
     local target_path="/usr/local/bin/$shortcut"
     if [[ -e "$target_path" ]]; then
-        echo "快捷键 '$shortcut' 已存在，请选择其他名称。"
-        return 1
+        echo "快捷键 '$shortcut' 已存在。是否覆盖？(y/n)"
+        read -r overwrite
+        if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
+            echo "快捷键创建已取消。"
+            return 1
+        fi
+        sudo rm -f "$target_path"
     fi
 
     sudo ln -s "$(realpath "$0")" "$target_path"
