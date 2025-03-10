@@ -96,19 +96,30 @@ function download_script() {
 
     # 如果脚本已存在，直接返回路径
     if [[ -f "$script_path" ]]; then
-        echo "$script_path"
+        echo "脚本 $script_name 已存在，跳过下载。" >&2
+        echo "DEBUG: download_script - 脚本已存在, script_path: $script_path" >> "$LOG_FILE" # DEBUG
+        echo -n "$script_path"
         return 0
     fi
 
     # 下载脚本
-    echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
+    echo "正在下载 $script_name..." >&2
     if curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"; then
-        chmod +x "$script_path"
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
-        echo "$script_path"
-        return 0
+        if [[ -s "$script_path" ]]; then # 检查文件是否为空
+            chmod +x "$script_path"
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
+            echo "DEBUG: download_script - 下载成功, script_path: $script_path" >> "$LOG_FILE" # DEBUG
+            echo -n "$script_path"
+            return 0
+        else
+            echo "下载 $script_name 后文件为空，下载失败。" >&2
+            rm -f "$script_path" # 删除空文件
+            echo "DEBUG: download_script - 下载文件为空, 返回失败" >> "$LOG_FILE" # DEBUG
+            return 1
+        fi
     else
-        echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" | tee -a "$LOG_FILE"
+        echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" >&2
+        echo "DEBUG: download_script - curl 下载失败, 返回失败" >> "$LOG_FILE" # DEBUG
         return 1
     fi
 }
@@ -119,6 +130,11 @@ function run_script() {
     if [[ -f "$script_path" ]]; then
         echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
         bash "$script_path" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -eq 0 ]]; then
+            echo "脚本 $script_path 运行成功。" | tee -a "$LOG_FILE"
+        else
+            echo "脚本 $script_path 运行失败，请检查日志。" | tee -a "$LOG_FILE"
+        fi
     else
         echo "脚本文件不存在：$script_path" | tee -a "$LOG_FILE"
     fi
@@ -153,6 +169,7 @@ function main() {
             [1-9]|1[0-5])
                 manage_logs
                 script_path=$(download_script "$choice")
+                echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE" # DEBUG
                 if [[ $? -eq 0 && -n "$script_path" && -f "$script_path" ]]; then
                     run_script "$script_path"
                 else
