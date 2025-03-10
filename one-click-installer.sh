@@ -175,10 +175,9 @@ function main() {
                 ;;
             [1-9]|1[0-5])
                 manage_logs
-                if script_path=$(download_script "$choice"); then
-                    if run_script "$script_path"; then
-                        echo "脚本执行完成。"
-                    fi
+                script_path=$(download_script "$choice")
+                if [[ $? -eq 0 ]]; then
+                    run_script "$script_path"
                 fi
                 read -rp "按回车键返回主菜单..."
                 ;;
