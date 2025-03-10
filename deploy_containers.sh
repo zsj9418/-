@@ -102,9 +102,22 @@ deploy_webssh() {
 
 # 部署 Looking Glass Server
 deploy_looking_glass() {
-    read -p "请输入 Looking Glass Server 监听端口（默认 80，直接回车使用默认）：" HTTP_PORT
+    read -p "请输入 Looking Glass Server 外部访问端口（默认 80，直接回车使用默认）：" HTTP_PORT
     HTTP_PORT=${HTTP_PORT:-80}
-    deploy_container "looking-glass" "$HTTP_PORT" "wikihostinc/looking-glass-server" "$HTTP_PORT"
+    
+    # 保持内部服务监听端口为 80
+    echo -e "${YELLOW}正在部署 Looking Glass Server 容器...${NC}"
+    docker run -d --name "looking-glass" \
+        -p "$HTTP_PORT:80" \
+        "wikihostinc/looking-glass-server"
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}Looking Glass Server 容器已成功部署！${NC}"
+        echo -e "${YELLOW}访问地址：http://<你的服务器IP>:$HTTP_PORT${NC}"
+    else
+        echo -e "${RED}错误: Looking Glass Server 容器部署失败${NC}"
+        exit 1
+    fi
 }
 
 # 卸载容器
