@@ -11,7 +11,7 @@ if [[ ! -d "$SCRIPT_DIR" ]]; then
     mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
 fi
 
-# GitHub 加速代理前缀（国内推荐使用）
+# GitHub 代理地址
 PROXY_PREFIX="https://ghfast.top/"
 
 # 脚本列表（按顺序定义）
@@ -31,27 +31,27 @@ OPTIONS=(
     "13. 配置定时任务（setup_cronjob.sh）"
     "14. 部署 Sub-Store（sub-store-deploy.sh）"
     "15. 更新 Sing-box 配置（update_singbox.sh）"
-    "16. 创建快捷方式"
+    "16. 创建或清除快捷方式"
     "0. 退出"
 )
 
-# 脚本对应的 URL
+# 脚本对应的 URL（直接使用 GitHub Raw URL）
 declare -A SCRIPTS=(
-    ["1"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/clean-system.sh"
-    ["2"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/deploy_containers.sh"
-    ["3"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/device_info.sh"
-    ["4"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-adg.sh"
-    ["5"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-alist.sh"
-    ["6"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-nexterm.sh"
-    ["7"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-openapi.sh"
-    ["8"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-sing-box.sh"
-    ["9"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-subc.sh"
-    ["10"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker.sh"
-    ["11"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_tools.sh"
-    ["12"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/set-dns.sh"
-    ["13"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_cronjob.sh"
-    ["14"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/sub-store-deploy.sh"
-    ["15"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/update_singbox.sh"
+    ["1"]="https://raw.githubusercontent.com/zsj9418/-/main/clean-system.sh"
+    ["2"]="https://raw.githubusercontent.com/zsj9418/-/main/deploy_containers.sh"
+    ["3"]="https://raw.githubusercontent.com/zsj9418/-/main/device_info.sh"
+    ["4"]="https://raw.githubusercontent.com/zsj9418/-/main/install-adg.sh"
+    ["5"]="https://raw.githubusercontent.com/zsj9418/-/main/install-alist.sh"
+    ["6"]="https://raw.githubusercontent.com/zsj9418/-/main/install-nexterm.sh"
+    ["7"]="https://raw.githubusercontent.com/zsj9418/-/main/install-openapi.sh"
+    ["8"]="https://raw.githubusercontent.com/zsj9418/-/main/install-sing-box.sh"
+    ["9"]="https://raw.githubusercontent.com/zsj9418/-/main/install-subc.sh"
+    ["10"]="https://raw.githubusercontent.com/zsj9418/-/main/install_docker.sh"
+    ["11"]="https://raw.githubusercontent.com/zsj9418/-/main/install_tools.sh"
+    ["12"]="https://raw.githubusercontent.com/zsj9418/-/main/set-dns.sh"
+    ["13"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
+    ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
+    ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
 )
 
 # 管理日志大小和行数
@@ -87,7 +87,7 @@ function print_menu() {
     echo "----------------------------------------"
 }
 
-# 下载脚本（支持代理和重试）
+# 下载脚本（支持 GitHub 和代理下载）
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
@@ -100,9 +100,9 @@ function download_script() {
         echo "使用本地缓存脚本：$script_path"
     else
         echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
-        if ! curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"; then
-            echo "使用代理下载失败，尝试直接下载..." | tee -a "$LOG_FILE"
-            if ! curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"; then
+        if ! curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"; then
+            echo "GitHub 下载失败，尝试使用代理下载..." | tee -a "$LOG_FILE"
+            if ! curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"; then
                 echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" | tee -a "$LOG_FILE"
                 return 1
             fi
@@ -129,8 +129,8 @@ function run_script() {
     fi
 }
 
-# 创建快捷键
-function create_symlink() {
+# 创建或清除快捷方式
+function manage_symlink() {
     echo "请输入您希望的快捷键（例如：q）："
     read -r shortcut
     if [[ -z "$shortcut" ]]; then
@@ -140,16 +140,22 @@ function create_symlink() {
 
     local target_path="/usr/local/bin/$shortcut"
     if [[ -e "$target_path" ]]; then
-        echo "快捷键 '$shortcut' 已存在，请选择其他名称。"
-        return 1
-    fi
-
-    if sudo ln -s "$(realpath "$0")" "$target_path"; then
-        echo "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
-        hash -r
+        echo "快捷键 '$shortcut' 已存在，是否删除？(y/n)"
+        read -r confirm
+        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            sudo rm "$target_path"
+            echo "快捷键 '$shortcut' 已删除。"
+            hash -r
+        else
+            echo "操作已取消。"
+        fi
     else
-        echo "快捷键创建失败，请检查权限。"
-        return 1
+        if sudo ln -s "$(realpath "$0")" "$target_path"; then
+            echo "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
+            hash -r
+        else
+            echo "快捷键创建失败，请检查权限。"
+        fi
     fi
 }
 
@@ -164,7 +170,7 @@ function main() {
                 exit 0
                 ;;
             16)
-                create_symlink
+                manage_symlink
                 read -rp "按回车键返回主菜单..."
                 ;;
             [1-9]|1[0-5])
