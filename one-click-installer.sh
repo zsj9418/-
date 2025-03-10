@@ -95,23 +95,23 @@ function download_script() {
     local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
     local script_path="$SCRIPT_DIR/$script_name"
 
+    # 如果脚本已存在，直接返回路径
     if [[ -f "$script_path" ]]; then
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $script_name 已存在，跳过下载。" >> "$LOG_FILE"
-        echo "使用本地缓存脚本：$script_path"
-    else
-        echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
-        if ! curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"; then
-            echo "GitHub 下载失败，尝试使用代理下载..." | tee -a "$LOG_FILE"
-            if ! curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"; then
-                echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-        fi
-        chmod +x "$script_path"
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
+        echo "$script_path"
+        return 0
     fi
 
-    echo "$script_path"
+    # 下载脚本
+    echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
+    if curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"; then
+        chmod +x "$script_path"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
+        echo "$script_path"
+        return 0
+    else
+        echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" | tee -a "$LOG_FILE"
+        return 1
+    fi
 }
 
 # 运行脚本
@@ -119,47 +119,27 @@ function run_script() {
     local script_path="$1"
     if [[ -f "$script_path" ]]; then
         echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
-        set -o pipefail
-        if ! bash "$script_path" 2>&1 | tee -a "$LOG_FILE"; then
-            echo "运行脚本时发生错误，请检查日志或脚本内容。" | tee -a "$LOG_FILE"
-            set +o pipefail
-            return 1
-        fi
-        set +o pipefail
-        echo "脚本执行成功！" | tee -a "$LOG_FILE"
+        bash "$script_path" 2>&1 | tee -a "$LOG_FILE"
     else
         echo "脚本文件不存在：$script_path" | tee -a "$LOG_FILE"
-        return 1
     fi
 }
 
-# 创建或清除快捷方式
+# 快捷键管理
 function manage_symlink() {
-    echo "请输入您希望的快捷键（例如：q）："
+    echo "请输入快捷键（例如 q）："
     read -r shortcut
-    if [[ -z "$shortcut" ]]; then
-        echo "快捷键不能为空！"
-        return 1
-    fi
-
-    local target_path="/usr/local/bin/$shortcut"
-    if [[ -e "$target_path" ]]; then
-        echo "快捷键 '$shortcut' 已存在，是否删除？(y/n)"
+    local link="/usr/local/bin/$shortcut"
+    if [[ -e "$link" ]]; then
+        echo "快捷键已存在，是否删除？(y/n)"
         read -r confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            sudo rm "$target_path"
-            echo "快捷键 '$shortcut' 已删除。"
-            hash -r
-        else
-            echo "操作已取消。"
+        if [[ "$confirm" == "y" ]]; then
+            rm -f "$link"
+            echo "快捷键已删除"
         fi
     else
-        if sudo ln -s "$(realpath "$0")" "$target_path"; then
-            echo "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
-            hash -r
-        else
-            echo "快捷键创建失败，请检查权限。"
-        fi
+        ln -s "$(realpath "$0")" "$link"
+        echo "快捷键已创建"
     fi
 }
 
@@ -169,19 +149,15 @@ function main() {
         print_menu
         read -rp "请输入选项编号: " choice
         case "$choice" in
-            0)
-                echo "退出脚本。" | tee -a "$LOG_FILE"
-                exit 0
-                ;;
-            16)
-                manage_symlink
-                read -rp "按回车键返回主菜单..."
-                ;;
+            0) exit 0 ;;
+            16) manage_symlink ;;
             [1-9]|1[0-5])
                 manage_logs
                 script_path=$(download_script "$choice")
-                if [[ $? -eq 0 ]]; then
+                if [[ $? -eq 0 && -n "$script_path" && -f "$script_path" ]]; then
                     run_script "$script_path"
+                else
+                    echo "脚本下载失败或文件不存在，请检查日志。" | tee -a "$LOG_FILE"
                 fi
                 read -rp "按回车键返回主菜单..."
                 ;;
@@ -193,5 +169,4 @@ function main() {
     done
 }
 
-# 运行主函数
 main
