@@ -5,53 +5,58 @@ SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
 mkdir -p "$SCRIPT_DIR"
 
-# 脚本列表及对应的 URL
-declare -A SCRIPTS=(
-    ["1. 清理系统（clean-system.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/clean-system.sh"
-    ["2. 部署容器（deploy_containers.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/deploy_containers.sh"
-    ["3. 获取设备信息（device_info.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/device_info.sh"
-    ["4. 安装 AdGuard Home（install-adg.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-adg.sh"
-    ["5. 安装 Alist（install-alist.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-alist.sh"
-    ["6. 安装 NexTerm（install-nexterm.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-nexterm.sh"
-    ["7. 安装 OpenAPI（install-openapi.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-openapi.sh"
-    ["8. 安装 Sing-box（install-sing-box.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-sing-box.sh"
-    ["9. 安装 Subconverter（install-subc.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-subc.sh"
-    ["10. 安装 Docker（install_docker.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker.sh"
-    ["11. 安装工具（install_tools.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_tools.sh"
-    ["12. 设置 DNS（set-dns.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/set-dns.sh"
-    ["13. 配置定时任务（setup_cronjob.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_cronjob.sh"
-    ["14. 部署 Sub-Store（sub-store-deploy.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/sub-store-deploy.sh"
-    ["15. 更新 Sing-box 配置（update_singbox.sh）"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/update_singbox.sh"
+# 脚本列表（按顺序定义）
+OPTIONS=(
+    "1. 清理系统（clean-system.sh）"
+    "2. 部署容器（deploy_containers.sh）"
+    "3. 获取设备信息（device_info.sh）"
+    "4. 安装 AdGuard Home（install-adg.sh）"
+    "5. 安装 Alist（install-alist.sh）"
+    "6. 安装 NexTerm（install-nexterm.sh）"
+    "7. 安装 OpenAPI（install-openapi.sh）"
+    "8. 安装 Sing-box（install-sing-box.sh）"
+    "9. 安装 Subconverter（install-subc.sh）"
+    "10. 安装 Docker（install_docker.sh）"
+    "11. 安装工具（install_tools.sh）"
+    "12. 设置 DNS（set-dns.sh）"
+    "13. 配置定时任务（setup_cronjob.sh）"
+    "14. 部署 Sub-Store（sub-store-deploy.sh）"
+    "15. 更新 Sing-box 配置（update_singbox.sh）"
+    "0. 退出"
 )
 
-# 初始化日志记录
-function init_logging() {
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
-    exec > >(tee -a "$LOG_FILE") 2>&1
-}
-
-# 检查网络连接
-function check_network() {
-    if ! ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
-        echo "网络连接不可用，请检查网络后重试。"
-        exit 1
-    fi
-}
+# 脚本对应的 URL
+declare -A SCRIPTS=(
+    ["1"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/clean-system.sh"
+    ["2"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/deploy_containers.sh"
+    ["3"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/device_info.sh"
+    ["4"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-adg.sh"
+    ["5"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-alist.sh"
+    ["6"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-nexterm.sh"
+    ["7"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-openapi.sh"
+    ["8"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-sing-box.sh"
+    ["9"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-subc.sh"
+    ["10"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker.sh"
+    ["11"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_tools.sh"
+    ["12"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/set-dns.sh"
+    ["13"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_cronjob.sh"
+    ["14"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/sub-store-deploy.sh"
+    ["15"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/update_singbox.sh"
+)
 
 # 打印菜单
 function print_menu() {
     echo "请选择要安装或运行的脚本："
-    for key in "${!SCRIPTS[@]}"; do
-        echo "$key"
+    for option in "${OPTIONS[@]}"; do
+        echo "$option"
     done
-    echo "0. 退出"
 }
 
 # 下载脚本
 function download_script() {
-    local script_name=$(echo "$1" | awk '{print $2}')
-    local url="$2"
+    local choice="$1"
+    local url="${SCRIPTS[$choice]}"
+    local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk '{print $NF}' | tr -d '（）()')
     local script_path="$SCRIPT_DIR/$script_name"
 
     if [[ -f "$script_path" ]]; then
@@ -81,19 +86,8 @@ function run_script() {
     fi
 }
 
-# 检查管理员权限
-function check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "某些脚本需要管理员权限，请使用 sudo 运行此脚本。"
-        exit 1
-    fi
-}
-
 # 主函数
 function main() {
-    init_logging
-    check_network
-
     while true; do
         print_menu
         read -p "请输入选项编号: " choice
@@ -104,16 +98,13 @@ function main() {
         fi
 
         if [[ -n "${SCRIPTS[$choice]}" ]]; then
-            script_path=$(download_script "$choice" "${SCRIPTS[$choice]}")
+            script_path=$(download_script "$choice")
             run_script "$script_path"
         else
             echo "无效选项，请重新输入。"
         fi
     done
 }
-
-# 检查管理员权限（某些脚本可能需要 root）
-check_root
 
 # 执行主函数
 main
