@@ -3,6 +3,9 @@
 # 一键脚本存放目录
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
+LOG_MAX_SIZE=512000   # 日志文件最大大小（单位：字节，500KB）
+LOG_MAX_LINES=100      # 日志文件最大行数
+
 mkdir -p "$SCRIPT_DIR"
 
 # GitHub 加速代理前缀（国内推荐使用）
@@ -47,6 +50,28 @@ declare -A SCRIPTS=(
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/update_singbox.sh"
 )
 
+# 管理日志大小和行数
+function manage_logs() {
+    # 检查日志文件大小
+    if [[ -f "$LOG_FILE" ]]; then
+        local log_size=$(stat --printf="%s" "$LOG_FILE")
+        if [[ $log_size -ge $LOG_MAX_SIZE ]]; then
+            echo "日志文件超过 $LOG_MAX_SIZE 字节，正在清理..."
+            mv "$LOG_FILE" "$LOG_FILE.old"
+            echo "日志已归档为 $LOG_FILE.old"
+            > "$LOG_FILE"
+        fi
+
+        # 检查日志文件行数
+        local log_lines=$(wc -l < "$LOG_FILE")
+        if [[ $log_lines -ge $LOG_MAX_LINES ]]; then
+            echo "日志文件超过 $LOG_MAX_LINES 行，正在清理..."
+            tail -n $LOG_MAX_LINES "$LOG_FILE" > "$LOG_FILE.tmp"
+            mv "$LOG_FILE.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+
 # 打印菜单
 function print_menu() {
     echo "请选择要安装或运行的脚本："
@@ -65,23 +90,23 @@ function download_script() {
 
     # 如果脚本已存在，跳过下载
     if [[ -f "$script_path" ]]; then
-        echo "$script_name 已存在，跳过下载。"
+        echo "$script_name 已存在，跳过下载。" | tee -a "$LOG_FILE"
     else
-        echo "正在下载 $script_name..."
+        echo "正在下载 $script_name..." | tee -a "$LOG_FILE"
 
         # 下载脚本（尝试使用代理）
         curl -fsSL --retry 5 --retry-delay 5 "$proxy_url" -o "$script_path"
         if [[ $? -ne 0 ]]; then
-            echo "使用代理下载失败，尝试直接下载..."
+            echo "使用代理下载失败，尝试直接下载..." | tee -a "$LOG_FILE"
             curl -fsSL --retry 5 --retry-delay 5 "$url" -o "$script_path"
             if [[ $? -ne 0 ]]; then
-                echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。"
+                echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" | tee -a "$LOG_FILE"
                 exit 1
             fi
         fi
 
         chmod +x "$script_path"
-        echo "已下载脚本到 $script_path，并赋予执行权限。"
+        echo "已下载脚本到 $script_path，并赋予执行权限。" | tee -a "$LOG_FILE"
     fi
 
     echo "$script_path"
@@ -90,10 +115,10 @@ function download_script() {
 # 运行脚本
 function run_script() {
     local script_path="$1"
-    echo "正在运行脚本 $script_path..."
-    bash "$script_path"
+    echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
+    bash "$script_path" | tee -a "$LOG_FILE"
     if [[ $? -ne 0 ]]; then
-        echo "运行脚本时发生错误，请检查日志或脚本内容。"
+        echo "运行脚本时发生错误，请检查日志或脚本内容。" | tee -a "$LOG_FILE"
         exit 1
     fi
 }
@@ -105,15 +130,16 @@ function main() {
         read -p "请输入选项编号: " choice
 
         if [[ "$choice" == "0" ]]; then
-            echo "退出脚本。"
+            echo "退出脚本。" | tee -a "$LOG_FILE"
             exit 0
         fi
 
         if [[ -n "${SCRIPTS[$choice]}" ]]; then
+            manage_logs  # 在每次操作前管理日志文件
             script_path=$(download_script "$choice")
             run_script "$script_path"
         else
-            echo "无效选项，请重新输入。"
+            echo "无效选项，请重新输入。" | tee -a "$LOG_FILE"
         fi
     done
 }
