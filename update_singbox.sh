@@ -4,6 +4,18 @@ set -euo pipefail
 # 环境变量文件路径
 ENV_FILE="$HOME/.singbox_env"
 
+# 获取设备名称（兼容 OpenWrt 和其他系统）
+get_device_name() {
+  if command -v hostname >/dev/null 2>&1; then
+    hostname
+  elif [[ -f /proc/sys/kernel/hostname ]]; then
+    cat /proc/sys/kernel/hostname
+  else
+    echo "unknown-device"
+  fi
+}
+DEVICE_NAME=$(get_device_name)
+
 # 彩色输出
 red() { echo -e "\033[31m$1\033[0m"; }
 green() { echo -e "\033[32m$1\033[0m"; }
@@ -36,11 +48,14 @@ setup_env() {
   read -p "请输入企业微信 Webhook 地址（可直接回车跳过，默认不通知）: " WX_WEBHOOK
   WX_WEBHOOK=${WX_WEBHOOK:-""}
 
-  read -p "请输入订阅链接（多个链接用空格分隔，必填）: " SUBSCRIBE_URLS
-  if [[ -z "$SUBSCRIBE_URLS" ]]; then
-    red "订阅链接不能为空，请重新运行脚本配置"
-    exit 1
-  fi
+  while true; do
+    read -p "请输入订阅链接（多个链接用空格分隔，必填）: " SUBSCRIBE_URLS
+    if [[ -z "$SUBSCRIBE_URLS" ]]; then
+      red "订阅链接不能为空，请重新输入"
+    else
+      break
+    fi
+  done
 
   read -p "请输入配置文件路径 [默认: /etc/sing-box/config.json]: " CONFIG_PATH
   CONFIG_PATH=${CONFIG_PATH:-"/etc/sing-box/config.json"}
@@ -57,35 +72,39 @@ send_msg() {
     yellow "未配置企业微信 Webhook，跳过通知"
     return
   fi
-  local msg=$1
+  local msg="$1"
   curl -sSf -H "Content-Type: application/json" \
-    -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"$msg\"}}" \
+    -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"设备 [$DEVICE_NAME] 通知：\n$msg\"}}" \
     "$WX_WEBHOOK" >/dev/null || red "通知发送失败"
 }
 
-# 安装依赖
+# 安装依赖（针对不同系统）
 install_dependencies() {
   if ! command -v jq >/dev/null 2>&1; then
     yellow "检测到 jq 未安装，正在安装..."
-    if command -v apt >/dev/null 2>&1; then
-      apt update && apt install -y jq
+    if command -v opkg >/dev/null 2>&1; then
+      opkg update && opkg install jq curl psmisc
+    elif command -v apt >/dev/null 2>&1; then
+      apt update && apt install -y jq psmisc
     elif command -v yum >/dev/null 2>&1; then
-      yum install -y jq
+      yum install -y jq psmisc
     else
-      red "未找到支持的包管理器，请手动安装 jq"
+      red "未找到支持的包管理器，请手动安装 jq 和 psmisc"
       exit 1
     fi
-    green "jq 安装完成"
+    green "jq 和 psmisc 安装完成"
   fi
 }
 
 # 停止 sing-box 服务
 stop_singbox() {
-  if systemctl is-active --quiet sing-box; then
-    systemctl stop sing-box
-    green "sing-box 服务已停止"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q sing-box; then
+    if systemctl is-active --quiet sing-box; then
+      systemctl stop sing-box
+      green "sing-box 服务已停止"
+    fi
   elif pgrep sing-box >/dev/null 2>&1; then
-    killall sing-box
+    pkill -f sing-box || true
     green "sing-box 进程已终止"
   else
     yellow "sing-box 未运行"
@@ -94,13 +113,34 @@ stop_singbox() {
 
 # 启动 sing-box 服务
 start_singbox() {
-  if systemctl list-unit-files | grep -q sing-box; then
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q sing-box; then
     systemctl start sing-box
-    green "sing-box 服务已启动"
+    if systemctl is-active --quiet sing-box; then
+      green "sing-box 服务已成功启动"
+    else
+      red "sing-box 服务启动失败，请检查配置"
+      exit 1
+    fi
   else
     nohup sing-box run -c "$CONFIG_PATH" >/dev/null 2>&1 &
-    green "sing-box 已通过手动方式启动"
+    sleep 2
+    if pgrep -f sing-box >/dev/null 2>&1; then
+      green "sing-box 已通过手动方式启动"
+    else
+      red "sing-box 手动启动失败，请检查配置"
+      exit 1
+    fi
   fi
+}
+
+# 网络连通性检查
+check_network() {
+  if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    red "网络连接失败，请检查配置文件或服务状态"
+    return 1
+  fi
+  green "网络正常"
+  return 0
 }
 
 # 备份配置文件
@@ -133,32 +173,34 @@ validate_config() {
     red "配置文件格式无效"
     return 1
   fi
+  if [[ $(jq '.outbounds | length' "$CONFIG_PATH") -eq 0 ]]; then
+    red "配置文件中未检测到节点配置"
+    return 1
+  fi
   return 0
-}
-
-# 获取节点数量
-get_node_count() {
-  jq '.outbounds | length' "$CONFIG_PATH" 2>/dev/null || echo "0"
 }
 
 # 更新配置文件
 update_config() {
   local message="📡 sing-box 更新报告"
-  local success=false
+  local success=1
   for sub in $SUBSCRIBE_URLS; do
     yellow "正在从 $sub 下载配置..."
     if curl -L "$sub" -o "$CONFIG_PATH" >/dev/null 2>&1; then
       if validate_config; then
         backup_config
         stop_singbox
+        mv "$CONFIG_PATH" "${CONFIG_PATH}.new"
+        mv "${CONFIG_PATH}.new" "$CONFIG_PATH"
         start_singbox
-        local node_count=$(get_node_count)
-        if [[ "$node_count" -eq "0" ]]; then
+        check_network
+        local node_count=$(jq '.outbounds | length' "$CONFIG_PATH")
+        if [[ "$node_count" -eq 0 ]]; then
           message="$message\n⚠️ 更新成功但未检测到节点: $sub"
         else
           message="$message\n✅ 更新成功: $sub\n节点数: $node_count"
         fi
-        success=true
+        success=0
         break
       else
         message="$message\n❌ 无效的配置文件: $sub"
@@ -169,25 +211,31 @@ update_config() {
     fi
   done
 
-  if ! $success; then
+  if [[ "$success" -ne 0 ]]; then
     restore_config
     message="$message\n❌ 所有订阅链接均失败，已还原备份配置"
   fi
 
   send_msg "$message"
   echo -e "$message"
-  if $success; then
-    exit 0
-  else
-    exit 1
-  fi
+  return "$success"
 }
 
 # 主流程
 main() {
   load_env
   install_dependencies
-  update_config
+
+  while true; do
+    update_config
+    if check_network && [[ $(jq '.outbounds | length' "$CONFIG_PATH") -gt 0 ]]; then
+      green "网络正常，节点数: $(jq '.outbounds | length' "$CONFIG_PATH")"
+      break
+    else
+      red "网络异常或未检测到节点，重新运行更新流程..."
+      sleep 5
+    fi
+  done
 }
 
 main
