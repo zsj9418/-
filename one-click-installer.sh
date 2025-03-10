@@ -60,7 +60,7 @@ function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
     local proxy_url="${PROXY_PREFIX}${url}"
-    local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk '{print $NF}' | tr -d '（）()')
+    local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
     local script_path="$SCRIPT_DIR/$script_name"
 
     # 如果脚本已存在，跳过下载
