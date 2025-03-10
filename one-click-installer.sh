@@ -125,32 +125,24 @@ function run_script() {
     fi
 }
 
-# 快捷键功能
-function enable_hotkey() {
-    echo "是否启用快捷键功能？(y/n)"
-    read -r hotkey_choice
-    if [[ "$hotkey_choice" == "y" || "$hotkey_choice" == "Y" ]]; then
-        echo "请输入快捷键（默认a）："
-        read -r hotkey
-        hotkey=${hotkey:-a}
-        echo "快捷键功能已启用。在 SSH 界面输入 '$hotkey' 即可启动主脚本。输入 'exit' 可退出快捷键模式。" | tee -a "$LOG_FILE"
-
-        while true; do
-            echo -n "等待快捷键输入："
-            read -r input
-            if [[ "$input" == "$hotkey" ]]; then
-                echo "快捷键 '$hotkey' 被触发，启动主脚本..." | tee -a "$LOG_FILE"
-                main
-            elif [[ "$input" == "exit" ]]; then
-                echo "退出快捷键监听模式。" | tee -a "$LOG_FILE"
-                break
-            else
-                echo "无效输入，请重新输入快捷键或 'exit' 退出。" | tee -a "$LOG_FILE"
-            fi
-        done
-    else
-        echo "快捷键功能未启用。" | tee -a "$LOG_FILE"
+# 创建快捷键
+function create_symlink() {
+    echo "请输入您希望的快捷键（例如：q）："
+    read shortcut
+    if [[ -z "$shortcut" ]]; then
+        echo "快捷键不能为空！"
+        return 1
     fi
+
+    local target_path="/usr/local/bin/$shortcut"
+    if [[ -e "$target_path" ]]; then
+        echo "快捷键 '$shortcut' 已存在，请选择其他名称。"
+        return 1
+    fi
+
+    sudo ln -s "$(realpath "$0")" "$target_path"
+    echo "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
+    hash -r  # 刷新环境变量，使快捷键立即可用
 }
 
 # 主函数
@@ -172,4 +164,7 @@ function main() {
 }
 
 # 启用快捷键功能
-enable_hotkey
+create_symlink
+
+# 运行主函数
+main
