@@ -6,7 +6,10 @@ LOG_FILE="$SCRIPT_DIR/installer.log"
 LOG_MAX_SIZE=512000  # 日志文件最大大小（单位：字节，500KB）
 LOG_MAX_LINES=100     # 日志文件最大行数
 
-mkdir -p "$SCRIPT_DIR"
+# 确保脚本目录存在且可写
+if [[ ! -w "$SCRIPT_DIR" ]]; then
+    mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
+fi
 
 # GitHub 加速代理前缀（国内推荐使用）
 PROXY_PREFIX="https://ghproxy.com/"
