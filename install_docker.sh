@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# 设置默认 TERM 环境变量以增强终端兼容性
+if [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    export TERM="xterm"
+fi
+
 # 检查是否具有 sudo 权限
 check_sudo() {
     if [[ $EUID -ne 0 ]]; then
@@ -129,10 +134,15 @@ select_docker_version() {
             MENU_ITEMS+=("$COUNTER" "$VERSION")
             COUNTER=$((COUNTER + 1))
         done
-        SELECTED_INDEX=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
+        # 使用临时文件保存 dialog 输出，避免终端乱码
+        TEMP_FILE=$(mktemp)
+        dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 2>"$TEMP_FILE"
         if [ $? -eq 0 ]; then
+            SELECTED_INDEX=$(cat "$TEMP_FILE")
+            rm -f "$TEMP_FILE"
             echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
         else
+            rm -f "$TEMP_FILE"
             echo ""
         fi
     else
