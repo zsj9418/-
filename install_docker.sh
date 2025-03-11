@@ -222,6 +222,54 @@ uninstall_docker_compose() {
     echo "Docker Compose 残留文件已清理。"
 }
 
+# 生成 daemon.json 配置文件
+generate_daemon_config() {
+    echo "正在生成 Docker daemon.json 配置文件..."
+
+    DEFAULT_DATA_ROOT="/opt/docker"
+    read -p "请输入 Docker data-root 路径 (留空默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
+    DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
+
+    DAEMON_CONFIG=$(cat <<EOF
+{
+  "iptables": true,
+  "ip6tables": true,
+  "registry-mirrors": [
+    "https://registry.cn-chengdu.aliyuncs.com",
+    "https://mirror.ccs.tencentyun.com",
+    "https://docker.mirrors.huaweicloud.com",
+    "https://hub-mirror.c.163.com"
+  ],
+  "data-root": "${DATA_ROOT}",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "5m",
+    "max-file": "3"
+  }
+}
+EOF
+)
+
+    echo "daemon.json 文件内容如下："
+    echo "$DAEMON_CONFIG"
+
+    sudo mkdir -p /etc/docker
+    echo "$DAEMON_CONFIG" | sudo tee /etc/docker/daemon.json > /dev/null
+
+    if [ $? -eq 0 ]; then
+        echo "/etc/docker/daemon.json 文件生成成功。"
+        echo "正在重启 Docker 服务以应用配置..."
+        sudo systemctl restart docker
+        if [ $? -eq 0 ]; then
+            echo "Docker 服务重启成功，新配置已加载。"
+        else
+            echo "Docker 服务重启失败，请手动重启 Docker 服务: sudo systemctl restart docker"
+        fi
+    else
+        echo "/etc/docker/daemon.json 文件生成失败，请检查权限或重试。"
+    fi
+}
+
 # 主脚本入口
 main() {
     check_sudo
@@ -244,8 +292,9 @@ main() {
         echo "5. 卸载 Docker Compose"
         echo "6. 卸载 Docker 和 Docker Compose"
         echo "7. 查询 Docker 和 Docker Compose 的安装状态"
-        echo "8. 退出脚本"
-        read -p "请输入数字 (1/2/3/4/5/6/7/8): " CHOICE
+        echo "8. 生成 daemon.json 配置文件"
+        echo "9. 退出脚本"
+        read -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
         case $CHOICE in
             1)
@@ -273,6 +322,9 @@ main() {
                 check_docker_compose_installed
                 ;;
             8)
+                generate_daemon_config
+                ;;
+            9)
                 echo "退出脚本。"
                 exit 0
                 ;;
