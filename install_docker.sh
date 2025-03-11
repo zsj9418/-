@@ -1,10 +1,5 @@
 #!/bin/bash
 
-# 设置默认 TERM 环境变量以增强终端兼容性
-if [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
-    export TERM="xterm"
-fi
-
 # 检查是否具有 sudo 权限
 check_sudo() {
     if [[ $EUID -ne 0 ]]; then
@@ -21,12 +16,8 @@ detect_package_manager() {
         PKG_MANAGER="yum"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf"
-    elif command -v pacman >/dev/null 2>&1; then
-        PKG_MANAGER="pacman"
-    elif command -v zypper >/dev/null 2>&1; then
-        PKG_MANAGER="zypper"
     else
-        echo "无法检测到支持的包管理工具 (apt-get/yum/dnf/pacman/zypper)，请手动安装必要的依赖后重试。"
+        echo "无法检测到支持的包管理工具 (apt-get/yum/dnf)，请手动安装必要的依赖后重试。"
         exit 1
     fi
 }
@@ -34,26 +25,20 @@ detect_package_manager() {
 # 检测并安装依赖，只执行一次
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
-    local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq")
+    local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq" "dialog")
     for DEP in "${DEPS[@]}"; do
-        if ! command -v "$DEP" >/dev/null 2>&1; then
+        if ! command -v $DEP >/dev/null 2>&1; then
             echo "安装依赖：$DEP"
             case $PKG_MANAGER in
                 apt-get)
                     sudo apt-get update
-                    sudo apt-get install -y "$DEP"
+                    sudo apt-get install -y $DEP
                     ;;
                 yum)
-                    sudo yum install -y "$DEP"
+                    sudo yum install -y $DEP
                     ;;
                 dnf)
-                    sudo dnf install -y "$DEP"
-                    ;;
-                pacman)
-                    sudo pacman -Sy --noconfirm "$DEP"
-                    ;;
-                zypper)
-                    sudo zypper install -y "$DEP"
+                    sudo dnf install -y $DEP
                     ;;
             esac
         else
@@ -71,7 +56,7 @@ get_architecture() {
         armv7l) ARCH="armv7" ;;
         *) echo "不支持的架构: $ARCH"; exit 1 ;;
     esac
-    echo "$ARCH"
+    echo $ARCH
 }
 
 # 检测系统版本
@@ -115,44 +100,54 @@ check_docker_compose_installed() {
 fetch_docker_versions() {
     local ARCH=$(get_architecture)
     local URL="https://download.docker.com/linux/static/stable/$ARCH/"
-    echo "正在获取可用的 Docker 版本列表..." >&2
-    curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq
-}
-
-# 选择 Docker 版本（使用 select 实现，圆圈数字显示）
-select_docker_version() {
-    local VERSIONS=($(fetch_docker_versions))
-    if [ ${#VERSIONS[@]} -eq 0 ]; then
-        echo "未找到可用 Docker 版本，退出。"
+    echo "正在获取可用的 Docker 版本列表..."
+    VERSIONS=$(curl -s $URL | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq)
+    if [ -z "$VERSIONS" ]; then
+        echo "无法获取版本列表，请检查网络连接。"
         exit 1
     fi
+    echo "$VERSIONS"
+}
 
-    # 定义圆圈数字数组
-    CIRCLE_NUMBERS=("①" "②" "③" "④" "⑤" "⑥" "⑦" "⑧" "⑨" "⑩" "⑪" "⑫" "⑬" "⑭" "⑮" "⑯" "⑰" "⑱" "⑲" "⑳")
-    for ((i=20; i<${#VERSIONS[@]}+1; i++)); do
-        CIRCLE_NUMBERS[$i]=$((i+1))  # 超出 ⑳ 后使用普通数字
+# 选择 Docker 版本（支持 dialog 和命令行两种交互方式）
+select_docker_version() {
+    local VERSIONS=($(fetch_docker_versions))
+    local MENU_ITEMS=()
+    local COUNTER=1
+
+    # 构建菜单项数组
+    for VERSION in "${VERSIONS[@]}"; do
+        MENU_ITEMS+=("$COUNTER" "$VERSION")
+        COUNTER=$((COUNTER + 1))
     done
 
-    echo "请使用上下键选择 Docker 版本（回车确认，留空选择最新版本）："
-    PS3="请输入数字选择版本（默认最新版本）： "
-    select VERSION in "${VERSIONS[@]}"; do
-        if [ -z "$REPLY" ]; then
-            echo ""
-            break
-        elif [ -n "$VERSION" ]; then
-            echo "$VERSION"
-            break
+    # 使用 dialog 或命令行选择版本
+    if command -v dialog >/dev/null 2>&1; then
+        SELECTED_INDEX=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
+        if [ $? -eq 0 ]; then
+            echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
         else
-            echo "无效选择，请重新选择。"
+            echo ""
         fi
-    done
+    else
+        echo "dialog 未安装或不可用，请使用命令行选择版本："
+        for i in "${!VERSIONS[@]}"; do
+            echo "$((i + 1)). ${VERSIONS[i]}"
+        done
+        read -p "请输入对应的数字选择版本（默认最新版本）： " SELECTED_INDEX
+        if [[ $SELECTED_INDEX =~ ^[0-9]+$ ]] && [ $SELECTED_INDEX -le ${#VERSIONS[@]} ]; then
+            echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
+        else
+            echo ""
+        fi
+    fi
 }
 
 # 安装 Docker
 install_docker() {
     if check_docker_installed; then
         read -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
-        if [[ "$REINSTALL" != "y" ]]; then
+        if [[ $REINSTALL != "y" ]]; then
             echo "跳过 Docker 安装。"
             return
         fi
@@ -174,15 +169,12 @@ install_docker() {
     fi
 
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    wget -O "$TEMP_DIR/docker.tgz" "$DOCKER_URL" || {
-        echo "下载失败，请检查以下事项："
-        echo "1. 网络连接是否正常"
-        echo "2. 代理设置是否正确（如有代理，请设置 http_proxy 和 https_proxy 环境变量）"
-        echo "3. DNS 配置是否有效（尝试使用 'ping download.docker.com' 测试）"
-        echo "4. 选择的版本号 ($VERSION) 是否存在于 https://download.docker.com/linux/static/stable/$ARCH/"
+    wget -O "$TEMP_DIR/docker.tgz" "$DOCKER_URL"
+    if [ $? -ne 0 ]; then
+        echo "下载失败，请检查版本号或网络状态。"
         rm -rf "$TEMP_DIR"
         exit 1
-    }
+    fi
 
     echo "正在解压 Docker 包到临时文件夹..."
     tar -zxf "$TEMP_DIR/docker.tgz" -C "$TEMP_DIR"
@@ -192,28 +184,22 @@ install_docker() {
     echo "清理临时文件..."
     rm -rf "$TEMP_DIR"
 
-    echo "Docker 安装完成，请重新登录以应用用户组更改或运行 'sudo systemctl start docker' 启动服务。"
+    echo "Docker 安装完成，请重新登录以应用用户组更改。"
 }
 
 # 安装 Docker Compose
 install_docker_compose() {
     if check_docker_compose_installed; then
         read -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
-        if [[ "$REINSTALL" != "y" ]]; then
+        if [[ $REINSTALL != "y" ]]; then
             echo "跳过 Docker Compose 安装。"
             return
         fi
     fi
 
     echo "正在安装 Docker Compose..."
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name) || {
-        echo "获取 Docker Compose 最新版本失败，请检查网络连接、代理设置或 GitHub API 是否可达。"
-        exit 1
-    }
-    sudo curl -L "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || {
-        echo "下载 Docker Compose 失败，请检查网络连接、代理设置或 GitHub 是否可达。"
-        exit 1
-    }
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    sudo curl -L "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
     sudo chmod +x /usr/local/bin/docker-compose
     echo "Docker Compose 安装完成。"
 }
@@ -221,7 +207,7 @@ install_docker_compose() {
 # 卸载 Docker
 uninstall_docker() {
     echo "正在卸载 Docker..."
-    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc
     sudo rm -rf /var/lib/docker
     sudo rm -rf /etc/docker
     sudo rm -rf /usr/bin/docker*
@@ -273,11 +259,11 @@ EOF
     if [ $? -eq 0 ]; then
         echo "/etc/docker/daemon.json 文件生成成功。"
         echo "正在重启 Docker 服务以应用配置..."
-        sudo systemctl restart docker || {
-            echo "Docker 服务重启失败，请确保 Docker 已正确安装并运行，或手动重启：sudo systemctl restart docker"
-        }
+        sudo systemctl restart docker
         if [ $? -eq 0 ]; then
             echo "Docker 服务重启成功，新配置已加载。"
+        else
+            echo "Docker 服务重启失败，请手动重启 Docker 服务: sudo systemctl restart docker"
         fi
     else
         echo "/etc/docker/daemon.json 文件生成失败，请检查权限或重试。"
@@ -299,15 +285,15 @@ main() {
 
     while true; do
         echo "请选择要执行的操作："
-        echo "① 安装 Docker"
-        echo "② 安装 Docker Compose"
-        echo "③ 安装 Docker 和 Docker Compose"
-        echo "④ 卸载 Docker"
-        echo "⑤ 卸载 Docker Compose"
-        echo "⑥ 卸载 Docker 和 Docker Compose"
-        echo "⑦ 查询 Docker 和 Docker Compose 的安装状态"
-        echo "⑧ 生成 daemon.json 配置文件"
-        echo "⑨ 退出脚本"
+        echo "1. 安装 Docker"
+        echo "2. 安装 Docker Compose"
+        echo "3. 安装 Docker 和 Docker Compose"
+        echo "4. 卸载 Docker"
+        echo "5. 卸载 Docker Compose"
+        echo "6. 卸载 Docker 和 Docker Compose"
+        echo "7. 查询 Docker 和 Docker Compose 的安装状态"
+        echo "8. 生成 daemon.json 配置文件"
+        echo "9. 退出脚本"
         read -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
         case $CHOICE in
