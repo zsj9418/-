@@ -75,15 +75,20 @@ fetch_docker_versions() {
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
     local MENU_ITEMS=()
+    local COUNTER=1
+
+    # 构建菜单项数组
     for VERSION in "${VERSIONS[@]}"; do
-        MENU_ITEMS+=("$VERSION" "$VERSION")
+        MENU_ITEMS+=("$COUNTER" "$VERSION")
+        COUNTER=$((COUNTER + 1))
     done
 
     # 使用 dialog 显示版本选择菜单
-    SELECTED_VERSION=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
+    SELECTED_INDEX=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
 
     if [ $? -eq 0 ]; then
-        echo "$SELECTED_VERSION"
+        # 通过索引获取版本号
+        echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
     else
         echo ""
     fi
