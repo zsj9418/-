@@ -116,15 +116,10 @@ fetch_docker_versions() {
     local ARCH=$(get_architecture)
     local URL="https://download.docker.com/linux/static/stable/$ARCH/"
     echo "正在获取可用的 Docker 版本列表..."
-    VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq)
-    if [ -z "$VERSIONS" ]; then
-        echo "无法获取版本列表，请检查网络连接、代理设置或 DNS 配置。"
-        exit 1
-    fi
-    echo "$VERSIONS"
+    curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq
 }
 
-# 选择 Docker 版本（使用 select 实现上下键选择）
+# 选择 Docker 版本（自定义圆圈数字显示）
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
     if [ ${#VERSIONS[@]} -eq 0 ]; then
@@ -132,10 +127,16 @@ select_docker_version() {
         exit 1
     fi
 
+    # 定义圆圈数字数组
+    CIRCLE_NUMBERS=("①" "②" "③" "④" "⑤" "⑥" "⑦" "⑧" "⑨" "⑩" "⑪" "⑫" "⑬" "⑭" "⑮" "⑯" "⑰" "⑱" "⑲" "⑳")
+    for ((i=20; i<${#VERSIONS[@]}+1; i++)); do
+        CIRCLE_NUMBERS[$i]=$((i+1))  # 超出 ⑳ 后使用普通数字
+    done
+
     echo "请使用上下键选择 Docker 版本（回车确认，留空选择最新版本）："
     PS3="请输入数字选择版本（默认最新版本）： "
-    select VERSION in "${VERSIONS[@]}" "默认最新版本"; do
-        if [ "$VERSION" = "默认最新版本" ] || [ -z "$REPLY" ]; then
+    select VERSION in "${VERSIONS[@]}"; do
+        if [ -z "$REPLY" ]; then
             echo ""
             break
         elif [ -n "$VERSION" ]; then
@@ -294,15 +295,15 @@ main() {
 
     while true; do
         echo "请选择要执行的操作："
-        echo "1. 安装 Docker"
-        echo "2. 安装 Docker Compose"
-        echo "3. 安装 Docker 和 Docker Compose"
-        echo "4. 卸载 Docker"
-        echo "5. 卸载 Docker Compose"
-        echo "6. 卸载 Docker 和 Docker Compose"
-        echo "7. 查询 Docker 和 Docker Compose 的安装状态"
-        echo "8. 生成 daemon.json 配置文件"
-        echo "9. 退出脚本"
+        echo "① 安装 Docker"
+        echo "② 安装 Docker Compose"
+        echo "③ 安装 Docker 和 Docker Compose"
+        echo "④ 卸载 Docker"
+        echo "⑤ 卸载 Docker Compose"
+        echo "⑥ 卸载 Docker 和 Docker Compose"
+        echo "⑦ 查询 Docker 和 Docker Compose 的安装状态"
+        echo "⑧ 生成 daemon.json 配置文件"
+        echo "⑨ 退出脚本"
         read -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
         case $CHOICE in
