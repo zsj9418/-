@@ -1,31 +1,46 @@
 #!/bin/bash
 
-# 检测是否具有 sudo 权限
+# 检查是否具有 sudo 权限
 check_sudo() {
     if [[ $EUID -ne 0 ]]; then
-        echo "此脚本需要 root 权限或 sudo 权限运行。请以 root 用户运行或使用 'sudo' 执行。"
+        echo "此脚本需要 root 权限运行，请以 root 用户运行或使用 'sudo' 执行。"
         exit 1
     fi
 }
 
-# 检测和安装缺失的依赖
+# 检测系统包管理工具
+detect_package_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt-get"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    else
+        echo "无法检测到支持的包管理工具 (apt-get/yum/dnf)，请手动安装必要的依赖后重试。"
+        exit 1
+    fi
+}
+
+# 检测并安装依赖，只执行一次
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
     local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq" "dialog")
     for DEP in "${DEPS[@]}"; do
         if ! command -v $DEP >/dev/null 2>&1; then
             echo "安装依赖：$DEP"
-            if command -v apt-get >/dev/null 2>&1; then
-                sudo apt-get update
-                sudo apt-get install -y $DEP
-            elif command -v yum >/dev/null 2>&1; then
-                sudo yum install -y $DEP
-            elif command -v dnf >/dev/null 2>&1; then
-                sudo dnf install -y $DEP
-            else
-                echo "无法自动安装依赖 $DEP，请手动安装后重试。"
-                exit 1
-            fi
+            case $PKG_MANAGER in
+                apt-get)
+                    sudo apt-get update
+                    sudo apt-get install -y $DEP
+                    ;;
+                yum)
+                    sudo yum install -y $DEP
+                    ;;
+                dnf)
+                    sudo dnf install -y $DEP
+                    ;;
+            esac
         else
             echo "$DEP 已安装，跳过..."
         fi
@@ -62,8 +77,10 @@ check_docker_installed() {
     if command -v docker >/dev/null 2>&1; then
         echo "Docker 已安装，版本信息如下："
         docker --version
+        return 0
     else
         echo "Docker 未安装。"
+        return 1
     fi
 }
 
@@ -72,8 +89,10 @@ check_docker_compose_installed() {
     if command -v docker-compose >/dev/null 2>&1; then
         echo "Docker Compose 已安装，版本信息如下："
         docker-compose --version
+        return 0
     else
         echo "Docker Compose 未安装。"
+        return 1
     fi
 }
 
@@ -102,7 +121,7 @@ select_docker_version() {
         COUNTER=$((COUNTER + 1))
     done
 
-    # 检查是否安装 dialog
+    # 使用 dialog 或命令行选择版本
     if command -v dialog >/dev/null 2>&1; then
         SELECTED_INDEX=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
         if [ $? -eq 0 ]; then
@@ -126,6 +145,14 @@ select_docker_version() {
 
 # 安装 Docker
 install_docker() {
+    if check_docker_installed; then
+        read -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
+        if [[ $REINSTALL != "y" ]]; then
+            echo "跳过 Docker 安装。"
+            return
+        fi
+    fi
+
     local ARCH=$(get_architecture)
     local VERSION=$(select_docker_version)
 
@@ -162,6 +189,14 @@ install_docker() {
 
 # 安装 Docker Compose
 install_docker_compose() {
+    if check_docker_compose_installed; then
+        read -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
+        if [[ $REINSTALL != "y" ]]; then
+            echo "跳过 Docker Compose 安装。"
+            return
+        fi
+    fi
+
     echo "正在安装 Docker Compose..."
     COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
     sudo curl -L "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
@@ -190,6 +225,7 @@ uninstall_docker_compose() {
 # 主脚本入口
 main() {
     check_sudo
+    detect_package_manager
     install_dependencies
 
     echo "欢迎使用 Docker 和 Docker Compose 一键安装脚本"
@@ -199,48 +235,52 @@ main() {
     echo "系统架构: $ARCH"
     echo "系统版本: $OS"
 
-    echo "请选择要执行的操作："
-    echo "1. 安装 Docker"
-    echo "2. 安装 Docker Compose"
-    echo "3. 安装 Docker 和 Docker Compose"
-    echo "4. 卸载 Docker"
-    echo "5. 卸载 Docker Compose"
-    echo "6. 卸载 Docker 和 Docker Compose"
-    echo "7. 查询 Docker 和 Docker Compose 的安装状态"
-    read -p "请输入数字 (1/2/3/4/5/6/7): " CHOICE
+    while true; do
+        echo "请选择要执行的操作："
+        echo "1. 安装 Docker"
+        echo "2. 安装 Docker Compose"
+        echo "3. 安装 Docker 和 Docker Compose"
+        echo "4. 卸载 Docker"
+        echo "5. 卸载 Docker Compose"
+        echo "6. 卸载 Docker 和 Docker Compose"
+        echo "7. 查询 Docker 和 Docker Compose 的安装状态"
+        echo "8. 退出脚本"
+        read -p "请输入数字 (1/2/3/4/5/6/7/8): " CHOICE
 
-    case $CHOICE in
-        1)
-            install_docker
-            ;;
-        2)
-            install_docker_compose
-            ;;
-        3)
-            install_docker
-            install_docker_compose
-            ;;
-        4)
-            uninstall_docker
-            ;;
-        5)
-            uninstall_docker_compose
-            ;;
-        6)
-            uninstall_docker
-            uninstall_docker_compose
-            ;;
-        7)
-            check_docker_installed
-            check_docker_compose_installed
-            ;;
-        *)
-            echo "无效的选择，退出脚本。"
-            exit 1
-            ;;
-    esac
-
-    echo "脚本执行完成！"
+        case $CHOICE in
+            1)
+                install_docker
+                ;;
+            2)
+                install_docker_compose
+                ;;
+            3)
+                install_docker
+                install_docker_compose
+                ;;
+            4)
+                uninstall_docker
+                ;;
+            5)
+                uninstall_docker_compose
+                ;;
+            6)
+                uninstall_docker
+                uninstall_docker_compose
+                ;;
+            7)
+                check_docker_installed
+                check_docker_compose_installed
+                ;;
+            8)
+                echo "退出脚本。"
+                exit 0
+                ;;
+            *)
+                echo "无效的选择，请重新输入。"
+                ;;
+        esac
+    done
 }
 
 main
