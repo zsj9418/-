@@ -115,11 +115,11 @@ check_docker_compose_installed() {
 fetch_docker_versions() {
     local ARCH=$(get_architecture)
     local URL="https://download.docker.com/linux/static/stable/$ARCH/"
-    echo "正在获取可用的 Docker 版本列表..."
+    echo "正在获取可用的 Docker 版本列表..." >&2
     curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq
 }
 
-# 选择 Docker 版本（自定义圆圈数字显示）
+# 选择 Docker 版本（使用 select 实现，圆圈数字显示）
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
     if [ ${#VERSIONS[@]} -eq 0 ]; then
@@ -175,7 +175,11 @@ install_docker() {
 
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
     wget -O "$TEMP_DIR/docker.tgz" "$DOCKER_URL" || {
-        echo "下载失败，请检查网络连接、代理设置、DNS 配置或 Docker 版本号是否正确。"
+        echo "下载失败，请检查以下事项："
+        echo "1. 网络连接是否正常"
+        echo "2. 代理设置是否正确（如有代理，请设置 http_proxy 和 https_proxy 环境变量）"
+        echo "3. DNS 配置是否有效（尝试使用 'ping download.docker.com' 测试）"
+        echo "4. 选择的版本号 ($VERSION) 是否存在于 https://download.docker.com/linux/static/stable/$ARCH/"
         rm -rf "$TEMP_DIR"
         exit 1
     }
