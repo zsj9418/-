@@ -34,7 +34,7 @@ detect_package_manager() {
 # 检测并安装依赖，只执行一次
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
-    local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq" "dialog")
+    local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq")
     for DEP in "${DEPS[@]}"; do
         if ! command -v "$DEP" >/dev/null 2>&1; then
             echo "安装依赖：$DEP"
@@ -124,40 +124,27 @@ fetch_docker_versions() {
     echo "$VERSIONS"
 }
 
-# 选择 Docker 版本（支持 dialog 和 select 两种交互方式）
+# 选择 Docker 版本（使用 select 实现上下键选择）
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
-    if command -v dialog >/dev/null 2>&1; then
-        local MENU_ITEMS=()
-        local COUNTER=1
-        for VERSION in "${VERSIONS[@]}"; do
-            MENU_ITEMS+=("$COUNTER" "$VERSION")
-            COUNTER=$((COUNTER + 1))
-        done
-        # 使用临时文件保存 dialog 输出，避免终端乱码
-        TEMP_FILE=$(mktemp)
-        dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 2>"$TEMP_FILE"
-        if [ $? -eq 0 ]; then
-            SELECTED_INDEX=$(cat "$TEMP_FILE")
-            rm -f "$TEMP_FILE"
-            echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
-        else
-            rm -f "$TEMP_FILE"
-            echo ""
-        fi
-    else
-        echo "使用上下键选择 Docker 版本（回车确认，留空选择最新版本）："
-        PS3="请输入数字选择版本（默认最新版本）： "
-        select VERSION in "${VERSIONS[@]}"; do
-            if [ -n "$VERSION" ]; then
-                echo "$VERSION"
-                break
-            elif [ -z "$REPLY" ]; then
-                echo ""
-                break
-            fi
-        done
+    if [ ${#VERSIONS[@]} -eq 0 ]; then
+        echo "未找到可用 Docker 版本，退出。"
+        exit 1
     fi
+
+    echo "请使用上下键选择 Docker 版本（回车确认，留空选择最新版本）："
+    PS3="请输入数字选择版本（默认最新版本）： "
+    select VERSION in "${VERSIONS[@]}" "默认最新版本"; do
+        if [ "$VERSION" = "默认最新版本" ] || [ -z "$REPLY" ]; then
+            echo ""
+            break
+        elif [ -n "$VERSION" ]; then
+            echo "$VERSION"
+            break
+        else
+            echo "无效选择，请重新选择。"
+        fi
+    done
 }
 
 # 安装 Docker
