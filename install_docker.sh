@@ -1,6 +1,18 @@
 #!/bin/bash
 
-# 检查是否具有 sudo 权限
+# 依赖列表 (gnupg 和 lsb-release 根据常见系统情况添加)
+DEPS=("curl" "wget" "jq" "fzf")
+DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
+
+# 全局变量
+INSTALL_STATUS=$(mktemp)  # 记录依赖安装状态
+DOCKER_URL=""
+DOCKER_INSTALL_DIR="/tmp/docker_install"
+ARCH=""
+OS=""
+PKG_MANAGER=""
+
+# 函数: 检查是否具有 sudo 权限
 check_sudo() {
     if [[ $EUID -ne 0 ]]; then
         echo "此脚本需要 root 权限运行，请以 root 用户运行或使用 'sudo' 执行。"
@@ -8,7 +20,7 @@ check_sudo() {
     fi
 }
 
-# 检测系统包管理工具
+# 函数: 检测系统包管理工具
 detect_package_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MANAGER="apt-get"
@@ -22,57 +34,93 @@ detect_package_manager() {
     fi
 }
 
-# 检测并安装依赖，只执行一次
+# 函数: 安装依赖
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
-    local DEPS=("curl" "gnupg" "lsb-release" "ca-certificates" "software-properties-common" "wget" "jq" "dialog")
+
+    # 检查是否已经安装过
+    local installed_deps=($(cat "$INSTALL_STATUS" 2>/dev/null)) # 读取安装状态,忽略报错
+    local needs_install=()
+
+    # 先尝试安装基础依赖,不管安装情况
+    case "$PKG_MANAGER" in
+        apt-get)
+            sudo apt-get update -y >/dev/null 2>&1
+            sudo apt-get install -y --no-install-recommends ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
+            ;;
+        yum)
+            sudo yum install -y ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
+            ;;
+        dnf)
+            sudo dnf install -y ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
+            ;;
+    esac
+
+    # 检测真正需要安装的
     for DEP in "${DEPS[@]}"; do
-        if ! command -v $DEP >/dev/null 2>&1; then
-            echo "安装依赖：$DEP"
-            case $PKG_MANAGER in
-                apt-get)
-                    sudo apt-get update
-                    sudo apt-get install -y $DEP
-                    ;;
-                yum)
-                    sudo yum install -y $DEP
-                    ;;
-                dnf)
-                    sudo dnf install -y $DEP
-                    ;;
-            esac
-        else
-            echo "$DEP 已安装，跳过..."
+        is_installed=false
+        for INSTALLED in "${installed_deps[@]}"; do
+            if [[ "$DEP" == "$INSTALLED" ]]; then
+                is_installed=true
+                break
+            fi
+        done
+
+        if ! $is_installed; then
+            if ! command -v "$DEP" >/dev/null 2>&1; then
+                needs_install+=("$DEP")  # 加入待安装列表
+            fi
         fi
     done
+
+    # 开始安装
+    if [[ ${#needs_install[@]} -gt 0 ]]; then
+        echo "需要安装以下依赖: ${needs_install[*]}"
+        for DEP in "${needs_install[@]}"; do
+            echo "安装依赖：$DEP"
+            case "$PKG_MANAGER" in
+                apt-get)
+                    sudo apt-get install -y --no-install-recommends "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
+                    ;;
+                yum)
+                    sudo yum install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
+                    ;;
+                dnf)
+                    sudo dnf install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
+                    ;;
+            esac
+            echo "$DEP" >> "$INSTALL_STATUS" # 添加到安装状态
+        done
+    else
+        echo "所有依赖已安装，跳过..."
+    fi
 }
 
-# 检测系统架构
+# 函数: 获取系统架构
 get_architecture() {
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) ARCH="x86_64" ;;
         aarch64) ARCH="aarch64" ;;
-        armv7l) ARCH="armv7" ;;
+        armv7l) ARCH="armv7l" ;;
         *) echo "不支持的架构: $ARCH"; exit 1 ;;
     esac
-    echo $ARCH
+    echo "$ARCH"
 }
 
-# 检测系统版本
+# 函数: 获取系统版本
 get_os_version() {
     if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME=$ID
-        OS_VERSION=$VERSION_ID
+        OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
+        OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     else
-        echo "无法检测系统版本"
+        echo "无法检测系统版本。请确保 /etc/os-release 文件存在并且格式正确。"
         exit 1
     fi
     echo "$OS_NAME $OS_VERSION"
 }
 
-# 检测是否安装 Docker
+# 函数: 检测是否安装 Docker
 check_docker_installed() {
     if command -v docker >/dev/null 2>&1; then
         echo "Docker 已安装，版本信息如下："
@@ -84,7 +132,7 @@ check_docker_installed() {
     fi
 }
 
-# 检测是否安装 Docker Compose
+# 函数: 检测是否安装 Docker Compose
 check_docker_compose_installed() {
     if command -v docker-compose >/dev/null 2>&1; then
         echo "Docker Compose 已安装，版本信息如下："
@@ -96,102 +144,133 @@ check_docker_compose_installed() {
     fi
 }
 
-# 获取可用 Docker 版本
+# 函数: 获取 Docker 版本列表并进行过滤(去除重复版本)
 fetch_docker_versions() {
-    local ARCH=$(get_architecture)
-    local URL="https://download.docker.com/linux/static/stable/$ARCH/"
-    echo "正在获取可用的 Docker 版本列表..."
-    VERSIONS=$(curl -s $URL | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | uniq)
+    ARCH=$(get_architecture)
+    local URL="$DOCKER_VERSIONS_URL$ARCH/"
+    local VERSIONS
+    VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
     if [ -z "$VERSIONS" ]; then
-        echo "无法获取版本列表，请检查网络连接。"
+        echo "无法获取版本列表，请检查网络连接或该架构是否支持。"
         exit 1
     fi
+    # 去掉多余的提示词，只返回版本
     echo "$VERSIONS"
 }
 
-# 选择 Docker 版本（支持 dialog 和命令行两种交互方式）
+# 函数: 选择 Docker 版本
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
-    local MENU_ITEMS=()
-    local COUNTER=1
 
-    # 构建菜单项数组
-    for VERSION in "${VERSIONS[@]}"; do
-        MENU_ITEMS+=("$COUNTER" "$VERSION")
-        COUNTER=$((COUNTER + 1))
-    done
-
-    # 使用 dialog 或命令行选择版本
-    if command -v dialog >/dev/null 2>&1; then
-        SELECTED_INDEX=$(dialog --clear --title "Docker 版本选择" --menu "使用上下键选择版本，回车确定：" 15 50 10 "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
-        if [ $? -eq 0 ]; then
-            echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
+    if command -v fzf >/dev/null 2>&1; then
+        # 使用 fzf 工具
+        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf --prompt="选择 Docker 版本 > " --height 20 --reverse)
+        # 清理版本号中的多余字符（如换行符和空格）
+        SELECTED_VERSION=$(echo "$SELECTED_VERSION" | tr -d '[:space:]')
+        if [ -n "$SELECTED_VERSION" ]; then
+            echo "$SELECTED_VERSION"
+            return
         else
-            echo ""
-        fi
-    else
-        echo "dialog 未安装或不可用，请使用命令行选择版本："
-        for i in "${!VERSIONS[@]}"; do
-            echo "$((i + 1)). ${VERSIONS[i]}"
-        done
-        read -p "请输入对应的数字选择版本（默认最新版本）： " SELECTED_INDEX
-        if [[ $SELECTED_INDEX =~ ^[0-9]+$ ]] && [ $SELECTED_INDEX -le ${#VERSIONS[@]} ]; then
-            echo "${VERSIONS[$((SELECTED_INDEX - 1))]}"
-        else
-            echo ""
+            echo "未选择版本，跳过..."
+            return
         fi
     fi
+
+    echo ""  # 如果没有任何工具可用或用户退出，返回空字符串
 }
 
-# 安装 Docker
+# 函数: 安装 Docker
 install_docker() {
     if check_docker_installed; then
-        read -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
-        if [[ $REINSTALL != "y" ]]; then
+        read -r -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
+        if [[ "$REINSTALL" != "y" ]]; then
             echo "跳过 Docker 安装。"
             return
         fi
     fi
 
-    local ARCH=$(get_architecture)
+    ARCH=$(get_architecture)
+    echo "正在获取可用的 Docker 版本列表..." # 放在选择版本之前提示
     local VERSION=$(select_docker_version)
-
-    # 定义临时文件夹
-    TEMP_DIR="/tmp/docker_install"
-    mkdir -p "$TEMP_DIR"
+    DOCKER_INSTALL_DIR="/tmp/docker_install"
+    mkdir -p "$DOCKER_INSTALL_DIR"
 
     if [ -z "$VERSION" ]; then
         echo "未选择版本，安装最新版本的 Docker..."
-        DOCKER_URL="https://download.docker.com/linux/static/stable/$ARCH/docker.tgz"
+        DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker.tgz"
     else
         echo "您选择安装的 Docker 版本为：$VERSION"
-        DOCKER_URL="https://download.docker.com/linux/static/stable/$ARCH/docker-$VERSION.tgz"
+        # 确保 VERSION 是干净的，没有多余字符
+        VERSION=$(echo "$VERSION" | tr -d '[:space:]')
+        DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
     fi
 
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    wget -O "$TEMP_DIR/docker.tgz" "$DOCKER_URL"
-    if [ $? -ne 0 ]; then
-        echo "下载失败，请检查版本号或网络状态。"
-        rm -rf "$TEMP_DIR"
-        exit 1
-    fi
+    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || { echo "下载失败，请检查版本号或网络状态。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
     echo "正在解压 Docker 包到临时文件夹..."
-    tar -zxf "$TEMP_DIR/docker.tgz" -C "$TEMP_DIR"
-    sudo mv "$TEMP_DIR/docker/"* /usr/bin/
+    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo "解压失败。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+
+    # 安装 Docker 二进制文件
+    sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
+    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/
+
+    # 创建 Docker 用户组
+    sudo groupadd -f docker
+
+    # 将当前用户添加到 Docker 用户组
+    if ! sudo gpasswd -a "$USER" docker; then
+        echo "无法将当前用户添加到 'docker' 用户组，请手动添加。"
+    fi
+    newgrp docker
+
+    # 创建 Docker 服务文件
+    cat <<EOF | sudo tee /etc/systemd/system/docker.service
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd
+ExecReload=/bin/kill -s HUP \$MAINPID
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable docker
+    sudo systemctl start docker
+
+    # 验证安装
+    if command -v docker >/dev/null 2>&1; then
+        docker version >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "Docker 安装成功，请重新登录以应用用户组更改。"
+        else
+            echo "Docker 安装后，版本验证失败，请检查安装。"
+        fi
+    else
+        echo "Docker 安装失败。"
+    fi
 
     # 清理临时文件夹
     echo "清理临时文件..."
-    rm -rf "$TEMP_DIR"
-
-    echo "Docker 安装完成，请重新登录以应用用户组更改。"
+    rm -rf "$DOCKER_INSTALL_DIR"
 }
 
-# 安装 Docker Compose
+# 函数: 安装 Docker Compose
 install_docker_compose() {
     if check_docker_compose_installed; then
-        read -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
-        if [[ $REINSTALL != "y" ]]; then
+        read -r -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
+        if [[ "$REINSTALL" != "y" ]]; then
             echo "跳过 Docker Compose 安装。"
             return
         fi
@@ -199,22 +278,44 @@ install_docker_compose() {
 
     echo "正在安装 Docker Compose..."
     COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    sudo curl -L "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || { echo "下载 Docker Compose 失败"; exit 1; }
     sudo chmod +x /usr/local/bin/docker-compose
     echo "Docker Compose 安装完成。"
 }
 
-# 卸载 Docker
+# 函数: 卸载 Docker
 uninstall_docker() {
     echo "正在卸载 Docker..."
-    sudo apt-get remove -y docker docker-engine docker.io containerd runc
+
+    # 停止并禁用 Docker 服务
+    sudo systemctl stop docker
+    sudo systemctl disable docker
+
+    # 删除软件包
+    case "$PKG_MANAGER" in
+        apt-get)
+            sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc
+            ;;
+        yum|dnf)
+            sudo yum remove -y docker docker-engine docker.io containerd runc
+            ;;
+    esac
+
+    # 清理文件和目录
     sudo rm -rf /var/lib/docker
     sudo rm -rf /etc/docker
-    sudo rm -rf /usr/bin/docker*
+    sudo rm -rf /usr/local/bin/docker*
+    sudo rm -f /etc/systemd/system/docker.service
+
+    # 清理用户组
+    sudo groupdel docker
     echo "Docker 残留文件已清理。"
+
+    # 清理镜像、容器和网络
+    docker system prune -a -f
 }
 
-# 卸载 Docker Compose
+# 函数: 卸载 Docker Compose
 uninstall_docker_compose() {
     echo "正在卸载 Docker Compose..."
     sudo rm -rf /usr/local/bin/docker-compose
@@ -222,29 +323,35 @@ uninstall_docker_compose() {
     echo "Docker Compose 残留文件已清理。"
 }
 
-# 生成 daemon.json 配置文件
+# 函数: 生成 daemon.json 配置文件
 generate_daemon_config() {
     echo "正在生成 Docker daemon.json 配置文件..."
 
-    DEFAULT_DATA_ROOT="/opt/docker"
-    read -p "请输入 Docker data-root 路径 (留空默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
+    local DEFAULT_DATA_ROOT="/opt/docker"
+    local DEFAULT_REGISTRY_MIRRORS=(
+        "https://registry.cn-chengdu.aliyuncs.com"
+        "https://mirror.ccs.tencentyun.com"
+        "https://docker.mirrors.huaweicloud.com"
+        "https://hub-mirror.c.163.com"
+    )
+    local DEFAULT_LOG_MAX_SIZE="5m"
+    local DEFAULT_LOG_MAX_FILE="3"
+
+    read -r -p "请输入 Docker data-root 路径 (留空默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
     DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
+
+    local REGISTRY_MIRRORS_JSON=$(echo "${DEFAULT_REGISTRY_MIRRORS[@]}" | jq -c -s .)
 
     DAEMON_CONFIG=$(cat <<EOF
 {
   "iptables": true,
   "ip6tables": true,
-  "registry-mirrors": [
-    "https://registry.cn-chengdu.aliyuncs.com",
-    "https://mirror.ccs.tencentyun.com",
-    "https://docker.mirrors.huaweicloud.com",
-    "https://hub-mirror.c.163.com"
-  ],
+  "registry-mirrors": $REGISTRY_MIRRORS_JSON,
   "data-root": "${DATA_ROOT}",
   "log-driver": "json-file",
   "log-opts": {
-    "max-size": "5m",
-    "max-file": "3"
+    "max-size": "${DEFAULT_LOG_MAX_SIZE}",
+    "max-file": "${DEFAULT_LOG_MAX_FILE}"
   }
 }
 EOF
@@ -270,7 +377,7 @@ EOF
     fi
 }
 
-# 主脚本入口
+# 主函数: 脚本入口
 main() {
     check_sudo
     detect_package_manager
@@ -294,9 +401,9 @@ main() {
         echo "7. 查询 Docker 和 Docker Compose 的安装状态"
         echo "8. 生成 daemon.json 配置文件"
         echo "9. 退出脚本"
-        read -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
+        read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
-        case $CHOICE in
+        case "$CHOICE" in
             1)
                 install_docker
                 ;;
@@ -336,3 +443,6 @@ main() {
 }
 
 main
+
+# 删除安装状态文件,保证只安装一次依赖
+rm -f "$INSTALL_STATUS"
