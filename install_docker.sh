@@ -315,24 +315,57 @@ install_docker_compose() {
 # 函数: 卸载 Docker
 uninstall_docker() {
     echo "正在卸载 Docker..."
-    sudo systemctl stop docker
-    sudo systemctl disable docker
 
+    # 1. 停止 Docker 服务
+    sudo systemctl stop docker.service 2>/dev/null || true # 忽略停止失败
+
+    # 2. 禁用 Docker 服务
+    sudo systemctl disable docker.service 2>/dev/null || true # 忽略禁用失败
+
+    # 3. 移除 Docker 包 (根据包管理器)
     case "$PKG_MANAGER" in
-        apt-get) sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc ;;
-        yum|dnf) sudo yum remove -y docker docker-engine docker.io containerd runc ;;
+        apt-get) sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;; # 忽略移除失败，包含 docker-ce
+        yum|dnf) sudo yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;; # 忽略移除失败，包含 docker-ce
     esac
 
-    sudo rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /etc/systemd/system/docker.service
-    sudo groupdel docker 2>/dev/null
-    echo "Docker 残留文件已清理。"
-    docker system prune -a -f 2>/dev/null
+    # 4. 移除相关文件和目录
+    sudo rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker  # 删除 /opt/docker
+    sudo rm -f /etc/systemd/system/docker.service
+    sudo rm -f /etc/systemd/system/docker.socket
+    sudo rm -rf /var/run/docker
+    sudo rm -rf /var/log/docker*
+
+    # 5. 移除 Docker 用户组
+    sudo groupdel docker 2>/dev/null || true # 忽略用户组删除失败
+
+    # 6. 清理镜像、容器、网络和卷
+    echo "清理 Docker 镜像，容器，网络和卷..."
+    docker system prune -a -f 2>/dev/null || true  # 忽略清理失败
+
+    # 7. 尝试清理 containerd 和 runc 的残留
+    echo "尝试清理 containerd 和 runc 的残留..."
+    sudo rm -rf /var/lib/containerd 2>/dev/null || true
+    sudo rm -rf /run/containerd 2>/dev/null || true
+    sudo rm -rf /usr/local/bin/containerd 2>/dev/null || true
+    sudo rm -rf /usr/local/bin/runc 2>/dev/null || true
+
+    # 8. 清理日志 (可选)
+    echo "尝试清理 Docker 日志..."
+    sudo find /var/log -name "docker*" -delete 2>/dev/null || true
+
+    # 9. 更新 systemd
+    sudo systemctl daemon-reload 2>/dev/null || true
+    sudo systemctl reset-failed 2>/dev/null || true
+
+    echo "Docker 已卸载，残留文件已清理。"
 }
+
 
 # 函数: 卸载 Docker Compose
 uninstall_docker_compose() {
     echo "正在卸载 Docker Compose..."
     sudo rm -rf /usr/local/bin/docker-compose ~/.docker/compose
+    sudo rm -rf /opt/docker-compose # 删除可能的compose安装目录
     echo "Docker Compose 残留文件已清理。"
 }
 
