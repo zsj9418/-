@@ -7,7 +7,7 @@ DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 # 全局变量
 INSTALL_STATUS=$(mktemp)  # 记录依赖安装状态
 DOCKER_URL=""
-DOCKER_INSTALL_DIR="/tmp/docker_install"
+DOCKER_INSTALL_DIR=""
 ARCH=""
 OS=""
 PKG_MANAGER=""
@@ -38,11 +38,9 @@ detect_package_manager() {
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
 
-    # 检查是否已经安装过
-    local installed_deps=($(cat "$INSTALL_STATUS" 2>/dev/null)) # 读取安装状态,忽略报错
+    local installed_deps=($(cat "$INSTALL_STATUS" 2>/dev/null))
     local needs_install=()
 
-    # 先尝试安装基础依赖,不管安装情况
     case "$PKG_MANAGER" in
         apt-get)
             sudo apt-get update -y >/dev/null 2>&1
@@ -56,7 +54,6 @@ install_dependencies() {
             ;;
     esac
 
-    # 检测真正需要安装的
     for DEP in "${DEPS[@]}"; do
         is_installed=false
         for INSTALLED in "${installed_deps[@]}"; do
@@ -66,30 +63,21 @@ install_dependencies() {
             fi
         done
 
-        if ! $is_installed; then
-            if ! command -v "$DEP" >/dev/null 2>&1; then
-                needs_install+=("$DEP")  # 加入待安装列表
-            fi
+        if ! $is_installed && ! command -v "$DEP" >/dev/null 2>&1; then
+            needs_install+=("$DEP")
         fi
     done
 
-    # 开始安装
     if [[ ${#needs_install[@]} -gt 0 ]]; then
         echo "需要安装以下依赖: ${needs_install[*]}"
         for DEP in "${needs_install[@]}"; do
             echo "安装依赖：$DEP"
             case "$PKG_MANAGER" in
-                apt-get)
-                    sudo apt-get install -y --no-install-recommends "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
-                    ;;
-                yum)
-                    sudo yum install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
-                    ;;
-                dnf)
-                    sudo dnf install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; }
-                    ;;
+                apt-get) sudo apt-get install -y --no-install-recommends "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
+                yum) sudo yum install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
+                dnf) sudo dnf install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
             esac
-            echo "$DEP" >> "$INSTALL_STATUS" # 添加到安装状态
+            echo "$DEP" >> "$INSTALL_STATUS"
         done
     else
         echo "所有依赖已安装，跳过..."
@@ -120,6 +108,45 @@ get_os_version() {
     echo "$OS_NAME $OS_VERSION"
 }
 
+# 函数: 检查磁盘空间并选择安装目录
+check_and_set_install_dir() {
+    local REQUIRED_SPACE=500  # 需要至少 500MB 空间
+    local DEFAULT_DIR="/tmp/docker_install"
+    local FALLBACK_DIR="/var/tmp/docker_install"
+
+    # 检查默认目录空间
+    local AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+    if [[ -z "$AVAILABLE_SPACE" || "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
+        echo "默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)"
+        # 检查备用目录
+        AVAILABLE_SPACE=$(df -m "$FALLBACK_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+        if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
+            DOCKER_INSTALL_DIR="$FALLBACK_DIR"
+            echo "切换到备用目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+        else
+            echo "备用目录 $FALLBACK_DIR 空间也不足 (可用: ${AVAILABLE_SPACE}MB)"
+            read -r -p "请输入自定义安装目录 (需至少 ${REQUIRED_SPACE}MB 可用空间): " CUSTOM_DIR
+            if [[ -n "$CUSTOM_DIR" ]]; then
+                AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+                if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
+                    DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
+                    echo "使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+                else
+                    echo "自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB)，退出脚本。"
+                    exit 1
+                fi
+            else
+                echo "未提供有效目录，退出脚本。"
+                exit 1
+            fi
+        fi
+    else
+        DOCKER_INSTALL_DIR="$DEFAULT_DIR"
+        echo "使用默认目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+    fi
+    mkdir -p "$DOCKER_INSTALL_DIR" || { echo "创建目录 $DOCKER_INSTALL_DIR 失败"; exit 1; }
+}
+
 # 函数: 检测是否安装 Docker
 check_docker_installed() {
     if command -v docker >/dev/null 2>&1; then
@@ -144,7 +171,7 @@ check_docker_compose_installed() {
     fi
 }
 
-# 函数: 获取 Docker 版本列表并进行过滤(去除重复版本)
+# 函数: 获取 Docker 版本列表并进行过滤
 fetch_docker_versions() {
     ARCH=$(get_architecture)
     local URL="$DOCKER_VERSIONS_URL$ARCH/"
@@ -154,18 +181,26 @@ fetch_docker_versions() {
         echo "无法获取版本列表，请检查网络连接或该架构是否支持。"
         exit 1
     fi
-    # 去掉多余的提示词，只返回版本
     echo "$VERSIONS"
 }
 
-# 函数: 选择 Docker 版本
+# 函数: 选择 Docker 版本（美化 fzf 界面）
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
 
     if command -v fzf >/dev/null 2>&1; then
-        # 使用 fzf 工具
-        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf --prompt="选择 Docker 版本 > " --height 20 --reverse)
-        # 清理版本号中的多余字符（如换行符和空格）
+        local HEADER="选择 Docker 版本 (架构: $ARCH)"
+        local INFO="使用 ↑↓ 导航，Enter 确认，Ctrl+C 取消"
+        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
+            --prompt="请选择版本 > " \
+            --header="$HEADER" \
+            --header-lines=1 \
+            --info=inline:"$INFO" \
+            --height=20 \
+            --reverse \
+            --border \
+            --color="header:blue,bg+:black,pointer:green" \
+            --preview="echo '预览: Docker v{}'")
         SELECTED_VERSION=$(echo "$SELECTED_VERSION" | tr -d '[:space:]')
         if [ -n "$SELECTED_VERSION" ]; then
             echo "$SELECTED_VERSION"
@@ -176,7 +211,7 @@ select_docker_version() {
         fi
     fi
 
-    echo ""  # 如果没有任何工具可用或用户退出，返回空字符串
+    echo ""
 }
 
 # 函数: 安装 Docker
@@ -190,17 +225,15 @@ install_docker() {
     fi
 
     ARCH=$(get_architecture)
-    echo "正在获取可用的 Docker 版本列表..." # 放在选择版本之前提示
+    echo "正在获取可用的 Docker 版本列表..."
     local VERSION=$(select_docker_version)
-    DOCKER_INSTALL_DIR="/tmp/docker_install"
-    mkdir -p "$DOCKER_INSTALL_DIR"
+    check_and_set_install_dir
 
     if [ -z "$VERSION" ]; then
         echo "未选择版本，安装最新版本的 Docker..."
         DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker.tgz"
     else
         echo "您选择安装的 Docker 版本为：$VERSION"
-        # 确保 VERSION 是干净的，没有多余字符
         VERSION=$(echo "$VERSION" | tr -d '[:space:]')
         DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
     fi
@@ -209,22 +242,17 @@ install_docker() {
     curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || { echo "下载失败，请检查版本号或网络状态。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
     echo "正在解压 Docker 包到临时文件夹..."
-    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo "解压失败。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo "解压失败，可能是空间不足或权限问题。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
-    # 安装 Docker 二进制文件
     sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
     sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/
 
-    # 创建 Docker 用户组
     sudo groupadd -f docker
-
-    # 将当前用户添加到 Docker 用户组
     if ! sudo gpasswd -a "$USER" docker; then
         echo "无法将当前用户添加到 'docker' 用户组，请手动添加。"
     fi
     newgrp docker
 
-    # 创建 Docker 服务文件
     cat <<EOF | sudo tee /etc/systemd/system/docker.service
 [Unit]
 Description=Docker Application Container Engine
@@ -249,19 +277,12 @@ EOF
     sudo systemctl enable docker
     sudo systemctl start docker
 
-    # 验证安装
-    if command -v docker >/dev/null 2>&1; then
-        docker version >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            echo "Docker 安装成功，请重新登录以应用用户组更改。"
-        else
-            echo "Docker 安装后，版本验证失败，请检查安装。"
-        fi
+    if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
+        echo "Docker 安装成功，请重新登录以应用用户组更改。"
     else
-        echo "Docker 安装失败。"
+        echo "Docker 安装失败或版本验证失败，请检查安装。"
     fi
 
-    # 清理临时文件夹
     echo "清理临时文件..."
     rm -rf "$DOCKER_INSTALL_DIR"
 }
@@ -286,40 +307,24 @@ install_docker_compose() {
 # 函数: 卸载 Docker
 uninstall_docker() {
     echo "正在卸载 Docker..."
-
-    # 停止并禁用 Docker 服务
     sudo systemctl stop docker
     sudo systemctl disable docker
 
-    # 删除软件包
     case "$PKG_MANAGER" in
-        apt-get)
-            sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc
-            ;;
-        yum|dnf)
-            sudo yum remove -y docker docker-engine docker.io containerd runc
-            ;;
+        apt-get) sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc ;;
+        yum|dnf) sudo yum remove -y docker docker-engine docker.io containerd runc ;;
     esac
 
-    # 清理文件和目录
-    sudo rm -rf /var/lib/docker
-    sudo rm -rf /etc/docker
-    sudo rm -rf /usr/local/bin/docker*
-    sudo rm -f /etc/systemd/system/docker.service
-
-    # 清理用户组
+    sudo rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /etc/systemd/system/docker.service
     sudo groupdel docker
     echo "Docker 残留文件已清理。"
-
-    # 清理镜像、容器和网络
-    docker system prune -a -f
+    docker system prune -a -f 2>/dev/null
 }
 
 # 函数: 卸载 Docker Compose
 uninstall_docker_compose() {
     echo "正在卸载 Docker Compose..."
-    sudo rm -rf /usr/local/bin/docker-compose
-    sudo rm -rf ~/.docker/compose
+    sudo rm -rf /usr/local/bin/docker-compose ~/.docker/compose
     echo "Docker Compose 残留文件已清理。"
 }
 
@@ -370,7 +375,7 @@ EOF
         if [ $? -eq 0 ]; then
             echo "Docker 服务重启成功，新配置已加载。"
         else
-            echo "Docker 服务重启失败，请手动重启 Docker 服务: sudo systemctl restart docker"
+            echo "Docker 服务重启失败，请手动重启: sudo systemctl restart docker"
         fi
     else
         echo "/etc/docker/daemon.json 文件生成失败，请检查权限或重试。"
@@ -404,45 +409,20 @@ main() {
         read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
         case "$CHOICE" in
-            1)
-                install_docker
-                ;;
-            2)
-                install_docker_compose
-                ;;
-            3)
-                install_docker
-                install_docker_compose
-                ;;
-            4)
-                uninstall_docker
-                ;;
-            5)
-                uninstall_docker_compose
-                ;;
-            6)
-                uninstall_docker
-                uninstall_docker_compose
-                ;;
-            7)
-                check_docker_installed
-                check_docker_compose_installed
-                ;;
-            8)
-                generate_daemon_config
-                ;;
-            9)
-                echo "退出脚本。"
-                exit 0
-                ;;
-            *)
-                echo "无效的选择，请重新输入。"
-                ;;
+            1) install_docker ;;
+            2) install_docker_compose ;;
+            3) install_docker; install_docker_compose ;;
+            4) uninstall_docker ;;
+            5) uninstall_docker_compose ;;
+            6) uninstall_docker; uninstall_docker_compose ;;
+            7) check_docker_installed; check_docker_compose_installed ;;
+            8) generate_daemon_config ;;
+            9) echo "退出脚本。"; exit 0 ;;
+            *) echo "无效的选择，请重新输入。" ;;
         esac
     done
 }
 
 main
 
-# 删除安装状态文件,保证只安装一次依赖
 rm -f "$INSTALL_STATUS"
