@@ -32,8 +32,6 @@ DEFAULT_OPTIONS=(
     "14. 部署 Sub-Store（sub-store-deploy.sh）"
     "15. 更新 Sing-box 配置（update_singbox.sh）"
     "16. 创建或清除快捷方式"
-    "17. 管理自定义菜单"
-    "0. 退出"
 )
 
 # 默认脚本对应的 URL
@@ -54,6 +52,9 @@ declare -A DEFAULT_SCRIPTS=(
     ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
 )
+
+# 声明全局变量
+declare -A CUSTOM_SCRIPT_NAMES=()
 
 # ------------------------- 核心函数 -------------------------
 
@@ -83,47 +84,61 @@ function check_network() {
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
-    local script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
-    local script_path="$SCRIPT_DIR/$script_name"
 
-    # 如果脚本已存在，直接返回路径
-    if [[ -f "$script_path" ]]; then
-        echo "脚本 $script_name 已存在，跳过下载。" >&2
-        echo "DEBUG: download_script - 脚本已存在, script_path: $script_path" >> "$LOG_FILE"
-        echo -n "$script_path"
-        return 0
+    # 获取脚本文件名
+    if [[ -n "${CUSTOM_SCRIPT_NAMES[$choice]}" ]]; then  # 自定义脚本
+        local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
+    else  # 默认脚本
+        script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
+        [[ "$script_name" == *".sh" ]] || script_name="${script_name}.sh"  # 确保后缀
     fi
 
-    # 网络检测：优先使用直连，失败后使用代理
-    if check_network; then
-        echo "正在使用直连下载 $script_name..." >&2
-    else
-        echo "直连不可用，正在使用代理下载 $script_name..." >&2
-        url="${PROXY_PREFIX}${url#https://raw.githubusercontent.com/}"
+    local script_path="$SCRIPT_DIR/$script_name"
+
+    # 检查脚本目录是否可写
+    mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
+    if [[ ! -w "$SCRIPT_DIR" ]]; then
+        echo "错误：脚本目录 $SCRIPT_DIR 不可写，无法下载脚本。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    # 如果脚本已存在，避免文件名冲突
+    if [[ -f "$script_path" ]]; then
+        local counter=1
+        while [[ -f "$script_path" ]]; do
+            script_name="${script_name%.sh}_${counter}.sh"
+            script_path="$SCRIPT_DIR/$script_name"
+            counter=$((counter + 1))
+        done
+        echo "警告：脚本文件名冲突，已重命名为 $script_name。" | tee -a "$LOG_FILE"
     fi
 
     # 下载脚本（带重试机制）
     for ((i=1; i<=RETRY_COUNT; i++)); do
         if curl -fsSL "$url" -o "$script_path"; then
-            if [[ -s "$script_path" ]]; then # 检查文件是否为空
+            if [[ -s "$script_path" ]]; then
                 chmod +x "$script_path"
                 echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
-                echo "DEBUG: download_script - 下载成功, script_path: $script_path" >> "$LOG_FILE"
                 echo -n "$script_path"
                 return 0
             else
                 echo "下载 $script_name 后文件为空，下载失败。" >&2
-                rm -f "$script_path" # 删除空文件
+                rm -f "$script_path"
                 return 1
             fi
         else
             echo "下载 $script_name 失败，重试中 ($i/$RETRY_COUNT)..." >&2
+            # 如果是 GitHub 资源且未使用代理，切换到代理
+            if [[ "$url" == https://raw.githubusercontent.com/* && "$url" != "${PROXY_PREFIX}"* ]]; then
+                url="${PROXY_PREFIX}${url#https://raw.githubusercontent.com/}"
+                echo "切换到代理 URL: $url" >&2
+            fi
             sleep 2
         fi
     done
 
     echo "下载 $script_name 失败，请检查网络连接或 URL 是否正确。" >&2
-    echo "DEBUG: download_script - curl 下载失败, 返回失败" >> "$LOG_FILE"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] 下载失败: URL=$url, 错误码=$?" >> "$LOG_FILE"
     return 1
 }
 
@@ -209,21 +224,15 @@ function manage_custom_menu() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             1)
-                while true; do
-                    echo "请输入新菜单项编号（例如 18）："
-                    read -r id
-                    if grep -q "^$id|" "$CUSTOM_MENU_FILE"; then
-                        echo "编号 $id 已存在，请使用其他编号。"
-                    else
-                        break
-                    fi
-                done
+                next_id=$(get_next_custom_menu_id)
                 echo "请输入新菜单项显示名称："
                 read -r name
                 echo "请输入脚本 URL 或本地路径："
                 read -r url
-                echo "$id|$name|$url" >> "$CUSTOM_MENU_FILE"
-                echo "菜单项已添加。"
+                # 生成脚本文件名
+                local script_name=$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]').sh
+                echo "$next_id|$name|$url|$script_name" >> "$CUSTOM_MENU_FILE"
+                echo "菜单项已添加，编号为 $next_id，脚本文件将保存为 $script_name。"
                 ;;
             2)
                 echo "请输入要删除的菜单项编号："
@@ -241,28 +250,63 @@ function manage_custom_menu() {
         read -rp "按回车键继续..."
     done
 }
+# 获取下一个自定义菜单 ID
+function get_next_custom_menu_id() {
+    local max_default_id=0
+    for option in "${DEFAULT_OPTIONS[@]}"; do
+        local id_part=$(echo "$option" | awk -F '.' '{print $1}')
+        if [[ "$id_part" =~ ^[0-9]+$ ]]; then
+            if [[ "$id_part" -gt "$max_default_id" ]]; then
+                max_default_id="$id_part"
+            fi
+        fi
+    done
 
+    local max_custom_id=$max_default_id
+    while IFS= read -r line; do
+        if [[ -n "$line" && "$line" != \#* ]]; then
+            IFS='|' read -r id name url script_name <<< "$line"
+            if [[ "$id" -gt "$max_custom_id" ]]; then
+                max_custom_id="$id"
+            fi
+        fi
+    done < "$CUSTOM_MENU_FILE"
+    echo $((max_custom_id + 1))
+}
 # 加载菜单选项
 function load_menu() {
+    OPTIONS=() # Reset OPTIONS array to avoid duplicate entries
     OPTIONS=("${DEFAULT_OPTIONS[@]}")
     SCRIPTS=()
+    CUSTOM_SCRIPT_NAMES=()  # 清空自定义脚本名缓存
+
+    # 加载默认脚本
     for key in "${!DEFAULT_SCRIPTS[@]}"; do
         SCRIPTS["$key"]="${DEFAULT_SCRIPTS[$key]}"
     done
 
-    # 加载自定义菜单
+    # 加载自定义菜单并按编号排序
+    local custom_options=()
     while IFS= read -r line; do
-        if [[ "$line" != \#* ]]; then
-            IFS='|' read -r id name url <<< "$line"
-            OPTIONS+=("$id. $name")
-            SCRIPTS["$id"]="$url"
+        if [[ -n "$line" && "$line" != \#* ]]; then
+            IFS='|' read -r id name url script_name <<< "$line"
+            custom_options+=("$id|$name|$url|$script_name")
         fi
     done < "$CUSTOM_MENU_FILE"
-
-    # 对菜单项进行排序
-    IFS=$'\n' sorted_options=($(sort -V <<< "${OPTIONS[*]}"))
+    # 按编号排序
+    IFS=$'\n' sorted_custom_options=($(sort -n <<< "${custom_options[*]}"))
     unset IFS
-    OPTIONS=("${sorted_options[@]}")
+
+    # 添加排序后的自定义菜单项
+    for line in "${sorted_custom_options[@]}"; do
+        IFS='|' read -r id name url script_name <<< "$line"
+        OPTIONS+=("$id. $name")
+        SCRIPTS["$id"]="$url"
+        CUSTOM_SCRIPT_NAMES["$id"]="$script_name"  # 存储自定义脚本名
+    done
+
+    # 确保“管理自定义菜单”和“退出”选项在最后
+    OPTIONS+=("99. 管理自定义菜单" "0. 退出")
 }
 
 # 打印菜单
@@ -286,8 +330,7 @@ function main() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             0) exit 0 ;;
-            16) manage_symlink ;;
-            17) manage_custom_menu ;;
+            99) manage_custom_menu ;;
             [1-9]|1[0-9])
                 manage_logs
                 script_path=$(download_script "$choice")
