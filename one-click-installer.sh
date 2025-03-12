@@ -32,6 +32,7 @@ DEFAULT_OPTIONS=(
     "14. 部署 Sub-Store（sub-store-deploy.sh）"
     "15. 更新 Sing-box 配置（update_singbox.sh）"
     "16. 创建或清除快捷方式"
+    "17. 科技lion一键脚本工具"
 )
 
 # 默认脚本对应的 URL
@@ -51,6 +52,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["13"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
     ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
+    ["17"]="https://raw.githubusercontent.com/lion-king007/QuantumultX/main/Tasks/zk_tools.sh"
 )
 
 # 声明全局变量
@@ -84,9 +86,9 @@ function check_network() {
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
-    
+
     # 获取脚本文件名
-    if [[ -n "${CUSTOM_SCRIPT_NAMES[$choice]}" ]]; then  # 自定义脚本
+    if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then  # 检查 $choice 是否为 CUSTOM_SCRIPT_NAMES 的键 (自定义脚本)
         local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
     else  # 默认脚本
         script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
@@ -94,7 +96,7 @@ function download_script() {
     fi
 
     local script_path="$SCRIPT_DIR/$script_name"
-    
+
     # 检查脚本目录是否可写
     mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
     if [[ ! -w "$SCRIPT_DIR" ]]; then
@@ -224,23 +226,15 @@ function manage_custom_menu() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             1)
-                while true; do
-                    echo "请输入新菜单项编号（例如 18）："
-                    read -r id
-                    if grep -q "^$id|" "$CUSTOM_MENU_FILE"; then
-                        echo "编号 $id 已存在，请使用其他编号。"
-                    else
-                        break
-                    fi
-                done
+                next_id=$(get_next_custom_menu_id)
                 echo "请输入新菜单项显示名称："
                 read -r name
                 echo "请输入脚本 URL 或本地路径："
                 read -r url
                 # 生成脚本文件名
                 local script_name=$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]').sh
-                echo "$id|$name|$url|$script_name" >> "$CUSTOM_MENU_FILE"
-                echo "菜单项已添加，脚本文件将保存为 $script_name。"
+                echo "$next_id|$name|$url|$script_name" >> "$CUSTOM_MENU_FILE"
+                echo "菜单项已添加，编号为 $next_id，脚本文件将保存为 $script_name。"
                 ;;
             2)
                 echo "请输入要删除的菜单项编号："
@@ -258,9 +252,32 @@ function manage_custom_menu() {
         read -rp "按回车键继续..."
     done
 }
+# 获取下一个自定义菜单 ID
+function get_next_custom_menu_id() {
+    local max_default_id=0
+    for option in "${DEFAULT_OPTIONS[@]}"; do
+        local id_part=$(echo "$option" | awk -F '.' '{print $1}')
+        if [[ "$id_part" =~ ^[0-9]+$ ]]; then
+            if [[ "$id_part" -gt "$max_default_id" ]]; then
+                max_default_id="$id_part"
+            fi
+        fi
+    done
 
+    local max_custom_id=$max_default_id
+    while IFS= read -r line; do
+        if [[ -n "$line" && "$line" != \#* ]]; then
+            IFS='|' read -r id name url script_name <<< "$line"
+            if [[ "$id" -gt "$max_custom_id" ]]; then
+                max_custom_id="$id"
+            fi
+        fi
+    done < "$CUSTOM_MENU_FILE"
+    echo $((max_custom_id + 1))
+}
 # 加载菜单选项
 function load_menu() {
+    OPTIONS=() # Reset OPTIONS array to avoid duplicate entries
     OPTIONS=("${DEFAULT_OPTIONS[@]}")
     SCRIPTS=()
     CUSTOM_SCRIPT_NAMES=()  # 清空自定义脚本名缓存
@@ -291,7 +308,7 @@ function load_menu() {
     done
 
     # 确保“管理自定义菜单”和“退出”选项在最后
-    OPTIONS+=("17. 管理自定义菜单" "0. 退出")
+    OPTIONS+=("99. 管理自定义菜单" "0. 退出")
 }
 
 # 打印菜单
@@ -315,8 +332,8 @@ function main() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             0) exit 0 ;;
-            17) manage_custom_menu ;;
-            [1-9]|1[0-9])
+            99) manage_custom_menu ;;
+            [1-9]|1[0-9]|17)
                 manage_logs
                 script_path=$(download_script "$choice")
                 echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
