@@ -209,9 +209,20 @@ function manage_custom_menu() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             1)
-                echo "请输入新菜单项（格式：编号|显示名称|脚本URL或本地路径）："
-                read -r new_item
-                echo "$new_item" >> "$CUSTOM_MENU_FILE"
+                while true; do
+                    echo "请输入新菜单项编号（例如 18）："
+                    read -r id
+                    if grep -q "^$id|" "$CUSTOM_MENU_FILE"; then
+                        echo "编号 $id 已存在，请使用其他编号。"
+                    else
+                        break
+                    fi
+                done
+                echo "请输入新菜单项显示名称："
+                read -r name
+                echo "请输入脚本 URL 或本地路径："
+                read -r url
+                echo "$id|$name|$url" >> "$CUSTOM_MENU_FILE"
                 echo "菜单项已添加。"
                 ;;
             2)
@@ -247,6 +258,11 @@ function load_menu() {
             SCRIPTS["$id"]="$url"
         fi
     done < "$CUSTOM_MENU_FILE"
+
+    # 对菜单项进行排序
+    IFS=$'\n' sorted_options=($(sort -V <<< "${OPTIONS[*]}"))
+    unset IFS
+    OPTIONS=("${sorted_options[@]}")
 }
 
 # 打印菜单
@@ -272,7 +288,7 @@ function main() {
             0) exit 0 ;;
             16) manage_symlink ;;
             17) manage_custom_menu ;;
-            [1-9]|1[0-5])
+            [1-9]|1[0-9])
                 manage_logs
                 script_path=$(download_script "$choice")
                 echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
