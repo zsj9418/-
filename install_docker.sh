@@ -3,6 +3,7 @@
 # 依赖列表 (gnupg 和 lsb-release 根据常见系统情况添加)
 DEPS=("curl" "wget" "jq" "fzf")
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
+COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
 # 全局变量
 INSTALL_STATUS=$(mktemp)  # 记录依赖安装状态
@@ -91,6 +92,7 @@ get_architecture() {
         x86_64) ARCH="x86_64" ;;
         aarch64) ARCH="aarch64" ;;
         armv7l) ARCH="armv7l" ;;
+        armv6l) ARCH="armv6l" ;;
         *) echo "不支持的架构: $ARCH"; exit 1 ;;
     esac
     echo "$ARCH"
@@ -212,6 +214,46 @@ select_docker_version() {
     echo ""
 }
 
+# 函数: 获取 Docker Compose 版本列表
+fetch_docker_compose_versions() {
+    local VERSIONS
+    VERSIONS=$(curl -s "$COMPOSE_RELEASES_URL" | jq -r '.[].tag_name' | sort -Vr | uniq)
+    if [ -z "$VERSIONS" ]; then
+        echo "无法获取 Docker Compose 版本列表，请检查网络连接。"
+        exit 1
+    fi
+    echo "$VERSIONS"
+}
+
+# 函数: 选择 Docker Compose 版本 (美化 fzf 界面)
+select_docker_compose_version() {
+    local VERSIONS=($(fetch_docker_compose_versions))
+
+    if command -v fzf >/dev/null 2>&1; then
+        local HEADER="选择 Docker Compose 版本"
+        local INFO="使用 ↑↓ 导航，Enter 确认，Ctrl+C 取消"
+        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
+            --prompt="请选择版本 > " \
+            --header="$HEADER" \
+            --header-lines=1 \
+            --info=inline:"$INFO" \
+            --height=20 \
+            --reverse \
+            --border \
+            --color="header:blue,bg+:black,pointer:green" \
+            --preview="echo '预览: Docker Compose v{}'")
+        SELECTED_VERSION=$(echo "$SELECTED_VERSION" | tr -d '[:space:]')
+        if [ -n "$SELECTED_VERSION" ]; then
+            echo "$SELECTED_VERSION"
+            return
+        else
+            echo "未选择版本，跳过..."
+            return
+        fi
+    fi
+    echo ""
+}
+
 # 函数: 安装 Docker
 install_docker() {
     if check_docker_installed; then
@@ -305,9 +347,52 @@ install_docker_compose() {
         fi
     fi
 
-    echo "正在安装 Docker Compose..."
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || { echo "下载 Docker Compose 失败"; exit 1; }
+    echo "正在获取可用的 Docker Compose 版本列表..."
+    local COMPOSE_VERSION=$(select_docker_compose_version)
+
+    if [ -z "$COMPOSE_VERSION" ]; then
+        echo "未选择版本，安装最新版本的 Docker Compose..."
+        COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    else
+        echo "您选择安装的 Docker Compose 版本为：$COMPOSE_VERSION"
+        COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
+    fi
+
+    ARCH=$(get_architecture)
+    os_name=$(uname -s)
+    arch_name=$(uname -m)
+
+    case "$os_name" in
+        Linux)
+            case "$arch_name" in
+                x86_64) compose_file="docker-compose-Linux-x86_64" ;;
+                aarch64) compose_file="docker-compose-Linux-aarch64" ;;
+                armv7l) compose_file="docker-compose-Linux-armv7l" ;; # 适用于32位ARM
+                armv6l) compose_file="docker-compose-Linux-armv6l" ;; # 早期树莓派
+                *)
+                    echo "不支持的 Linux 架构: $arch_name"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        Darwin) # macOS
+            case "$arch_name" in
+                x86_64) compose_file="docker-compose-Darwin-x86_64" ;;
+                arm64) compose_file="docker-compose-Darwin-arm64" ;; # Apple Silicon
+                *)
+                    echo "不支持的 macOS 架构: $arch_name"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "不支持的操作系统: $os_name"
+            exit 1
+            ;;
+    esac
+
+    echo "正在安装 Docker Compose 版本：$COMPOSE_VERSION"
+    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" -o /usr/local/bin/docker-compose || { echo "下载 Docker Compose 失败"; exit 1; }
     sudo chmod +x /usr/local/bin/docker-compose
     echo "Docker Compose 安装完成。"
 }
