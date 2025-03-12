@@ -32,7 +32,6 @@ DEFAULT_OPTIONS=(
     "14. 部署 Sub-Store（sub-store-deploy.sh）"
     "15. 更新 Sing-box 配置（update_singbox.sh）"
     "16. 创建或清除快捷方式"
-    "17. 科技lion一键脚本工具"
 )
 
 # 默认脚本对应的 URL
@@ -52,7 +51,6 @@ declare -A DEFAULT_SCRIPTS=(
     ["13"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
     ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
-    ["17"]="https://raw.githubusercontent.com/lion-king007/QuantumultX/main/Tasks/zk_tools.sh"
 )
 
 # 声明全局变量
@@ -333,7 +331,7 @@ function main() {
         case "$choice" in
             0) exit 0 ;;
             99) manage_custom_menu ;;
-            [1-9]|1[0-9]|17)
+            [1-9]|1[0-9])
                 manage_logs
                 script_path=$(download_script "$choice")
                 echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
