@@ -13,10 +13,16 @@ ARCH=""
 OS=""
 PKG_MANAGER=""
 
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
 # 函数: 检查是否具有 sudo 权限
 check_sudo() {
     if [[ $EUID -ne 0 ]]; then
-        echo "此脚本需要 root 权限运行，请以 root 用户运行或使用 'sudo' 执行。"
+        echo -e "${RED}此脚本需要 root 权限运行，请以 root 用户运行或使用 'sudo' 执行。${NC}"
         exit 1
     fi
 }
@@ -30,7 +36,7 @@ detect_package_manager() {
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf"
     else
-        echo "无法检测到支持的包管理工具 (apt-get/yum/dnf)，请手动安装必要的依赖后重试。"
+        echo -e "${RED}无法检测到支持的包管理工具 (apt-get/yum/dnf)，请手动安装必要的依赖后重试。${NC}"
         exit 1
     fi
 }
@@ -74,9 +80,9 @@ install_dependencies() {
         for DEP in "${needs_install[@]}"; do
             echo "安装依赖：$DEP"
             case "$PKG_MANAGER" in
-                apt-get) sudo apt-get install -y --no-install-recommends "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
-                yum) sudo yum install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
-                dnf) sudo dnf install -y "$DEP" || { echo "安装 $DEP 失败"; exit 1; } ;;
+                apt-get) sudo apt-get install -y --no-install-recommends "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
+                yum) sudo yum install -y "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
+                dnf) sudo dnf install -y "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
             esac
             echo "$DEP" >> "$INSTALL_STATUS"
         done
@@ -93,7 +99,7 @@ get_architecture() {
         aarch64) ARCH="aarch64" ;;
         armv7l) ARCH="armv7l" ;;
         armv6l) ARCH="armv6l" ;;
-        *) echo "不支持的架构: $ARCH"; exit 1 ;;
+        *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exit 1 ;;
     esac
     echo "$ARCH"
 }
@@ -104,7 +110,7 @@ get_os_version() {
         OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
         OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     else
-        echo "无法检测系统版本。请确保 /etc/os-release 文件存在并且格式正确。"
+        echo -e "${RED}无法检测系统版本。请确保 /etc/os-release 文件存在并且格式正确。${NC}"
         exit 1
     fi
     echo "$OS_NAME $OS_VERSION"
@@ -118,43 +124,43 @@ check_and_set_install_dir() {
 
     local AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
     if [[ -z "$AVAILABLE_SPACE" || "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
-        echo "默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)"
+        echo -e "${YELLOW}默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)${NC}"
         AVAILABLE_SPACE=$(df -m "$FALLBACK_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
         if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
             DOCKER_INSTALL_DIR="$FALLBACK_DIR"
-            echo "切换到备用目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+            echo -e "${GREEN}切换到备用目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
         else
-            echo "备用目录 $FALLBACK_DIR 空间也不足 (可用: ${AVAILABLE_SPACE}MB)"
+            echo -e "${YELLOW}备用目录 $FALLBACK_DIR 空间也不足 (可用: ${AVAILABLE_SPACE}MB)${NC}"
             read -r -p "请输入自定义安装目录 (需至少 ${REQUIRED_SPACE}MB 可用空间): " CUSTOM_DIR
             if [[ -n "$CUSTOM_DIR" ]]; then
                 AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
                 if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
                     DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
-                    echo "使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+                    echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
                 else
-                    echo "自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB)，退出脚本。"
+                    echo -e "${RED}自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB)，退出脚本。${NC}"
                     exit 1
                 fi
             else
-                echo "未提供有效目录，退出脚本。"
+                echo -e "${RED}未提供有效目录，退出脚本。${NC}"
                 exit 1
             fi
         fi
     else
         DOCKER_INSTALL_DIR="$DEFAULT_DIR"
-        echo "使用默认目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)"
+        echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
     fi
-    mkdir -p "$DOCKER_INSTALL_DIR" || { echo "创建目录 $DOCKER_INSTALL_DIR 失败"; exit 1; }
+    mkdir -p "$DOCKER_INSTALL_DIR" || { echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败${NC}"; exit 1; }
 }
 
 # 函数: 检测是否安装 Docker
 check_docker_installed() {
     if command -v docker >/dev/null 2>&1; then
-        echo "Docker 已安装，版本信息如下："
+        echo -e "${GREEN}Docker 已安装，版本信息如下：${NC}"
         docker --version
         return 0
     else
-        echo "Docker 未安装。"
+        echo -e "${YELLOW}Docker 未安装。${NC}"
         return 1
     fi
 }
@@ -162,11 +168,11 @@ check_docker_installed() {
 # 函数: 检测是否安装 Docker Compose
 check_docker_compose_installed() {
     if command -v docker-compose >/dev/null 2>&1; then
-        echo "Docker Compose 已安装，版本信息如下："
+        echo -e "${GREEN}Docker Compose 已安装，版本信息如下：${NC}"
         docker-compose --version
         return 0
     else
-        echo "Docker Compose 未安装。"
+        echo -e "${YELLOW}Docker Compose 未安装。${NC}"
         return 1
     fi
 }
@@ -178,7 +184,7 @@ fetch_docker_versions() {
     local VERSIONS
     VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
     if [ -z "$VERSIONS" ]; then
-        echo "无法获取版本列表，请检查网络连接或该架构是否支持。"
+        echo -e "${RED}无法获取版本列表，请检查网络连接或该架构是否支持。${NC}"
         exit 1
     fi
     echo "$VERSIONS"
@@ -206,7 +212,7 @@ select_docker_version() {
             echo "$SELECTED_VERSION"
             return
         else
-            echo "未选择版本，跳过..."
+            echo -e "${YELLOW}未选择版本，跳过...${NC}"
             return
         fi
     fi
@@ -219,7 +225,7 @@ fetch_docker_compose_versions() {
     local VERSIONS
     VERSIONS=$(curl -s "$COMPOSE_RELEASES_URL" | jq -r '.[].tag_name' | sort -Vr | uniq)
     if [ -z "$VERSIONS" ]; then
-        echo "无法获取 Docker Compose 版本列表，请检查网络连接。"
+        echo -e "${RED}无法获取 Docker Compose 版本列表，请检查网络连接。${NC}"
         exit 1
     fi
     echo "$VERSIONS"
@@ -247,7 +253,7 @@ select_docker_compose_version() {
             echo "$SELECTED_VERSION"
             return
         else
-            echo "未选择版本，跳过..."
+            echo -e "${YELLOW}未选择版本，跳过...${NC}"
             return
         fi
     fi
@@ -259,7 +265,7 @@ install_docker() {
     if check_docker_installed; then
         read -r -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
         if [[ "$REINSTALL" != "y" ]]; then
-            echo "跳过 Docker 安装。"
+            echo -e "${YELLOW}跳过 Docker 安装。${NC}"
             return
         fi
     fi
@@ -270,32 +276,32 @@ install_docker() {
     check_and_set_install_dir
 
     if [ -z "$VERSION" ]; then
-        echo "未选择版本，安装最新版本的 Docker..."
+        echo -e "${YELLOW}未选择版本，安装最新版本的 Docker...${NC}"
         DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker.tgz"
     else
-        echo "您选择安装的 Docker 版本为：$VERSION"
+        echo -e "${GREEN}您选择安装的 Docker 版本为：$VERSION${NC}"
         VERSION=$(echo "$VERSION" | tr -d '[:space:]')
         DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
     fi
 
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || { echo "下载失败，请检查版本号或网络状态。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || { echo -e "${RED}下载失败，请检查版本号或网络状态。${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
     echo "正在解压 Docker 包到临时文件夹..."
-    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo "解压失败，可能是空间不足或权限问题。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo -e "${RED}解压失败，可能是空间不足或权限问题。${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
     echo "正在安装 Docker 二进制文件..."
     sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
-    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || { echo "移动 Docker 文件失败，请检查权限或磁盘空间。"; exit 1; }
+    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || { echo -e "${RED}移动 Docker 文件失败，请检查权限或磁盘空间。${NC}"; exit 1; }
 
     echo "创建 Docker 用户组..."
     sudo groupadd -f docker
 
     echo "将当前用户添加到 Docker 用户组..."
     if ! sudo gpasswd -a "$USER" docker >/dev/null 2>&1; then
-        echo "警告：无法将用户 '$USER' 添加到 'docker' 组，请手动执行 'sudo gpasswd -a $USER docker'。"
+        echo -e "${YELLOW}警告：无法将用户 '$USER' 添加到 'docker' 组，请手动执行 'sudo gpasswd -a $USER docker'。${NC}"
     else
-        echo "用户 '$USER' 已成功添加到 'docker' 组。"
+        echo -e "${GREEN}用户 '$USER' 已成功添加到 'docker' 组。${NC}"
     fi
 
     echo "配置 Docker 服务..."
@@ -325,11 +331,11 @@ EOF
     sudo systemctl start docker >/dev/null 2>&1
 
     if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
-        echo "Docker 安装成功！版本信息："
+        echo -e "${GREEN}Docker 安装成功！版本信息：${NC}"
         docker --version
-        echo "请重新登录或重启 shell 以应用 'docker' 组更改。"
+        echo -e "${YELLOW}请重新登录或重启 shell 以应用 'docker' 组更改。${NC}"
     else
-        echo "Docker 安装失败或服务启动失败，请检查日志：sudo journalctl -u docker"
+        echo -e "${RED}Docker 安装失败或服务启动失败，请检查日志：sudo journalctl -u docker${NC}"
         exit 1
     fi
 
@@ -342,7 +348,7 @@ install_docker_compose() {
     if check_docker_compose_installed; then
         read -r -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
         if [[ "$REINSTALL" != "y" ]]; then
-            echo "跳过 Docker Compose 安装。"
+            echo -e "${YELLOW}跳过 Docker Compose 安装。${NC}"
             return
         fi
     fi
@@ -351,10 +357,10 @@ install_docker_compose() {
     local COMPOSE_VERSION=$(select_docker_compose_version)
 
     if [ -z "$COMPOSE_VERSION" ]; then
-        echo "未选择版本，安装最新版本的 Docker Compose..."
+        echo -e "${YELLOW}未选择版本，安装最新版本的 Docker Compose...${NC}"
         COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
     else
-        echo "您选择安装的 Docker Compose 版本为：$COMPOSE_VERSION"
+        echo -e "${GREEN}您选择安装的 Docker Compose 版本为：$COMPOSE_VERSION${NC}"
         COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
     fi
 
@@ -370,7 +376,7 @@ install_docker_compose() {
                 armv7l) compose_file="docker-compose-Linux-armv7l" ;; # 适用于32位ARM
                 armv6l) compose_file="docker-compose-Linux-armv6l" ;; # 早期树莓派
                 *)
-                    echo "不支持的 Linux 架构: $arch_name"
+                    echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"
                     exit 1
                     ;;
             esac
@@ -380,21 +386,21 @@ install_docker_compose() {
                 x86_64) compose_file="docker-compose-Darwin-x86_64" ;;
                 arm64) compose_file="docker-compose-Darwin-arm64" ;; # Apple Silicon
                 *)
-                    echo "不支持的 macOS 架构: $arch_name"
+                    echo -e "${RED}不支持的 macOS 架构: $arch_name${NC}"
                     exit 1
                     ;;
             esac
             ;;
         *)
-            echo "不支持的操作系统: $os_name"
+            echo -e "${RED}不支持的操作系统: $os_name${NC}"
             exit 1
             ;;
     esac
 
     echo "正在安装 Docker Compose 版本：$COMPOSE_VERSION"
-    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" -o /usr/local/bin/docker-compose || { echo "下载 Docker Compose 失败"; exit 1; }
+    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" -o /usr/local/bin/docker-compose || { echo -e "${RED}下载 Docker Compose 失败${NC}"; exit 1; }
     sudo chmod +x /usr/local/bin/docker-compose
-    echo "Docker Compose 安装完成。"
+    echo -e "${GREEN}Docker Compose 安装完成。${NC}"
 }
 
 # 函数: 卸载 Docker
@@ -442,7 +448,7 @@ uninstall_docker() {
     sudo systemctl daemon-reload 2>/dev/null || true
     sudo systemctl reset-failed 2>/dev/null || true
 
-    echo "Docker 已卸载，残留文件已清理。"
+    echo -e "${GREEN}Docker 已卸载，残留文件已清理。${NC}"
 }
 
 
@@ -451,7 +457,7 @@ uninstall_docker_compose() {
     echo "正在卸载 Docker Compose..."
     sudo rm -rf /usr/local/bin/docker-compose ~/.docker/compose
     sudo rm -rf /opt/docker-compose # 删除可能的compose安装目录
-    echo "Docker Compose 残留文件已清理。"
+    echo -e "${GREEN}Docker Compose 残留文件已清理。${NC}"
 }
 
 # 函数: 生成 daemon.json 配置文件
@@ -495,7 +501,7 @@ EOF
 
     # 验证 JSON 格式是否正确
     if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
-        echo "错误：生成的 daemon.json 格式不正确，请检查脚本依赖（如 jq）。"
+        echo -e "${RED}错误：生成的 daemon.json 格式不正确，请检查脚本依赖（如 jq）。${NC}"
         exit 1
     fi
 
@@ -503,16 +509,16 @@ EOF
     echo "$DAEMON_CONFIG" | sudo tee /etc/docker/daemon.json > /dev/null
 
     if [ $? -eq 0 ]; then
-        echo "/etc/docker/daemon.json 文件生成成功。"
+        echo -e "${GREEN}/etc/docker/daemon.json 文件生成成功。${NC}"
         echo "正在重启 Docker 服务以应用配置..."
         sudo systemctl restart docker
         if [ $? -eq 0 ]; then
-            echo "Docker 服务重启成功，新配置已加载。"
+            echo -e "${GREEN}Docker 服务重启成功，新配置已加载。${NC}"
         else
-            echo "Docker 服务重启失败，请手动重启: sudo systemctl restart docker"
+            echo -e "${YELLOW}Docker 服务重启失败，请手动重启: sudo systemctl restart docker${NC}"
         fi
     else
-        echo "/etc/docker/daemon.json 文件生成失败，请检查权限或重试。"
+        echo -e "${RED}/etc/docker/daemon.json 文件生成失败，请检查权限或重试。${NC}"
     fi
 }
 
@@ -530,16 +536,16 @@ main() {
     echo "系统版本: $OS"
 
     while true; do
-        echo "请选择要执行的操作："
-        echo "1. 安装 Docker"
-        echo "2. 安装 Docker Compose"
-        echo "3. 安装 Docker 和 Docker Compose"
-        echo "4. 卸载 Docker"
-        echo "5. 卸载 Docker Compose"
-        echo "6. 卸载 Docker 和 Docker Compose"
-        echo "7. 查询 Docker 和 Docker Compose 的安装状态"
-        echo "8. 生成 daemon.json 配置文件"
-        echo "9. 退出脚本"
+        echo -e "${YELLOW}请选择要执行的操作：${NC}"
+        echo -e "${GREEN}1. 安装 Docker${NC}"
+        echo -e "${GREEN}2. 安装 Docker Compose${NC}"
+        echo -e "${GREEN}3. 安装 Docker 和 Docker Compose${NC}"
+        echo -e "${RED}4. 卸载 Docker${NC}"
+        echo -e "${RED}5. 卸载 Docker Compose${NC}"
+        echo -e "${RED}6. 卸载 Docker 和 Docker Compose${NC}"
+        echo -e "${YELLOW}7. 查询 Docker 和 Docker Compose 的安装状态${NC}"
+        echo -e "${YELLOW}8. 生成 daemon.json 配置文件${NC}"
+        echo -e "${RED}9. 退出脚本${NC}"
         read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
         case "$CHOICE" in
@@ -551,8 +557,8 @@ main() {
             6) uninstall_docker; uninstall_docker_compose ;;
             7) check_docker_installed; check_docker_compose_installed ;;
             8) generate_daemon_config ;;
-            9) echo "退出脚本。"; exit 0 ;;
-            *) echo "无效的选择，请重新输入。" ;;
+            9) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
+            *) echo -e "${RED}无效的选择，请重新输入。${NC}" ;;
         esac
     done
 }
