@@ -168,7 +168,8 @@ function manage_symlink() {
         echo "当前已创建的快捷键："
         ls -l /usr/local/bin | grep "$SCRIPT_DIR"
         echo "----------------------------------------"
-        echo "1. 创建快捷键"
+        echo "请选择操作："  # More explicit prompt
+        echo "1. 创建 **新** 快捷键"  # Emphasize "新"
         echo "2. 删除快捷键"
         echo "0. 返回主菜单"
         echo "----------------------------------------"
@@ -331,7 +332,8 @@ function main() {
         case "$choice" in
             0) exit 0 ;;
             99) manage_custom_menu ;;
-            [1-9]|1[0-9])
+            16) manage_symlink ;;  # 直接调用 manage_symlink 函数
+            [1-9]|1[0-5]|1[7-9]) # 修改选项范围，排除 16，但包含 17-19 (如果未来添加了更多默认脚本)
                 manage_logs
                 script_path=$(download_script "$choice")
                 echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
