@@ -31,7 +31,7 @@ DEFAULT_OPTIONS=(
     "13. 配置定时任务（setup_cronjob.sh）"
     "14. 部署 Sub-Store（sub-store-deploy.sh）"
     "15. 更新 Sing-box 配置（update_singbox.sh）"
-    "16. 创建或清除快捷方式"
+    "16. 快捷键管理" # 合并后的选项
 )
 
 # 默认脚本对应的 URL
@@ -147,14 +147,46 @@ function run_script() {
     fi
 }
 
-# 快捷键管理增强
-# 快捷键管理增强
+# 快捷键管理（合并了脚本绑定功能）
 function manage_symlink() {
     local current_script=$(realpath "$0")
     while true; do
         clear
         echo "========================================"
         echo "          快捷键管理"
+        echo "========================================"
+        echo "请选择操作："
+        echo "1. 管理当前脚本快捷键"
+        echo "2. 绑定指定脚本到快捷键"
+        echo "0. 返回主菜单"
+        echo "----------------------------------------"
+        read -rp "请输入选项编号: " choice
+
+        case "$choice" in
+            1)
+                manage_current_script_symlink "$current_script"
+                ;;
+            2)
+                bind_script_to_shortcut
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "无效选项，请重新输入。"
+                read -rp "按回车键继续..."
+                ;;
+        esac
+    done
+}
+
+# 管理当前脚本快捷键
+function manage_current_script_symlink() {
+    local current_script="$1"
+    while true; do
+        clear
+        echo "========================================"
+        echo "    管理当前脚本快捷键"
         echo "========================================"
         echo "当前脚本路径: $current_script"
         echo "当前已创建的快捷键："
@@ -180,7 +212,7 @@ function manage_symlink() {
         echo "请选择操作："
         echo "1. 创建 **新** 快捷键"
         echo "2. 删除快捷键"
-        echo "0. 返回主菜单"
+        echo "0. 返回上一级菜单"
         echo "----------------------------------------"
         read -rp "请输入选项编号: " choice
         case "$choice" in
@@ -188,32 +220,108 @@ function manage_symlink() {
                 echo "请输入快捷键（例如 q）："
                 read -r shortcut
                 local link="/usr/local/bin/$shortcut"
+
+                # 检查快捷键是否已存在
                 if [[ -e "$link" ]]; then
-                    echo "快捷键已存在，请使用其他名称。"
-                else
-                    ln -s "$current_script" "$link"
-                    echo "快捷键 $shortcut 已创建。"
+                    echo "错误: 快捷键已存在，请使用其他名称。"
+                    read -rp "按回车键继续..."
+                    continue
                 fi
+
+                sudo ln -s "$current_script" "$link"
+
+                if [[ $? -eq 0 ]]; then
+                    echo "快捷键 $shortcut 已创建。"
+                else
+                    echo "错误: 创建快捷键失败.  请确保您有足够的权限 (sudo)."
+                fi
+
+                read -rp "按回车键继续..."
                 ;;
             2)
                 echo "请输入要删除的快捷键（例如 q）："
                 read -r shortcut
                 local link="/usr/local/bin/$shortcut"
                 if [[ -e "$link" ]]; then
-                    rm -f "$link"
-                    echo "快捷键 $shortcut 已删除。"
+                    sudo rm -f "$link"
+
+                    if [[ $? -eq 0 ]]; then
+                       echo "快捷键 $shortcut 已删除。"
+                    else
+                       echo "错误: 删除快捷键失败.  请确保您有足够的权限 (sudo)."
+                    fi
+
                 else
                     echo "快捷键 $shortcut 不存在。"
                 fi
+                read -rp "按回车键继续..."
                 ;;
             0)
                 break
                 ;;
             *)
                 echo "无效选项，请重新输入。"
+                read -rp "按回车键继续..."
                 ;;
         esac
-        read -rp "按回车键继续..."
+    done
+}
+
+# 指定脚本绑定快捷键
+function bind_script_to_shortcut() {
+    while true; do
+        clear
+        echo "========================================"
+        echo "    绑定指定脚本到快捷键"
+        echo "========================================"
+        echo " "
+        echo "----------------------------------------"
+        echo "请输入脚本的完整路径: "
+        read -r script_path
+
+        # 路径验证
+        if [[ ! -f "$script_path" ]]; then
+            echo "错误: 脚本文件不存在: $script_path"
+            read -rp "按回车键继续..."
+            continue
+        fi
+
+        echo "请输入要绑定的快捷键 (例如: myscript): "
+        read -r shortcut
+
+        # 快捷键验证
+        if [[ -z "$shortcut" ]]; then
+            echo "错误: 快捷键不能为空."
+            read -rp "按回车键继续..."
+            continue
+        fi
+
+        local link="/usr/local/bin/$shortcut"
+        if [[ -e "$link" ]]; then
+            echo "错误: 快捷键已存在，请使用其他名称。"
+            read -rp "按回车键继续..."
+            continue
+        fi
+
+        sudo ln -s "$script_path" "$link"
+
+        if [[ $? -eq 0 ]]; then
+            echo "快捷键 '$shortcut' 已成功绑定到 '$script_path'."
+        else
+            echo "错误: 绑定快捷键失败.  请确保您有足够的权限 (sudo) ."
+        fi
+
+        echo "----------------------------------------"
+        echo "0. 返回上一级菜单"
+        read -rp "按回车键继续..." choice
+        case "$choice" in
+            0)
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
     done
 }
 
@@ -341,7 +449,7 @@ function main() {
         case "$choice" in
             0) exit 0 ;;
             99) manage_custom_menu ;;
-            16) manage_symlink ;;
+            16) manage_symlink ;;  # 使用新的 manage_symlink 函数
             [1-9]|[1-9][0-9])  # 修改为更宽泛的匹配，支持所有数字选项
                 manage_logs
                 script_path=$(download_script "$choice")
