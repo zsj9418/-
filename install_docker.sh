@@ -114,11 +114,9 @@ check_and_set_install_dir() {
     local DEFAULT_DIR="/tmp/docker_install"
     local FALLBACK_DIR="/var/tmp/docker_install"
 
-    # 检查默认目录空间
     local AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
     if [[ -z "$AVAILABLE_SPACE" || "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
         echo "默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)"
-        # 检查备用目录
         AVAILABLE_SPACE=$(df -m "$FALLBACK_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
         if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
             DOCKER_INSTALL_DIR="$FALLBACK_DIR"
@@ -244,15 +242,21 @@ install_docker() {
     echo "正在解压 Docker 包到临时文件夹..."
     tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo "解压失败，可能是空间不足或权限问题。"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
 
+    echo "正在安装 Docker 二进制文件..."
     sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
-    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/
+    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || { echo "移动 Docker 文件失败，请检查权限或磁盘空间。"; exit 1; }
 
+    echo "创建 Docker 用户组..."
     sudo groupadd -f docker
-    if ! sudo gpasswd -a "$USER" docker; then
-        echo "无法将当前用户添加到 'docker' 用户组，请手动添加。"
-    fi
-    newgrp docker
 
+    echo "将当前用户添加到 Docker 用户组..."
+    if ! sudo gpasswd -a "$USER" docker >/dev/null 2>&1; then
+        echo "警告：无法将用户 '$USER' 添加到 'docker' 组，请手动执行 'sudo gpasswd -a $USER docker'。"
+    else
+        echo "用户 '$USER' 已成功添加到 'docker' 组。"
+    fi
+
+    echo "配置 Docker 服务..."
     cat <<EOF | sudo tee /etc/systemd/system/docker.service
 [Unit]
 Description=Docker Application Container Engine
@@ -273,14 +277,18 @@ OOMScoreAdjust=-500
 WantedBy=multi-user.target
 EOF
 
+    echo "启动 Docker 服务..."
     sudo systemctl daemon-reload
-    sudo systemctl enable docker
-    sudo systemctl start docker
+    sudo systemctl enable docker >/dev/null 2>&1
+    sudo systemctl start docker >/dev/null 2>&1
 
     if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
-        echo "Docker 安装成功，请重新登录以应用用户组更改。"
+        echo "Docker 安装成功！版本信息："
+        docker --version
+        echo "请重新登录或重启 shell 以应用 'docker' 组更改。"
     else
-        echo "Docker 安装失败或版本验证失败，请检查安装。"
+        echo "Docker 安装失败或服务启动失败，请检查日志：sudo journalctl -u docker"
+        exit 1
     fi
 
     echo "清理临时文件..."
@@ -316,7 +324,7 @@ uninstall_docker() {
     esac
 
     sudo rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /etc/systemd/system/docker.service
-    sudo groupdel docker
+    sudo groupdel docker 2>/dev/null
     echo "Docker 残留文件已清理。"
     docker system prune -a -f 2>/dev/null
 }
@@ -345,13 +353,15 @@ generate_daemon_config() {
     read -r -p "请输入 Docker data-root 路径 (留空默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
     DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
 
-    local REGISTRY_MIRRORS_JSON=$(echo "${DEFAULT_REGISTRY_MIRRORS[@]}" | jq -c -s .)
+    # 使用 jq 确保 registry-mirrors 正确生成 JSON 数组
+    local REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${DEFAULT_REGISTRY_MIRRORS[@]}" | jq -R . | jq -s .)
 
+    # 使用 heredoc 和变量替换生成完整的 JSON 配置
     DAEMON_CONFIG=$(cat <<EOF
 {
   "iptables": true,
   "ip6tables": true,
-  "registry-mirrors": $REGISTRY_MIRRORS_JSON,
+  "registry-mirrors": ${REGISTRY_MIRRORS_JSON},
   "data-root": "${DATA_ROOT}",
   "log-driver": "json-file",
   "log-opts": {
@@ -364,6 +374,12 @@ EOF
 
     echo "daemon.json 文件内容如下："
     echo "$DAEMON_CONFIG"
+
+    # 验证 JSON 格式是否正确
+    if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
+        echo "错误：生成的 daemon.json 格式不正确，请检查脚本依赖（如 jq）。"
+        exit 1
+    fi
 
     sudo mkdir -p /etc/docker
     echo "$DAEMON_CONFIG" | sudo tee /etc/docker/daemon.json > /dev/null
