@@ -119,38 +119,57 @@ get_os_version() {
 # 函数: 检查磁盘空间并选择安装目录
 check_and_set_install_dir() {
     local REQUIRED_SPACE=500  # 需要至少 500MB 空间
-    local DEFAULT_DIR="/tmp/docker_install"
-    local FALLBACK_DIR="/var/tmp/docker_install"
 
+    # 获取脚本的存放目录
+    local DIR=$(dirname "$(realpath "$0")")
+    local DEFAULT_DIR="${DIR}/docker_install"
+
+    # 确保默认目录存在
+    mkdir -p "$DEFAULT_DIR" 2>/dev/null || {
+        echo -e "${RED}无法创建默认目录 $DEFAULT_DIR，请检查权限。${NC}"
+        exit 1
+    }
+
+    # 检查默认目录的可用空间
     local AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-    if [[ -z "$AVAILABLE_SPACE" || "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
-        echo -e "${YELLOW}默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)${NC}"
-        AVAILABLE_SPACE=$(df -m "$FALLBACK_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-        if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
-            DOCKER_INSTALL_DIR="$FALLBACK_DIR"
-            echo -e "${GREEN}切换到备用目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
-        else
-            echo -e "${YELLOW}备用目录 $FALLBACK_DIR 空间也不足 (可用: ${AVAILABLE_SPACE}MB)${NC}"
-            read -r -p "请输入自定义安装目录 (需至少 ${REQUIRED_SPACE}MB 可用空间): " CUSTOM_DIR
-            if [[ -n "$CUSTOM_DIR" ]]; then
-                AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-                if [[ -n "$AVAILABLE_SPACE" && "$AVAILABLE_SPACE" -ge "$REQUIRED_SPACE" ]]; then
-                    DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
-                    echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
-                else
-                    echo -e "${RED}自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB)，退出脚本。${NC}"
-                    exit 1
-                fi
-            else
-                echo -e "${RED}未提供有效目录，退出脚本。${NC}"
-                exit 1
-            fi
+    if [[ -z "$AVAILABLE_SPACE" ]]; then
+        echo -e "${RED}无法检测目录 $DEFAULT_DIR 的磁盘空间，请检查系统状态。${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}默认目录: $DEFAULT_DIR (可用空间: ${AVAILABLE_SPACE}MB, 需要空间: ${REQUIRED_SPACE}MB)${NC}"
+    read -r -p "是否需要指定自定义安装目录？(直接回车使用默认目录): " CUSTOM_DIR
+
+    if [[ -n "$CUSTOM_DIR" ]]; then
+        # 确保自定义目录存在
+        mkdir -p "$CUSTOM_DIR" 2>/dev/null || {
+            echo -e "${RED}无法创建自定义目录 $CUSTOM_DIR，请检查权限。${NC}"
+            exit 1
+        }
+        AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+        if [[ -z "$AVAILABLE_SPACE" ]]; then
+            echo -e "${RED}无法检测目录 $CUSTOM_DIR 的磁盘空间，请检查系统状态。${NC}"
+            exit 1
         fi
+        if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
+            echo -e "${RED}自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)，退出脚本。${NC}"
+            exit 1
+        fi
+        DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
+        echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
     else
+        if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
+            echo -e "${RED}默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)，退出脚本。${NC}"
+            exit 1
+        fi
         DOCKER_INSTALL_DIR="$DEFAULT_DIR"
         echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
     fi
-    mkdir -p "$DOCKER_INSTALL_DIR" || { echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败${NC}"; exit 1; }
+
+    mkdir -p "$DOCKER_INSTALL_DIR" || {
+        echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败，请检查权限或磁盘空间。${NC}"
+        exit 1
+    }
 }
 
 # 函数: 检测是否安装 Docker
