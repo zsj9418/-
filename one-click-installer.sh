@@ -86,31 +86,20 @@ function download_script() {
     local url="${SCRIPTS[$choice]}"
 
     # 获取脚本文件名
-    if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then  # 检查 $choice 是否为 CUSTOM_SCRIPT_NAMES 的键 (自定义脚本)
+    if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then
         local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
-    else  # 默认脚本
+    else
         script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
-        [[ "$script_name" == *".sh" ]] || script_name="${script_name}.sh"  # 确保后缀
+        [[ "$script_name" == *".sh" ]] || script_name="${script_name}.sh"
     fi
 
     local script_path="$SCRIPT_DIR/$script_name"
 
-    # 检查脚本目录是否可写
-    mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
-    if [[ ! -w "$SCRIPT_DIR" ]]; then
-        echo "错误：脚本目录 $SCRIPT_DIR 不可写，无法下载脚本。" | tee -a "$LOG_FILE"
-        return 1
-    fi
-
-    # 如果脚本已存在，避免文件名冲突
+    # 检查是否已存在，如果存在则直接返回路径
     if [[ -f "$script_path" ]]; then
-        local counter=1
-        while [[ -f "$script_path" ]]; do
-            script_name="${script_name%.sh}_${counter}.sh"
-            script_path="$SCRIPT_DIR/$script_name"
-            counter=$((counter + 1))
-        done
-        echo "警告：脚本文件名冲突，已重命名为 $script_name。" | tee -a "$LOG_FILE"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] 脚本已存在: $script_path" >> "$LOG_FILE"
+        echo -n "$script_path"
+        return 0
     fi
 
     # 下载脚本（带重试机制）
@@ -159,17 +148,37 @@ function run_script() {
 }
 
 # 快捷键管理增强
+# 快捷键管理增强
 function manage_symlink() {
+    local current_script=$(realpath "$0")
     while true; do
         clear
         echo "========================================"
         echo "          快捷键管理"
         echo "========================================"
+        echo "当前脚本路径: $current_script"
         echo "当前已创建的快捷键："
-        ls -l /usr/local/bin | grep "$SCRIPT_DIR"
+
+        # 检查 /usr/local/bin 中的符号链接
+        local found_links=0
+        for link in /usr/local/bin/*; do
+            if [[ -L "$link" ]]; then  # 只处理符号链接
+                local target=$(readlink -f "$link")
+                if [[ "$target" == "$current_script" || "$target" == "$SCRIPT_DIR"/* ]]; then
+                    local link_name=$(basename "$link")
+                    echo "$link_name -> $target"
+                    found_links=1
+                fi
+            fi
+        done
+
+        if [[ $found_links -eq 0 ]]; then
+            echo "暂无相关快捷键"
+        fi
+
         echo "----------------------------------------"
-        echo "请选择操作："  # More explicit prompt
-        echo "1. 创建 **新** 快捷键"  # Emphasize "新"
+        echo "请选择操作："
+        echo "1. 创建 **新** 快捷键"
         echo "2. 删除快捷键"
         echo "0. 返回主菜单"
         echo "----------------------------------------"
@@ -182,7 +191,7 @@ function manage_symlink() {
                 if [[ -e "$link" ]]; then
                     echo "快捷键已存在，请使用其他名称。"
                 else
-                    ln -s "$(realpath "$0")" "$link"
+                    ln -s "$current_script" "$link"
                     echo "快捷键 $shortcut 已创建。"
                 fi
                 ;;
@@ -332,8 +341,8 @@ function main() {
         case "$choice" in
             0) exit 0 ;;
             99) manage_custom_menu ;;
-            16) manage_symlink ;;  # 直接调用 manage_symlink 函数
-            [1-9]|1[0-5]|1[7-9]) # 修改选项范围，排除 16，但包含 17-19 (如果未来添加了更多默认脚本)
+            16) manage_symlink ;;
+            [1-9]|[1-9][0-9])  # 修改为更宽泛的匹配，支持所有数字选项
                 manage_logs
                 script_path=$(download_script "$choice")
                 echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
