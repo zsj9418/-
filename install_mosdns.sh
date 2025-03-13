@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MosDNS 一键安装与管理脚本
+# MosDNS 一键安装与管理脚本（通用版）
 
 RED='\e[31m'
 GREEN='\e[32m'
@@ -16,6 +16,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# 检测包管理器
 if command -v apt >/dev/null 2>&1; then
     PKG_MANAGER="apt"
     INSTALL_CMD="apt install -y"
@@ -25,25 +26,40 @@ elif command -v yum >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     PKG_MANAGER="dnf"
     INSTALL_CMD="dnf install -y"
+elif command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+    INSTALL_CMD="apk add"
+elif command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"
+    INSTALL_CMD="pacman -S --noconfirm"
 else
-    echo -e "${RED}错误：未检测到支持的包管理器${RESET}"
-    exit 1
+    echo -e "${RED}警告：未检测到支持的包管理器，依赖安装可能失败${RESET}"
+    PKG_MANAGER="none"
 fi
 
-DEPENDENCIES=("curl" "unzip" "sed" "net-tools" "awk" "fzf" "dnsutils" "yamllint" "cron")
+# 核心依赖（必装）
+CORE_DEPS=("curl" "unzip" "sed" "awk")
+# 可选依赖（非必需）
+OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron")
 INSTALLED_DEPS=()
 
 check_install_deps() {
     echo -e "${YELLOW}检查并安装依赖...${RESET}"
-    $PKG_MANAGER update
-    for dep in "${DEPENDENCIES[@]}"; do
+    [ "$PKG_MANAGER" != "none" ] && $PKG_MANAGER update 2>/dev/null
+    for dep in "${CORE_DEPS[@]}"; do
         if ! command -v "${dep%%:*}" >/dev/null 2>&1; then
-            echo -e "${YELLOW}安装 $dep${RESET}"
-            $INSTALL_CMD "$dep" || { echo -e "${RED}错误：无法安装 $dep${RESET}"; exit 1; }
+            echo -e "${YELLOW}安装核心依赖：$dep${RESET}"
+            $INSTALL_CMD "$dep" || { echo -e "${RED}警告：无法安装 $dep，可能影响功能${RESET}"; }
             INSTALLED_DEPS+=("$dep")
         fi
     done
-    [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装依赖：${INSTALLED_DEPS[*]}${RESET}"
+    for dep in "${OPTIONAL_DEPS[@]}"; do
+        if ! command -v "${dep%%:*}" >/dev/null 2>&1; then
+            echo -e "${YELLOW}安装可选依赖：$dep${RESET}"
+            $INSTALL_CMD "$dep" 2>/dev/null || echo -e "${YELLOW}跳过 $dep，未安装${RESET}"
+        fi
+    done
+    [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装核心依赖：${INSTALLED_DEPS[*]}${RESET}"
 }
 
 download_with_retry() {
@@ -64,18 +80,23 @@ download_with_retry() {
 
 release_port_53() {
     echo -e "${YELLOW}检查并释放53端口...${RESET}"
-    if netstat -tuln | grep -q ":53 "; then
-        PIDS=$(lsof -i :53 | awk 'NR>1 {print $2}' | sort -u)
-        for PID in $PIDS; do
-            SERVICE=$(ps -p "$PID" -o comm=)
-            echo -e "${YELLOW}找到占用53端口的服务：$SERVICE (PID: $PID)${RESET}"
-            if systemctl is-active "systemd-resolved" >/dev/null 2>&1 && [[ "$SERVICE" =~ systemd ]]; then
-                systemctl stop systemd-resolved
-                systemctl disable systemd-resolved
-            else
-                kill -9 "$PID"
-            fi
-        done
+    if command -v netstat >/dev/null 2>&1 && netstat -tuln | grep -q ":53 "; then
+        if command -v lsof >/dev/null 2>&1; then
+            PIDS=$(lsof -i :53 | awk 'NR>1 {print $2}' | sort -u)
+            for PID in $PIDS; do
+                SERVICE=$(ps -p "$PID" -o comm=)
+                echo -e "${YELLOW}找到占用53端口的服务：$SERVICE (PID: $PID)${RESET}"
+                if command -v systemctl >/dev/null 2>&1 && systemctl is-active "systemd-resolved" >/dev/null 2>&1 && [[ "$SERVICE" =~ systemd ]]; then
+                    systemctl stop systemd-resolved
+                    systemctl disable systemd-resolved
+                else
+                    kill -9 "$PID"
+                fi
+            done
+        else
+            echo -e "${YELLOW}未安装 lsof，无法精确释放端口，尝试直接杀进程${RESET}"
+            kill -9 $(netstat -tuln | grep ":53 " | awk '{print $NF}') 2>/dev/null
+        fi
         sleep 1
         if netstat -tuln | grep -q ":53 "; then
             echo -e "${RED}错误：无法释放53端口${RESET}"
@@ -83,7 +104,7 @@ release_port_53() {
         fi
         echo -e "${GREEN}53端口已释放${RESET}"
     else
-        echo -e "${GREEN}53端口未被占用${RESET}"
+        echo -e "${GREEN}53端口未被占用或 netstat 未安装${RESET}"
     fi
 }
 
@@ -176,14 +197,18 @@ EOF
     kill "$MOSDNS_PID"
     rm -f "$TEMP_LOG"
 
-    systemctl restart mosdns
-    sleep 3
-    if systemctl status mosdns.service | grep -q "running"; then
-        echo -e "${GREEN}成功：MosDNS已重启并应用新配置${RESET}"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart mosdns
+        sleep 3
+        if systemctl status mosdns.service | grep -q "running"; then
+            echo -e "${GREEN}成功：MosDNS已重启并应用新配置${RESET}"
+        else
+            echo -e "${RED}错误：MosDNS 重启失败${RESET}"
+            systemctl status mosdns.service
+            exit 1
+        fi
     else
-        echo -e "${RED}错误：MosDNS 重启失败${RESET}"
-        systemctl status mosdns.service
-        exit 1
+        echo -e "${YELLOW}无 systemd，跳过服务重启，请手动重启 MosDNS${RESET}"
     fi
 }
 
@@ -197,15 +222,22 @@ install_mosdns() {
     case "$ARCH" in
         x86_64) ARCHITECTURE="amd64" ;;
         aarch64) ARCHITECTURE="arm64" ;;
+        armv7l) ARCHITECTURE="armv7" ;;
+        armv6l) ARCHITECTURE="armv6" ;;
+        mips) ARCHITECTURE="mips" ;;
+        mipsel) ARCHITECTURE="mipsle" ;;
+        i386|i686) ARCHITECTURE="386" ;;
         *) echo -e "${RED}错误：不支持的架构：$ARCH${RESET}"; exit 1 ;;
     esac
+    echo -e "${GREEN}检测到架构：$ARCHITECTURE${RESET}"
 
     INSTALL_PATH="/usr/local/bin"
     CONFIG_PATH="/etc/mosdns"
-    mkdir -p "$CONFIG_PATH"
+    mkdir -p "$CONFIG_PATH" || { echo -e "${RED}错误：无法创建配置目录${RESET}"; exit 1; }
 
     if ! command -v fzf >/dev/null 2>&1; then
         VERSION="latest"
+        echo -e "${YELLOW}未安装 fzf，默认使用最新版本${RESET}"
     else
         for attempt in {1..3}; do
             VERSIONS=$(curl -s --retry 3 "https://api.github.com/repos/IrineSistiana/mosdns/releases" | grep -oP '"tag_name": "\K[^"]+' | sort -rV)
@@ -320,7 +352,8 @@ EOF
     kill "$MOSDNS_PID"
     rm -f "$TEMP_LOG"
 
-    cat > /etc/systemd/system/mosdns.service <<EOF
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/mosdns.service <<EOF
 [Unit]
 Description=MosDNS Service
 After=network.target
@@ -333,19 +366,32 @@ WorkingDirectory=$CONFIG_PATH
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable mosdns.service
-    systemctl start mosdns.service
+        systemctl daemon-reload
+        systemctl enable mosdns.service
+        systemctl start mosdns.service
 
-    sleep 3
-    if systemctl status mosdns.service | grep -q "running"; then
-        echo -e "${GREEN}成功：MosDNS正常运行${RESET}"
-        echo "nameserver 127.0.0.1" > /etc/resolv.conf
-        chmod 644 /etc/resolv.conf
+        sleep 3
+        if systemctl status mosdns.service | grep -q "running"; then
+            echo -e "${GREEN}成功：MosDNS正常运行${RESET}"
+            echo "nameserver 127.0.0.1" > /etc/resolv.conf
+            chmod 644 /etc/resolv.conf
+        else
+            echo -e "${RED}错误：MosDNS 服务未运行${RESET}"
+            systemctl status mosdns.service
+            exit 1
+        fi
     else
-        echo -e "${RED}错误：MosDNS 服务未运行${RESET}"
-        systemctl status mosdns.service
-        exit 1
+        echo -e "${YELLOW}无 systemd，尝试直接运行 MosDNS${RESET}"
+        "$INSTALL_PATH/mosdns" start -c "$CONFIG_PATH/config.yaml" &
+        sleep 3
+        if ps -ef | grep -q "[m]osdns start"; then
+            echo -e "${GREEN}成功：MosDNS已在后台运行${RESET}"
+            echo "nameserver 127.0.0.1" > /etc/resolv.conf
+            chmod 644 /etc/resolv.conf
+        else
+            echo -e "${RED}错误：MosDNS 启动失败${RESET}"
+            exit 1
+        fi
     fi
 
     echo -e "\n${YELLOW}是否配置双AdGuard Home分流？(y/n)：${RESET}"
@@ -359,10 +405,14 @@ EOF
 
 uninstall_mosdns() {
     echo -e "${YELLOW}开始卸载MosDNS...${RESET}"
-    systemctl stop mosdns.service 2>/dev/null
-    systemctl disable mosdns.service 2>/dev/null
-    rm -f /etc/systemd/system/mosdns.service
-    systemctl daemon-reload
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop mosdns.service 2>/dev/null
+        systemctl disable mosdns.service 2>/dev/null
+        rm -f /etc/systemd/system/mosdns.service
+        systemctl daemon-reload
+    else
+        killall mosdns 2>/dev/null
+    fi
     rm -f /usr/local/bin/mosdns
     rm -rf /etc/mosdns
 
@@ -375,7 +425,7 @@ uninstall_mosdns() {
         echo -e "${GREEN}未找到备份，使用默认DNS 8.8.8.8${RESET}"
     fi
 
-    crontab -l | grep -v "update_mosdns_rules.sh" | crontab -
+    crontab -l 2>/dev/null | grep -v "update_mosdns_rules.sh" | crontab -
     echo -e "${GREEN}MosDNS 已卸载${RESET}"
 }
 
@@ -405,19 +455,34 @@ update_rules() {
         exit 1
     fi
 
-    systemctl restart mosdns
-    sleep 3
-    if systemctl status mosdns.service | grep -q "running"; then
-        echo -e "${GREEN}规则更新成功${RESET}"
-    else
-        echo -e "${RED}重启失败，回滚规则...${RESET}"
-        [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
-        [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl restart mosdns
-        exit 1
+        sleep 3
+        if systemctl status mosdns.service | grep -q "running"; then
+            echo -e "${GREEN}规则更新成功${RESET}"
+        else
+            echo -e "${RED}重启失败，回滚规则...${RESET}"
+            [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
+            [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+            systemctl restart mosdns
+            exit 1
+        fi
+    else
+        killall mosdns 2>/dev/null
+        /usr/local/bin/mosdns start -c "$CONFIG_PATH/config.yaml" &
+        sleep 3
+        if ps -ef | grep -q "[m]osdns start"; then
+            echo -e "${GREEN}规则更新成功${RESET}"
+        else
+            echo -e "${RED}重启失败，回滚规则...${RESET}"
+            [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
+            [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+            exit 1
+        fi
     fi
 
-    cat > /usr/local/bin/update_mosdns_rules.sh <<EOF
+    if command -v cron >/dev/null 2>&1; then
+        cat > /usr/local/bin/update_mosdns_rules.sh <<EOF
 #!/bin/bash
 CONFIG_PATH="/etc/mosdns"
 cp "\$CONFIG_PATH/cn_domains.txt" "\$CONFIG_PATH/cn_domains.txt.bak" 2>/dev/null
@@ -435,11 +500,19 @@ if [ ! -s "\$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "\$CONFIG_PATH/non_cn_domai
     [ -f "\$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "\$CONFIG_PATH/non_cn_domains.txt.bak" "\$CONFIG_PATH/non_cn_domains.txt"
     exit 1
 fi
-systemctl restart mosdns
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart mosdns
+else
+    killall mosdns 2>/dev/null
+    /usr/local/bin/mosdns start -c "\$CONFIG_PATH/config.yaml" &
+fi
 EOF
-    chmod +x /usr/local/bin/update_mosdns_rules.sh
-    (crontab -l 2>/dev/null | grep -v "update_mosdns_rules.sh"; echo "0 0 * * 5 /usr/local/bin/update_mosdns_rules.sh") | crontab -
-    echo -e "${GREEN}已设置每周五自动更新${RESET}"
+        chmod +x /usr/local/bin/update_mosdns_rules.sh
+        (crontab -l 2>/dev/null | grep -v "update_mosdns_rules.sh"; echo "0 0 * * 5 /usr/local/bin/update_mosdns_rules.sh") | crontab -
+        echo -e "${GREEN}已设置每周五自动更新${RESET}"
+    else
+        echo -e "${YELLOW}无 cron，跳过自动更新设置${RESET}"
+    fi
 }
 
 echo -e "${YELLOW}MosDNS 安装与管理脚本${RESET}"
