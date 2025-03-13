@@ -75,7 +75,7 @@ deploy_container() {
     check_port "$port"
 
     echo -e "${YELLOW}正在部署 $name 容器...${NC}"
-    docker run -d --name "$name" -p "$port:$internal_port" "$image"
+    docker run -d --restart unless-stopped --name "$name" -p "$port:$internal_port" "$image"
 
     if [[ $? -eq 0 ]]; then
         echo -e "${GREEN}$name 容器已成功部署！${NC}"
@@ -107,7 +107,7 @@ deploy_looking_glass() {
     
     # 保持内部服务监听端口为 80
     echo -e "${YELLOW}正在部署 Looking Glass Server 容器...${NC}"
-    docker run -d --name "looking-glass" \
+    docker run -d --restart unless-stopped --name "looking-glass" \
         -p "$HTTP_PORT:80" \
         "wikihostinc/looking-glass-server"
 
