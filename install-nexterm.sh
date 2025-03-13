@@ -5,19 +5,19 @@ set -euo pipefail
 docker_name="nexterm"
 docker_img="germannewsmaker/nexterm:latest"
 default_port=6989
+internal_port=6989  # 容器内部服务端口
 CONFIG_DIR="/home/docker/nexterm"
 LOG_FILE="/var/log/nexterm-deploy.log"
+LOG_MAX_SIZE=1048576  # 1M
 
 # 初始化日志路径
 setup_logging() {
     local log_dir=$(dirname "$LOG_FILE")
-    if [[ ! -d "$log_dir" ]]; then
-        mkdir -p "$log_dir"
-    fi
-    if [[ ! -w "$log_dir" ]]; then
-        echo -e "\033[31m日志目录 $log_dir 无写权限，请检查权限设置。\033[0m"
-        exit 1
-    fi
+    [[ ! -d "$log_dir" ]] && mkdir -p "$log_dir"
+    [[ ! -w "$log_dir" ]] && { echo -e "\033[31m日志目录 $log_dir 无写权限，请检查权限设置。\033[0m"; exit 1; }
+
+    # 如果日志文件超过 1MB，则清空
+    [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE") -ge $LOG_MAX_SIZE ]] && > "$LOG_FILE"
     touch "$LOG_FILE"
     exec > >(tee -a "$LOG_FILE") 2>&1
 }
@@ -35,20 +35,26 @@ red() { echo -e "\033[31m$@\033[0m"; }
 green() { echo -e "\033[32m$@\033[0m"; }
 yellow() { echo -e "\033[33m$@\033[0m"; }
 
-# 输入验证
+# 封装用户输入询问
+prompt_user_input() {
+    local prompt=$1
+    local default_value=$2
+    local input
+    read -p "$prompt（默认值：$default_value）：" input
+    echo "${input:-$default_value}"
+}
+
+# 封装确认操作
 confirm_operation() {
     local prompt=$1
-    local max_attempts=3
-    for ((i=1; i<=max_attempts; i++)); do
-        read -rp "${prompt} (y/n) " answer
+    while true; do
+        read -rp "${prompt} (y/n): " answer
         case "$answer" in
             [yY]|yes|YES) return 0 ;;
             [nN]|no|NO) return 1 ;;
-            *) red "无效输入，请重试 ($i/$max_attempts)";;
+            *) red "无效输入，请输入 y 或 n。" ;;
         esac
     done
-    red "超过最大尝试次数，操作中止"
-    exit 1
 }
 
 # 系统和架构检测
@@ -66,60 +72,19 @@ detect_system_and_architecture() {
 
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64 | amd64)
-            PLATFORM="linux/amd64"
-            ;;
-        armv7l | armhf)
-            PLATFORM="linux/arm/v7"
-            ;;
-        aarch64 | arm64)
-            PLATFORM="linux/arm64"
-            ;;
-        *)
-            red "当前设备架构 ($ARCH) 未被支持，请确认镜像是否兼容。"
-            exit 1
-            ;;
+        x86_64 | amd64) PLATFORM="linux/amd64" ;;
+        armv7l | armhf) PLATFORM="linux/arm/v7" ;;
+        aarch64 | arm64) PLATFORM="linux/arm64" ;;
+        *) red "当前设备架构 ($ARCH) 未被支持，请确认镜像是否兼容。"; exit 1 ;;
     esac
 
     green "检测到系统：$SYSTEM，架构：$ARCH，适配平台：$PLATFORM"
 }
 
-# 依赖安装
-install_dependencies() {
-    yellow "开始安装系统依赖..."
-    if ! command -v docker &>/dev/null; then
-        case $SYSTEM in
-            debian)
-                sudo $PACKAGE_MANAGER update && sudo $PACKAGE_MANAGER install -y docker.io curl jq bash-completion || {
-                    red "依赖安装失败，请检查网络连接或权限。"; exit 1; }
-                ;;
-            centos)
-                sudo $PACKAGE_MANAGER install -y docker-ce docker-ce-cli containerd.io bash-completion jq || {
-                    red "依赖安装失败，请检查网络连接或权限。"; exit 1; }
-                ;;
-        esac
-        sudo systemctl enable --now docker
-        green "Docker 安装完成。"
-    else
-        green "Docker 已安装，跳过依赖安装。"
-    fi
-}
-
-# 检查用户权限
-check_user_permission() {
-    if ! groups | grep -q docker; then
-        yellow "当前用户不在 docker 组中，正在尝试添加..."
-        sudo usermod -aG docker $USER
-        red "已将用户添加到 docker 组，请重新登录后运行脚本，或者使用 'sudo' 运行脚本。"
-        exit 1
-    fi
-}
-
 # 检测端口是否可用
 validate_port() {
     while true; do
-        read -p "请输入希望使用的端口（默认 $default_port）：" user_port
-        user_port=${user_port:-$default_port}
+        user_port=$(prompt_user_input "请输入希望使用的端口" "$default_port")
         if [[ "$user_port" =~ ^[0-9]+$ && "$user_port" -ge 1 && "$user_port" -le 65535 ]]; then
             if lsof -i:$user_port &>/dev/null; then
                 red "端口 $user_port 已被占用，请选择其他端口。"
@@ -134,17 +99,50 @@ validate_port() {
     done
 }
 
+# 提供网络模式选择并提示
+choose_network_mode() {
+    echo -e "\n请选择网络模式："
+    echo "1. bridge（推荐，适合大多数场景）"
+    echo "2. host（直接使用主机网络，可能与其他服务冲突）"
+    while true; do
+        read -p "请输入选项（1 或 2）：" choice
+        case $choice in
+            1) NETWORK_MODE="bridge"; green "选择的网络模式：bridge"; break ;;
+            2) NETWORK_MODE="host"; green "选择的网络模式：host"; break ;;
+            *) red "无效选项，请重新输入。" ;;
+        esac
+    done
+}
+
 # 清理旧版本
 clean_legacy() {
     if docker inspect $docker_name &>/dev/null; then
-        yellow "发现已存在容器"
+        yellow "发现已存在容器 $docker_name"
         confirm_operation "是否卸载当前版本？" && {
             docker stop $docker_name || true
             docker rm $docker_name || true
-            docker rmi $docker_img || true
-            rm -rf $CONFIG_DIR
-            green "旧版本已清理"
+            green "容器已删除。"
+
+            if docker images | grep -q $docker_img; then
+                docker rmi $docker_img || true
+                green "镜像已删除。"
+            fi
+
+            if [[ -d "$CONFIG_DIR" ]]; then
+                confirm_operation "是否删除持久化数据目录 $CONFIG_DIR？" && {
+                    rm -rf "$CONFIG_DIR"
+                    green "持久化数据目录已删除。"
+                } || {
+                    yellow "持久化数据目录保留，方便下次部署加载。"
+                }
+            fi
+
+            docker network prune -f || true
+            docker volume prune -f || true
+            green "无用的网络和卷已清理。"
         }
+    else
+        yellow "未发现需要清理的容器。"
     fi
 }
 
@@ -152,7 +150,7 @@ clean_legacy() {
 pull_image() {
     yellow "尝试拉取镜像..."
     if docker pull $docker_img; then
-        green "镜像拉取成功"
+        green "镜像拉取成功。"
     else
         red "镜像拉取失败，请检查网络连接或镜像地址。"
         exit 1
@@ -162,14 +160,24 @@ pull_image() {
 # 容器启动
 start_container() {
     yellow "启动容器..."
-    docker_run="docker run -d \
-        --name $docker_name \
-        --network host \
-        -v $CONFIG_DIR:/app/data \
-        --restart unless-stopped \
-        $docker_img"
-    eval $docker_run || {
-        red "容器启动失败"; exit 1; }
+    if [[ "$NETWORK_MODE" == "host" ]]; then
+        docker_run="docker run -d \
+            --name $docker_name \
+            --network host \
+            -v $CONFIG_DIR:/app/data \
+            --restart unless-stopped \
+            $docker_img"
+    else
+        docker_run="docker run -d \
+            --name $docker_name \
+            --network bridge \
+            -v $CONFIG_DIR:/app/data \
+            -p $PORT:$internal_port \
+            --restart unless-stopped \
+            $docker_img"
+    fi
+
+    eval $docker_run || { red "容器启动失败，请检查日志。"; exit 1; }
 }
 
 # 部署验证
@@ -179,24 +187,42 @@ verify_deployment() {
         green "部署成功！访问地址：http://${public_ip}:${PORT}"
         echo "数据目录：$CONFIG_DIR"
         echo "使用以下命令检查容器日志：docker logs $docker_name"
+        echo "使用以下命令停止容器：docker stop $docker_name"
     else
         red "容器运行异常，请检查日志：docker logs $docker_name"
         exit 1
     fi
 }
 
+# 菜单功能
+menu() {
+    echo -e "\n请选择操作："
+    echo "1. 部署 Nexterm"
+    echo "2. 卸载清理 Nexterm"
+    echo "3. 退出脚本"
+    read -p "请输入选项（1-3）：" choice
+    case $choice in
+        1)
+            validate_port
+            choose_network_mode
+            clean_legacy
+            pull_image
+            start_container
+            verify_deployment
+            ;;
+        2) clean_legacy ;;
+        3) green "退出脚本。"; exit 0 ;;
+        *) red "无效选项，请重新选择。" ;;
+    esac
+}
+
 # 主流程
 main() {
     setup_logging
-    confirm_operation "是否执行 Nexterm 部署？" || exit
     detect_system_and_architecture
-    check_user_permission
-    install_dependencies
-    validate_port
-    clean_legacy
-    pull_image
-    start_container
-    verify_deployment
+    while true; do
+        menu
+    done
 }
 
 main
