@@ -28,11 +28,11 @@ DEFAULT_OPTIONS=(
     "10. 安装 Sing-box（install-sing-box.sh）"
     "11. 安装 Subconverter（install-subc.sh）"
     "12. 设置 DNS（set-dns.sh）"
-    "13. 安装 MosDNS（install_mosdns.sh）" 
+    "13. 安装 MosDNS（install_mosdns.sh）"
     "14. 配置定时任务（setup_cronjob.sh）"
     "15. 部署 Sub-Store（sub-store-deploy.sh）"
     "16. 更新 Sing-box 配置（update_singbox.sh）"
-    "17. 快捷键管理" # 合并后的选项，原 16 变为 17
+    "98. 快捷键管理"  # 修改为固定编号 98
 )
 
 # 默认脚本对应的 URL
@@ -449,17 +449,28 @@ function main() {
         print_menu
         read -rp "请输入选项编号: " choice
         case "$choice" in
-            0) exit 0 ;;
-            99) manage_custom_menu ;;
-            16) manage_symlink ;;  # 使用新的 manage_symlink 函数
-            [1-9]|[1-9][0-9])  # 修改为更宽泛的匹配，支持所有数字选项
-                manage_logs
-                script_path=$(download_script "$choice")
-                echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
-                if [[ $? -eq 0 && -n "$script_path" && -f "$script_path" ]]; then
-                    run_script "$script_path"
-                else
-                    echo "脚本下载失败或文件不存在，请检查日志。" | tee -a "$LOG_FILE"
+            0)
+                exit 0
+                ;;
+            98)  # 新增 98 处理快捷键管理
+                manage_symlink
+                ;;
+            99)
+                manage_custom_menu
+                ;;
+            [1-9]|[1-9][0-9])  # 匹配所有数字选项
+                # 只对需要下载和运行的脚本选项执行以下逻辑
+                if [[ "$choice" -le 16 ]]; then  # 限制为 1-16 的脚本选项
+                    manage_logs
+                    script_path=$(download_script "$choice")
+                    echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
+                    if [[ $? -eq 0 && -n "$script_path" && -f "$script_path" ]]; then
+                        run_script "$script_path"
+                    else
+                        echo "脚本下载失败或文件不存在，请检查日志。" | tee -a "$LOG_FILE"
+                    fi
+                elif [[ "$choice" -ne 98 && "$choice" -ne 99 ]]; then  # 排除 98 和 99
+                    echo "无效选项，请重新输入。" | tee -a "$LOG_FILE"
                 fi
                 read -rp "按回车键返回主菜单..."
                 ;;
