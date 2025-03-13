@@ -28,10 +28,11 @@ DEFAULT_OPTIONS=(
     "10. 安装 Sing-box（install-sing-box.sh）"
     "11. 安装 Subconverter（install-subc.sh）"
     "12. 设置 DNS（set-dns.sh）"
-    "13. 配置定时任务（setup_cronjob.sh）"
-    "14. 部署 Sub-Store（sub-store-deploy.sh）"
-    "15. 更新 Sing-box 配置（update_singbox.sh）"
-    "16. 快捷键管理" # 合并后的选项
+    "13. 安装 MosDNS（install_mosdns.sh）" 
+    "14. 配置定时任务（setup_cronjob.sh）"
+    "15. 部署 Sub-Store（sub-store-deploy.sh）"
+    "16. 更新 Sing-box 配置（update_singbox.sh）"
+    "17. 快捷键管理" # 合并后的选项，原 16 变为 17
 )
 
 # 默认脚本对应的 URL
@@ -48,9 +49,10 @@ declare -A DEFAULT_SCRIPTS=(
     ["10"]="https://raw.githubusercontent.com/zsj9418/-/main/install-sing-box.sh"
     ["11"]="https://raw.githubusercontent.com/zsj9418/-/main/install-subc.sh"
     ["12"]="https://raw.githubusercontent.com/zsj9418/-/main/set-dns.sh"
-    ["13"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
-    ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
-    ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
+    ["13"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_mosdns.sh"
+    ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
+    ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
+    ["16"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
 )
 
 # 声明全局变量
