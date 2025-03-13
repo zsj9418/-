@@ -7,6 +7,7 @@
 DATA_DIR="/opt/substore/data"
 BACKUP_DIR="/opt/substore/backup"
 LOG_FILE="/var/log/docker_management.log"
+LOG_MAX_SIZE=1048576  # 1M
 CONTAINER_NAME="substore"
 WATCHTOWER_CONTAINER_NAME="watchtower"
 TIMEZONE="Asia/Shanghai"
@@ -24,18 +25,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# 初始化变量
-ARCH=""
-OS=""
-WECHAT_WEBHOOK=""
-TELEGRAM_URL=""
-SUB_STORE_BACKEND_SYNC_CRON=""
-NETWORK_MODE="bridge"  # 默认网络模式
-HOST_PORT_1=""
-HOST_PORT_2=""
-SUB_STORE_FRONTEND_BACKEND_PATH=""
-
-# 日志记录函数
+# 初始化日志
 log() {
   local level=$1
   local message=$2
@@ -46,6 +36,12 @@ log() {
     "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" ;;
   esac
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
+
+  # 限制日志大小为 1M，超过后清空
+  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
+    > "$LOG_FILE"
+    log "INFO" "日志文件大小超过 1M，已清空日志。"
+  fi
 }
 
 # 检测设备架构和操作系统
@@ -146,10 +142,7 @@ install_watchtower() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     $WATCHTOWER_IMAGE_NAME \
     --cleanup \
-    -i 3600 \
-    --warn-on-head-failure never \
-    --notification-url "$TELEGRAM_URL" \
-    --notification-title-tag "Watchtower" || {
+    -i 3600 || {
       log "ERROR" "Watchtower 部署失败"
       exit 1
     }
@@ -183,9 +176,6 @@ install_substore() {
       --name $CONTAINER_NAME \
       --restart=always \
       -v "${DATA_DIR}:/opt/app/data" \
-      -e "SUB_STORE_PUSH_SERVICE=${WECHAT_WEBHOOK}" \
-      -e "SUB_STORE_BACKEND_SYNC_CRON=${SUB_STORE_BACKEND_SYNC_CRON}" \
-      -e "SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH}" \
       -e TZ=${TIMEZONE} \
       $SUB_STORE_IMAGE_NAME || {
         log "ERROR" "容器启动失败"
@@ -202,9 +192,6 @@ install_substore() {
       -p $HOST_PORT_1:3000 \
       -p $HOST_PORT_2:3001 \
       -v "${DATA_DIR}:/opt/app/data" \
-      -e "SUB_STORE_PUSH_SERVICE=${WECHAT_WEBHOOK}" \
-      -e "SUB_STORE_BACKEND_SYNC_CRON=${SUB_STORE_BACKEND_SYNC_CRON}" \
-      -e "SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH}" \
       -e TZ=${TIMEZONE} \
       $SUB_STORE_IMAGE_NAME || {
         log "ERROR" "容器启动失败"
@@ -213,6 +200,12 @@ install_substore() {
   fi
 
   log "INFO" "Sub-Store 部署成功"
+}
+
+# 查看所有容器状态
+check_all_containers_status() {
+  log "INFO" "正在检查所有容器状态..."
+  docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 }
 
 # 增强版卸载容器
@@ -280,20 +273,18 @@ interactive_menu() {
     echo -e "\n选择操作："
     echo "1. 部署 Sub-Store"
     echo "2. 部署 Watchtower"
-    echo "3. 卸载容器（Sub-Store 或 Watchtower）"
-    echo "4. 数据备份"
-    echo "5. 数据恢复"
-    echo "6. 退出"
+    echo "3. 查看所有容器状态"
+    echo "4. 卸载容器（Sub-Store 或 Watchtower）"
+    echo "5. 数据备份"
+    echo "6. 数据恢复"
+    echo "7. 退出"
     read -p "请输入选项编号: " choice
 
     case $choice in
-      1)
-        install_substore
-        ;;
-      2)
-        install_watchtower
-        ;;
-      3)
+      1) install_substore ;;
+      2) install_watchtower ;;
+      3) check_all_containers_status ;;
+      4)
         echo -e "选择卸载的容器："
         echo "1. Sub-Store"
         echo "2. Watchtower"
@@ -304,13 +295,9 @@ interactive_menu() {
           *) log "WARN" "无效输入，返回主菜单" ;;
         esac
         ;;
-      4)
-        backup_data
-        ;;
-      5)
-        restore_data
-        ;;
-      6)
+      5) backup_data ;;
+      6) restore_data ;;
+      7)
         log "INFO" "退出脚本"
         exit 0
         ;;
