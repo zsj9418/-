@@ -57,6 +57,45 @@ check_install_deps() {
     [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装依赖：${INSTALLED_DEPS[*]}${RESET}"
 }
 
+# 强制释放53端口
+release_port_53() {
+    echo -e "${YELLOW}检查并释放53端口...${RESET}"
+    if netstat -tuln | grep -q ":53 "; then
+        echo -e "${YELLOW}检测到53端口被占用，正在识别服务...${RESET}"
+        PIDS=$(lsof -i :53 | awk 'NR>1 {print $2}' | sort -u)
+        if [ -n "$PIDS" ]; then
+            for PID in $PIDS; do
+                SERVICE=$(ps -p "$PID" -o comm=)
+                echo -e "${YELLOW}找到占用53端口的服务：$SERVICE (PID: $PID)${RESET}"
+                if systemctl is-active "systemd-resolved" >/dev/null 2>&1 && [[ "$SERVICE" =~ systemd ]]; then
+                    echo -e "${YELLOW}停止并禁用 systemd-resolved...${RESET}"
+                    systemctl stop systemd-resolved
+                    systemctl disable systemd-resolved
+                elif systemctl is-active "dnsmasq" >/dev/null 2>&1 && [[ "$SERVICE" =~ dnsmasq ]]; then
+                    echo -e "${YELLOW}停止并禁用 dnsmasq...${RESET}"
+                    systemctl stop dnsmasq
+                    systemctl disable dnsmasq
+                elif systemctl is-active "AdGuardHome" >/dev/null 2>&1 && [[ "$SERVICE" =~ AdGuard ]]; then
+                    echo -e "${YELLOW}停止 AdGuardHome（稍后需调整其端口）...${RESET}"
+                    systemctl stop AdGuardHome
+                else
+                    echo -e "${YELLOW}强制终止未知服务 (PID: $PID)...${RESET}"
+                    kill -9 "$PID"
+                fi
+            done
+        fi
+        sleep 1
+        if netstat -tuln | grep -q ":53 "; then
+            echo -e "${RED}错误：无法释放53端口，请手动检查并终止占用进程${RESET}"
+            exit 1
+        else
+            echo -e "${GREEN}53端口已成功释放${RESET}"
+        fi
+    else
+        echo -e "${GREEN}53端口未被占用${RESET}"
+    fi
+}
+
 # 配置双ADG并生成新配置文件
 configure_dual_adg() {
     echo -e "\n${YELLOW}配置双AdGuard Home (ADG) 分流${RESET}"
@@ -76,11 +115,23 @@ configure_dual_adg() {
         exit 1
     fi
 
-    # 检查端口是否被占用（排除mosdns自身）
+    # 提示用户确认ADG已运行
+    echo -e "${YELLOW}请确保国内ADG已运行在 $LOCAL_ADG，国外ADG已运行在 $REMOTE_ADG${RESET}"
+    echo -e "如果ADG未启动，请先启动ADG服务。继续配置？(y/n，默认y)："
+    read -p "> " CONFIRM
+    if [ "${CONFIRM:-y}" != "y" ]; then
+        echo -e "${RED}配置中止，请启动ADG后再运行脚本${RESET}"
+        exit 1
+    fi
+
+    # 检查端口是否被非MosDNS服务占用（可选）
     for PORT in "${LOCAL_ADG##*:}" "${REMOTE_ADG##*:}"; do
         if netstat -tuln | grep -v "127.0.0.1:53" | grep -q ":$PORT "; then
-            echo -e "${RED}错误：端口 $PORT 已被占用，请选择其他端口${RESET}"
-            exit 1
+            echo -e "${YELLOW}警告：端口 $PORT 已被占用，可能为ADG或其他服务${RESET}"
+            if ! lsof -i :"$PORT" | grep -q "AdGuard"; then
+                echo -e "${RED}错误：端口 $PORT 被非ADG服务占用，请选择其他端口或手动释放${RESET}"
+                exit 1
+            fi
         fi
     done
 
@@ -229,14 +280,9 @@ install_mosdns() {
     fi
     echo -e "${GREEN}选择的版本：$VERSION${RESET}"
 
-    # 用户输入：监听端口
-    echo -e "\n${YELLOW}请输入MosDNS监听端口（默认53）：${RESET}"
-    read -p "> " PORT
-    PORT=${PORT:-53}
-    if netstat -tuln | grep -q ":$PORT "; then
-        echo -e "${RED}错误：端口 $PORT 已被占用，请选择其他端口或释放该端口${RESET}"
-        exit 1
-    fi
+    # 强制释放53端口
+    release_port_53
+    PORT=53  # 固定使用53端口
 
     # 用户输入：国内DNS
     echo -e "\n${YELLOW}请输入国内DNS地址（格式：https://x.x.x.x/dns-query），每行一个${RESET}"
@@ -403,14 +449,6 @@ EOF
     echo -e "${GREEN}初始配置文件测试通过${RESET}"
     rm -f "$TEMP_LOG"
 
-    # 检查并禁用冲突服务
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        echo -e "${YELLOW}检测到 systemd-resolved 运行，可能冲突，正在禁用...${RESET}"
-        systemctl stop systemd-resolved
-        systemctl disable systemd-resolved
-        RESOLVED_DISABLED=true
-    fi
-
     # 创建systemd服务
     echo -e "${YELLOW}设置系统服务...${RESET}"
     cat > /etc/systemd/system/mosdns.service <<EOF
@@ -431,7 +469,7 @@ EOF
     systemctl start mosdns.service
 
     # 运行验证
-    echo -e "${YELLOW}验证MosDNS运行...${RESET}"
+echo -e "${YELLOW}验证MosDNS运行...${RESET}"
     sleep 3
     if systemctl status mosdns.service | grep -q "running"; then
         if command -v dig >/dev/null 2>&1; then
@@ -461,8 +499,8 @@ EOF
         echo -e "${GREEN}跳过双ADG配置，使用默认DNS分流${RESET}"
     fi
 
-    # 完成提示
-    echo -e "\n${GREEN}MosDNS 已启动并监听 127.0.0.1:$PORT${RESET}"
+    # 修正完成提示，确保显示正确的端口
+    echo -e "\n${GREEN}MosDNS 已启动并监听 127.0.0.1:53${RESET}"
     echo -e "配置文件：$CONFIG_PATH/config.yaml"
     echo -e "日志文件：$CONFIG_PATH/mosdns.log"
     echo -e "\n${YELLOW}常用命令：${RESET}"
@@ -470,6 +508,12 @@ EOF
     echo "  停止服务：systemctl stop mosdns"
     echo "  重启服务：systemctl restart mosdns"
     echo "  查看日志：tail -f $CONFIG_PATH/mosdns.log"
+    
+    # 配置系统DNS为127.0.0.1
+    echo -e "${YELLOW}配置系统DNS为 127.0.0.1...${RESET}"
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chmod 644 /etc/resolv.conf
+    echo -e "${GREEN}系统DNS已设置为 127.0.0.1${RESET}"    
 }
 
 # 卸载清理MosDNS
@@ -486,12 +530,6 @@ uninstall_mosdns() {
     systemctl daemon-reload
     rm -f "$INSTALL_PATH/mosdns"
     rm -rf "$CONFIG_PATH"
-
-    if [ "${RESOLVED_DISABLED:-false}" = true ] && command -v systemd-resolve >/dev/null 2>&1; then
-        echo -e "${YELLOW}恢复 systemd-resolved 服务...${RESET}"
-        systemctl enable systemd-resolved
-        systemctl start systemd-resolved
-    fi
 
     echo -e "${GREEN}MosDNS 已卸载并清理完成！${RESET}"
 }
