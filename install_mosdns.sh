@@ -57,6 +57,139 @@ check_install_deps() {
     [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装依赖：${INSTALLED_DEPS[*]}${RESET}"
 }
 
+# 配置双ADG并生成新配置文件
+configure_dual_adg() {
+    echo -e "\n${YELLOW}配置双AdGuard Home (ADG) 分流${RESET}"
+    echo -e "请输入负责国内DNS的ADG地址（格式：IP:端口，默认 127.0.0.1:530）："
+    read -p "> " LOCAL_ADG
+    LOCAL_ADG=${LOCAL_ADG:-127.0.0.1:530}
+    if ! [[ "$LOCAL_ADG" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+        echo -e "${RED}错误：格式无效，必须为 IP:端口（如 127.0.0.1:530）${RESET}"
+        exit 1
+    fi
+
+    echo -e "请输入负责国外DNS的ADG地址（格式：IP:端口，默认 127.0.0.1:531）："
+    read -p "> " REMOTE_ADG
+    REMOTE_ADG=${REMOTE_ADG:-127.0.0.1:531}
+    if ! [[ "$REMOTE_ADG" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+        echo -e "${RED}错误：格式无效，必须为 IP:端口（如 127.0.0.1:531）${RESET}"
+        exit 1
+    fi
+
+    # 检查端口是否被占用（排除mosdns自身）
+    for PORT in "${LOCAL_ADG##*:}" "${REMOTE_ADG##*:}"; do
+        if netstat -tuln | grep -v "127.0.0.1:53" | grep -q ":$PORT "; then
+            echo -e "${RED}错误：端口 $PORT 已被占用，请选择其他端口${RESET}"
+            exit 1
+        fi
+    done
+
+    # 生成新配置文件
+    echo -e "${YELLOW}生成新配置文件...${RESET}"
+    CONFIG_PATH="/etc/mosdns"
+    cat > "$CONFIG_PATH/config.yaml" <<EOF
+log:
+  level: info
+  file: "$CONFIG_PATH/mosdns.log"
+
+plugins:
+  - tag: "direct_domain"
+    type: domain_set
+    args:
+      files:
+        - "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt"
+        - "$CONFIG_PATH/apple.china.conf.raw.txt"
+
+  - tag: "local_forward"
+    type: forward
+    args:
+      concurrent: 4
+      upstreams:
+        - addr: "$LOCAL_ADG"  # 国内ADG
+
+  - tag: "remote_forward"
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: "$REMOTE_ADG"  # 国外ADG
+
+  - tag: "local_sequence"
+    type: sequence
+    args:
+      - exec: \$local_forward
+
+  - tag: "remote_sequence"
+    type: sequence
+    args:
+      - exec: \$remote_forward
+
+  - tag: "main_sequence"
+    type: sequence
+    args:
+      - matches: "qname \$direct_domain"
+        exec: goto local_sequence
+      - exec: goto remote_sequence
+
+  - type: udp_server
+    args:
+      entry: main_sequence
+      listen: 127.0.0.1:53
+EOF
+
+    # 校验新配置文件
+    echo -e "${YELLOW}校验新配置文件语法...${RESET}"
+    if command -v yamllint >/dev/null 2>&1; then
+        TEMP_YAML_CONF=$(mktemp)
+        cat > "$TEMP_YAML_CONF" <<EOF
+---
+extends: default
+rules:
+  key-duplicates: enable
+EOF
+        if ! yamllint -c "$TEMP_YAML_CONF" "$CONFIG_PATH/config.yaml"; then
+            echo -e "${RED}错误：新配置文件语法无效，请检查 $CONFIG_PATH/config.yaml${RESET}"
+            rm -f "$TEMP_YAML_CONF"
+            exit 1
+        fi
+        rm -f "$TEMP_YAML_CONF"
+        echo -e "${GREEN}新配置文件语法校验通过${RESET}"
+    else
+        echo -e "${YELLOW}警告：未安装 yamllint，跳过高级语法检查${RESET}"
+    fi
+
+    # 测试运行新配置文件
+    echo -e "${YELLOW}测试运行新配置文件...${RESET}"
+    TEMP_LOG=$(mktemp)
+    /usr/local/bin/mosdns start -c "$CONFIG_PATH/config.yaml" >"$TEMP_LOG" 2>&1 &
+    MOSDNS_PID=$!
+    sleep 2
+    if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
+        echo -e "${RED}错误：新配置文件运行失败，请检查 $CONFIG_PATH/config.yaml${RESET}"
+        echo -e "${YELLOW}详细信息：${RESET}"
+        cat "$TEMP_LOG"
+        rm -f "$TEMP_LOG"
+        exit 1
+    fi
+    kill "$MOSDNS_PID"
+    echo -e "${GREEN}新配置文件测试通过${RESET}"
+    rm -f "$TEMP_LOG"
+
+    # 重启服务
+    echo -e "${YELLOW}重启MosDNS服务以应用新配置...${RESET}"
+    systemctl restart mosdns
+    sleep 3
+    if systemctl status mosdns.service | grep -q "running"; then
+        echo -e "${GREEN}成功：MosDNS已重启并应用新配置${RESET}"
+        echo -e "国内DNS指向：$LOCAL_ADG"
+        echo -e "国外DNS指向：$REMOTE_ADG"
+    else
+        echo -e "${RED}错误：MosDNS 重启失败${RESET}"
+        systemctl status mosdns.service
+        exit 1
+    fi
+}
+
 # 安装MosDNS
 install_mosdns() {
     # 检测架构
@@ -175,9 +308,8 @@ install_mosdns() {
     awk '{print $2}' "$CONFIG_PATH/accelerated-domains.china.conf" > "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt"
     awk '{print $2}' "$CONFIG_PATH/apple.china.conf" > "$CONFIG_PATH/apple.china.conf.raw.txt"
 
-    # 生成配置文件
-    echo -e "${YELLOW}生成配置文件...${RESET}"
-    [ -f "$CONFIG_PATH/config.yaml" ] && mv "$CONFIG_PATH/config.yaml" "$CONFIG_PATH/config.yaml.bak"
+    # 生成初始配置文件
+    echo -e "${YELLOW}生成初始配置文件...${RESET}"
     cat > "$CONFIG_PATH/config.yaml" <<EOF
 log:
   level: info
@@ -191,13 +323,6 @@ plugins:
         - "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt"
         - "$CONFIG_PATH/apple.china.conf.raw.txt"
 
-  - tag: "remote_forward"
-    type: forward
-    args:
-      concurrent: 2
-      upstreams:
-$(for addr in "${FOREIGN_DNS[@]}"; do echo "        - addr: \"$addr\""; done)
-
   - tag: "local_forward"
     type: forward
     args:
@@ -209,6 +334,13 @@ $(for addr in "${DOMESTIC_DNS[@]}"; do
     echo "          enable_pipeline: true"
     echo "          dial_addr: \"${addr#https://}\""
 done | sed 's|/dns-query||')
+
+  - tag: "remote_forward"
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+$(for addr in "${FOREIGN_DNS[@]}"; do echo "        - addr: \"$addr\""; done)
 
   - tag: "local_sequence"
     type: sequence
@@ -233,8 +365,8 @@ done | sed 's|/dns-query||')
       listen: 127.0.0.1:$PORT
 EOF
 
-    # 校验配置文件语法
-    echo -e "${YELLOW}校验配置文件语法...${RESET}"
+    # 校验初始配置文件
+    echo -e "${YELLOW}校验初始配置文件语法...${RESET}"
     if command -v yamllint >/dev/null 2>&1; then
         TEMP_YAML_CONF=$(mktemp)
         cat > "$TEMP_YAML_CONF" <<EOF
@@ -244,31 +376,31 @@ rules:
   key-duplicates: enable
 EOF
         if ! yamllint -c "$TEMP_YAML_CONF" "$CONFIG_PATH/config.yaml"; then
-            echo -e "${RED}错误：配置文件语法无效，请检查 $CONFIG_PATH/config.yaml${RESET}"
+            echo -e "${RED}错误：初始配置文件语法无效，请检查 $CONFIG_PATH/config.yaml${RESET}"
             rm -f "$TEMP_YAML_CONF"
             exit 1
         fi
         rm -f "$TEMP_YAML_CONF"
-        echo -e "${GREEN}配置文件语法校验通过${RESET}"
+        echo -e "${GREEN}初始配置文件语法校验通过${RESET}"
     else
         echo -e "${YELLOW}警告：未安装 yamllint，跳过高级语法检查${RESET}"
     fi
 
-    # 测试运行配置文件
-    echo -e "${YELLOW}测试运行配置文件...${RESET}"
+    # 测试运行初始配置文件
+    echo -e "${YELLOW}测试运行初始配置文件...${RESET}"
     TEMP_LOG=$(mktemp)
     "$INSTALL_PATH/mosdns" start -c "$CONFIG_PATH/config.yaml" >"$TEMP_LOG" 2>&1 &
     MOSDNS_PID=$!
     sleep 2
     if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
-        echo -e "${RED}错误：配置文件运行失败，请检查 $CONFIG_PATH/config.yaml${RESET}"
+        echo -e "${RED}错误：初始配置文件运行失败，请检查 $CONFIG_PATH/config.yaml${RESET}"
         echo -e "${YELLOW}详细信息：${RESET}"
         cat "$TEMP_LOG"
         rm -f "$TEMP_LOG"
         exit 1
     fi
     kill "$MOSDNS_PID"
-    echo -e "${GREEN}配置文件测试通过${RESET}"
+    echo -e "${GREEN}初始配置文件测试通过${RESET}"
     rm -f "$TEMP_LOG"
 
     # 检查并禁用冲突服务
@@ -320,8 +452,17 @@ EOF
         exit 1
     fi
 
+    # 交互式选项：配置双ADG
+    echo -e "\n${YELLOW}安装完成！是否配置双AdGuard Home分流？(y/n)：${RESET}"
+    read -p "> " CONFIG_ADG
+    if [ "${CONFIG_ADG:-n}" = "y" ]; then
+        configure_dual_adg
+    else
+        echo -e "${GREEN}跳过双ADG配置，使用默认DNS分流${RESET}"
+    fi
+
     # 完成提示
-    echo -e "\n${GREEN}安装完成！MosDNS 已启动并监听 127.0.0.1:$PORT${RESET}"
+    echo -e "\n${GREEN}MosDNS 已启动并监听 127.0.0.1:$PORT${RESET}"
     echo -e "配置文件：$CONFIG_PATH/config.yaml"
     echo -e "日志文件：$CONFIG_PATH/mosdns.log"
     echo -e "\n${YELLOW}常用命令：${RESET}"
