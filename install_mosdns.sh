@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MosDNS 一键安装与管理脚本（专业版）
+# MosDNS 一键安装与管理脚本
 
 # 颜色定义
 RED='\e[31m'
@@ -243,6 +243,15 @@ EOF
 
 # 安装MosDNS
 install_mosdns() {
+    # 备份原始DNS配置
+    echo -e "${YELLOW}备份原始DNS配置...${RESET}"
+    if [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        echo -e "${GREEN}已备份 /etc/resolv.conf 到 /etc/resolv.conf.bak${RESET}"
+    else
+        echo -e "${YELLOW}警告：未找到 /etc/resolv.conf，卸载时将使用默认DNS${RESET}"
+    fi
+
     # 检测架构
     echo -e "${YELLOW}检测系统架构...${RESET}"
     ARCH=$(uname -m)
@@ -351,8 +360,16 @@ install_mosdns() {
     MOSDNS_VERSION=$("$INSTALL_PATH/mosdns" version 2>/dev/null || "$INSTALL_PATH/mosdns" --version)
     echo -e "${GREEN}MosDNS 版本：$MOSDNS_VERSION${RESET}"
     rm -f mosdns.zip
-    awk '{print $2}' "$CONFIG_PATH/accelerated-domains.china.conf" > "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt"
-    awk '{print $2}' "$CONFIG_PATH/apple.china.conf" > "$CONFIG_PATH/apple.china.conf.raw.txt"
+
+    # 修复域名列表生成
+    echo -e "${YELLOW}生成域名列表...${RESET}"
+    awk -F'/' '{print $2}' "$CONFIG_PATH/accelerated-domains.china.conf" > "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt"
+    awk -F'/' '{print $2}' "$CONFIG_PATH/apple.china.conf" > "$CONFIG_PATH/apple.china.conf.raw.txt"
+    if [ ! -s "$CONFIG_PATH/accelerated-domains.china.conf.raw.txt" ] || [ ! -s "$CONFIG_PATH/apple.china.conf.raw.txt" ]; then
+        echo -e "${RED}错误：域名列表文件为空，请检查下载内容${RESET}"
+        exit 1
+    fi
+    echo -e "${GREEN}域名列表生成成功${RESET}"
 
     # 生成初始配置文件
     echo -e "${YELLOW}生成初始配置文件...${RESET}"
@@ -469,7 +486,7 @@ EOF
     systemctl start mosdns.service
 
     # 运行验证
-echo -e "${YELLOW}验证MosDNS运行...${RESET}"
+    echo -e "${YELLOW}验证MosDNS运行...${RESET}"
     sleep 3
     if systemctl status mosdns.service | grep -q "running"; then
         if command -v dig >/dev/null 2>&1; then
@@ -490,6 +507,12 @@ echo -e "${YELLOW}验证MosDNS运行...${RESET}"
         exit 1
     fi
 
+    # 配置系统DNS为127.0.0.1
+    echo -e "${YELLOW}配置系统DNS为 127.0.0.1...${RESET}"
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chmod 644 /etc/resolv.conf
+    echo -e "${GREEN}系统DNS已设置为 127.0.0.1${RESET}"
+
     # 交互式选项：配置双ADG
     echo -e "\n${YELLOW}安装完成！是否配置双AdGuard Home分流？(y/n)：${RESET}"
     read -p "> " CONFIG_ADG
@@ -499,7 +522,7 @@ echo -e "${YELLOW}验证MosDNS运行...${RESET}"
         echo -e "${GREEN}跳过双ADG配置，使用默认DNS分流${RESET}"
     fi
 
-    # 修正完成提示，确保显示正确的端口
+    # 完成提示
     echo -e "\n${GREEN}MosDNS 已启动并监听 127.0.0.1:53${RESET}"
     echo -e "配置文件：$CONFIG_PATH/config.yaml"
     echo -e "日志文件：$CONFIG_PATH/mosdns.log"
@@ -508,15 +531,9 @@ echo -e "${YELLOW}验证MosDNS运行...${RESET}"
     echo "  停止服务：systemctl stop mosdns"
     echo "  重启服务：systemctl restart mosdns"
     echo "  查看日志：tail -f $CONFIG_PATH/mosdns.log"
-    
-    # 配置系统DNS为127.0.0.1
-    echo -e "${YELLOW}配置系统DNS为 127.0.0.1...${RESET}"
-    echo "nameserver 127.0.0.1" > /etc/resolv.conf
-    chmod 644 /etc/resolv.conf
-    echo -e "${GREEN}系统DNS已设置为 127.0.0.1${RESET}"    
 }
 
-# 卸载清理MosDNS
+# 卸载清理MosDNS并还原配置
 uninstall_mosdns() {
     echo -e "${YELLOW}开始卸载并清理MosDNS...${RESET}"
     INSTALL_PATH="/usr/local/bin"
@@ -530,6 +547,18 @@ uninstall_mosdns() {
     systemctl daemon-reload
     rm -f "$INSTALL_PATH/mosdns"
     rm -rf "$CONFIG_PATH"
+
+    # 还原DNS配置
+    echo -e "${YELLOW}还原系统DNS配置...${RESET}"
+    if [ -f /etc/resolv.conf.bak ]; then
+        mv /etc/resolv.conf.bak /etc/resolv.conf
+        chmod 644 /etc/resolv.conf
+        echo -e "${GREEN}已还原原始DNS配置：/etc/resolv.conf${RESET}"
+    else
+        echo -e "${YELLOW}未找到备份DNS配置，使用默认DNS 8.8.8.8${RESET}"
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        chmod 644 /etc/resolv.conf
+    fi
 
     echo -e "${GREEN}MosDNS 已卸载并清理完成！${RESET}"
 }
