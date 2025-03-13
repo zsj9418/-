@@ -2,13 +2,20 @@
 set -euo pipefail
 
 # 配置常量
-SUB_CONVERTER_IMAGE="asdlokj1qpi23/subconverter:latest"
+SUB_WEB_IMAGE="careywong/subweb:latest"
+SUB_WEB_NAME="SubWeb"
+SUB_WEB_PORT_DEFAULT=8091
+SUB_WEB_CONTAINER_PORT=80  # 容器内部服务监听端口
+
+SUB_CONVERTER_IMAGE="ghcr.io/metacubex/subconverter:latest"
 SUB_CONVERTER_NAME="SubConverter"
 SUB_CONVERTER_PORT_DEFAULT=25500
+SUB_CONVERTER_CONTAINER_PORT=25500  # 容器内部服务监听端口
 
 SING_BOX_IMAGE="jwy8645/sing-box-subscribe:latest"
 SING_BOX_NAME="sing-box-subscribe"
 SING_BOX_PORT_DEFAULT=5000
+SING_BOX_CONTAINER_PORT=5000  # 容器内部服务监听端口
 
 LOG_FILE="/var/log/deploy-tools.log"
 
@@ -27,62 +34,17 @@ red() { echo -e "\033[31m$@\033[0m"; }
 green() { echo -e "\033[32m$@\033[0m"; }
 yellow() { echo -e "\033[33m$@\033[0m"; }
 
-# 系统和架构检测
-detect_system_and_architecture() {
-    local os=""
-    local arch=""
-    if grep -qiE "ubuntu|debian" /etc/os-release; then
-        os="debian"
-    elif grep -qi "centos" /etc/os-release; then
-        os="centos"
-    else
-        red "不支持的操作系统类型"
-        exit 1
-    fi
-
-    case "$(uname -m)" in
-        x86_64|amd64) arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        armv7l|armhf) arch="armv7" ;;
-        *) red "不支持的架构: $(uname -m)"; exit 1 ;;
-    esac
-
-    echo "$os $arch"
-}
-
-# 安装依赖
-install_dependencies() {
-    yellow "开始安装系统依赖..."
-    local system_info
-    system_info=$(detect_system_and_architecture)
-    local os_type=$(echo "$system_info" | awk '{print $1}')
-
-    case "$os_type" in
-        debian)
-            sudo apt update && sudo apt install -y docker.io curl jq
-            ;;
-        centos)
-            sudo yum install -y yum-utils device-mapper-persistent-data lvm2
-            sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            sudo yum install -y docker-ce docker-ce-cli containerd.io jq
-            ;;
-    esac
-
-    sudo systemctl enable --now docker
-    sudo usermod -aG docker "$USER" || true
-    green "依赖安装完成！"
-}
-
 # 清理旧容器
 clean_legacy() {
     local container_name=$1
     if docker ps -a --format '{{.Names}}' | grep -q "^$container_name$"; then
         yellow "发现已存在容器 $container_name"
-        confirm_operation "是否卸载当前版本？" && {
+        read -p "是否卸载当前版本？(y/n): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
             docker stop "$container_name" || true
             docker rm "$container_name" || true
             green "旧版本已清理"
-        }
+        fi
     fi
 }
 
@@ -98,11 +60,13 @@ check_port() {
 # 部署容器的通用函数
 deploy_container() {
     local name=$1
-    local port=$2
-    local image=$3
+    local host_port=$2
+    local container_port=$3
+    local image=$4
+    local network_mode=$5
 
     clean_legacy "$name"
-    check_port "$port"
+    check_port "$host_port"
 
     yellow "正在部署 $name 容器..."
     docker pull "$image" || {
@@ -110,41 +74,84 @@ deploy_container() {
         exit 1
     }
 
-    docker run -d --name "$name" --restart always --net host -p "$port:$port" "$image" || {
-        red "容器启动失败，请检查日志：docker logs $name"
-        exit 1
-    }
+    if [[ "$network_mode" == "host" ]]; then
+        docker run -d --name "$name" --restart always --net host "$image" || {
+            red "容器启动失败，请检查日志：docker logs $name"
+            exit 1
+        }
+    else
+        docker run -d --name "$name" --restart always --net bridge -p "$host_port:$container_port" "$image" || {
+            red "容器启动失败，请检查日志：docker logs $name"
+            exit 1
+        }
+    fi
 
-    green "$name 部署成功！访问地址：http://<你的服务器IP>:$port"
+    green "$name 部署成功！访问地址：http://<你的服务器IP>:${host_port}"
+}
+
+# 部署 SubWeb
+deploy_sub_web() {
+    read -p "请输入 SubWeb 监听端口（默认 $SUB_WEB_PORT_DEFAULT，直接回车使用默认）：" port
+    port=${port:-$SUB_WEB_PORT_DEFAULT}
+
+    echo -e "\n请选择网络模式："
+    select network_mode in "bridge" "host"; do
+        case $network_mode in
+            bridge|host) break ;;
+            *) red "无效选项，请重新选择。" ;;
+        esac
+    done
+
+    deploy_container "$SUB_WEB_NAME" "$port" "$SUB_WEB_CONTAINER_PORT" "$SUB_WEB_IMAGE" "$network_mode"
 }
 
 # 部署 SubConverter
 deploy_sub_converter() {
     read -p "请输入 SubConverter 监听端口（默认 $SUB_CONVERTER_PORT_DEFAULT，直接回车使用默认）：" port
     port=${port:-$SUB_CONVERTER_PORT_DEFAULT}
-    deploy_container "$SUB_CONVERTER_NAME" "$port" "$SUB_CONVERTER_IMAGE"
+
+    echo -e "\n请选择网络模式："
+    select network_mode in "bridge" "host"; do
+        case $network_mode in
+            bridge|host) break ;;
+            *) red "无效选项，请重新选择。" ;;
+        esac
+    done
+
+    deploy_container "$SUB_CONVERTER_NAME" "$port" "$SUB_CONVERTER_CONTAINER_PORT" "$SUB_CONVERTER_IMAGE" "$network_mode"
 }
 
 # 部署 SingBoxSubscribe
 deploy_sing_box() {
     read -p "请输入 SingBoxSubscribe 监听端口（默认 $SING_BOX_PORT_DEFAULT，直接回车使用默认）：" port
     port=${port:-$SING_BOX_PORT_DEFAULT}
-    deploy_container "$SING_BOX_NAME" "$port" "$SING_BOX_IMAGE"
+
+    echo -e "\n请选择网络模式："
+    select network_mode in "bridge" "host"; do
+        case $network_mode in
+            bridge|host) break ;;
+            *) red "无效选项，请重新选择。" ;;
+        esac
+    done
+
+    deploy_container "$SING_BOX_NAME" "$port" "$SING_BOX_CONTAINER_PORT" "$SING_BOX_IMAGE" "$network_mode"
 }
 
 # 主菜单
 main_menu() {
     while true; do
         echo -e "\n\033[32m请选择要执行的操作：\033[0m"
-        echo "1. 部署 SubConverter"
-        echo "2. 部署 SingBoxSubscribe"
-        echo "3. 退出"
-        read -p "请输入选项（1/2/3）：" choice
+        echo "1. 部署 SubWeb"
+        echo "2. 部署 SubConverter"
+        echo "3. 部署 SingBoxSubscribe"
+        echo "4. 退出"
+        read -p "请输入选项（1/2/3/4）：" choice
 
         case $choice in
-            1) deploy_sub_converter ;;
-            2) deploy_sing_box ;;
-            3) green "退出脚本"; exit 0 ;;
+            1) deploy_sub_web ;;
+            2) deploy_sub_converter ;;
+            3) deploy_sing_box ;;
+            4) green "退出脚本"; exit 0 ;;
             *) red "无效选项，请重试。" ;;
         esac
     done
