@@ -32,7 +32,7 @@ DEFAULT_OPTIONS=(
     "14. 配置定时任务（setup_cronjob.sh）"
     "15. 部署 Sub-Store（sub-store-deploy.sh）"
     "16. 更新 Sing-box 配置（update_singbox.sh）"
-    "98. 快捷键管理"  # 修改为固定编号 98
+    "98. 快捷键管理"
 )
 
 # 默认脚本对应的 URL
