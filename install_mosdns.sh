@@ -38,7 +38,7 @@ else
 fi
 
 # 核心依赖（必装）
-CORE_DEPS=("curl" "unzip" "sed" "awk")
+CORE_DEPS=("curl" "unzip" "sed" "awk" "lsof")
 # 可选依赖（非必需）
 OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron")
 INSTALLED_DEPS=()
