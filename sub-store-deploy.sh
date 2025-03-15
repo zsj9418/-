@@ -31,9 +31,9 @@ log() {
   local message=$2
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   case $level in
-    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" ;;
-    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" ;;
-    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" ;;
+    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
+    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
+    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
   esac
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
@@ -130,6 +130,27 @@ install_dependencies() {
   else
     log "INFO" "Docker 已存在，跳过安装"
   fi
+
+  # 检查并安装 jq
+  if ! command -v jq &> /dev/null; then
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+      apt install -y jq || {
+        log "ERROR" "jq 安装失败"
+        exit 1
+      }
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" ]]; then
+      yum install -y jq || {
+        log "ERROR" "jq 安装失败"
+        exit 1
+      }
+    else
+      log "ERROR" "不支持的操作系统: $OS"
+      exit 1
+    fi
+    log "INFO" "jq 已成功安装"
+  else
+    log "INFO" "jq 已存在，跳过安装"
+  fi
 }
 
 # 部署 Watchtower
@@ -149,10 +170,47 @@ install_watchtower() {
   log "INFO" "Watchtower 部署成功"
 }
 
+# 获取 Sub-Store 版本列表
+get_substore_versions() {
+  log "INFO" "正在获取 Sub-Store 版本列表..."
+  # 调用 Docker Hub API 获取版本信息，增加 page_size 参数以获取更多版本
+  curl -s "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r
+}
+
+# 提示用户选择版本
+prompt_for_version() {
+  local versions=($(get_substore_versions))
+  local num_versions=${#versions[@]}
+
+  if [ $num_versions -eq 0 ]; then
+    log "ERROR" "无法获取 Sub-Store 版本列表"
+    exit 1
+  fi
+
+  echo "请选择 Sub-Store 版本："
+  for i in "${!versions[@]}"; do
+    echo "$((i + 1)). ${versions[$i]}"
+  done
+
+  while true; do
+    read -p "请输入版本编号: " version_choice
+    if [[ $version_choice =~ ^[0-9]+$ ]] && [ $version_choice -ge 1 ] && [ $version_choice -le $num_versions ]; then
+      SUB_STORE_VERSION=${versions[$((version_choice - 1))]}
+      break
+    else
+      log "WARN" "无效的选择，请重新输入"
+    fi
+  done
+
+  log "INFO" "选择的 Sub-Store 版本: $SUB_STORE_VERSION"
+}
+
 # 部署 Sub-Store
 install_substore() {
-  log "INFO" "正在拉取最新镜像..."
-  docker pull $SUB_STORE_IMAGE_NAME
+  prompt_for_version
+
+  log "INFO" "正在拉取镜像 xream/sub-store:$SUB_STORE_VERSION..."
+  docker pull "xream/sub-store:$SUB_STORE_VERSION"
 
   # 提示用户选择网络模式
   while true; do
@@ -177,7 +235,7 @@ install_substore() {
       --restart=always \
       -v "${DATA_DIR}:/opt/app/data" \
       -e TZ=${TIMEZONE} \
-      $SUB_STORE_IMAGE_NAME || {
+      "xream/sub-store:$SUB_STORE_VERSION" || {
         log "ERROR" "容器启动失败"
         exit 1
       }
@@ -193,7 +251,7 @@ install_substore() {
       -p $HOST_PORT_2:3001 \
       -v "${DATA_DIR}:/opt/app/data" \
       -e TZ=${TIMEZONE} \
-      $SUB_STORE_IMAGE_NAME || {
+      "xream/sub-store:$SUB_STORE_VERSION" || {
         log "ERROR" "容器启动失败"
         exit 1
       }
@@ -290,7 +348,7 @@ interactive_menu() {
         echo "2. Watchtower"
         read -p "请输入选项编号: " uninstall_choice
         case $uninstall_choice in
-          1) uninstall_container $CONTAINER_NAME $SUB_STORE_IMAGE_NAME ;;
+          1) uninstall_container $CONTAINER_NAME "xream/sub-store:$SUB_STORE_VERSION" ;;
           2) uninstall_container $WATCHTOWER_CONTAINER_NAME $WATCHTOWER_IMAGE_NAME ;;
           *) log "WARN" "无效输入，返回主菜单" ;;
         esac
