@@ -4,7 +4,7 @@ set -euo pipefail  # 严格错误处理
 # ------------------------- 配置区域 -------------------------
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
-LOG_MAX_LINES=1000  # 日志文件最大行数
+LOG_MAX_SIZE=1048576  # 日志文件最大大小，1MB = 1048576 字节
 PROXY_PREFIX="https://ghfast.top/"  # GitHub 代理地址
 RETRY_COUNT=3  # 下载重试次数
 CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"  # 自定义菜单配置文件
@@ -32,6 +32,7 @@ DEFAULT_OPTIONS=(
     "14. 配置定时任务（setup_cronjob.sh）"
     "15. 部署 Sub-Store（sub-store-deploy.sh）"
     "16. 更新 Sing-box 配置（update_singbox.sh）"
+    "17. 设置 WiFi 热点（wifi-hotspot.sh）"
     "98. 快捷键管理"
 )
 
@@ -53,6 +54,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["16"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
+    ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
 )
 
 # 声明全局变量
@@ -60,14 +62,19 @@ declare -A CUSTOM_SCRIPT_NAMES=()
 
 # ------------------------- 核心函数 -------------------------
 
-# 管理日志行数
+# 管理日志大小
 function manage_logs() {
     if [[ -f "$LOG_FILE" ]]; then
-        local log_lines=$(wc -l < "$LOG_FILE")
-        if [[ $log_lines -ge $LOG_MAX_LINES ]]; then
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 日志文件超过 $LOG_MAX_LINES 行，正在清理..." | tee -a "$LOG_FILE"
-            tail -n $LOG_MAX_LINES "$LOG_FILE" > "$LOG_FILE.tmp"
+        # 获取文件大小（字节）
+        local log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || ls -l "$LOG_FILE" | awk '{print $5}')
+        if [[ $log_size -ge $LOG_MAX_SIZE ]]; then
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 日志文件超过 1MB（当前大小: $log_size 字节），正在清理..." | tee -a "$LOG_FILE"
+            # 计算需要保留的字节数（大约最后 50% 的内容，防止截断过少）
+            local keep_size=$((LOG_MAX_SIZE / 2))
+            # 使用 tail 处理字节而不是行数
+            tail -c "$keep_size" "$LOG_FILE" > "$LOG_FILE.tmp"
             mv "$LOG_FILE.tmp" "$LOG_FILE"
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 日志清理完成，新大小: $(stat -c%s "$LOG_FILE" 2>/dev/null || ls -l "$LOG_FILE" | awk '{print $5}') 字节" >> "$LOG_FILE"
         fi
     fi
 }
@@ -460,7 +467,7 @@ function main() {
                 ;;
             [1-9]|[1-9][0-9])  # 匹配所有数字选项
                 # 只对需要下载和运行的脚本选项执行以下逻辑
-                if [[ "$choice" -le 16 ]]; then  # 限制为 1-16 的脚本选项
+                if [[ "$choice" -le 17 ]]; then  # 限制为 1-17 的脚本选项
                     manage_logs
                     script_path=$(download_script "$choice")
                     echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
