@@ -90,14 +90,22 @@ update_system() {
 # 安装常用工具
 install_common_tools() {
   echo "正在安装常用工具..."
+  
+  # 原有的常用工具
   COMMON_TOOLS="sudo git vim curl wget htop tmux tree zip unzip openssh-server dos2unix"
-  $PKG_MANAGER install -y $COMMON_TOOLS
+
+  # 从分析的脚本中提取的必要依赖项
+  NECESSARY_TOOLS="jq lsof tar iptables ipset resolvconf util-linux cron net-tools fzf dnsutils psmisc yamllint"
+
+  # 安装
+  $PKG_MANAGER install -y $COMMON_TOOLS $NECESSARY_TOOLS
+  echo "常用工具和必要依赖安装完成。"
 }
 
 # 安装开发工具
 install_dev_tools() {
   echo "正在安装开发工具..."
-  DEV_TOOLS="build-essential gcc g++ make cmake python3 python3-pip nodejs npm openjdk-17-jdk maven docker-ce docker-ce-cli containerd.io"
+  DEV_TOOLS="build-essential gcc g++ make cmake python3 python3-pip nodejs npm openjdk-17-jdk maven"
   $PKG_MANAGER install -y $DEV_TOOLS
 }
 
