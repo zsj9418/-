@@ -35,7 +35,28 @@ fi
 
 # 检测设备架构
 ARCH=$(uname -m)
-echo "检测到系统架构为：$ARCH"
+case "$ARCH" in
+  x86_64)
+    ARCH="amd64"
+    ;;
+  aarch64)
+    ARCH="arm64"
+    ;;
+  armv7l)
+    ARCH="armv7"
+    ;;
+  *)
+    echo "不支持的设备架构: $ARCH"
+    exit 1
+    ;;
+esac
+echo "检测到设备架构为：$ARCH"
+
+# 检测系统版本
+if [ "$PKG_MANAGER" = "apt" ]; then
+  SYSTEM_VERSION=$(lsb_release -cs)
+  echo "检测到系统版本: $SYSTEM_VERSION"
+fi
 
 # 错误处理函数
 handle_error() {
@@ -78,13 +99,20 @@ change_to_aliyun() {
   echo "正在更换为阿里云镜像源..."
   case $PKG_MANAGER in
     apt)
-      sed -i 's|http://[^/]*|http://mirrors.aliyun.com|g' "$SOURCES_LIST" || handle_error "更换阿里云镜像源失败"
+      sed -i "s|http://[^/]*|http://mirrors.aliyun.com|g" "$SOURCES_LIST"
+      sed -i "s|ubuntu|ubuntu $SYSTEM_VERSION|g" "$SOURCES_LIST" || handle_error "更换阿里云镜像源失败"
       ;;
     yum|dnf)
       curl -o "$SOURCES_LIST" http://mirrors.aliyun.com/repo/Centos-7.repo || handle_error "下载阿里云镜像源配置失败"
       ;;
     pacman)
-      sudo sed -i 's|^Server = .*|Server = http://mirrors.aliyun.com/archlinux/$repo/os/$arch|g' /etc/pacman.d/mirrorlist || handle_error "更换阿里云镜像源失败"
+      sudo sed -i "s|^Server = .*|Server = http://mirrors.aliyun.com/archlinux/$repo/os/$ARCH|g" /etc/pacman.d/mirrorlist || handle_error "更换阿里云镜像源失败"
+      ;;
+    apk)
+      echo "阿里云暂不支持 apk 包管理器源切换。"
+      ;;
+    *)
+      echo "未找到适配的源配置，跳过更换。"
       ;;
   esac
   echo "已更换为阿里云镜像源。"
