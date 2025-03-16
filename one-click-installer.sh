@@ -33,6 +33,7 @@ DEFAULT_OPTIONS=(
     "15. 部署 Sub-Store（sub-store-deploy.sh）"
     "16. 更新 Sing-box 配置（update_singbox.sh）"
     "17. 设置 WiFi 热点（wifi-hotspot.sh）"
+    "18. 安装 Sun-Panel（docker_sunpanel.sh）"
     "98. 快捷键管理"
 )
 
@@ -55,6 +56,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["16"]="https://raw.githubusercontent.com/zsj9418/-/main/update_singbox.sh"
     ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
+    ["18"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
 )
 
 # 声明全局变量
@@ -467,7 +469,7 @@ function main() {
                 ;;
             [1-9]|[1-9][0-9])  # 匹配所有数字选项
                 # 只对需要下载和运行的脚本选项执行以下逻辑
-                if [[ "$choice" -le 17 ]]; then  # 限制为 1-17 的脚本选项
+                if [[ "$choice" -le 18 ]]; then  # 限制为 1-18 的脚本选项
                     manage_logs
                     script_path=$(download_script "$choice")
                     echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
