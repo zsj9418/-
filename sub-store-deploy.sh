@@ -235,6 +235,7 @@ install_substore() {
       --restart=always \
       -v "${DATA_DIR}:/opt/app/data" \
       -e TZ=${TIMEZONE} \
+      -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
       "xream/sub-store:$SUB_STORE_VERSION" || {
         log "ERROR" "容器启动失败"
         exit 1
@@ -251,6 +252,7 @@ install_substore() {
       -p $HOST_PORT_2:3001 \
       -v "${DATA_DIR}:/opt/app/data" \
       -e TZ=${TIMEZONE} \
+      -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
       "xream/sub-store:$SUB_STORE_VERSION" || {
         log "ERROR" "容器启动失败"
         exit 1
