@@ -17,10 +17,6 @@ else
     exit 1
 fi
 
-# 检测设备架构
-ARCH=$(uname -m)
-echo "检测到的设备架构: $ARCH"
-
 # 检查是否安装 nmcli
 if ! command -v nmcli &> /dev/null; then
     echo "nmcli 未安装，正在安装 NetworkManager 工具..."
@@ -44,6 +40,8 @@ usage() {
     echo "  2. 连接其他 Wi-Fi 网络并删除已创建的热点"
     echo "  3. 自动切换 Wi-Fi 模式（根据网线状态）"
     echo "  4. 后台运行自动切换模式（自启动）"
+    echo "  5. 停止并卸载后台服务"
+    echo "  6. 查看保存的 Wi-Fi 网络并添加新网络"
     exit 1
 }
 
@@ -72,12 +70,32 @@ check_ethernet_connection() {
     fi
 }
 
+# 清理旧的热点配置
+clear_old_hotspots() {
+    local HOTSPOT_PREFIX="AutoHotspot-"
+    local OLD_HOTSPOTS=$(nmcli con | grep "$HOTSPOT_PREFIX" | awk '{print $1}')
+    if [[ -n "$OLD_HOTSPOTS" ]]; then
+        echo "正在清理旧的热点配置..."
+        for HOTSPOT in $OLD_HOTSPOTS; do
+            echo "正在删除热点配置: $HOTSPOT"
+            nmcli con down "$HOTSPOT" > /dev/null 2>&1
+            nmcli con delete "$HOTSPOT" > /dev/null 2>&1
+        done
+        echo "旧的热点配置清理完成。"
+    else
+        echo "没有找到旧的热点配置。"
+    fi
+}
+
 # 创建 Wi-Fi 热点
 create_wifi_hotspot() {
     local INTERFACE=$1
-    local WIFI_NAME=${2:-"AutoHotspot"}
+    local WIFI_NAME=${2:-"4G-WIFI"}
     local WIFI_PASSWORD=${3:-"12345678"}
     local HOTSPOT_CONNECTION_NAME="AutoHotspot-$WIFI_NAME"
+
+    # 清理旧的热点配置
+    clear_old_hotspots
 
     echo "正在创建 Wi-Fi 发射点..."
     nmcli con add type wifi ifname "$INTERFACE" con-name "$HOTSPOT_CONNECTION_NAME" ssid "$WIFI_NAME" 802-11-wireless.mode ap
@@ -99,6 +117,14 @@ connect_wifi_network() {
     local INTERFACE=$1
     local TARGET_SSID=$2
     local TARGET_PASSWORD=$3
+
+    # 断开当前连接
+    CURRENT_CONNECTION=$(nmcli dev show "$INTERFACE" | grep "GENERAL.CONNECTION" | awk '{print $2}')
+    if [[ -n "$CURRENT_CONNECTION" && "$CURRENT_CONNECTION" != "--" ]]; then
+        echo "正在断开当前连接: $CURRENT_CONNECTION..."
+        nmcli con down "$CURRENT_CONNECTION"
+        echo "已断开连接: $CURRENT_CONNECTION"
+    fi
 
     echo "正在连接到 Wi-Fi 网络: $TARGET_SSID..."
     nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD"
@@ -168,6 +194,36 @@ EOF
     echo "后台服务已启动，自动切换 Wi-Fi 模式。"
 }
 
+# 停止并卸载后台服务
+stop_and_uninstall_service() {
+    local SERVICE_NAME="wifi_auto_switch.service"
+
+    echo "停止并卸载后台服务..."
+    systemctl stop "$SERVICE_NAME"
+    systemctl disable "$SERVICE_NAME"
+    rm /etc/systemd/system/$SERVICE_NAME
+    systemctl daemon-reload
+    echo "后台服务已停止并卸载。"
+}
+
+# 查看保存的 Wi-Fi 网络并添加新网络
+manage_saved_wifi() {
+    echo "以下是设备保存的 Wi-Fi 网络："
+    nmcli con show | grep wifi | awk '{print $1}'
+    echo "-----------------------------------"
+    read -p "是否要添加新的 Wi-Fi 网络？(y/n): " choice
+    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+        read -p "请输入 Wi-Fi 网络名称: " NEW_SSID
+        read -p "请输入 Wi-Fi 网络密码: " NEW_PASSWORD
+        nmcli dev wifi connect "$NEW_SSID" password "$NEW_PASSWORD"
+        if [[ $? -eq 0 ]]; then
+            echo "成功添加并连接到 Wi-Fi 网络：$NEW_SSID"
+        else
+            echo "添加 Wi-Fi 网络失败，请检查输入的 SSID 和密码。"
+        fi
+    fi
+}
+
 # 主菜单逻辑
 if [[ "$1" == "auto-switch" ]]; then
     while true; do
@@ -180,19 +236,29 @@ else
     echo "2. 连接其他 Wi-Fi 网络并删除已创建的热点"
     echo "3. 自动切换 Wi-Fi 模式（根据网线状态）"
     echo "4. 后台运行自动切换模式（自启动）"
-    read -p "输入选项 (1, 2, 3 或 4): " choice
+    echo "5. 停止并卸载后台服务"
+    echo "6. 查看保存的 Wi-Fi 网络并添加新网络"
+    read -p "输入选项 (1, 2, 3, 4, 5 或 6): " choice
 
     case $choice in
         1)
             INTERFACE=$(detect_wifi_interface)
-            read -p "请输入 Wi-Fi 发射点名称（默认: AutoHotspot）: " WIFI_NAME
-            WIFI_NAME=${WIFI_NAME:-"AutoHotspot"}
+            if [[ -z "$INTERFACE" ]]; then
+                echo "未检测到无线网卡，请检查硬件配置。"
+                exit 1
+            fi
+            read -p "请输入 Wi-Fi 发射点名称（默认: 4G-WIFI）: " WIFI_NAME
+            WIFI_NAME=${WIFI_NAME:-"4G-WIFI"}
             read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
             WIFI_PASSWORD=${WIFI_PASSWORD:-"12345678"}
             create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
             ;;
         2)
             INTERFACE=$(detect_wifi_interface)
+            if [[ -z "$INTERFACE" ]]; then
+                echo "未检测到无线网卡，请检查硬件配置。"
+                exit 1
+            fi
             read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
             read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
             connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
@@ -203,8 +269,14 @@ else
         4)
             start_background_service
             ;;
+        5)
+            stop_and_uninstall_service
+            ;;
+        6)
+            manage_saved_wifi
+            ;;
         *)
-            echo "无效的选择，请输入 1、2、3 或 4。"
+            echo "无效的选择，请输入 1、2、3、4、5 或 6。"
             usage
             ;;
     esac
