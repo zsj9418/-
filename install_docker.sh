@@ -44,33 +44,11 @@ detect_package_manager() {
 # 函数: 安装依赖
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
-
-    local installed_deps=($(cat "$INSTALL_STATUS" 2>/dev/null))
+    local installed_deps=($(dpkg-query -f '${binary:Package}\n' -W | grep -Fxf <(printf "%s\n" "${DEPS[@]}") 2>/dev/null))
     local needs_install=()
 
-    case "$PKG_MANAGER" in
-        apt-get)
-            sudo apt-get update -y >/dev/null 2>&1
-            sudo apt-get install -y --no-install-recommends ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
-            ;;
-        yum)
-            sudo yum install -y ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
-            ;;
-        dnf)
-            sudo dnf install -y ca-certificates gnupg lsb-release software-properties-common >/dev/null 2>&1
-            ;;
-    esac
-
     for DEP in "${DEPS[@]}"; do
-        is_installed=false
-        for INSTALLED in "${installed_deps[@]}"; do
-            if [[ "$DEP" == "$INSTALLED" ]]; then
-                is_installed=true
-                break
-            fi
-        done
-
-        if ! $is_installed && ! command -v "$DEP" >/dev/null 2>&1; then
+        if [[ ! " ${installed_deps[@]} " =~ " ${DEP} " ]]; then
             needs_install+=("$DEP")
         fi
     done
@@ -198,6 +176,12 @@ check_docker_compose_installed() {
 
 # 函数: 获取 Docker 版本列表并进行过滤
 fetch_docker_versions() {
+    local CACHE_FILE="$DOCKER_INSTALL_DIR/docker_versions_cache"
+    if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE") -gt $(($(date +%s) - 3600)) ]]; then
+        cat "$CACHE_FILE"
+        return
+    fi
+
     ARCH=$(get_architecture)
     local URL="$DOCKER_VERSIONS_URL$ARCH/"
     local VERSIONS
@@ -206,6 +190,7 @@ fetch_docker_versions() {
         echo -e "${RED}无法获取版本列表，请检查网络连接或该架构是否支持。${NC}"
         exit 1
     fi
+    echo "$VERSIONS" > "$CACHE_FILE"
     echo "$VERSIONS"
 }
 
