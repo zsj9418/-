@@ -226,7 +226,7 @@ install_sunpanel() {
   # 提示用户如何使用
   echo -e "\n${GREEN}部署完成！以下是使用信息：${NC}"
   echo "默认账号密码："
-  echo "账号：[admin@sun.cc]"
+  echo "账号：admin@sun.cc"
   echo "密码：12345678"
   echo "访问地址："
   if [[ "$NETWORK_MODE" == "host" ]]; then
