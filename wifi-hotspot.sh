@@ -171,25 +171,72 @@ auto_switch_wifi_mode() {
     fi
 }
 
-# 连接之前保存的 Wi-Fi 网络
+# 连接之前保存的 Wi-Fi 网络 (改进版，排除热点，检查信号)
 connect_previously_saved_wifi() {
     local INTERFACE=$1
-    # 获取之前保存的 Wi-Fi 连接名称
-    local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
-    if [[ -n "$SAVED_CONNECTIONS" ]]; then
-        for CONNECTION in $SAVED_CONNECTIONS; do
-            echo "尝试连接到保存的 Wi-Fi 网络: $CONNECTION..."
-            nmcli con up "$CONNECTION" ifname "$INTERFACE"
-            if [[ $? -eq 0 ]]; then
-                echo "成功连接到 Wi-Fi 网络：$CONNECTION"
-                return
+
+    echo "正在扫描可用 Wi-Fi 网络..."
+    AVAILABLE_WIFI_LIST=$(nmcli dev wifi list)
+
+    if [[ -n "$AVAILABLE_WIFI_LIST" ]]; then
+        echo "可用 Wi-Fi 网络列表 (扫描结果):"
+        echo "$AVAILABLE_WIFI_LIST"
+        echo "-----------------------------------"
+
+        local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
+        local BEST_SAVED_CONNECTION=""
+
+        if [[ -n "$SAVED_CONNECTIONS" ]]; then
+            echo "正在检查已保存的 Wi-Fi 网络..."
+            for CONNECTION in $SAVED_CONNECTIONS; do
+                # 排除以 "AutoHotspot-" 开头的连接 (设备自身热点)
+                if [[ "$CONNECTION" == AutoHotspot-* ]]; then
+                    echo "跳过已保存的热点配置: $CONNECTION"
+                    continue
+                fi
+
+                # 获取已保存连接的 SSID
+                SAVED_SSID=$(nmcli con show "$CONNECTION" | grep "connection.id" | awk '{print $3}')
+
+                # 在扫描结果中查找匹配的 SSID 并且有信号
+                SIGNAL_STRENGTH=$(echo "$AVAILABLE_WIFI_LIST" | grep "$SAVED_SSID" | awk '{print $6}')
+
+                if [[ -n "$SIGNAL_STRENGTH" && "$SIGNAL_STRENGTH" != "--" ]]; then # 检查信号强度不为空且不为 "--" (表示有信号)
+                    echo "找到已保存且有信号的 Wi-Fi 网络: $SAVED_SSID (连接名称: $CONNECTION, 信号强度: $SIGNAL_STRENGTH)"
+                    BEST_SAVED_CONNECTION="$CONNECTION" # 找到第一个符合条件的保存网络就尝试连接
+                    break # 找到一个就跳出循环，连接第一个找到的
+                else
+                    echo "已保存网络 $SAVED_SSID (连接名称: $CONNECTION) 无信号或未在扫描结果中找到。"
+                fi
+            done
+
+            if [[ -n "$BEST_SAVED_CONNECTION" ]]; then
+                echo "尝试连接到最佳已保存 Wi-Fi 网络: $BEST_SAVED_CONNECTION..."
+                nmcli con up "$BEST_SAVED_CONNECTION" ifname "$INTERFACE"
+                if [[ $? -eq 0 ]]; then
+                    echo "成功连接到 Wi-Fi 网络：$BEST_SAVED_CONNECTION"
+                    return 0 # 连接成功返回 0
+                else
+                    echo "连接到 Wi-Fi 网络 $BEST_SAVED_CONNECTION 失败，请检查配置。"
+                    return 1 # 连接失败返回 1
+                fi
             else
-                echo "连接到 Wi-Fi 网络失败，请检查配置。"
+                echo "没有找到已保存的且有信号的 Wi-Fi 网络。"
+                # 可以选择是否继续扫描并提示用户手动连接，这里先保持原有的扫描提示逻辑
             fi
-        done
+        else
+            echo "没有找到已保存的 Wi-Fi 网络，将扫描可用网络。"
+            # 继续执行扫描和提示用户连接的逻辑 (如果需要)
+        fi
     else
-        echo "没有找到保存的 Wi-Fi 网络，请手动添加。"
+        echo "没有扫描到可用的 Wi-Fi 网络。"
+        return 1 # 没有可用网络返回 1
     fi
+
+    #  如果以上尝试都失败，可以考虑 fallback 到提示用户手动选择或扫描网络
+    #  为了简化，这里先不修改 fallback 逻辑，保持之前的行为，即没有找到合适的保存网络，可能后续会提示扫描
+    echo "未能自动连接到已保存的 Wi-Fi 网络，请检查或手动添加网络。"
+    return 1 # 默认返回 1，表示连接失败或没有进行连接
 }
 
 # 后台运行自动切换模式
