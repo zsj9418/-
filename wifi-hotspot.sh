@@ -147,6 +147,46 @@ connect_wifi_network() {
     fi
 }
 
+# 连接之前保存的 Wi-Fi 网络 (改进版 - 顺序尝试)
+connect_previously_saved_wifi() {
+    local INTERFACE=$1
+    local connected=0  # 添加一个标志来跟踪是否成功连接
+
+    echo "正在尝试连接已保存的 Wi-Fi 网络..."
+
+    local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
+
+    if [[ -n "$SAVED_CONNECTIONS" ]]; then
+        echo "已保存的 Wi-Fi 网络列表:"
+        for CONNECTION in $SAVED_CONNECTIONS; do
+            # 排除自身创建的热点（通过检查连接类型）
+            CONNECTION_TYPE=$(nmcli con show "$CONNECTION" | grep "802-11-wireless.mode" | awk '{print $3}')
+            if [[ "$CONNECTION_TYPE" == "ap" ]]; then
+                echo "跳过自身创建的热点: $CONNECTION"
+                continue
+            fi
+
+            echo "尝试连接到 Wi-Fi 网络: $CONNECTION..."
+            nmcli con up "$CONNECTION" ifname "$INTERFACE"
+            if [[ $? -eq 0 ]]; then
+                echo "成功连接到 Wi-Fi 网络：$CONNECTION"
+                connected=1 # 设置标志为已连接
+                return 0  # 连接成功，退出函数
+            else
+                echo "连接到 Wi-Fi 网络 $CONNECTION 失败，请检查配置。"
+            fi
+        done
+
+        echo "所有已保存的 Wi-Fi 网络连接尝试均失败。"
+    else
+        echo "没有找到已保存的 Wi-Fi 网络。"
+    fi
+
+    echo "未能自动连接到任何已保存的 Wi-Fi 网络。"
+    return 1  # 所有尝试都失败，返回 1
+}
+
+
 # 自动切换 Wi-Fi 模式
 auto_switch_wifi_mode() {
     local WIFI_INTERFACE=$(detect_wifi_interface)
@@ -174,47 +214,18 @@ auto_switch_wifi_mode() {
         create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
     elif [[ $CONNECTION_STATUS -eq 1 ]]; then
         echo "网线未连接，切换到 Wi-Fi 客户端模式。"
-        connect_previously_saved_wifi "$WIFI_INTERFACE"
+        if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
+            echo "成功连接到 Wi-Fi 网络，保持客户端模式。"
+        else
+            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。"
+            # 使用自定义名称和密码，如果已设置
+            local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
+            local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
+            create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
+        fi
     else
         echo "未检测到网线接口，请检查设备配置。"
     fi
-}
-
-# 连接之前保存的 Wi-Fi 网络 (改进版 - 顺序尝试)
-connect_previously_saved_wifi() {
-    local INTERFACE=$1
-
-    echo "正在尝试连接已保存的 Wi-Fi 网络..."
-
-    local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
-
-    if [[ -n "$SAVED_CONNECTIONS" ]]; then
-        echo "已保存的 Wi-Fi 网络列表:"
-        for CONNECTION in $SAVED_CONNECTIONS; do
-            # 排除自身创建的热点（通过检查连接类型）
-            CONNECTION_TYPE=$(nmcli con show "$CONNECTION" | grep "802-11-wireless.mode" | awk '{print $3}')
-            if [[ "$CONNECTION_TYPE" == "ap" ]]; then
-                echo "跳过自身创建的热点: $CONNECTION"
-                continue
-            fi
-
-            echo "尝试连接到 Wi-Fi 网络: $CONNECTION..."
-            nmcli con up "$CONNECTION" ifname "$INTERFACE"
-            if [[ $? -eq 0 ]]; then
-                echo "成功连接到 Wi-Fi 网络：$CONNECTION"
-                return 0  # 连接成功，退出函数
-            else
-                echo "连接到 Wi-Fi 网络 $CONNECTION 失败，请检查配置。"
-            fi
-        done
-
-        echo "所有已保存的 Wi-Fi 网络连接尝试均失败。"
-    else
-        echo "没有找到已保存的 Wi-Fi 网络。"
-    fi
-
-    echo "未能自动连接到任何已保存的 Wi-Fi 网络，请检查或手动添加网络。"
-    return 1  # 所有尝试都失败，返回 1
 }
 
 # 后台运行自动切换模式
