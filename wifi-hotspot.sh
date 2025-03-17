@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# 全局变量，用于保存自定义 Wi-Fi 名称和密码
+CUSTOM_WIFI_NAME=""
+CUSTOM_WIFI_PASSWORD=""
+
 # 检测操作系统类型
 OS_TYPE=$(uname -s)
 if [[ "$OS_TYPE" == "Linux" ]]; then
@@ -122,6 +126,7 @@ connect_wifi_network() {
     local TARGET_SSID=$2
     local TARGET_PASSWORD=$3
 
+    echo "尝试连接 Wi-Fi，无线网卡接口: $INTERFACE" # 调试输出
     # 断开当前连接
     CURRENT_CONNECTION=$(nmcli dev show "$INTERFACE" | grep "GENERAL.CONNECTION" | awk '{print $2}')
     if [[ -n "$CURRENT_CONNECTION" && "$CURRENT_CONNECTION" != "--" ]]; then
@@ -131,12 +136,13 @@ connect_wifi_network() {
     fi
 
     echo "正在连接到 Wi-Fi 网络: $TARGET_SSID..."
-    nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD"
+    nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD"  2>&1 | tee /tmp/wifi_connect.log # 移除 -v, 重定向全部输出到日志
+    # nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD" # 原命令
 
     if [[ $? -eq 0 ]]; then
         echo "成功连接到 Wi-Fi 网络：$TARGET_SSID"
     else
-        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码。"
+        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码，详细信息请查看 /tmp/wifi_connect.log。"
         exit 1
     fi
 }
@@ -162,7 +168,10 @@ auto_switch_wifi_mode() {
 
     if [[ $CONNECTION_STATUS -eq 0 ]]; then
         echo "网线已连接，切换到 Wi-Fi 热点模式。"
-        create_wifi_hotspot "$WIFI_INTERFACE"
+        # 使用自定义名称和密码，如果已设置
+        local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
+        local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
+        create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
     elif [[ $CONNECTION_STATUS -eq 1 ]]; then
         echo "网线未连接，切换到 Wi-Fi 客户端模式。"
         connect_previously_saved_wifi "$WIFI_INTERFACE"
@@ -353,6 +362,9 @@ else
             WIFI_NAME=${WIFI_NAME:-"4G-WIFI"}
             read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
             WIFI_PASSWORD=${WIFI_PASSWORD:-"12345678"}
+            # 保存自定义名称和密码
+            CUSTOM_WIFI_NAME="$WIFI_NAME"
+            CUSTOM_WIFI_PASSWORD="$WIFI_PASSWORD"
             create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
             ;;
         2)
