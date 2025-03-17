@@ -27,6 +27,10 @@ if ! command -v nmcli &> /dev/null; then
     fi
 fi
 
+# 确保 NetworkManager 在系统启动时自动启动
+systemctl enable NetworkManager
+systemctl start NetworkManager
+
 # 检查是否为 root 用户
 if [[ $EUID -ne 0 ]]; then
     echo "请以 root 权限运行此脚本。"
@@ -161,11 +165,30 @@ auto_switch_wifi_mode() {
         create_wifi_hotspot "$WIFI_INTERFACE"
     elif [[ $CONNECTION_STATUS -eq 1 ]]; then
         echo "网线未连接，切换到 Wi-Fi 客户端模式。"
-        read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
-        read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
-        connect_wifi_network "$WIFI_INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
+        connect_previously_saved_wifi "$WIFI_INTERFACE"
     else
         echo "未检测到网线接口，请检查设备配置。"
+    fi
+}
+
+# 连接之前保存的 Wi-Fi 网络
+connect_previously_saved_wifi() {
+    local INTERFACE=$1
+    # 获取之前保存的 Wi-Fi 连接名称
+    local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
+    if [[ -n "$SAVED_CONNECTIONS" ]]; then
+        for CONNECTION in $SAVED_CONNECTIONS; do
+            echo "尝试连接到保存的 Wi-Fi 网络: $CONNECTION..."
+            nmcli con up "$CONNECTION" ifname "$INTERFACE"
+            if [[ $? -eq 0 ]]; then
+                echo "成功连接到 Wi-Fi 网络：$CONNECTION"
+                return
+            else
+                echo "连接到 Wi-Fi 网络失败，请检查配置。"
+            fi
+        done
+    else
+        echo "没有找到保存的 Wi-Fi 网络，请手动添加。"
     fi
 }
 
@@ -178,7 +201,8 @@ start_background_service() {
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME
 [Unit]
 Description=WiFi Auto Switch Service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=$SCRIPT_PATH auto-switch
@@ -194,16 +218,39 @@ EOF
     echo "后台服务已启动，自动切换 Wi-Fi 模式。"
 }
 
+# 检查服务状态
+check_service_status() {
+    local SERVICE_NAME="wifi_auto_switch.service"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        return 0  # 服务正在运行
+    else
+        return 1  # 服务未运行
+    fi
+}
+
 # 停止并卸载后台服务
 stop_and_uninstall_service() {
     local SERVICE_NAME="wifi_auto_switch.service"
 
-    echo "停止并卸载后台服务..."
-    systemctl stop "$SERVICE_NAME"
-    systemctl disable "$SERVICE_NAME"
-    rm /etc/systemd/system/$SERVICE_NAME
-    systemctl daemon-reload
-    echo "后台服务已停止并卸载。"
+    check_service_status
+    SERVICE_STATUS=$?
+
+    if [[ $SERVICE_STATUS -eq 0 ]]; then
+        echo "服务 $SERVICE_NAME 正在运行。"
+        read -p "是否确认停止并卸载该服务？(y/n): " choice
+        if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+            echo "停止并卸载后台服务..."
+            systemctl stop "$SERVICE_NAME"
+            systemctl disable "$SERVICE_NAME"
+            rm /etc/systemd/system/$SERVICE_NAME
+            systemctl daemon-reload
+            echo "后台服务已停止并卸载。"
+        else
+            echo "取消停止并卸载服务。"
+        fi
+    else
+        echo "服务 $SERVICE_NAME 未运行。"
+    fi
 }
 
 # 查看保存的 Wi-Fi 网络并添加新网络
@@ -226,9 +273,17 @@ manage_saved_wifi() {
 
 # 主菜单逻辑
 if [[ "$1" == "auto-switch" ]]; then
+    local LAST_CONNECTION_STATUS=-1  # 初始化为无效状态
     while true; do
         auto_switch_wifi_mode
-        sleep 10
+        check_ethernet_connection "$NET_INTERFACE"
+        CURRENT_CONNECTION_STATUS=$?
+        if [[ $CURRENT_CONNECTION_STATUS -eq $LAST_CONNECTION_STATUS ]]; then
+            sleep 60  # 如果状态未变化，增加检测间隔时间
+        else
+            sleep 5  # 如果状态变化，减少检测间隔时间
+        fi
+        LAST_CONNECTION_STATUS=$CURRENT_CONNECTION_STATUS
     done
 else
     echo "请选择操作:"
