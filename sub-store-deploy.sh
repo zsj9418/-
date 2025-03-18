@@ -2,11 +2,14 @@
 # Docker管理脚本
 # 功能：支持 Watchtower 和 Sub-Store 的部署、通知、日志记录和数据备份/恢复
 # 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口。
+# 动态脚本加载：支持在根目录下自动创建一个目录并挂载读取各种规则文件以备后续的拓展性
 
 # 配置区（默认值）
-DATA_DIR="/opt/substore/data"
-BACKUP_DIR="/opt/substore/backup"
-LOG_FILE="/var/log/docker_management.log"
+DATA_DIR="$HOME/substore/data"
+SCRIPTS_DIR="$HOME/substore/scripts"
+BACKUP_DIR="$HOME/substore/backup"
+LOG_DIR="$HOME/substore/logs"
+LOG_FILE="$LOG_DIR/docker_management.log"
 LOG_MAX_SIZE=1048576  # 1M
 CONTAINER_NAME="substore"
 WATCHTOWER_CONTAINER_NAME="watchtower"
@@ -24,6 +27,15 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
+
+# 创建必要的目录
+create_directories() {
+  mkdir -p "$DATA_DIR"
+  mkdir -p "$SCRIPTS_DIR"
+  mkdir -p "$BACKUP_DIR"
+  mkdir -p "$LOG_DIR"
+  log "INFO" "所有必要的目录已创建"
+}
 
 # 初始化日志
 log() {
@@ -205,6 +217,175 @@ prompt_for_version() {
   log "INFO" "选择的 Sub-Store 版本: $SUB_STORE_VERSION"
 }
 
+# 初始化示例脚本
+initialize_example_scripts() {
+  echo "是否需要初始化示例脚本目录? (y/n) [默认: y]: "
+  read init_scripts
+  init_scripts=${init_scripts:-y}
+  if [[ "$init_scripts" == "y" || "$init_scripts" == "Y" ]]; then
+    cat <<'EOF' > "$SCRIPTS_DIR/ip风险度.js"
+async function operator(proxies, targetPlatform, context) {
+    const $ = $substore;
+    const cacheEnabled = $arguments.cache;
+    const cache = scriptResourceCache;
+
+    // 配置参数
+    const CONFIG = {
+        TIMEOUT: parseInt($arguments.timeout) || 10000,
+        RETRIES: parseInt($arguments.retries) || 3,
+        RETRY_DELAY: parseInt($arguments.retry_delay) || 2000,
+        CONCURRENCY: parseInt($arguments.concurrency) || 10
+    };
+
+    const ipListAPIs = [
+        'https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt',
+        'https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt',
+        'https://check.torproject.org/exit-addresses',
+        'https://www.dan.me.uk/torlist/',
+        'https://raw.githubusercontent.com/jhassine/server-ip-addresses/refs/heads/master/data/datacenters.txt'
+    ];
+
+    let riskyIPs = new Set();
+    const cacheKey = 'risky_ips_cache';
+    const cacheExpiry = 6 * 60 * 60 * 1000; // 缩短缓存时间到 6 小时
+
+    // 尝试使用缓存
+    if (cacheEnabled) {
+        const cachedData = cache.get(cacheKey);
+        if (cachedData?.timestamp && (Date.now() - cachedData.timestamp < cacheExpiry)) {
+            riskyIPs = new Set(cachedData.ips);
+            $.info(' 使用缓存数据 ');
+            return await processProxies();
+        }
+    }
+
+    let initialLoadSuccess = false; // 标记首次加载是否成功
+
+    // 获取风险 IP 列表
+    async function fetchIPList(api) {
+        const options = {
+            url: api,
+            timeout: CONFIG.TIMEOUT,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        };
+
+        let retries = 0;
+        while (retries < CONFIG.RETRIES) {
+            try {
+                const response = await $.http.get(options);
+                if (response.body) {
+                    // 特殊处理 TOR 列表
+                    if (api.includes('torproject.org/exit-addresses')) {
+                        return response.body.split('\n')
+                            .filter(line => line.startsWith('ExitAddress'))
+                            .map(line => line.split(' ')[1])
+                            .filter(Boolean);
+                    } else if (api.includes('dan.me.uk/torlist/')) {
+                        return response.body.split('\n')
+                            .map(line => line.trim())
+                            .filter(line => line && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(line));
+                    }
+                    return response.body
+                        .split('\n')
+                        .map(line => line.trim())
+                        .filter(line => line && !line.startsWith('#'));
+                }
+                return;
+            } catch (error) {
+                retries++;
+                $.error(`获取 IP 列表失败 (尝试 ${retries}/${CONFIG.RETRIES}): ${api}, ${error}`);
+                if (retries === CONFIG.RETRIES) {
+                    return;
+                }
+                await $.wait(CONFIG.RETRY_DELAY * retries);
+            }
+        }
+        return;
+    }
+
+    // 更新风险 IP 列表
+    try {
+        const results = await Promise.all(ipListAPIs.map(api => fetchIPList(api)));
+        const fetchedIPs = results.flat();
+        if (fetchedIPs.length > 0) {
+            riskyIPs = new Set(fetchedIPs);
+            $.info(`成功更新风险 IP 列表: ${riskyIPs.size} 条记录`);
+            initialLoadSuccess = true;
+            if (cacheEnabled) {
+                cache.set(cacheKey, {
+                    timestamp: Date.now(),
+                    ips: Array.from(riskyIPs)
+                });
+            }
+        } else {
+            $.warn(' 未获取到任何 IP 数据 ');
+        }
+    } catch (error) {
+        $.error(`更新风险 IP 列表失败: ${error}`);
+    } finally {
+        if (!initialLoadSuccess && cacheEnabled && !cache.get(cacheKey)?.ips) {
+            $.warn(' 首次加载 IP 列表失败且没有可用缓存，可能无法进行风险 IP 检测。');
+        } else if (!initialLoadSuccess && !cacheEnabled) {
+            $.warn(' 首次加载 IP 列表失败且未启用缓存，可能无法进行风险 IP 检测。');
+        }
+    }
+
+    return await processProxies();
+
+    // 处理代理列表并筛除风险 IP
+    async function processProxies() {
+        const nonRiskyProxies = [];
+        for (const proxy of proxies) {
+            try {
+                const node = ProxyUtils.produce([{ ...proxy }], 'ClashMeta', 'internal')?.[0];
+                if (node) {
+                    const serverAddress = node.server;
+                    if (isIPAddress(serverAddress) && isRiskyIP(serverAddress)) {
+                        $.info(`发现风险 IP 节点，已排除: ${proxy.name} (${serverAddress})`);
+                    } else {
+                        nonRiskyProxies.push(proxy);
+                    }
+                } else {
+                    nonRiskyProxies.push(proxy);
+                    $.warn(`处理节点失败，已保留: ${proxy.name}`);
+                }
+            } catch (e) {
+                $.error(`处理节点失败，已保留: ${proxy.name}, 错误: ${e}`);
+                nonRiskyProxies.push(proxy);
+            }
+        }
+        $.info(`处理完成，剩余 ${nonRiskyProxies.length} 个非风险 IP 节点`);
+        return nonRiskyProxies;
+    }
+
+    function isIPAddress(ip) {
+        return /^(\d{1,3}\.){3}\d{1,3}$/.test(ip);
+    }
+
+    function isRiskyIP(ip) {
+        if (riskyIPs.has(ip)) return true;
+        for (const riskyCIDR of riskyIPs) {
+            if (riskyCIDR.includes('/') && isIPInCIDR(ip, riskyCIDR)) return true;
+        }
+        return false;
+    }
+
+    function isIPInCIDR(ip, cidr) {
+        const [range, bits = 32] = cidr.split('/');
+        const mask = ~((1 << (32 - bits)) - 1);
+        const ipNum = ip.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
+        const rangeNum = range.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
+        return (ipNum & mask) === (rangeNum & mask);
+    }
+}
+EOF
+    chmod +x "$SCRIPTS_DIR/ip风险度.js"
+    log "INFO" "已初始化示例脚本: $SCRIPTS_DIR/ip风险度.js"
+  fi
+}
+
 # 部署 Sub-Store
 install_substore() {
   prompt_for_version
@@ -234,6 +415,7 @@ install_substore() {
       --name $CONTAINER_NAME \
       --restart=always \
       -v "${DATA_DIR}:/opt/app/data" \
+      -v "${SCRIPTS_DIR}:/opt/app/scripts" \
       -e TZ=${TIMEZONE} \
       -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
       "xream/sub-store:$SUB_STORE_VERSION" || {
@@ -251,6 +433,7 @@ install_substore() {
       -p $HOST_PORT_1:3000 \
       -p $HOST_PORT_2:3001 \
       -v "${DATA_DIR}:/opt/app/data" \
+      -v "${SCRIPTS_DIR}:/opt/app/scripts" \
       -e TZ=${TIMEZONE} \
       -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
       "xream/sub-store:$SUB_STORE_VERSION" || {
@@ -259,7 +442,7 @@ install_substore() {
       }
   fi
 
-  log "INFO" "Sub-Store 部署成功"
+  log "INFO" "Sub-Store 容器启动成功"
 }
 
 # 查看所有容器状态
@@ -341,7 +524,11 @@ interactive_menu() {
     read -p "请输入选项编号: " choice
 
     case $choice in
-      1) install_substore ;;
+      1)
+        initialize_directories
+        initialize_example_scripts
+        install_substore
+        ;;
       2) install_watchtower ;;
       3) check_all_containers_status ;;
       4)
@@ -370,6 +557,7 @@ interactive_menu() {
 
 # 主流程
 main() {
+  create_directories
   detect_system
   install_dependencies
   interactive_menu
