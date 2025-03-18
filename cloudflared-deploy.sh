@@ -18,9 +18,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# 系统类型检测 (保留，虽然现在强制 host 网络，但系统类型检测可能在未来扩展功能时有用)
+# 系统类型检测
 IS_OPENWRT=false
-if grep -q "OpenWrt" /etc/os-release 2>/dev/null; then
+if [ -f "/etc/openwrt_release" ]; then
   IS_OPENWRT=true
   SYSTEM_TYPE="OpenWrt"
 elif grep -q "Debian" /etc/os-release 2>/dev/null || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
@@ -32,7 +32,7 @@ else
 fi
 echo "Detected System: ${SYSTEM_TYPE}"
 
-# 初始化日志 (保持一致)
+# 初始化日志 (修改日志大小检查方式为 wc -c)
 log() {
   local level=$1
   local message=$2
@@ -44,8 +44,8 @@ log() {
   esac
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
-  # 限制日志大小为 1M，超过后清空 (统一使用 stat -c%s)
-  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
+  # 限制日志大小为 1M，超过后清空 (使用 wc -c 检查日志大小)
+  if [[ -f "$LOG_FILE" && $(wc -c < "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
     > "$LOG_FILE"
     log "INFO" "日志文件大小超过 1M，已清空日志。"
   fi
@@ -108,7 +108,7 @@ generate_unique_container_name() {
   echo "$container_name"
 }
 
-# 调整 UDP 缓冲区大小 (条件化执行，保持不变)
+# 调整 UDP 缓冲区大小 (条件化执行，并确保 sudo 命令在条件块内)
 adjust_udp_buffer() {
   if [[ "$IS_OPENWRT" == false ]]; then # 只在非 OpenWRT 系统上执行
     log "INFO" "正在调整 UDP 缓冲区大小..."
