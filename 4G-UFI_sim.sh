@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# 脚本名称: 4G-UFI_sim.sh
-# 功能: 在高通410棒子上执行切卡操作
+# 脚本名称: sim_manager.sh
+# 功能: 高通410棒子SIM卡管理工具
 
 # 设置日志文件路径
-LOGFILE="/var/log/switch_sim.log"
+LOGFILE="/var/log/sim_manager.log"
 
 # 记录日志函数
 log() {
@@ -12,52 +12,111 @@ log() {
 }
 
 # 检查是否以 root 用户运行
-if [ "$EUID" -ne 0 ]; then
-    log "请以 root 用户运行此脚本。"
-    exit 1
-fi
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log "请以 root 用户运行此脚本。"
+        exit 1
+    fi
+}
 
-# 等待 3 秒，确保系统初始化完成
-log "等待 3 秒..."
-sleep 3
+# 切换为卡槽
+switch_to_slot() {
+    log "切换到卡槽..."
+    echo 1 > /sys/class/leds/sim:sel/brightness || log "设置 sim:sel 失败！"
+    echo 0 > /sys/class/leds/sim:en/brightness || log "设置 sim:en 失败！"
+    echo 0 > /sys/class/leds/sim:sel2/brightness || log "设置 sim:sel2 失败！"
+    echo 0 > /sys/class/leds/sim:en2/brightness || log "设置 sim:en2 失败！"
+    modprobe -r qcom-q6v5-mss || log "卸载 qcom-q6v5-mss 驱动失败！"
+    modprobe qcom-q6v5-mss || log "加载 qcom-q6v5-mss 驱动失败！"
+    systemctl restart rmtfs || log "重启 rmtfs 服务失败！"
+    systemctl restart dbus-org.freedesktop.ModemManager1.service || log "重启 ModemManager 服务失败！"
+    log "切换到卡槽完成！"
+}
 
-# 检查 USB 设备是否处于全速模式，如果是则切换到 host 模式
-log "检查 USB 设备模式..."
-if grep 0 /sys/kernel/debug/usb/ci_hdrc.0/device | grep speed; then
-    log "切换到 host 模式..."
-    echo host > /sys/kernel/debug/usb/ci_hdrc.0/role || log "切换 host 模式失败！"
-else
-    log "USB 设备已处于 host 模式。"
-fi
+# 切换为 eSIM
+switch_to_esim() {
+    log "切换到 eSIM..."
+    echo 0 > /sys/class/leds/sim:sel/brightness || log "设置 sim:sel 失败！"
+    echo 0 > /sys/class/leds/sim:en/brightness || log "设置 sim:en 失败！"
+    echo 1 > /sys/class/leds/sim:sel2/brightness || log "设置 sim:sel2 失败！"
+    echo 0 > /sys/class/leds/sim:en2/brightness || log "设置 sim:en2 失败！"
+    modprobe -r qcom-q6v5-mss || log "卸载 qcom-q6v5-mss 驱动失败！"
+    modprobe qcom-q6v5-mss || log "加载 qcom-q6v5-mss 驱动失败！"
+    systemctl restart rmtfs || log "重启 rmtfs 服务失败！"
+    systemctl restart dbus-org.freedesktop.ModemManager1.service || log "重启 ModemManager 服务失败！"
+    log "切换到 eSIM 完成！"
+}
 
-# 控制 SIM 卡相关 LED 状态
-log "设置 SIM 卡 LED 状态..."
-echo 1 > /sys/class/leds/sim:sel/brightness || log "设置 sim:sel 失败！"
-echo 0 > /sys/class/leds/sim:en/brightness || log "设置 sim:en 失败！"
-echo 0 > /sys/class/leds/sim:sel2/brightness || log "设置 sim:sel2 失败！"
-echo 0 > /sys/class/leds/sim:en2/brightness || log "设置 sim:en2 失败！"
+# 设置为自启动
+enable_autostart() {
+    log "设置脚本为自启动..."
+    cat <<EOF | sudo tee /etc/systemd/system/sim_manager.service > /dev/null
+[Unit]
+Description=SIM Card Manager Script
+After=network.target
 
-# 重新加载调制解调器驱动
-log "重新加载调制解调器驱动..."
-modprobe -r qcom-q6v5-mss || log "卸载 qcom-q6v5-mss 驱动失败！"
-modprobe qcom-q6v5-mss || log "加载 qcom-q6v5-mss 驱动失败！"
+[Service]
+ExecStart=/usr/local/bin/sim_manager.sh
+Restart=on-failure
 
-# 重启 rmtfs 和 ModemManager 服务
-log "重启 rmtfs 服务..."
-systemctl restart rmtfs || log "重启 rmtfs 服务失败！"
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || log "重新加载 systemd 配置失败！"
+    systemctl enable sim_manager.service || log "启用自启动失败！"
+    systemctl start sim_manager.service || log "启动服务失败！"
+    log "自启动设置完成！"
+}
 
-log "重启 ModemManager 服务..."
-systemctl restart dbus-org.freedesktop.ModemManager1.service || log "重启 ModemManager 服务失败！"
+# 卸载清理
+uninstall() {
+    log "卸载脚本及服务..."
+    systemctl stop sim_manager.service || log "停止服务失败！"
+    systemctl disable sim_manager.service || log "禁用服务失败！"
+    rm /etc/systemd/system/sim_manager.service || log "删除服务文件失败！"
+    rm /usr/local/bin/sim_manager.sh || log "删除脚本文件失败！"
+    systemctl daemon-reload || log "重新加载 systemd 配置失败！"
+    log "卸载完成！"
+}
 
-# 等待 3 秒，确保服务重启完成
-log "等待 3 秒..."
-sleep 3
+# 查看 Modem 状态
+check_modem_status() {
+    log "查看 Modem 状态..."
+    mmcli -m 0
+    mmcli -i 0
+}
 
-# 停止 ModemManager，重置 SIM 卡电源，然后重新启动 ModemManager
-log "重置 SIM 卡电源..."
-systemctl stop ModemManager || log "停止 ModemManager 服务失败！"
-qmicli -d /dev/wwan0qmi0 --uim-sim-power-off=1 || log "关闭 SIM 卡电源失败！"
-qmicli -d /dev/wwan0qmi0 --uim-sim-power-on=1 || log "打开 SIM 卡电源失败！"
-systemctl start ModemManager || log "启动 ModemManager 服务失败！"
+# 显示菜单
+show_menu() {
+    echo "==============================="
+    echo "高通410棒子SIM卡管理工具"
+    echo "1. 切换到卡槽"
+    echo "2. 切换到 eSIM"
+    echo "3. 设置为自启动"
+    echo "4. 卸载清理"
+    echo "5. 查看 Modem 状态"
+    echo "6. 退出"
+    echo "==============================="
+}
 
-log "切卡操作完成！"
+# 主函数
+main() {
+    check_root
+    while true; do
+        show_menu
+        read -p "请输入选项 (1-6): " choice
+        case $choice in
+            1) switch_to_slot ;;
+            2) switch_to_esim ;;
+            3) enable_autostart ;;
+            4) uninstall ;;
+            5) check_modem_status ;;
+            6) log "退出脚本。" && exit 0 ;;
+            *) log "无效选项，请重新输入。" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
+# 执行主函数
+main
