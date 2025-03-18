@@ -60,19 +60,20 @@ function detect_os() {
 # 通用依赖安装函数
 function install_dependency() {
   local cmd=$1
+  local package_name=$2 # 添加 package_name 参数
   local install_cmd=""
   case "$PACKAGE_MANAGER" in
     apt)
-      install_cmd="sudo apt update && sudo apt install -y $cmd"
+      install_cmd="sudo apt update && sudo apt install -y $package_name" # 使用 package_name
       ;;
     yum)
-      install_cmd="sudo yum install -y $cmd"
+      install_cmd="sudo yum install -y $package_name" # 使用 package_name
       ;;
     dnf)
-      install_cmd="sudo dnf install -y $cmd"
+      install_cmd="sudo dnf install -y $package_name" # 使用 package_name
       ;;
     pacman)
-      install_cmd="sudo pacman -S --noconfirm $cmd"
+      install_cmd="sudo pacman -S --noconfirm $package_name" # 使用 package_name
       ;;
     *)
       red "不支持的包管理器：$PACKAGE_MANAGER"
@@ -88,17 +89,39 @@ function install_dependency() {
       red "$cmd 安装失败，请手动安装。"
       exit 1
     fi
+  else
+    green "$cmd 已安装，跳过安装。"
   fi
 }
 
-# 检查依赖（仅首次运行时检查）
+# 检查依赖
 function check_dependencies() {
-  if [[ ! -f "/var/log/deploy_dependencies_checked" ]]; then
-    install_dependency "docker" "sudo $PACKAGE_MANAGER install -y docker.io"
-    install_dependency "docker-compose" "sudo curl -L https://github.com/docker/compose/releases/download/v2.23.0/docker-compose-$(uname -s)-$(uname -m) -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose"
-    touch "/var/log/deploy_dependencies_checked"
+  # 检查 Docker
+  if ! command -v docker &>/dev/null; then
+    install_dependency "docker" "docker.io" # 修正 docker 安装，使用 package_name
   else
-    green "依赖已安装，跳过检查。"
+    green "Docker 已安装，跳过安装。"
+  fi
+
+  # 检查 Docker Compose
+  if ! command -v docker-compose &>/dev/null; then
+    yellow "正在安装 docker-compose..."
+    DOCKER_COMPOSE_URL="https://github.com/docker/compose/releases/download/v2.29.2/docker-compose-$(uname -s)-$(uname -m)"
+    if curl -sSL "$DOCKER_COMPOSE_URL" -o /tmp/docker-compose; then
+      sudo mv /tmp/docker-compose /usr/local/bin/docker-compose
+      sudo chmod +x /usr/local/bin/docker-compose
+      if command -v docker-compose &>/dev/null; then
+        green "docker-compose 安装成功。"
+      else
+        red "docker-compose 安装失败，请手动安装。"
+        exit 1
+      fi
+    else
+      red "docker-compose 下载失败，请检查网络连接或手动下载安装。"
+      exit 1
+    fi
+  else
+    green "Docker Compose 已安装，跳过安装。"
   fi
 }
 
