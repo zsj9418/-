@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 脚本名称: sim_manager.sh
+# 脚本名称: 4G-UFI_sim.sh
 # 功能: 高通410棒子SIM卡管理工具
 
 # 设置日志文件路径
@@ -17,6 +17,41 @@ check_root() {
         log "请以 root 用户运行此脚本。"
         exit 1
     fi
+}
+
+# 创建 APN 连接
+create_apn() {
+    log "创建 APN 连接..."
+    # 删除现有的 APN 连接
+    nmcli con del modem 2>/dev/null || log "删除现有 APN 连接失败或连接不存在。"
+
+    # 选择运营商
+    echo "请选择运营商："
+    echo "1. 中国移动 (cmnet)"
+    echo "2. 中国移动 (cmtds)"
+    echo "3. 中国电信 (ctlte)"
+    echo "4. 中国电信 (ctnet)"
+    echo "5. 中国联通 (3gnet)"
+    echo "6. 中国联通 (cmtds)"
+    echo "7. 中国广电 (cbnet)"
+    echo "8. 中国广电 (cmnet)"
+    read -p "请输入选项 (1-8): " apn_choice
+
+    case $apn_choice in
+        1) APN="cmnet" ;;
+        2) APN="cmtds" ;;
+        3) APN="ctlte" ;;
+        4) APN="ctnet" ;;
+        5) APN="3gnet" ;;
+        6) APN="cmtds" ;;
+        7) APN="cbnet" ;;
+        8) APN="cmnet" ;;
+        *) log "无效选项，未创建 APN 连接。" && return ;;
+    esac
+
+    # 创建 APN 连接
+    nmcli con add type gsm ifname wwan0qmi0 con-name modem apn "$APN" || log "创建 APN 连接失败！"
+    log "APN 连接创建完成，APN: $APN"
 }
 
 # 切换为卡槽
@@ -90,12 +125,13 @@ check_modem_status() {
 show_menu() {
     echo "==============================="
     echo "高通410棒子SIM卡管理工具"
-    echo "1. 切换到卡槽"
-    echo "2. 切换到 eSIM"
-    echo "3. 设置为自启动"
-    echo "4. 卸载清理"
-    echo "5. 查看 Modem 状态"
-    echo "6. 退出"
+    echo "1. 设置 SIM-APN 信号"
+    echo "2. 切换到卡槽"
+    echo "3. 切换到 eSIM"
+    echo "4. 设置为自启动"
+    echo "5. 卸载清理"
+    echo "6. 查看 Modem 状态"
+    echo "7. 退出"
     echo "==============================="
 }
 
@@ -104,14 +140,15 @@ main() {
     check_root
     while true; do
         show_menu
-        read -p "请输入选项 (1-6): " choice
+        read -p "请输入选项 (1-7): " choice
         case $choice in
-            1) switch_to_slot ;;
-            2) switch_to_esim ;;
-            3) enable_autostart ;;
-            4) uninstall ;;
-            5) check_modem_status ;;
-            6) log "退出脚本。" && exit 0 ;;
+            1) create_apn ;;
+            2) switch_to_slot ;;
+            3) switch_to_esim ;;
+            4) enable_autostart ;;
+            5) uninstall ;;
+            6) check_modem_status ;;
+            7) log "退出脚本。" && exit 0 ;;
             *) log "无效选项，请重新输入。" ;;
         esac
         read -p "按回车键继续..."
