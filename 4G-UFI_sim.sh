@@ -5,9 +5,20 @@
 
 # 设置日志文件路径
 LOGFILE="/var/log/sim_manager.log"
+# 日志文件大小限制 (1MB)
+LOG_SIZE_LIMIT=$((1 * 1024 * 1024))
+
+# 检查日志文件大小，超过限制则清空
+check_log_size() {
+    if [ -f "$LOGFILE" ] && [ $(stat -c%s "$LOGFILE") -gt "$LOG_SIZE_LIMIT" ]; then
+        echo "" > "$LOGFILE"
+        log "日志文件超过 1MB，已清空。"
+    fi
+}
 
 # 记录日志函数
 log() {
+    check_log_size
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
 }
 
@@ -125,7 +136,7 @@ check_modem_status() {
 show_menu() {
     echo "==============================="
     echo "高通410棒子SIM卡管理工具"
-    echo "1. 设置 SIM-APN 信号"
+    echo "1. 创建 APN 连接"
     echo "2. 切换到卡槽"
     echo "3. 切换到 eSIM"
     echo "4. 设置为自启动"
