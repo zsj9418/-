@@ -92,7 +92,8 @@ CPU架构: $(uname -m)
 CPU型号: $(grep -m 1 'model name' /proc/cpuinfo | cut -d ':' -f2 | xargs || echo '未知')
 CPU核心数: $(nproc)
 CPU频率: $(lscpu | grep -oP '(?<=CPU MHz:).*' | xargs || echo '未知')
-局域网 IP: $(get_lan_ip)
+局域网 IP:
+$(get_lan_ip)
 CPU占用: $(top -bn1 | grep "Cpu(s)" | sed "s/.* \([0-9.]*\)% id.*/\1/" | awk '{print 100 - $1"%"}' || echo '未知')
 系统负载: $(uptime | awk -F'load average:' '{print $2}' | xargs || echo '未知')
 物理内存: $(free -m | awk 'NR==2{printf "%.2f/%.2fM (%.2f%%)", $3, $2, $3*100/$2}' || echo '未知')
@@ -111,13 +112,45 @@ EOF
 
 ### 获取局域网 IPv4 地址 ###
 get_lan_ip() {
+    # 使用 `ip` 命令获取所有非回环接口的IP地址
     if command -v ip >/dev/null 2>&1; then
-        ip -4 addr show | awk '/inet / && !/127.0.0.1/ {gsub(/\/[0-9]+/, "", $2); print $2}' | head -n 1 || echo "未知"
+        ip_addresses=$(ip -4 addr show | awk '/inet / && !/127.0.0.1/ {gsub(/\/[0-9]+/, "", $2); print $2}')
     elif command -v ifconfig >/dev/null 2>&1; then
-        ifconfig | awk '/inet / && $1 != "127.0.0.1" {print $2}' | head -n 1 || echo "未知"
+        ip_addresses=$(ifconfig | awk '/inet / && $1 != "127.0.0.1" {print $2}')
     else
         echo "未知"
+        return
     fi
+
+    # 初始化分类存储
+    local ethernet_ip=""
+    local wifi_ip=""
+
+    # 获取所有网络接口的类型
+    while read -r ip; do
+        # 获取接口名称
+        local interface=$(ip -4 addr show | awk -v ip="$ip" '$2 ~ ip {print $NF}')
+        
+        # 获取接口的类型
+        local interface_type=$(cat /sys/class/net/$interface/type 2>/dev/null)
+
+        if [[ "$interface_type" == "ether" ]]; then
+            ethernet_ip+="$ip "
+        elif [[ "$interface_type" == "wireless" ]]; then
+            wifi_ip+="$ip "
+        fi
+    done <<< "$ip_addresses"
+
+    # 格式化输出
+    local output=""
+    if [ -n "$ethernet_ip" ]; then
+        output+="有线网络 IP: $ethernet_ip\n"
+    fi
+    if [ -n "$wifi_ip" ]; then
+        output+="无线网络 IP: $wifi_ip\n"
+    fi
+
+    echo -e "$output"
 }
 
 ### 获取公网信息（通过 ipinfo.io） ###
