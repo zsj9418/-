@@ -35,6 +35,7 @@ DEFAULT_OPTIONS=(
     "17. 设置 WiFi 热点（wifi-hotspot.sh）"
     "18. 安装 Sun-Panel（docker_sunpanel.sh）"
     "19. 安装 cloudflared（cloudflared-deploy.sh）"
+    "20. 4G-UFI切卡管理（4G-UFI_sim.sh）"
     "98. 快捷键管理"
 )
 
@@ -59,6 +60,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
     ["18"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
     ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cloudflared-deploy.sh"
+    ["20"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
 )
 
 # 声明全局变量
@@ -471,7 +473,7 @@ function main() {
                 ;;
             [1-9]|[1-9][0-9])  # 匹配所有数字选项
                 # 只对需要下载和运行的脚本选项执行以下逻辑
-                if [[ "$choice" -le 19 ]]; then  # 限制为 1-19 的脚本选项
+                if [[ "$choice" -le 20 ]]; then  # 限制为 1-20 的脚本选项
                     manage_logs
                     script_path=$(download_script "$choice")
                     echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
