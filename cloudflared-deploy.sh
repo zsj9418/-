@@ -2,7 +2,7 @@
 
 # 配置区
 BASE_CONTAINER_NAME="cloudflared"
-IMAGE_NAME="cloudflare/cloudflared:latest-arm64"  # 确保镜像与架构兼容
+IMAGE_NAME="cloudflare/cloudflared:latest"
 LOG_FILE="/var/log/cloudflared_deploy.log"
 LOG_MAX_SIZE=1048576  # 1M
 
@@ -31,7 +31,7 @@ log() {
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
   # 限制日志大小为 1M，超过后清空
-  if [[ -f "$LOG_FILE" && $(wc -c < "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
+  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
     > "$LOG_FILE"
     log "INFO" "日志文件大小超过 1M，已清空日志。"
   fi
@@ -94,6 +94,14 @@ generate_unique_container_name() {
   echo "$container_name"
 }
 
+# 调整 UDP 缓冲区大小
+adjust_udp_buffer() {
+  log "INFO" "正在调整 UDP 缓冲区大小..."
+  sudo sysctl -w net.core.rmem_max=8388608
+  sudo sysctl -w net.core.rmem_default=8388608
+  log "INFO" "UDP 缓冲区大小调整完成。"
+}
+
 # 部署 Cloudflared 容器
 deploy_cloudflared() {
   local container_name=$(generate_unique_container_name)
@@ -101,7 +109,6 @@ deploy_cloudflared() {
   docker run -d \
     --name "$container_name" \
     --restart=always \
-    --network host \
     "$IMAGE_NAME" tunnel --no-autoupdate run --protocol http2 --token "$TOKEN" && {
       log "INFO" "Cloudflared 容器 $container_name 部署成功。"
       echo -e "${GREEN}Cloudflared 容器 $container_name 部署成功。${NC}"
@@ -162,15 +169,6 @@ uninstall_container() {
   fi
 }
 
-# 调整 UDP 缓冲区大小
-adjust_udp_buffer() {
-  log "INFO" "正在调整 UDP 缓冲区大小..."
-  # 这里可以添加调整缓冲区的命令，例如:
-  # sysctl -w net.core.rmem_max=16777216
-  # sysctl -w net.core.wmem_max=16777216
-  log "INFO" "UDP 缓冲区大小已调整。"
-}
-
 # 交互式菜单
 interactive_menu() {
   while true; do
@@ -209,7 +207,6 @@ interactive_menu() {
 main() {
   check_docker
   check_architecture
-  adjust_udp_buffer
   interactive_menu
 }
 
