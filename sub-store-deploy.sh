@@ -525,7 +525,7 @@ interactive_menu() {
 
     case $choice in
       1)
-        initialize_directories
+        create_directories
         initialize_example_scripts
         install_substore
         ;;
