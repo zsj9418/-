@@ -50,6 +50,7 @@ usage() {
     echo "  4. 后台运行自动切换模式（自启动）"
     echo "  5. 停止并卸载后台服务"
     echo "  6. 查看保存的 Wi-Fi 网络并添加新网络"
+    echo "  7. 退出"
     exit 1
 }
 
@@ -194,12 +195,12 @@ auto_switch_wifi_mode() {
 
     if [[ -z "$WIFI_INTERFACE" ]]; then
         echo "未检测到无线网卡，请检查硬件配置。"
-        exit 1
+        return 1
     fi
 
     if [[ -z "$NET_INTERFACE" ]]; then
         echo "未检测到网线接口，请检查硬件配置。"
-        exit 1
+        return 1
     fi
 
     echo "正在检测网线状态..."
@@ -225,7 +226,9 @@ auto_switch_wifi_mode() {
         fi
     else
         echo "未检测到网线接口，请检查设备配置。"
+        return 1
     fi
+    return 0
 }
 
 # 后台运行自动切换模式
@@ -308,6 +311,19 @@ manage_saved_wifi() {
 }
 
 # 主菜单逻辑
+show_menu() {
+    echo "请选择操作:"
+    echo "1. 创建 Wi-Fi 发射点"
+    echo "2. 连接其他 Wi-Fi 网络并删除已创建的热点"
+    echo "3. 自动切换 Wi-Fi 模式（根据网线状态）"
+    echo "4. 后台运行自动切换模式（自启动）"
+    echo "5. 停止并卸载后台服务"
+    echo "6. 查看保存的 Wi-Fi 网络并添加新网络"
+    echo "7. 退出"
+    read -p "输入选项 (1, 2, 3, 4, 5, 6 或 7): " choice
+}
+
+# 主循环
 if [[ "$1" == "auto-switch" ]]; then
     local LAST_CONNECTION_STATUS=-1  # 初始化为无效状态
     local NET_INTERFACE=$(detect_ethernet_interface)  # 确保 NET_INTERFACE 被定义
@@ -323,58 +339,57 @@ if [[ "$1" == "auto-switch" ]]; then
         LAST_CONNECTION_STATUS=$CURRENT_CONNECTION_STATUS
     done
 else
-    echo "请选择操作:"
-    echo "1. 创建 Wi-Fi 发射点"
-    echo "2. 连接其他 Wi-Fi 网络并删除已创建的热点"
-    echo "3. 自动切换 Wi-Fi 模式（根据网线状态）"
-    echo "4. 后台运行自动切换模式（自启动）"
-    echo "5. 停止并卸载后台服务"
-    echo "6. 查看保存的 Wi-Fi 网络并添加新网络"
-    read -p "输入选项 (1, 2, 3, 4, 5 或 6): " choice
+    while true; do
+        show_menu
 
-    case $choice in
-        1)
-            INTERFACE=$(detect_wifi_interface)
-            if [[ -z "$INTERFACE" ]]; then
-                echo "未检测到无线网卡，请检查硬件配置。"
-                exit 1
-            fi
-            read -p "请输入 Wi-Fi 发射点名称（默认: 4G-WIFI）: " WIFI_NAME
-            WIFI_NAME=${WIFI_NAME:-"4G-WIFI"}
-            read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
-            WIFI_PASSWORD=${WIFI_PASSWORD:-"12345678"}
-            # 保存自定义名称和密码
-            CUSTOM_WIFI_NAME="$WIFI_NAME"
-            CUSTOM_WIFI_PASSWORD="$WIFI_PASSWORD"
-            create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
-            ;;
-        2)
-            INTERFACE=$(detect_wifi_interface)
-            if [[ -z "$INTERFACE" ]]; then
-                echo "未检测到无线网卡，请检查硬件配置。"
-                exit 1
-            fi
-            read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
-            read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
-            connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
-            ;;
-        3)
-            auto_switch_wifi_mode
-            ;;
-        4)
-            start_background_service
-            ;;
-        5)
-            stop_and_uninstall_service
-            ;;
-        6)
-            manage_saved_wifi
-            ;;
-        *)
-            echo "无效的选择，请输入 1、2、3、4、5 或 6。"
-            usage
-            ;;
-    esac
+        case $choice in
+            1)
+                INTERFACE=$(detect_wifi_interface)
+                if [[ -z "$INTERFACE" ]]; then
+                    echo "未检测到无线网卡，请检查硬件配置。"
+                    continue
+                fi
+                read -p "请输入 Wi-Fi 发射点名称（默认: 4G-WIFI）: " WIFI_NAME
+                WIFI_NAME=${WIFI_NAME:-"4G-WIFI"}
+                read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
+                WIFI_PASSWORD=${WIFI_PASSWORD:-"12345678"}
+                # 保存自定义名称和密码
+                CUSTOM_WIFI_NAME="$WIFI_NAME"
+                CUSTOM_WIFI_PASSWORD="$WIFI_PASSWORD"
+                create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
+                ;;
+            2)
+                INTERFACE=$(detect_wifi_interface)
+                if [[ -z "$INTERFACE" ]]; then
+                    echo "未检测到无线网卡，请检查硬件配置。"
+                    continue
+                fi
+                read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
+                read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
+                connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
+                ;;
+            3)
+                auto_switch_wifi_mode
+                ;;
+            4)
+                start_background_service
+                ;;
+            5)
+                stop_and_uninstall_service
+                ;;
+            6)
+                manage_saved_wifi
+                ;;
+            7)
+                echo "退出脚本。"
+                exit 0
+                ;;
+            *)
+                echo "无效的选择，请输入 1、2、3、4、5、6 或 7。"
+                usage
+                ;;
+        esac
+    done
 fi
 
 exit 0
