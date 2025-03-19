@@ -76,6 +76,7 @@ switch_to_slot() {
     modprobe qcom-q6v5-mss || log "加载 qcom-q6v5-mss 驱动失败！"
     systemctl restart rmtfs || log "重启 rmtfs 服务失败！"
     systemctl restart dbus-org.freedesktop.ModemManager1.service || log "重启 ModemManager 服务失败！"
+    sleep 5 && systemctl stop ModemManager && qmicli -d /dev/wwan0qmi0 --uim-sim-power-off=1 && qmicli -d /dev/wwan0qmi0 --uim-sim-power-on=1 && systemctl start ModemManager || log "卡槽切换后操作 ModemManager 和 qmicli 命令失败！"
     log "切换到卡槽完成！"
 }
 
@@ -90,6 +91,7 @@ switch_to_esim() {
     modprobe qcom-q6v5-mss || log "加载 qcom-q6v5-mss 驱动失败！"
     systemctl restart rmtfs || log "重启 rmtfs 服务失败！"
     systemctl restart dbus-org.freedesktop.ModemManager1.service || log "重启 ModemManager 服务失败！"
+    sleep 5 && systemctl stop ModemManager && qmicli -d /dev/wwan0qmi0 --uim-sim-power-off=1 && qmicli -d /dev/wwan0qmi0 --uim-sim-power-on=1 && systemctl start ModemManager || log "eSIM 切换后操作 ModemManager 和 qmicli 命令失败！"
     log "切换到 eSIM 完成！"
 }
 
