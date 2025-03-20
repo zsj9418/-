@@ -157,11 +157,12 @@ connect_wifi_network() {
     fi
 }
 
-# 连接之前保存的 Wi-Fi 网络 (改进版 - 顺序尝试)
+# 连接之前保存的 Wi-Fi 网络 (增强版 - 带重试机制)
 connect_previously_saved_wifi() {
     local INTERFACE=$1
-    local connected=0  # 添加一个标志来跟踪是否成功连接
-
+    local MAX_RETRIES=3  # 最大重试次数
+    local WAIT_TIME=5    # 每次重试之间的等待时间（秒）
+    
     echo "正在尝试连接已保存的 Wi-Fi 网络..."
 
     local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
@@ -169,21 +170,35 @@ connect_previously_saved_wifi() {
     if [[ -n "$SAVED_CONNECTIONS" ]]; then
         echo "已保存的 Wi-Fi 网络列表:"
         for CONNECTION in $SAVED_CONNECTIONS; do
-            # 排除自身创建的热点（通过检查连接类型）
+            # 排除自身创建的热点
             CONNECTION_TYPE=$(nmcli con show "$CONNECTION" | grep "802-11-wireless.mode" | awk '{print $3}')
             if [[ "$CONNECTION_TYPE" == "ap" ]]; then
                 echo "跳过自身创建的热点: $CONNECTION"
                 continue
             fi
 
+            local attempt=0
+            local success=0  # 标志：是否成功连接
             echo "尝试连接到 Wi-Fi 网络: $CONNECTION..."
-            nmcli con up "$CONNECTION" ifname "$INTERFACE"
-            if [[ $? -eq 0 ]]; then
-                echo "成功连接到 Wi-Fi 网络：$CONNECTION"
-                connected=1 # 设置标志为已连接
+
+            while [[ $attempt -lt $MAX_RETRIES ]]; do
+                # 连接到 Wi-Fi 网络
+                nmcli con up "$CONNECTION" ifname "$INTERFACE"
+                if [[ $? -eq 0 ]]; then
+                    echo "成功连接到 Wi-Fi 网络：$CONNECTION"
+                    success=1  # 设置成功标志
+                    break
+                else
+                    echo "连接到 Wi-Fi 网络 $CONNECTION 失败，尝试重试 $((attempt + 1))/$MAX_RETRIES..."
+                    attempt=$((attempt + 1))
+                    sleep $WAIT_TIME  # 等待一段时间再重试
+                fi
+            done
+
+            if [[ $success -eq 1 ]]; then
                 return 0  # 连接成功，退出函数
             else
-                echo "连接到 Wi-Fi 网络 $CONNECTION 失败，请检查配置。"
+                echo "连接到 Wi-Fi 网络 $CONNECTION 失败，已达到最大重试次数。"
             fi
         done
 
@@ -198,55 +213,56 @@ connect_previously_saved_wifi() {
 
 # 自动切换 Wi-Fi 模式
 auto_switch_wifi_mode() {
+    sleep 10  # 等待网络服务启动
     local WIFI_INTERFACE=$(detect_wifi_interface)
     local NET_INTERFACE=$(detect_ethernet_interface)
 
     if [[ -z "$WIFI_INTERFACE" ]]; then
-        echo "未检测到无线网卡，请检查硬件配置。"
+        echo "未检测到无线网卡，请检查硬件配置。" | tee -a /var/log/wifi_auto_switch.log
         exit 1
     fi
 
     if [[ -z "$NET_INTERFACE" ]]; then
-        echo "未检测到网线接口，请检查硬件配置。"
+        echo "未检测到网线接口，请检查硬件配置。" | tee -a /var/log/wifi_auto_switch.log
         exit 1
     fi
 
-    echo "正在检测网线状态..."
+    echo "正在检测网线状态..." | tee -a /var/log/wifi_auto_switch.log
     check_ethernet_connection "$NET_INTERFACE"
     CONNECTION_STATUS=$?
 
     if [[ $CONNECTION_STATUS -eq 0 ]]; then
-        echo "网线已连接，正在检测网络..."
+        echo "网线已连接，正在检测网络..." | tee -a /var/log/wifi_auto_switch.log
         # 使用 ping 检查网络连接
         if ping -c 1 223.5.5.5 &> /dev/null; then
-            echo "网络连接正常，可以创建热点。"
+            echo "网络连接正常，可以创建热点。" | tee -a /var/log/wifi_auto_switch.log
             # 使用自定义名称和密码，如果已设置
             local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
             local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
             create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
         else
-            echo "网络连接失败，尝试连接保存的 Wi-Fi 网络。"
+            echo "网络连接失败，尝试连接保存的 Wi-Fi 网络。" | tee -a /var/log/wifi_auto_switch.log
             if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
-                echo "成功连接到 Wi-Fi 网络，保持客户端模式。"
+                echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a /var/log/wifi_auto_switch.log
             else
-                echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。"
+                echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a /var/log/wifi_auto_switch.log
                 local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
                 local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
                 create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
             fi
         fi
     elif [[ $CONNECTION_STATUS -eq 1 ]]; then
-        echo "网线未连接，尝试连接保存的 Wi-Fi 网络..."
+        echo "网线未连接，尝试连接保存的 Wi-Fi 网络..." | tee -a /var/log/wifi_auto_switch.log
         if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
-            echo "成功连接到 Wi-Fi 网络，保持客户端模式。"
+            echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a /var/log/wifi_auto_switch.log
         else
-            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。"
+            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a /var/log/wifi_auto_switch.log
             local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
             local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
             create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
         fi
     else
-        echo "未检测到网线接口，请检查设备配置。"
+        echo "未检测到网线接口，请检查设备配置。" | tee -a /var/log/wifi_auto_switch.log
     fi
 }
 
