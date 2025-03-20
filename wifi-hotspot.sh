@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# 全局变量，用于保存自定义 Wi-Fi 名称和密码
-CUSTOM_WIFI_NAME=""
-CUSTOM_WIFI_PASSWORD=""
+# 全局变量，用于保存自定义 Wi-Fi 名称和密码，设置默认值
+CUSTOM_WIFI_NAME="4G-WIFI"
+CUSTOM_WIFI_PASSWORD="12345678"
 
 # 检测操作系统类型
 OS_TYPE=$(uname -s)
@@ -113,16 +113,34 @@ check_ht40_support() {
 # 创建 Wi-Fi 热点
 create_wifi_hotspot() {
     local INTERFACE=$1
-    local WIFI_NAME=${2:-"$CUSTOM_WIFI_NAME"}  # 使用 CUSTOM_WIFI_NAME 作为默认值
-    local WIFI_PASSWORD=${3:-"$CUSTOM_WIFI_PASSWORD"} # 使用 CUSTOM_WIFI_PASSWORD 作为默认值
-    local HOTSPOT_CONNECTION_NAME="AutoHotspot-$WIFI_NAME"  # 使用 WIFI_NAME 构建连接名称
+    local WIFI_NAME=$2
+    local WIFI_PASSWORD=$3
+    local HOTSPOT_CONNECTION_NAME="AutoHotspot-$WIFI_NAME"
     local HT40_SUPPORTED
 
     # 清理旧的热点配置
     clear_old_hotspots
 
     echo "正在创建 Wi-Fi 发射点..."
-    nmcli con add type wifi ifname "$INTERFACE" con-name "$HOTSPOT_CONNECTION_NAME" ssid "$WIFI_NAME" 802-11-wireless.mode ap
+
+    # --- 调试信息输出 --- (已移除)
+    # echo "调试信息: "
+    # echo "  INTERFACE: $INTERFACE"
+    # echo "  WIFI_NAME: $WIFI_NAME"
+    # echo "  WIFI_PASSWORD: $WIFI_PASSWORD"
+    # echo "  HOTSPOT_CONNECTION_NAME: $HOTSPOT_CONNECTION_NAME"
+    # --- 调试信息输出结束 --- (已移除)
+
+    # 将 nmcli con add 命令的错误输出重定向到文件 /tmp/hotspot_error.log
+    nmcli con add type wifi ifname "$INTERFACE" con-name "$HOTSPOT_CONNECTION_NAME" ssid "$WIFI_NAME" 802-11-wireless.mode ap 2> /tmp/hotspot_error.log
+
+    if [[ $? -ne 0 ]]; then # 检查 nmcli con add 是否成功
+        echo "创建 Wi-Fi 热点连接配置失败 (nmcli con add)，详细错误信息请查看 /tmp/hotspot_error.log。" >&2
+        cat /tmp/hotspot_error.log >&2 # 将错误日志输出到终端，方便查看
+        return 1 # 返回错误
+    fi
+
+
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.key-mgmt wpa-psk
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.psk "$WIFI_PASSWORD"
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" ipv4.method shared
@@ -146,9 +164,10 @@ create_wifi_hotspot() {
         else
             echo "Wi-Fi 热点模式已启动：SSID=$WIFI_NAME，密码=$WIFI_PASSWORD，信道=9 (2.4GHz)，模式=兼容模式"
         fi
+        return 0 # 返回成功
     else
-        echo "创建 Wi-Fi 发射点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。" >&2
-        exit 1
+        echo "启动 Wi-Fi 热点失败 (nmcli con up)，请检查无线网卡是否支持热点模式或驱动是否正常工作。" >&2
+        return 1 # 返回错误
     fi
 }
 
@@ -165,7 +184,7 @@ connect_wifi_network() {
         echo "正在断开当前连接: $CURRENT_CONNECTION..."
         nmcli con down "$CURRENT_CONNECTION"
         if [[ $? -ne 0 ]]; then
-            echo "断开连接 $CURRENT_CONNECTION 失败。" >&2  # 错误输出
+            echo "断开当前连接 $CURRENT_CONNECTION 失败。" >&2
             return 1  # 返回错误
         fi
         echo "已断开连接: $CURRENT_CONNECTION"
@@ -180,7 +199,7 @@ connect_wifi_network() {
         echo "成功连接到 Wi-Fi 网络：$TARGET_SSID"
         return 0  # 返回成功
     else
-        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码，详细信息请查看 /tmp/wifi_connect.log。" >&2 # 错误输出
+        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码，详细信息请查看 /tmp/wifi_connect.log。" >&2
         # 检查一下日志文件，看看是否有更详细的错误信息
         tail /tmp/wifi_connect.log
         return 1 # 返回错误
@@ -252,10 +271,8 @@ auto_switch_wifi_mode() {
 
     if [[ $CONNECTION_STATUS -eq 0 ]]; then
         echo "网线已连接，切换到 Wi-Fi 热点模式。"
-        # 使用自定义名称和密码，如果已设置
-        local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
-        local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
-        create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
+        # 使用全局变量 CUSTOM_WIFI_NAME 和 CUSTOM_WIFI_PASSWORD 作为热点名称和密码
+        create_wifi_hotspot "$WIFI_INTERFACE" "$CUSTOM_WIFI_NAME" "$CUSTOM_WIFI_PASSWORD"
         if [[ $? -ne 0 ]]; then
             echo "创建热点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。" >&2
         fi
@@ -265,10 +282,8 @@ auto_switch_wifi_mode() {
             echo "成功连接到 Wi-Fi 网络，保持客户端模式。"
         else
             echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。"
-            # 使用自定义名称和密码，如果已设置
-            local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
-            local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
-            create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
+            # 使用全局变量 CUSTOM_WIFI_NAME 和 CUSTOM_WIFI_PASSWORD 作为热点名称和密码
+            create_wifi_hotspot "$WIFI_INTERFACE" "$CUSTOM_WIFI_NAME" "$CUSTOM_WIFI_PASSWORD"
             if [[ $? -ne 0 ]]; then
                 echo "创建热点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。" >&2
             fi
@@ -395,29 +410,29 @@ else
             1)
                 INTERFACE=$(detect_wifi_interface)
                 if [[ -z "$INTERFACE" ]]; then
-                    echo "未检测到无线网卡，请检查硬件配置。" >&2 # 错误输出
+                    echo "未检测到无线网卡，请检查硬件配置。" >&2
                     continue
                 fi
-                read -p "请输入 Wi-Fi 发射点名称（默认: 4G-WIFI）: " WIFI_NAME
-                WIFI_NAME=${WIFI_NAME:-"$CUSTOM_WIFI_NAME"}  # 使用 CUSTOM_WIFI_NAME 作为默认值
-                read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
-                WIFI_PASSWORD=${WIFI_PASSWORD:-"$CUSTOM_WIFI_PASSWORD"} # 使用 CUSTOM_WIFI_PASSWORD 作为默认值
-                # 保存自定义名称和密码
-                # CUSTOM_WIFI_NAME="$WIFI_NAME"  #  不再需要，因为已经全局定义了
-                # CUSTOM_WIFI_PASSWORD="$WIFI_PASSWORD" #  不再需要，因为已经全局定义了
+                read -p "请输入 Wi-Fi 发射点名称（默认: 4G-WIFI）: " WIFI_NAME_INPUT
+                WIFI_NAME="${WIFI_NAME_INPUT:-"$CUSTOM_WIFI_NAME"}" # 使用输入值或全局默认值
+                read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD_INPUT
+                WIFI_PASSWORD="${WIFI_PASSWORD_INPUT:-"$CUSTOM_WIFI_PASSWORD"}" # 使用输入值或全局默认值
                 create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
+                if [[ $? -ne 0 ]]; then
+                    echo "创建 Wi-Fi 热点失败。" >&2
+                fi
                 ;;
             2)
                 INTERFACE=$(detect_wifi_interface)
                 if [[ -z "$INTERFACE" ]]; then
-                    echo "未检测到无线网卡，请检查硬件配置。" >&2 # 错误输出
+                    echo "未检测到无线网卡，请检查硬件配置。" >&2
                     continue
                 fi
                 read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
                 read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
                 connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
-                if [[ $? -ne 0 ]]; then # 检查连接是否失败
-                    echo "连接 Wi-Fi 失败，请重试或检查日志。" >&2 # 错误输出
+                if [[ $? -ne 0 ]]; then
+                    echo "连接 Wi-Fi 失败，请重试或检查日志。" >&2
                 fi
                 ;;
             3)
@@ -437,7 +452,7 @@ else
                 exit 0
                 ;;
             *)
-                echo "无效的选择，请输入 1、2、3、4、5、6 或 7。" >&2 # 错误输出
+                echo "无效的选择，请输入 1、2、3、4、5、6 或 7。" >&2
                 usage
                 ;;
         esac
