@@ -3,12 +3,12 @@
 ### 配置常量 ###
 LOG_FILE="/var/log/device_info.log"  # 日志文件路径
 WEBHOOK_URL=""                      # 企业微信机器人 Webhook URL
-DEPENDENCIES="curl jq ethtool ip"  # 修改：依赖列表只包含 ip, 不再有 iproute2
+DEPENDENCIES="curl jq ethtool ip"  # 依赖列表
 CONFIG_FILE="/etc/device_info.conf" # 配置文件路径
 STATUS_FILE="/tmp/device_notify_status" # 通知状态文件路径
 MAX_LOG_SIZE=2097152                # 最大日志文件大小 (2 MB)
 SCRIPT_PATH="$(realpath "$0")"      # 当前脚本路径
-PING_TARGET="223.5.5.5"             # 网络检测目标，用于判断网络连通性
+PING_TARGET="223.5.5.5"             # 网络检测目标
 MAX_RETRIES=10                      # 最大重试次数
 RETRY_INTERVAL=5                    # 重试间隔时间（秒）
 STABILIZATION_WAIT=20               # 重启后稳定等待时间（秒）
@@ -19,34 +19,39 @@ yellow() { echo -e "\033[33m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
 blue() { echo -e "\033[34m$*\033[0m"; } # 新增蓝色输出，用于调试信息
 
-### 日志记录函数 (增强) ###
+### 日志记录函数 (增强，增加写入错误检查) ###
 log_info() {
     if [ ! -d "$(dirname "$LOG_FILE")" ]; then
-        mkdir -p "$(dirname "$LOG_FILE")" # 自动创建日志目录
+        mkdir -p "$(dirname "$LOG_FILE")"
     fi
 
     if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -ge $MAX_LOG_SIZE ]; then
         mv "$LOG_FILE" "${LOG_FILE}.bak"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 日志文件已轮转为 ${LOG_FILE}.bak" >> "$LOG_FILE"
+        if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 日志文件已轮转为 ${LOG_FILE}.bak" >> "$LOG_FILE"; then
+            echo "ERROR: 日志轮转信息写入失败 (磁盘空间不足?)" >&2 # 输出到 stderr
+        fi
     fi
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $@" >> "$LOG_FILE"
+    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $@" >> "$LOG_FILE"; then
+        echo "ERROR: 日志信息写入失败 (磁盘空间不足?): $@" >&2 # 输出到 stderr
+    fi
 }
 
 log_error() {
     if [ ! -d "$(dirname "$LOG_FILE")" ]; then
         mkdir -p "$(dirname "$LOG_FILE")"
     fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $@" >> "$LOG_FILE"
+    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $@" >> "$LOG_FILE"; then
+        echo "ERROR: 错误日志写入失败 (磁盘空间不足?): $@" >&2 # 输出到 stderr
+    fi
     red "$@" # 错误信息同时输出到终端
 }
 
-log_debug() { # 新增 debug 日志函数，默认不输出到终端，需要时可调整
+log_debug() {
     if [ ! -d "$(dirname "$LOG_FILE")" ]; then
         mkdir -p "$(dirname "$LOG_FILE")"
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $@" >> "$LOG_FILE"
-    # blue "$@" # 可以选择性地将 debug 信息输出到终端，调试时取消注释
 }
 
 
@@ -64,33 +69,13 @@ check_dependencies() {
         log_info "缺少以下依赖：$missing_deps"
         log_info "正在安装依赖..."
         if command -v apt >/dev/null 2>&1; then
-            # 特别处理 ip 依赖，安装 iproute2 软件包
-            if echo "$missing_deps" | grep -q "ip"; then
-                sudo apt update && sudo apt install -y curl jq ethtool iproute2 # 直接安装所有需要的包，包括 iproute2
-            else
-                sudo apt update && sudo apt install -y $missing_deps
-            fi
+            sudo apt update && sudo apt install -y $missing_deps
         elif command -v yum >/dev/null 2>&1; then
-             # 特别处理 ip 依赖，安装 iproute2 软件包
-            if echo "$missing_deps" | grep -q "ip"; then
-                sudo yum install -y curl jq ethtool iproute2 # 直接安装所有需要的包，包括 iproute2
-            else
-                sudo yum install -y $missing_deps
-            fi
+            sudo yum install -y $missing_deps
         elif command -v apk >/dev/null 2>&1; then
-             # 特别处理 ip 依赖，安装 iproute2 软件包
-            if echo "$missing_deps" | grep -q "ip"; then
-                sudo apk add --no-cache curl jq ethtool iproute2 # 直接安装所有需要的包，包括 iproute2
-            else
-                sudo apk add --no-cache $missing_deps
-            fi
+            sudo apk add --no-cache $missing_deps
         elif command -v opkg >/dev/null 2>&1; then
-             # 特别处理 ip 依赖，安装 iproute2 软件包
-            if echo "$missing_deps" | grep -q "ip"; then
-                sudo opkg update && sudo opkg install curl jq ethtool iproute2 # 直接安装所有需要的包，包括 iproute2
-            else
-                sudo opkg update && sudo opkg install $missing_deps
-            fi
+            sudo opkg update && sudo opkg install $missing_deps
         else
             log_error "无法自动安装依赖，请手动安装以下工具：$missing_deps"
             exit 1
@@ -139,12 +124,12 @@ configure_script() {
 ### 获取系统详细信息并格式化 ###
 get_system_info() {
     local runtime=$(uptime -p | sed 's/up //')
-    runtime=$(echo "$runtime" | sed 's/hours/小时/g; s/hour/小时/g; s/minutes/分钟/g; s/minute/分钟/g; s/,/，/g; s/,//g') # 移除多余的逗号
+    runtime=$(echo "$runtime" | sed 's/hours/小时/g; s/hour/小时/g; s/minutes/分钟/g; s/minute/分钟/g; s/,/，/g; s/,//g')
 
     local lan_ips_formatted
     lan_ips_formatted=$(get_lan_ip)
     if [ -z "$lan_ips_formatted" ]; then
-        lan_ips_formatted="未获取到局域网 IP 地址" # 如果为空，显示更友好的提示
+        lan_ips_formatted="未获取到局域网 IP 地址"
     fi
 
     cat <<EOF
@@ -176,55 +161,25 @@ EOF
 ### 获取局域网 IPv4 地址 (改进版) ###
 get_lan_ip() {
     local ip_addresses=""
-
-    # 优先使用默认路由接口获取 IP (更可靠)
-    local default_interface=$(ip route get 8.8.8.8 2>/dev/null | awk 'NR==1 {print $5}') # 获取默认路由接口
-    log_debug "默认路由接口: $default_interface"
-
-    if [ -n "$default_interface" ]; then
-        local default_ip_info=$(ip -4 addr show "$default_interface" 2>/dev/null | awk '/inet / {print $2}')
-        if [ -n "$default_ip_info" ]; then
-            local default_ip=$(echo "$default_ip_info" | cut -d '/' -f 1)
-            if [ -n "$default_ip" ]; then
-                # 使用 ethtool 判断接口类型 (如果可用)
-                local interface_type=$(get_interface_type "$default_interface")
-                ip_addresses="${ip_addresses}${interface_type} (${default_interface}): ${default_ip}\n" # 修改：使用传统拼接
-                log_debug "通过默认路由接口获取到 IP: $ip_addresses"
-                echo -e "$ip_addresses"
-                return 0 # 成功获取到 IP，直接返回
-            fi
-        fi
-        log_debug "默认路由接口 '$default_interface' 未获取到有效 IP，尝试遍历所有接口。"
-    else
-        log_debug "未找到默认路由接口，尝试遍历所有接口。"
-    fi
-
-
-    # 如果默认路由接口方法失败，则遍历所有网络接口 (原有逻辑增强)
-    local interfaces=$(ip link show | awk '{print $2}' | tr -d ':' | grep -vE '^(lo|docker|veth|tun|br-)') # 排除 bridge 接口
-    log_debug "待检查的接口列表: $interfaces"
+    local interfaces=$(ip link show | awk '{print $2}' | tr -d ':' | grep -vE '^(lo|docker|veth|tun|br-)')
 
     if [ -z "$interfaces" ]; then
         log_info "未找到任何物理网络接口。"
-        echo "未找到局域网 IP 地址。" # 返回给调用者
+        echo "未找到局域网 IP 地址。"
         return 1
     fi
 
-
     for interface in $interfaces; do
         local ip_info=$(ip -4 addr show "$interface" 2>/dev/null | awk '/inet / {print $2}')
-
         if [ -n "$ip_info" ]; then
             local ip=$(echo "$ip_info" | cut -d '/' -f 1)
-
             if [ -n "$ip" ]; then
-                # 排除回环地址和 Docker 等虚拟网段，不过滤所有私有IP，避免误判
-                if ! echo "$ip" | grep -Eq "^(127\.0\.0\.1|172\.1[7-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.0\.0\.|192\.0\.2\.|192\.88\.99\.|192\.168\.|198\.1[8-9]\.|198\.51\.100\.|203\.0\.113\. )"; then #  保留 10. 开头的私有 IP 段
+                if ! echo "$ip" | grep -q "^127\.0\.0\.1$"; then
                     local interface_type=$(get_interface_type "$interface")
-                    ip_addresses="${ip_addresses}${interface_type} (${interface}): ${ip}\n" # 修改：使用传统拼接
-                    log_debug "遍历接口获取到 IP: $interface_type ($interface): $ip"
+                    ip_addresses="${ip_addresses}${interface_type} (${interface}): ${ip}\n"
+                    log_debug "获取到 IP: $interface_type ($interface): $ip"
                 else
-                    log_debug "排除私有或保留 IP: $ip on interface $interface"
+                    log_debug "排除回环地址: $ip on interface $interface"
                 fi
             fi
         fi
@@ -235,7 +190,7 @@ get_lan_ip() {
         echo "未找到局域网 IP 地址。"
         return 1
     else
-        echo -e "$ip_addresses" # 返回所有找到的局域网 IP 地址
+        echo -e "$ip_addresses"
         log_debug "最终获取到的局域网 IP 地址:\n$ip_addresses"
         return 0
     fi
@@ -246,36 +201,44 @@ get_interface_type() {
     local interface=$1
     if command -v ethtool >/dev/null 2>&1; then
         local link_status=$(sudo ethtool "$interface" 2>/dev/null | grep "Link detected" | awk '{print $3}')
-        # 彻底替换为 [ ... ] 语法，并注意空格和双引号
         if [ -n "$link_status" ] && [ "$link_status" = "yes" ]; then
             echo "有线"
         else
            if command -v iwconfig >/dev/null 2>&1 && iwconfig "$interface" 2>&1 | grep -q "ESSID:"; then
                echo "无线"
            else
-               echo "未知类型" # 无法确定接口类型
+               echo "未知类型"
            fi
         fi
     elif command -v iwconfig >/dev/null 2>&1 && iwconfig "$interface" 2>&1 | grep -q "ESSID:"; then
         echo "无线"
     else
-        echo "未知类型" # 无法确定接口类型
+        echo "未知类型"
     fi
 }
 
-
-### 获取公网信息（通过 ipinfo.io） ###
+### 获取公网信息（通过 ipinfo.io，优化版） ###
 get_public_info() {
     local field=$1
     local result
+    local ipinfo_data=$(curl -s ipinfo.io) # 一次请求获取所有数据
 
-    case "$field" in
-        "org") result=$(curl -s ipinfo.io/org || echo "未知运营商") ;;
-        "ip") result=$(curl -s ipinfo.io/ip || echo "未知 IPv4 地址") ;;
-        "location") result="$(curl -s ipinfo.io/city || echo "未知城市"), $(curl -s ipinfo.io/country || echo "未知国家")" ;;
-        *) result="未知信息" ;;
-    esac
-
+    if [ -n "$ipinfo_data" ]; then # 检查是否成功获取数据
+        if echo "$ipinfo_data" | jq -e '.'; then # 检查是否是有效的 JSON (防止 curl 错误信息)
+            case "$field" in
+                "org") result=$(echo "$ipinfo_data" | jq -r '.org' 2>/dev/null || echo "未知运营商") ;;
+                "ip") result=$(echo "$ipinfo_data" | jq -r '.ip' 2>/dev/null || echo "未知 IPv4 地址") ;;
+                "location") result="$(echo "$ipinfo_data" | jq -r '.city' 2>/dev/null || echo "未知城市"), $(echo "$ipinfo_data" | jq -r '.country' 2>/dev/null || echo "未知国家")" ;;
+                *) result="未知信息" ;;
+            esac
+        else
+            log_error "获取公网信息失败 (ipinfo.io 返回非 JSON 数据): $ipinfo_data"
+            result="未知信息"
+        fi
+    else
+        log_error "获取公网信息失败 (无法连接 ipinfo.io)"
+        result="未知信息"
+    fi
     echo "$result"
 }
 
@@ -288,7 +251,6 @@ send_wechat_notification() {
         return
     fi
 
-    # 检查状态文件是否存在且通知已成功
     if [ -f "$STATUS_FILE" ] && grep -q "success" "$STATUS_FILE"; then
         green "通知已成功发送，无需重复发送。"
         log_info "通知已成功发送，无需重复发送。"
@@ -300,7 +262,7 @@ send_wechat_notification() {
 
     while [ $retries -lt $MAX_RETRIES ]; do
         curl -sSf -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"[设备: $(hostname)] 系统信息:\n$system_info\"}}" \
+            -d "{\"msgtype\":\"text\":\"text\", \"text\":{\"content\":\"[设备: $(hostname)] 系统信息:\\n$system_info\"}}" \
             "$WEBHOOK_URL" >/dev/null
         if [ $? -eq 0 ]; then
             green "通知发送成功。"
@@ -331,6 +293,7 @@ Description=Device Info Logger
 Type=simple
 ExecStart=$SCRIPT_PATH
 Restart=always
+Restart=on-failure # 建议添加 restart policy
 
 [Install]
 WantedBy=multi-user.target" | sudo tee "$service_file" > /dev/null
@@ -351,10 +314,10 @@ WantedBy=multi-user.target" | sudo tee "$service_file" > /dev/null
 main() {
     load_config
     check_dependencies
-    sleep $STABILIZATION_WAIT  # 等待系统稳定
-    send_wechat_notification  # 重启后发送完整通知
+    sleep $STABILIZATION_WAIT
+    send_wechat_notification
     log_info "开始收集系统信息并记录日志..."
-    log_info "$(get_system_info)" # 直接将系统信息函数的结果记录到日志
+    log_info "$(get_system_info)"
     setup_autostart
     green "脚本执行完成。"
     log_info "脚本执行完成。"
