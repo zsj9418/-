@@ -111,10 +111,14 @@ create_wifi_hotspot() {
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.key-mgmt wpa-psk
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.psk "$WIFI_PASSWORD"
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" ipv4.method shared
+    nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless.band bg  # 显式指定为 2.4GHz 频段 (b/g/n)
+    nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless.channel 9  # 设置信道为 9
+    nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless.ht-mode HT40  # 启用 HT40 模式 (40MHz带宽)
+
     nmcli con up "$HOTSPOT_CONNECTION_NAME"
 
     if [[ $? -eq 0 ]]; then
-        echo "Wi-Fi 热点模式已启动：SSID=$WIFI_NAME，密码=$WIFI_PASSWORD"
+        echo "Wi-Fi 热点模式已启动：SSID=$WIFI_NAME，密码=$WIFI_PASSWORD，信道=9 (2.4GHz)，模式=802.11n HT40 (最佳模式)" # 修改提示信息
     else
         echo "创建 Wi-Fi 发射点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。"
         exit 1
