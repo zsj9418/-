@@ -4,7 +4,7 @@ set -euo pipefail
 # 配置常量
 SUB_WEB_IMAGE="careywong/subweb:latest"
 SUB_WEB_NAME="SubWeb"
-SUB_WEB_PORT_DEFAULT=8091
+SUB_WEB_PORT_DEFAULT=25501
 SUB_WEB_CONTAINER_PORT=80  # 容器内部服务监听端口
 
 SUB_CONVERTER_IMAGE="ghcr.io/metacubex/subconverter:latest"
