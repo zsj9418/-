@@ -3,15 +3,15 @@
 ### 配置常量 (恢复详细信息) ###
 LOG_FILE="/var/log/device_info.log"
 WEBHOOK_URL=""
-DEPENDENCIES="curl jq ethtool ip"  # 恢复 jq 和 ethtool 依赖
+DEPENDENCIES="curl ethtool ip"  
 CONFIG_FILE="/etc/device_info.conf"
 STATUS_FILE="/tmp/device_notify_status"
-MAX_LOG_SIZE=2097152                # 恢复日志文件大小到 2MB
+MAX_LOG_SIZE=2097152               
 SCRIPT_PATH="$(realpath "$0")"
 PING_TARGET="223.5.5.5"
-MAX_RETRIES=10                      # 恢复重试次数
-RETRY_INTERVAL=5                    # 恢复重试间隔
-STABILIZATION_WAIT=20               # 恢复稳定等待时间
+MAX_RETRIES=10                      
+RETRY_INTERVAL=5                   
+STABILIZATION_WAIT=20               
 
 ### 彩色输出函数 (完整) ###
 red() { echo -e "\033[31m$*\033[0m"; }
@@ -40,7 +40,7 @@ log_debug() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $@" >> "$LOG_FILE"
 }
 
-### 检查依赖 (完整) ###
+### 检查依赖 (精简，移除 jq 依赖) ###
 check_dependencies() {
     log_info "开始检查依赖..."
     local missing_deps=""
@@ -66,7 +66,7 @@ configure_script() {
     else echo "企业微信机器人通知已跳过。"; log_info "企业微信机器人通知已跳过。"; fi; save_config
 }
 
-### 获取系统信息 (最终修复，直接处理 JSON 响应) ###
+### 获取系统信息 (最终修复，移除 jq 依赖，使用 grep/sed 解析 JSON) ###
 get_system_info() {
     local runtime=$(uptime -p | sed 's/up //')
     runtime=$(echo "$runtime" | sed 's/hours/小时/g; s/hour/小时/g; s/minutes/分钟/g; s/minute/分钟/g; s/,/，/g; s/,//g')
@@ -100,15 +100,17 @@ get_system_info() {
     local cpu_freq=$(lscpu | grep -oP '(?<=CPU MHz:).*' | xargs || echo '未知')
     local os_version=$(grep -oP '(?<=PRETTY_NAME=").*(?=")' /etc/os-release || echo '未知')
 
-    # 直接在 get_system_info 中处理 get_public_info 的 JSON 响应
-    local ipinfo_json=$(get_public_info) # 获取 JSON 响应
+    # 使用 grep/sed 解析 JSON 响应，移除 jq 依赖
+    local ipinfo_json=$(get_public_info)
 
-    # 提取运营商信息
-    local operator=$(echo "$ipinfo_json" | jq -r '.org' 2>/dev/null || echo "未知运营商")
-    # 提取 IPv4 地址
-    local public_ip=$(echo "$ipinfo_json" | jq -r '.ip' 2>/dev/null || echo "未知 IPv4 地址")
-    # 提取地理位置信息，格式化为 "City, Country"
-    local location=$(echo "$ipinfo_json" | jq -r '.city' 2>/dev/null || echo '未知城市'), $(echo "$ipinfo_json" | jq -r '.country' 2>/dev/null || echo '未知国家')
+    # 提取运营商信息 (使用 grep/sed)
+    local operator=$(echo "$ipinfo_json" | grep -oP '"org": *"\K[^"]+' 2>/dev/null || echo "未知运营商")
+    # 提取 IPv4 地址 (使用 grep/sed)
+    local public_ip=$(echo "$ipinfo_json" | grep -oP '"ip": *"\K[^"]+' 2>/dev/null || echo "未知 IPv4 地址")
+    # 提取地理位置信息，格式化为 "City, Country" (使用 grep/sed)
+    local city=$(echo "$ipinfo_json" | grep -oP '"city": *"\K[^"]+' 2>/dev/null || echo '未知城市')
+    local country=$(echo "$ipinfo_json" | grep -oP '"country": *"\K[^"]+' 2>/dev/null || echo '未知国家')
+    local location="$city, $country"
 
 
     cat <<EOF
@@ -195,7 +197,7 @@ send_wechat_notification() {
     red "通知发送失败次数达上限（$MAX_RETRIES 次）。"; log_error "通知失败次数达上限（$MAX_RETRIES 次）。"; return 1
 }
 
-### 设置自启动 (同修复版) ###
+### 设置自启动 (修改 setup_autostart 函数，重启时删除状态文件, 增强 Systemd 配置) ###
 setup_autostart() {
     if command -v systemctl >/dev/null 2>&1; then
         local service_file="/etc/systemd/system/device_info.service"
@@ -203,7 +205,9 @@ setup_autostart() {
 Description=Device Info Logger
 
 [Service]
+WorkingDirectory=/root/one-click-scripts/  # 指定工作目录
 Type=simple
+ExecStartPre=/bin/rm -f $STATUS_FILE  # 在 ExecStart 前删除状态文件
 ExecStart=$SCRIPT_PATH
 Restart=on-failure
 RestartSec=30
@@ -213,7 +217,11 @@ WantedBy=multi-user.target" | sudo tee "$service_file" > /dev/null
         sudo systemctl enable device_info.service
         if [ $? -ne 0 ]; then log_error "systemd自启动失败: $service_file"; else log_info "已设置 systemd 自启动服务"; fi
     elif [ -f "/etc/rc.local" ]; then
-        if ! grep -q "$SCRIPT_PATH" /etc/rc.local; then sudo sed -i -e "\$i $SCRIPT_PATH &\n" /etc/rc.local; fi
+        if ! grep -q "$SCRIPT_PATH" /etc/rc.local; then
+            # 在 rc.local 中添加删除状态文件的命令
+            sudo sed -i -e "\$i rm -f $STATUS_FILE\n$SCRIPT_PATH &\n" /etc/rc.local
+            log_info "已设置 rc.local 自启动 (包含状态文件删除)"
+        fi
     fi
 }
 
