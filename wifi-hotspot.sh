@@ -1,8 +1,21 @@
 #!/bin/bash
 
+# 脚本版本
+SCRIPT_VERSION="1.0"
+
 # 全局变量，用于保存自定义 Wi-Fi 名称和密码
 CUSTOM_WIFI_NAME=""
 CUSTOM_WIFI_PASSWORD=""
+
+# 脚本名称
+SCRIPT_NAME=$(basename "$0")
+
+# 配置文件目录
+CONFIG_DIR="/var/lib/wifi_auto_switch"
+# 网线接口名称文件
+INTERFACE_NAME_FILE="$CONFIG_DIR/eth_iface"
+# 日志文件
+LOG_FILE="/var/log/wifi_auto_switch.log"
 
 # 检测操作系统类型
 OS_TYPE=$(uname -s)
@@ -38,12 +51,13 @@ systemctl start NetworkManager
 # 检查是否为 root 用户
 if [[ $EUID -ne 0 ]]; then
     echo "请以 root 权限运行此脚本。"
+    echo "请使用 sudo 或以 root 身份运行。"
     exit 1
 fi
 
 # 使用帮助信息
 usage() {
-    echo "Usage: $0"
+    echo "Usage: $SCRIPT_NAME"
     echo "  1. 创建 Wi-Fi 发射点"
     echo "  2. 连接其他 Wi-Fi 网络并删除已创建的热点"
     echo "  3. 自动切换 Wi-Fi 模式（根据网线状态）"
@@ -51,6 +65,7 @@ usage() {
     echo "  5. 停止并卸载后台服务"
     echo "  6. 查看保存的 Wi-Fi 网络并添加新网络"
     echo "  7. 退出"
+    echo "  8. 手动触发自动切换 Wi-Fi 模式"
     exit 1
 }
 
@@ -64,18 +79,17 @@ detect_ethernet_interface() {
     nmcli dev | grep ethernet | awk '{print $1}' | head -n 1
 }
 
-# 检测网线状态
-check_ethernet_connection() {
-    local NET_INTERFACE=$1
-    if [[ -f "/sys/class/net/$NET_INTERFACE/carrier" ]]; then
-        if [[ "$(cat /sys/class/net/$NET_INTERFACE/carrier)" -eq 1 ]]; then
-            return 0  # 网线已连接
+# 检查网线是否已经断开
+is_ethernet_disconnected() {
+    local interface=$1
+    if [[ -f "/sys/class/net/$interface/carrier" ]]; then
+        if [[ "$(cat /sys/class/net/$interface/carrier)" -eq 0 ]]; then
+            return 0  # 网线已断开
         else
-            return 1  # 网线未连接
+            return 1  # 网线未断开
         fi
     else
-        echo "网口 $NET_INTERFACE 不存在，请检查接口名称。"
-        return 2  # 网线接口不存在
+        return 1  # 接口不存在，视为未连接
     fi
 }
 
@@ -84,15 +98,15 @@ clear_old_hotspots() {
     local HOTSPOT_PREFIX="AutoHotspot-"
     local OLD_HOTSPOTS=$(nmcli con | grep "$HOTSPOT_PREFIX" | awk '{print $1}')
     if [[ -n "$OLD_HOTSPOTS" ]]; then
-        echo "正在清理旧的热点配置..."
+        echo "正在清理旧的热点配置..." | tee -a "$LOG_FILE"
         for HOTSPOT in $OLD_HOTSPOTS; do
-            echo "正在删除热点配置: $HOTSPOT"
+            echo "正在删除热点配置: $HOTSPOT" | tee -a "$LOG_FILE"
             nmcli con down "$HOTSPOT" > /dev/null 2>&1
             nmcli con delete "$HOTSPOT" > /dev/null 2>&1
         done
-        echo "旧的热点配置清理完成。"
+        echo "旧的热点配置清理完成。" | tee -a "$LOG_FILE"
     else
-        echo "没有找到旧的热点配置。"
+        echo "没有找到旧的热点配置。" | tee -a "$LOG_FILE"
     fi
 }
 
@@ -103,10 +117,9 @@ create_wifi_hotspot() {
     local WIFI_PASSWORD=${3:-"12345678"}
     local HOTSPOT_CONNECTION_NAME="AutoHotspot-$WIFI_NAME"
 
-    # 清理旧的热点配置
     clear_old_hotspots
 
-    echo "正在创建 Wi-Fi 发射点..."
+    echo "正在创建 Wi-Fi 发射点..." | tee -a "$LOG_FILE"
     nmcli con add type wifi ifname "$INTERFACE" con-name "$HOTSPOT_CONNECTION_NAME" ssid "$WIFI_NAME" 802-11-wireless.mode ap
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.key-mgmt wpa-psk
     nmcli con modify "$HOTSPOT_CONNECTION_NAME" 802-11-wireless-security.psk "$WIFI_PASSWORD"
@@ -114,9 +127,9 @@ create_wifi_hotspot() {
     nmcli con up "$HOTSPOT_CONNECTION_NAME"
 
     if [[ $? -eq 0 ]]; then
-        echo "Wi-Fi 热点模式已启动：SSID=$WIFI_NAME，密码=$WIFI_PASSWORD"
+        echo "Wi-Fi 热点模式已启动：SSID=$WIFI_NAME，密码=$WIFI_PASSWORD" | tee -a "$LOG_FILE"
     else
-        echo "创建 Wi-Fi 发射点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。"
+        echo "创建 Wi-Fi 发射点失败，请检查无线网卡是否支持热点模式或驱动是否正常工作。" | tee -a "$LOG_FILE"
         exit 1
     fi
 }
@@ -127,203 +140,163 @@ connect_wifi_network() {
     local TARGET_SSID=$2
     local TARGET_PASSWORD=$3
 
-    echo "尝试连接 Wi-Fi，无线网卡接口: $INTERFACE" # 调试输出
-    # 断开当前连接
+    echo "尝试连接 Wi-Fi，无线网卡接口: $INTERFACE" | tee -a "$LOG_FILE"
     CURRENT_CONNECTION=$(nmcli dev show "$INTERFACE" | grep "GENERAL.CONNECTION" | awk '{print $2}')
     if [[ -n "$CURRENT_CONNECTION" && "$CURRENT_CONNECTION" != "--" ]]; then
-        echo "正在断开当前连接: $CURRENT_CONNECTION..."
+        echo "正在断开当前连接: $CURRENT_CONNECTION..." | tee -a "$LOG_FILE"
         nmcli con down "$CURRENT_CONNECTION"
-        echo "已断开连接: $CURRENT_CONNECTION"
+        echo "已断开连接: $CURRENT_CONNECTION" | tee -a "$LOG_FILE"
     fi
 
-    # 等待一小段时间，确保网络管理器处理完断开请求
     sleep 2
 
-    echo "正在连接到 Wi-Fi 网络: $TARGET_SSID..."
-    nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD"  2>&1 | tee /tmp/wifi_connect.log # 移除 -v, 重定向全部输出到日志
-
+    echo "正在连接到 Wi-Fi 网络: $TARGET_SSID..." | tee -a "$LOG_FILE"
+    nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD" 2>&1 | tee -a "$LOG_FILE"
     if [[ $? -eq 0 ]]; then
-        echo "成功连接到 Wi-Fi 网络：$TARGET_SSID"
+        echo "成功连接到 Wi-Fi 网络：$TARGET_SSID" | tee -a "$LOG_FILE"
     else
-        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码，详细信息请查看 /tmp/wifi_connect.log。"
-        echo "尝试重新连接..."
-        # 尝试重新连接
-        nmcli dev wifi connect "$TARGET_SSID" password "$TARGET_PASSWORD"  2>&1 | tee -a /tmp/wifi_connect.log
-        if [[ $? -eq 0 ]]; then
-            echo "成功重新连接到 Wi-Fi 网络：$TARGET_SSID"
-        else
-            echo "重新连接失败，请检查配置。"
-        fi
+        echo "连接到 Wi-Fi 网络失败，请检查 SSID 和密码。" | tee -a "$LOG_FILE"
     fi
 }
 
-# 连接之前保存的 Wi-Fi 网络 (增强版 - 带重试机制)
+# 连接之前保存的 Wi-Fi 网络
 connect_previously_saved_wifi() {
     local INTERFACE=$1
-    local MAX_RETRIES=3  # 最大重试次数
-    local WAIT_TIME=5    # 每次重试之间的等待时间（秒）
-    
-    echo "正在尝试连接已保存的 Wi-Fi 网络..."
+    local MAX_RETRIES=3
+    local WAIT_TIME=5
+    local HOTSPOT_PREFIX="AutoHotspot-"
 
+    echo "正在尝试连接已保存的 Wi-Fi 网络..." | tee -a "$LOG_FILE"
     local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
 
     if [[ -n "$SAVED_CONNECTIONS" ]]; then
-        echo "已保存的 Wi-Fi 网络列表:"
         for CONNECTION in $SAVED_CONNECTIONS; do
-            # 排除自身创建的热点
-            CONNECTION_TYPE=$(nmcli con show "$CONNECTION" | grep "802-11-wireless.mode" | awk '{print $3}')
-            if [[ "$CONNECTION_TYPE" == "ap" ]]; then
-                echo "跳过自身创建的热点: $CONNECTION"
+            if [[ "$CONNECTION" == *"$HOTSPOT_PREFIX"* ]]; then
+                echo "跳过自建热点: $CONNECTION" | tee -a "$LOG_FILE"
                 continue
             fi
 
             local attempt=0
-            local success=0  # 标志：是否成功连接
-            echo "尝试连接到 Wi-Fi 网络: $CONNECTION..."
-
+            echo "尝试连接到: $CONNECTION" | tee -a "$LOG_FILE"
             while [[ $attempt -lt $MAX_RETRIES ]]; do
-                # 连接到 Wi-Fi 网络
-                nmcli con up "$CONNECTION" ifname "$INTERFACE"
+                nmcli con up "$CONNECTION" ifname "$INTERFACE" 2>&1 | tee -a "$LOG_FILE"
                 if [[ $? -eq 0 ]]; then
-                    echo "成功连接到 Wi-Fi 网络：$CONNECTION"
-                    success=1  # 设置成功标志
-                    break
+                    echo "成功连接到 Wi-Fi 网络：$CONNECTION" | tee -a "$LOG_FILE"
+                    return 0
                 else
-                    echo "连接到 Wi-Fi 网络 $CONNECTION 失败，尝试重试 $((attempt + 1))/$MAX_RETRIES..."
+                    echo "连接失败，重试 $((attempt + 1))/$MAX_RETRIES..." | tee -a "$LOG_FILE"
                     attempt=$((attempt + 1))
-                    sleep $WAIT_TIME  # 等待一段时间再重试
+                    sleep $WAIT_TIME
                 fi
             done
-
-            if [[ $success -eq 1 ]]; then
-                return 0  # 连接成功，退出函数
-            else
-                echo "连接到 Wi-Fi 网络 $CONNECTION 失败，已达到最大重试次数。"
-            fi
         done
-
-        echo "所有已保存的 Wi-Fi 网络连接尝试均失败。"
+        echo "所有已保存的 Wi-Fi 网络连接尝试均失败。" | tee -a "$LOG_FILE"
     else
-        echo "没有找到已保存的 Wi-Fi 网络。"
+        echo "没有找到已保存的 Wi-Fi 网络。" | tee -a "$LOG_FILE"
     fi
-
-    echo "未能自动连接到任何已保存的 Wi-Fi 网络。"
-    return 1  # 所有尝试都失败，返回 1
+    return 1
 }
 
 # 自动切换 Wi-Fi 模式
 auto_switch_wifi_mode() {
-    sleep 10  # 等待网络服务启动
+    echo "自动切换 Wi-Fi 模式触发..." | tee -a "$LOG_FILE"
+
     local WIFI_INTERFACE=$(detect_wifi_interface)
     local NET_INTERFACE=$(detect_ethernet_interface)
 
     if [[ -z "$WIFI_INTERFACE" ]]; then
-        echo "未检测到无线网卡，请检查硬件配置。" | tee -a /var/log/wifi_auto_switch.log
-        exit 1
+        echo "未检测到无线网卡，请检查硬件配置。" | tee -a "$LOG_FILE"
+        return 1
     fi
-
     if [[ -z "$NET_INTERFACE" ]]; then
-        echo "未检测到网线接口，请检查硬件配置。" | tee -a /var/log/wifi_auto_switch.log
-        exit 1
+        echo "未检测到网线接口，请检查硬件配置。" | tee -a "$LOG_FILE"
+        return 1
     fi
 
-    echo "正在检测网线状态..." | tee -a /var/log/wifi_auto_switch.log
-    check_ethernet_connection "$NET_INTERFACE"
-    CONNECTION_STATUS=$?
-
-    if [[ $CONNECTION_STATUS -eq 0 ]]; then
-        echo "网线已连接，正在检测网络..." | tee -a /var/log/wifi_auto_switch.log
-        # 使用 ping 检查网络连接
-        if ping -c 1 223.5.5.5 &> /dev/null; then
-            echo "网络连接正常，可以创建热点。" | tee -a /var/log/wifi_auto_switch.log
-            # 使用自定义名称和密码，如果已设置
-            local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
-            local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
-            create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
-        else
-            echo "网络连接失败，尝试连接保存的 Wi-Fi 网络。" | tee -a /var/log/wifi_auto_switch.log
-            if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
-                echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a /var/log/wifi_auto_switch.log
-            else
-                echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a /var/log/wifi_auto_switch.log
-                local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
-                local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
-                create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
-            fi
-        fi
-    elif [[ $CONNECTION_STATUS -eq 1 ]]; then
-        echo "网线未连接，尝试连接保存的 Wi-Fi 网络..." | tee -a /var/log/wifi_auto_switch.log
+    if is_ethernet_disconnected "$NET_INTERFACE"; then
+        echo "网线已断开，尝试连接保存的 Wi-Fi 网络..." | tee -a "$LOG_FILE"
         if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
-            echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a /var/log/wifi_auto_switch.log
+            echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a "$LOG_FILE"
         else
-            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a /var/log/wifi_auto_switch.log
+            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a "$LOG_FILE"
             local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
             local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
             create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
         fi
     else
-        echo "未检测到网线接口，请检查设备配置。" | tee -a /var/log/wifi_auto_switch.log
+        echo "网线已连接，不创建热点，保持当前状态。" | tee -a "$LOG_FILE"
     fi
 }
 
 # 后台运行自动切换模式
 start_background_service() {
-    local SCRIPT_PATH=$(realpath "$0")
-    local SERVICE_NAME="wifi_auto_switch.service"
+    local DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/wifi-auto-switch.sh"
 
-    echo "创建 systemd 服务以后台运行自动切换模式..."
-    cat <<EOF > /etc/systemd/system/$SERVICE_NAME
-[Unit]
-Description=WiFi Auto Switch Service
-After=network-online.target
-Wants=network-online.target
+    echo "安装 NetworkManager Dispatcher 脚本..." | tee -a "$LOG_FILE"
+    mkdir -p "$CONFIG_DIR"
+    local ETH_INTERFACE=$(detect_ethernet_interface)
+    if [[ -z "$ETH_INTERFACE" ]]; then
+        echo "未检测到网线接口，无法配置 Dispatcher 脚本。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    echo "检测到网线接口: $ETH_INTERFACE" | tee -a "$LOG_FILE"
+    echo "$ETH_INTERFACE" > "$INTERFACE_NAME_FILE"
 
-[Service]
-ExecStart=$SCRIPT_PATH auto-switch
-Restart=always
+    cat <<EOF > "$DISPATCHER_SCRIPT"
+#!/bin/bash
+INTERFACE=\$1
+ACTION=\$2
+ETH_INTERFACE_FILE="$INTERFACE_NAME_FILE"
+LOG_FILE="$LOG_FILE"
 
-[Install]
-WantedBy=multi-user.target
+if [[ -f "\$ETH_INTERFACE_FILE" ]]; then
+    ETH_INTERFACE_NAME=\$(cat "\$ETH_INTERFACE_FILE")
+else
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - 错误：无法读取网线接口名称文件 \$ETH_INTERFACE_FILE" >> "\$LOG_FILE"
+    exit 1
+fi
+
+echo "\$(date '+%Y-%m-%d %H:%M:%S') - Dispatcher 触发: Interface=\$INTERFACE, Action=\$ACTION" >> "\$LOG_FILE"
+
+if [[ "\$INTERFACE" == "\$ETH_INTERFACE_NAME" ]]; then
+    if [[ "\$ACTION" == "up" ]]; then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线连接 (up)，不创建热点" >> "\$LOG_FILE"
+    elif [[ "\$ACTION" == "down" || "\$ACTION" == "pre-down" || "\$ACTION" == "post-down" ]]; then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线断开 (\$ACTION)，触发切换" >> "\$LOG_FILE"
+        /usr/local/bin/$SCRIPT_NAME auto-switch-dispatcher
+    fi
+else
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - 忽略非网线接口事件 (Interface: \$INTERFACE, Action: \$ACTION)" >> "\$LOG_FILE"
+fi
+
+# 开机初始化检查
+if [[ "\$ACTION" == "up" && "\$INTERFACE" == "lo" ]]; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - 系统启动，检查网线状态" >> "\$LOG_FILE"
+    /usr/local/bin/$SCRIPT_NAME auto-switch-dispatcher
+fi
+
+exit 0
 EOF
 
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
-    echo "后台服务已启动，自动切换 Wi-Fi 模式。"
-}
-
-# 检查服务状态
-check_service_status() {
-    local SERVICE_NAME="wifi_auto_switch.service"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        return 0  # 服务正在运行
-    else
-        return 1  # 服务未运行
-    fi
+    chmod +x "$DISPATCHER_SCRIPT"
+    cp "$0" "/usr/local/bin/$SCRIPT_NAME"
+    chmod +x "/usr/local/bin/$SCRIPT_NAME"
+    echo "Dispatcher 脚本已安装到 $DISPATCHER_SCRIPT" | tee -a "$LOG_FILE"
 }
 
 # 停止并卸载后台服务
 stop_and_uninstall_service() {
-    local SERVICE_NAME="wifi_auto_switch.service"
-
-    check_service_status
-    SERVICE_STATUS=$?
-
-    if [[ $SERVICE_STATUS -eq 0 ]]; then
-        echo "服务 $SERVICE_NAME 正在运行。"
-        read -p "是否确认停止并卸载该服务？(y/n): " choice
+    local DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/wifi-auto-switch.sh"
+    if [[ -f "$DISPATCHER_SCRIPT" ]]; then
+        read -p "是否确认停止并卸载后台服务？(y/n): " choice
         if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-            echo "停止并卸载后台服务..."
-            systemctl stop "$SERVICE_NAME"
-            systemctl disable "$SERVICE_NAME"
-            rm /etc/systemd/system/$SERVICE_NAME
-            systemctl daemon-reload
-            echo "后台服务已停止并卸载。"
-        else
-            echo "取消停止并卸载服务。"
+            rm "$DISPATCHER_SCRIPT"
+            rm "/usr/local/bin/$SCRIPT_NAME"
+            rm -rf "$CONFIG_DIR"
+            echo "后台服务已卸载。" | tee -a "$LOG_FILE"
         fi
     else
-        echo "服务 $SERVICE_NAME 未运行。"
+        echo "后台服务未运行。" | tee -a "$LOG_FILE"
     fi
 }
 
@@ -336,12 +309,7 @@ manage_saved_wifi() {
     if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
         read -p "请输入 Wi-Fi 网络名称: " NEW_SSID
         read -p "请输入 Wi-Fi 网络密码: " NEW_PASSWORD
-        nmcli dev wifi connect "$NEW_SSID" password "$NEW_PASSWORD"
-        if [[ $? -eq 0 ]]; then
-            echo "成功添加并连接到 Wi-Fi 网络：$NEW_SSID"
-        else
-            echo "添加 Wi-Fi 网络失败，请检查输入的 SSID 和密码。"
-        fi
+        connect_wifi_network "$(detect_wifi_interface)" "$NEW_SSID" "$NEW_PASSWORD"
     fi
 }
 
@@ -355,7 +323,8 @@ while true; do
     echo "5. 停止并卸载后台服务"
     echo "6. 查看保存的 Wi-Fi 网络并添加新网络"
     echo "7. 退出"
-    read -p "输入选项 (1, 2, 3, 4, 5, 6 或 7): " choice
+    echo "8. 手动触发自动切换 Wi-Fi 模式"
+    read -p "输入选项 (1-8): " choice
 
     case $choice in
         1)
@@ -368,7 +337,6 @@ while true; do
             WIFI_NAME=${WIFI_NAME:-"4G-WIFI"}
             read -p "请输入 Wi-Fi 发射点密码（默认: 12345678）: " WIFI_PASSWORD
             WIFI_PASSWORD=${WIFI_PASSWORD:-"12345678"}
-            # 保存自定义名称和密码
             CUSTOM_WIFI_NAME="$WIFI_NAME"
             CUSTOM_WIFI_PASSWORD="$WIFI_PASSWORD"
             create_wifi_hotspot "$INTERFACE" "$WIFI_NAME" "$WIFI_PASSWORD"
@@ -383,7 +351,7 @@ while true; do
             read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
             connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
             ;;
-        3)
+        3|8)
             auto_switch_wifi_mode
             ;;
         4)
@@ -400,9 +368,13 @@ while true; do
             exit 0
             ;;
         *)
-            echo "无效的选择，请输入 1、2、3、4、5、6 或 7。"
+            echo "无效的选择，请输入 1-8。"
             ;;
     esac
 done
+
+if [[ "$1" == "auto-switch-dispatcher" ]]; then
+    auto_switch_wifi_mode
+fi
 
 exit 0
