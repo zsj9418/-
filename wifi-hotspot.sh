@@ -84,12 +84,15 @@ is_ethernet_disconnected() {
     local interface=$1
     if [[ -f "/sys/class/net/$interface/carrier" ]]; then
         if [[ "$(cat /sys/class/net/$interface/carrier)" -eq 0 ]]; then
+            echo "网线状态检查: $interface 已断开" | tee -a "$LOG_FILE"
             return 0  # 网线已断开
         else
+            echo "网线状态检查: $interface 已连接" | tee -a "$LOG_FILE"
             return 1  # 网线未断开
         fi
     else
-        return 1  # 接口不存在，视为未连接
+        echo "网线状态检查: $interface 接口不存在，视为断开" | tee -a "$LOG_FILE"
+        return 0  # 接口不存在，视为未连接
     fi
 }
 
@@ -116,6 +119,14 @@ create_wifi_hotspot() {
     local WIFI_NAME=${2:-"4G-WIFI"}
     local WIFI_PASSWORD=${3:-"12345678"}
     local HOTSPOT_CONNECTION_NAME="AutoHotspot-$WIFI_NAME"
+
+    # 断开当前 Wi-Fi 连接
+    local CURRENT_CONNECTION=$(nmcli dev show "$INTERFACE" | grep "GENERAL.CONNECTION" | awk '{print $2}')
+    if [[ -n "$CURRENT_CONNECTION" && "$CURRENT_CONNECTION" != "--" ]]; then
+        echo "正在断开当前 Wi-Fi 连接: $CURRENT_CONNECTION..." | tee -a "$LOG_FILE"
+        nmcli con down "$CURRENT_CONNECTION" > /dev/null 2>&1
+        sleep 2
+    fi
 
     clear_old_hotspots
 
@@ -159,14 +170,14 @@ connect_wifi_network() {
     fi
 }
 
-# 连接之前保存的 Wi-Fi 网络
+# 连接之前保存的 Wi-Fi 网络（排除自建热点）
 connect_previously_saved_wifi() {
     local INTERFACE=$1
     local MAX_RETRIES=3
     local WAIT_TIME=5
     local HOTSPOT_PREFIX="AutoHotspot-"
 
-    echo "正在尝试连接已保存的 Wi-Fi 网络..." | tee -a "$LOG_FILE"
+    echo "正在尝试连接已保存的非自建 Wi-Fi 网络..." | tee -a "$LOG_FILE"
     local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | awk '{print $1}')
 
     if [[ -n "$SAVED_CONNECTIONS" ]]; then
@@ -190,9 +201,9 @@ connect_previously_saved_wifi() {
                 fi
             done
         done
-        echo "所有已保存的 Wi-Fi 网络连接尝试均失败。" | tee -a "$LOG_FILE"
+        echo "所有非自建 Wi-Fi 网络连接尝试均失败。" | tee -a "$LOG_FILE"
     else
-        echo "没有找到已保存的 Wi-Fi 网络。" | tee -a "$LOG_FILE"
+        echo "没有找到非自建的已保存 Wi-Fi 网络。" | tee -a "$LOG_FILE"
     fi
     return 1
 }
@@ -214,17 +225,28 @@ auto_switch_wifi_mode() {
     fi
 
     if is_ethernet_disconnected "$NET_INTERFACE"; then
-        echo "网线已断开，尝试连接保存的 Wi-Fi 网络..." | tee -a "$LOG_FILE"
+        echo "网线已断开，尝试连接非自建的已保存 Wi-Fi 网络..." | tee -a "$LOG_FILE"
+        # 断开当前热点（如果存在）
+        local CURRENT_CONNECTION=$(nmcli dev show "$WIFI_INTERFACE" | grep "GENERAL.CONNECTION" | awk '{print $2}')
+        if [[ -n "$CURRENT_CONNECTION" && "$CURRENT_CONNECTION" != "--" ]]; then
+            echo "正在断开当前连接: $CURRENT_CONNECTION..." | tee -a "$LOG_FILE"
+            nmcli con down "$CURRENT_CONNECTION" > /dev/null 2>&1
+            sleep 2
+        fi
+
         if connect_previously_saved_wifi "$WIFI_INTERFACE"; then
-            echo "成功连接到 Wi-Fi 网络，保持客户端模式。" | tee -a "$LOG_FILE"
+            echo "成功连接到非自建 Wi-Fi 网络，保持客户端模式。" | tee -a "$LOG_FILE"
         else
-            echo "未能连接到任何已保存的 Wi-Fi 网络，切换到热点模式。" | tee -a "$LOG_FILE"
+            echo "未能连接到任何非自建 Wi-Fi 网络，切换到热点模式。" | tee -a "$LOG_FILE"
             local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
             local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
             create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
         fi
     else
-        echo "网线已连接，不创建热点，保持当前状态。" | tee -a "$LOG_FILE"
+        echo "网线已连接，切换到热点模式并分享网络..." | tee -a "$LOG_FILE"
+        local HOTSPOT_WIFI_NAME=${CUSTOM_WIFI_NAME:-"4G-WIFI"}
+        local HOTSPOT_WIFI_PASSWORD=${CUSTOM_WIFI_PASSWORD:-"12345678"}
+        create_wifi_hotspot "$WIFI_INTERFACE" "$HOTSPOT_WIFI_NAME" "$HOTSPOT_WIFI_PASSWORD"
     fi
 }
 
@@ -260,9 +282,10 @@ echo "\$(date '+%Y-%m-%d %H:%M:%S') - Dispatcher 触发: Interface=\$INTERFACE, 
 
 if [[ "\$INTERFACE" == "\$ETH_INTERFACE_NAME" ]]; then
     if [[ "\$ACTION" == "up" ]]; then
-        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线连接 (up)，不创建热点" >> "\$LOG_FILE"
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线连接 (up)，创建热点" >> "\$LOG_FILE"
+        /usr/local/bin/$SCRIPT_NAME auto-switch-dispatcher
     elif [[ "\$ACTION" == "down" || "\$ACTION" == "pre-down" || "\$ACTION" == "post-down" ]]; then
-        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线断开 (\$ACTION)，触发切换" >> "\$LOG_FILE"
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') - 网线断开 (\$ACTION)，尝试连接非自建 Wi-Fi" >> "\$LOG_FILE"
         /usr/local/bin/$SCRIPT_NAME auto-switch-dispatcher
     fi
 else
@@ -271,7 +294,7 @@ fi
 
 # 开机初始化检查
 if [[ "\$ACTION" == "up" && "\$INTERFACE" == "lo" ]]; then
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - 系统启动，检查网线状态" >> "\$LOG_FILE"
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - 系统启动，检查网线状态并执行切换" >> "\$LOG_FILE"
     /usr/local/bin/$SCRIPT_NAME auto-switch-dispatcher
 fi
 
