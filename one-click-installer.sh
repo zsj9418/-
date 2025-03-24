@@ -14,32 +14,37 @@ mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR";
 touch "$LOG_FILE" || { echo "无法创建日志文件"; exit 1; }
 touch "$CUSTOM_MENU_FILE" || { echo "无法创建自定义菜单文件"; exit 1; }
 
-# ------------------------- 默认脚本列表 -------------------------
+# ------------------------- 默认脚本列表 (已排序和分组) -------------------------
 DEFAULT_OPTIONS=(
-    "1. 安装 Docker（install_docker.sh）"
-    "2. 部署容器（deploy_containers.sh）"
-    "3. 安装工具（install_tools.sh）"
-    "4. 清理系统（clean-system.sh）"
-    "5. 获取设备信息（device_info.sh）"
-    "6. 安装 AdGuard Home（install-adg.sh）"
-    "7. 安装 Alist（install-alist.sh）"
-    "8. 安装 NexTerm（install-nexterm.sh）"
-    "9. 安装 OpenAPI（install-openapi.sh）"
-    "10. 安装 Sing-box（singbox-manager.sh）"
-    "11. 安装 Subconverter（install-subc.sh）"
-    "12. 设置 DNS（set-dns.sh）"
-    "13. 安装 MosDNS（install_mosdns.sh）"
-    "14. 配置定时任务（setup_cronjob.sh）"
-    "15. 部署 Sub-Store（sub-store-deploy.sh）"
-    "16. 安装 思源笔记（install_siyuan.sh）"
-    "17. 设置 WiFi 热点（wifi-hotspot.sh）"
-    "18. 安装 Sun-Panel（docker_sunpanel.sh）"
-    "19. 安装 cloudflared（cloudflared-deploy.sh）"
-    "20. 4G-UFI切卡管理（4G-UFI_sim.sh）"
+    "----- 基础系统工具 -----"
+    "1.  安装 Docker"
+    "2.  ssh工具和测速容器"
+    "3.  安装常用工具"
+    "4.  清理系统垃圾"
+    "5.  获取设备信息"
+    "----- 网络服务 -----"
+    "6.  安装 AdGuard Home"
+    "7.  安装 Alist"
+    "8.  安装 NexTerm"
+    "9.  安装 OpenAPI"
+    "10. 安装 Sing-box"
+    "11. 安装 Subconverter"
+    "12. 设置 DNS"
+    "13. 安装 MosDNS"
+    "14. 安装 cloudflared"
+    "----- 应用服务 -----"
+    "15. 部署 Sub-Store"
+    "16. 安装 思源笔记"
+    "17. 安装 Sun-Panel"
+    "----- 系统增强 -----"
+    "18. 配置定时任务"
+    "19. 设置 WiFi 热点"
+    "20. 4G-UFI 切卡管理"
+    "----- 管理功能 -----"
     "98. 快捷键管理"
 )
 
-# 默认脚本对应的 URL
+# 默认脚本对应的 URL (已排序并与 DEFAULT_OPTIONS 对应)
 declare -A DEFAULT_SCRIPTS=(
     ["1"]="https://raw.githubusercontent.com/zsj9418/-/main/install_docker.sh"
     ["2"]="https://raw.githubusercontent.com/zsj9418/-/main/deploy_containers.sh"
@@ -54,12 +59,12 @@ declare -A DEFAULT_SCRIPTS=(
     ["11"]="https://raw.githubusercontent.com/zsj9418/-/main/install-subc.sh"
     ["12"]="https://raw.githubusercontent.com/zsj9418/-/main/set-dns.sh"
     ["13"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_mosdns.sh"
-    ["14"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
+    ["14"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cloudflared-deploy.sh"
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/main/sub-store-deploy.sh"
     ["16"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_siyuan.sh"
-    ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
-    ["18"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
-    ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cloudflared-deploy.sh"
+    ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
+    ["18"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
+    ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
     ["20"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
 )
 
@@ -99,21 +104,23 @@ function check_network() {
 function download_script() {
     local choice="$1"
     local url="${SCRIPTS[$choice]}"
+    local script_path="" # 初始化 script_path 变量
 
     # 获取脚本文件名
     if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then
         local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
     else
-        script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '（' '{print $2}' | tr -d '（）()')
-        [[ "$script_name" == *".sh" ]] || script_name="${script_name}.sh"
+        script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '.' '{print $2}' | awk '{print $1}') # 修改: 使用 awk 两次，更精确提取脚本名
+        script_name="${script_name// /}.sh" # 移除空格并添加 .sh 后缀
     fi
 
-    local script_path="$SCRIPT_DIR/$script_name"
+    script_path="$SCRIPT_DIR/$script_name" # 明确赋值 script_path
+
 
     # 检查是否已存在，如果存在则直接返回路径
     if [[ -f "$script_path" ]]; then
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] 脚本已存在: $script_path" >> "$LOG_FILE"
-        echo -n "$script_path"
+        echo "$script_path" # 修改: 使用 echo 而不是 echo -n
         return 0
     fi
 
@@ -123,7 +130,7 @@ function download_script() {
             if [[ -s "$script_path" ]]; then
                 chmod +x "$script_path"
                 echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
-                echo -n "$script_path"
+                echo "$script_path" # 修改: 使用 echo 而不是 echo -n
                 return 0
             else
                 echo "下载 $script_name 后文件为空，下载失败。" >&2
@@ -145,6 +152,7 @@ function download_script() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] 下载失败: URL=$url, 错误码=$?" >> "$LOG_FILE"
     return 1
 }
+
 
 # 运行脚本
 function run_script() {
@@ -257,15 +265,19 @@ function manage_current_script_symlink() {
                 echo "请输入要删除的快捷键（例如 q）："
                 read -r shortcut
                 local link="/usr/local/bin/$shortcut"
-                if [[ -e "$link" ]]; then
-                    sudo rm -f "$link"
-
-                    if [[ $? -eq 0 ]]; then
-                       echo "快捷键 $shortcut 已删除。"
+                 # 检查快捷键是否存在，并且目标是否为当前脚本或脚本目录下的脚本
+                if [[ -L "$link" ]]; then
+                    local target=$(readlink -f "$link")
+                    if [[ "$target" == "$current_script" || "$target" == "$SCRIPT_DIR"/* ]]; then
+                        sudo rm -f "$link"
+                        if [[ $? -eq 0 ]]; then
+                            echo "快捷键 $shortcut 已删除。"
+                        else
+                            echo "错误: 删除快捷键失败. 请确保您有足够的权限 (sudo)."
+                        fi
                     else
-                       echo "错误: 删除快捷键失败.  请确保您有足够的权限 (sudo)."
+                        echo "快捷键 '$shortcut' 存在，但未绑定到当前脚本或脚本目录，无法删除。" # 更准确的提示信息
                     fi
-
                 else
                     echo "快捷键 $shortcut 不存在。"
                 fi
@@ -446,13 +458,21 @@ function load_menu() {
 function print_menu() {
     clear
     echo "========================================"
-    echo "          一键脚本管理平台"
+    echo "          🚀 一键脚本管理平台 🚀"
     echo "========================================"
     echo "请选择要安装或运行的脚本："
-    for option in "${OPTIONS[@]}"; do
-        echo "  $option"
-    done
+    echo "请输入选项编号并按回车键执行："
     echo "----------------------------------------"
+    for option in "${OPTIONS[@]}"; do
+        if [[ "$option" =~ ^-----+ ]]; then
+            echo "  ${option}"
+        elif [[ -z "$option" ]]; then
+            echo ""
+        else
+            echo "  $option"
+        fi
+    done
+    echo "----------------------------------------" # 只需要一个分隔线
 }
 
 # 主函数
@@ -465,24 +485,22 @@ function main() {
             0)
                 exit 0
                 ;;
-            98)  # 新增 98 处理快捷键管理
+            98)  # 快捷键管理
                 manage_symlink
                 ;;
-            99)
+            99)  # 自定义菜单管理
                 manage_custom_menu
                 ;;
-            [1-9]|[1-9][0-9])  # 匹配所有数字选项
-                # 只对需要下载和运行的脚本选项执行以下逻辑
-                if [[ "$choice" -le 20 ]]; then  # 限制为 1-20 的脚本选项
+            [1-9]|[1-9][0-9])  # 数字选项 (1-99)
+                if [[ "$choice" -le 20 ]]; then # 限制默认脚本为 1-20
                     manage_logs
                     script_path=$(download_script "$choice")
-                    echo "DEBUG: main - download_script 返回 script_path: $script_path, 返回码: $?" >> "$LOG_FILE"
-                    if [[ $? -eq 0 && -n "$script_path" && -f "$script_path" ]]; then
+                    if [[ $? -eq 0 ]]; then # 检查 download_script 是否成功
                         run_script "$script_path"
                     else
-                        echo "脚本下载失败或文件不存在，请检查日志。" | tee -a "$LOG_FILE"
+                        echo "脚本下载失败，请检查日志。" | tee -a "$LOG_FILE"
                     fi
-                elif [[ "$choice" -ne 98 && "$choice" -ne 99 ]]; then  # 排除 98 和 99
+                else
                     echo "无效选项，请重新输入。" | tee -a "$LOG_FILE"
                 fi
                 read -rp "按回车键返回主菜单..."
