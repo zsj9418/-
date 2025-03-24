@@ -56,7 +56,6 @@ detect_arch() {
         *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exit 1;;
     esac
     echo -e "${GREEN}检测到设备架构: $ARCH_NAME${NC}"
-    # b3log/siyuan 镜像支持多架构，无需显式指定架构标签
 }
 
 # 检查并安装依赖
@@ -69,7 +68,6 @@ check_dependencies() {
     echo -e "${BLUE}检查依赖...${NC}"
     local deps_installed=0
 
-    # 检查 Docker
     if ! command -v docker &> /dev/null; then
         echo -e "${YELLOW}Docker 未安装，正在安装...${NC}"
         case $OS_TYPE in
@@ -94,7 +92,6 @@ check_dependencies() {
         deps_installed=1
     fi
 
-    # 检查 curl
     if ! command -v curl &> /dev/null; then
         echo -e "${YELLOW}curl 未安装，正在安装...${NC}"
         case $OS_TYPE in
@@ -105,7 +102,6 @@ check_dependencies() {
         deps_installed=1
     fi
 
-    # 检查 ss（用于端口检测）
     if ! command -v ss &> /dev/null; then
         echo -e "${YELLOW}ss 未安装，正在安装...${NC}"
         case $OS_TYPE in
@@ -119,7 +115,7 @@ check_dependencies() {
     if [ $deps_installed -eq 0 ]; then
         echo -e "${GREEN}所有依赖已满足${NC}"
     fi
-    touch "$DEPENDENCY_CHECK_FILE" # 标记依赖检查完成
+    touch "$DEPENDENCY_CHECK_FILE"
 }
 
 # 获取可用镜像版本
@@ -127,7 +123,7 @@ get_available_tags() {
     echo -e "${BLUE}正在从 Docker Hub 获取可用版本...${NC}"
     TAGS=$(curl -s "https://hub.docker.com/v2/repositories/b3log/siyuan/tags/?page_size=100" | \
            grep -o '"name":"[^"]*"' | sed 's/"name":"\(.*\)"/\1/' | grep -v "latest" | sort -r)
-    TAGS="latest $TAGS" # 将 latest 放在首位
+    TAGS="latest $TAGS"
     if [ -z "$TAGS" ]; then
         echo -e "${RED}无法获取版本列表，使用默认版本 $DEFAULT_TAG${NC}"
         SELECTED_TAG="$DEFAULT_TAG"
@@ -264,18 +260,62 @@ view_containers() {
     docker ps -a
 }
 
-# 卸载功能
+# 强化卸载功能
 uninstall() {
     echo -e "${YELLOW}正在卸载 $CONTAINER_NAME...${NC}"
-    docker rm -f "$CONTAINER_NAME" 2>/dev/null
-    docker rmi "$IMAGE_NAME" 2>/dev/null
-    read -p "是否删除工作空间数据？(y/n): " DELETE_DATA
-    if [ "$DELETE_DATA" == "y" ]; then
-        rm -rf "$WORKSPACE"
-        echo -e "${GREEN}工作空间数据已删除${NC}"
+
+    # 停止并删除容器
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${BLUE}检测到容器 $CONTAINER_NAME${NC}"
+        docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        echo -e "${GREEN}容器 $CONTAINER_NAME 已删除${NC}"
+    else
+        echo -e "${YELLOW}未找到容器 $CONTAINER_NAME，跳过删除${NC}"
     fi
+
+    # 删除镜像
+    if docker images -q "$IMAGE_NAME" | grep -q .; then
+        read -p "是否删除镜像 $IMAGE_NAME？(y/n): " DELETE_IMAGE
+        if [ "$DELETE_IMAGE" == "y" ]; then
+            docker rmi "$IMAGE_NAME" 2>/dev/null
+            echo -e "${GREEN}镜像 $IMAGE_NAME 已删除${NC}"
+        else
+            echo -e "${YELLOW}保留镜像 $IMAGE_NAME${NC}"
+        fi
+    else
+        echo -e "${YELLOW}未找到镜像 $IMAGE_NAME，跳过删除${NC}"
+    fi
+
+    # 删除工作空间数据
+    if [ -d "$WORKSPACE" ]; then
+        read -p "是否删除工作空间数据 $WORKSPACE？(y/n): " DELETE_DATA
+        if [ "$DELETE_DATA" == "y" ]; then
+            rm -rf "$WORKSPACE"
+            echo -e "${GREEN}工作空间数据 $WORKSPACE 已删除${NC}"
+        else
+            echo -e "${YELLOW}保留工作空间数据 $WORKSPACE${NC}"
+        fi
+    else
+        echo -e "${YELLOW}未找到工作空间 $WORKSPACE，跳过删除${NC}"
+    fi
+
+    # 清理无用 Docker 资源
+    read -p "是否清理无用的 Docker 网络和卷？(y/n): " CLEAN_DOCKER
+    if [ "$CLEAN_DOCKER" == "y" ]; then
+        docker network prune -f 2>/dev/null
+        docker volume prune -f 2>/dev/null
+        echo -e "${GREEN}无用的 Docker 网络和卷已清理${NC}"
+    else
+        echo -e "${YELLOW}跳过清理 Docker 网络和卷${NC}"
+    fi
+
+    # 删除依赖检查标记文件
+    if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
+        rm -f "$DEPENDENCY_CHECK_FILE"
+        echo -e "${GREEN}依赖检查标记文件已删除${NC}"
+    fi
+
     echo -e "${GREEN}卸载完成${NC}"
-    rm -f "$DEPENDENCY_CHECK_FILE" # 删除依赖检查标记，便于下次重新检测
 }
 
 # 主菜单
