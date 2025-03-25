@@ -101,19 +101,19 @@ function check_network() {
 }
 
 # 下载脚本（支持直连和代理下载）
+# 下载脚本（支持直连和代理下载）
 function download_script() {
     local choice="$1"
-    local url="${SCRIPTS[$choice]}"
-    local script_path="" # 初始化 script_path 变量
+    local url="${DEFAULT_SCRIPTS[$choice]}"
+    local script_name=""
+    local script_path=""
 
-    # 获取脚本文件名
-    if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then
-        local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
-    else
-        script_name="${choice}.sh" # 直接使用编号作为脚本名
-    fi
+    # 从 URL 中提取脚本文件名
+    script_name=$(basename "$url")
+    # 构建新的文件名，例如 "4-clean-system.sh"
+    script_name="${choice}-${script_name}"
 
-    script_path="$SCRIPT_DIR/$script_name" # 明确赋值 script_path
+    script_path="$SCRIPT_DIR/$script_name"
 
     # 检查是否已存在，如果存在则直接返回路径
     if [[ -f "$script_path" ]]; then
