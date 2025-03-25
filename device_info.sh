@@ -7,7 +7,7 @@ DEPENDENCIES="curl ethtool ip"
 CONFIG_FILE="/etc/device_info.conf"
 STATUS_FILE="/tmp/device_notify_status"
 MAX_LOG_SIZE=2097152
-SCRIPT_PATH="$(realpath "\$0")"
+SCRIPT_PATH="$(realpath "$0")"
 PING_TARGET="223.5.5.5"
 MAX_RETRIES=10
 RETRY_INTERVAL=5
@@ -80,22 +80,22 @@ get_system_info() {
     if [ -z "$lan_ips_formatted" ]; then lan_ips_formatted="未获取到局域网 IP 地址"; fi
 
     # CPU 占用率: 恢复 top 命令方式, 更稳定
-    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.* $[0-9.]*$% id.*/\1/" | awk '{print 100 - \$1"%"}')
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print 100 - $8 "%"}') # Corrected awk command, $8 is usually %id
     if [ -z "$cpu_usage" ]; then cpu_usage="未知"; fi
 
     # 内存信息: 恢复 free 命令, 并修复重复输出问题 (实际已在之前版本修复)
-    local mem_info=$(free -m | awk 'NR==2{printf "%.2f/%.2fM (%.2f%%)", \$3, \$2, \$3*100/\$2}')
+    local mem_info=$(free -m | awk 'NR==2{printf "%.2f/%.2fM (%.2f%%)", $3, $2, $3*100/$2}') # Corrected awk command
     if [ -z "$mem_info" ]; then mem_usage="未知"; else mem_usage="$mem_info"; fi
-    local swap_info=$(free -m | awk 'NR==3{printf "%.2f/%.2fM (%.2f%%)", \$3, \$2, \$3*100/\$2}')
+    local swap_info=$(free -m | awk 'NR==3{printf "%.2f/%.2fM (%.2f%%)", $3, $2, $3*100/$2}') # Corrected awk command
     if [ -z "$swap_info" ]; then swap_usage="未知"; else swap_usage="$swap_info"; fi
 
 
-    local disk_usage=$(df -h / | awk 'NR==2{print \$3"/"\$2 " ("\$5")"}')
+    local disk_usage=$(df -h / | awk 'NR==2{print $3"/"$2 " ("$5")"}') # Corrected awk command
     if [ -z "$disk_usage" ]; then disk_usage="未知"; fi
 
-    local total_rx=$(awk 'BEGIN {rx_total=0} \$1 ~ /^(eth|enp|eno)/ {rx_total += \$2} END {printf "%.2f MB", rx_total/1024/1024}' /proc/net/dev)
+    local total_rx=$(awk 'BEGIN {rx_total=0} $1 ~ /^(eth|enp|eno)/ {rx_total += $2} END {printf "%.2f MB", rx_total/1024/1024}' /proc/net/dev) # Corrected awk command
     if [ -z "$total_rx" ]; then total_rx="未知"; fi
-    local total_tx=$(awk 'BEGIN {tx_total=0} \$1 ~ /^(eth|enp|eno)/ {tx_total += \$10} END {printf "%.2f MB", tx_total/1024/1024}' /proc/net/dev)
+    local total_tx=$(awk 'BEGIN {tx_total=0} $1 ~ /^(eth|enp|eno)/ {tx_total += $10} END {printf "%.2f MB", tx_total/1024/1024}' /proc/net/dev) # Corrected awk command
     if [ -z "$total_tx" ]; then total_tx="未知"; fi
 
     local network_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')
@@ -147,11 +147,11 @@ EOF
 ### 获取局域网 IPv4 地址 (改进版, 同之前版本) ###
 get_lan_ip() {
     local ip_addresses=""
-    local interfaces=$(ip link show | awk '{print \$2}' | tr -d ':' | grep -vE '^(lo|docker|veth|tun|br-)')
+    local interfaces=$(ip link show | awk '{print $2}' | tr -d ':' | grep -vE '^(lo|docker|veth|tun|br-)')
 
     if [ -z "$interfaces" ]; then log_info "未找到物理网络接口。"; echo "未找到局域网 IP 地址。"; return 1; fi
     for interface in $interfaces; do
-        local ip_info=$(ip -4 addr show "$interface" 2>/dev/null | awk '/inet / {print \$2}')
+        local ip_info=$(ip -4 addr show "$interface" 2>/dev/null | awk '/inet / {print $2}')
         if [ -n "$ip_info" ]; then
             local ip=$(echo "$ip_info" | cut -d '/' -f 1)
             if [ -n "$ip" ]; then
@@ -170,9 +170,9 @@ get_lan_ip() {
 
 ### 获取接口类型 (有线/无线, 同之前版本) ###
 get_interface_type() {
-    local interface=\$1
+    local interface=$1
     if command -v ethtool >/dev/null 2>&1; then
-        local link_status=$(sudo ethtool "$interface" 2>/dev/null | grep "Link detected" | awk '{print \$3}')
+        local link_status=$(sudo ethtool "$interface" 2>/dev/null | grep "Link detected" | awk '{print $3}')
         if [ -n "$link_status" ] && [ "$link_status" = "yes" ]; then echo "有线"; else
            if command -v iwconfig >/dev/null 2>&1 && iwconfig "$interface" 2>&1 | grep -q "ESSID:"; then echo "无线"; else echo "未知类型"; fi
         fi
@@ -191,7 +191,7 @@ wait_for_network() {
         # 使用多个目标进行网络连通性检测
         ping -c 1 $PING_TARGET > /dev/null 2>&1
         local ping_target_result=$?
-        ping -c 1 223.5.5.5 > /dev/null 2>&1 
+        ping -c 1 223.5.5.5 > /dev/null 2>&1
         local ping_google_result=$?
         ping -c 1 baidu.com > /dev/null 2>&1
         local ping_baidu_result=$?
@@ -215,12 +215,12 @@ wait_for_network() {
 ### 发送企业微信通知 (完整) ###
 send_wechat_notification() {
     # 确保加载 WEBHOOK_URL
-    if [ -z "$WEBHOOK_URL" ]; then 
+    if [ -z "$WEBHOOK_URL" ]; then
         log_info "WEBHOOK_URL 为空，尝试从配置文件加载。"
         if [ -f "$CONFIG_FILE" ]; then
             source "$CONFIG_FILE"
             if [ -z "$WEBHOOK_URL" ]; then
-                yellow "未配置企业微信 Webhook，跳过通知"; log_info "未配置 Webhook，跳过通知"; return; 
+                yellow "未配置企业微信 Webhook，跳过通知"; log_info "未配置 Webhook，跳过通知"; return;
             fi
         else
             yellow "未找到配置文件，跳过通知"; log_info "未找到配置文件，跳过通知"; return
