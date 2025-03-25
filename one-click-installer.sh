@@ -110,17 +110,15 @@ function download_script() {
     if [[ -v CUSTOM_SCRIPT_NAMES[$choice] ]]; then
         local script_name="${CUSTOM_SCRIPT_NAMES[$choice]}"
     else
-        script_name=$(echo "${OPTIONS[$((choice - 1))]}" | awk -F '.' '{print $2}' | awk '{print $1}') # 修改: 使用 awk 两次，更精确提取脚本名
-        script_name="${script_name// /}.sh" # 移除空格并添加 .sh 后缀
+        script_name="${choice}.sh" # 直接使用编号作为脚本名
     fi
 
     script_path="$SCRIPT_DIR/$script_name" # 明确赋值 script_path
 
-
     # 检查是否已存在，如果存在则直接返回路径
     if [[ -f "$script_path" ]]; then
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] 脚本已存在: $script_path" >> "$LOG_FILE"
-        echo "$script_path" # 修改: 使用 echo 而不是 echo -n
+        echo "$script_path"
         return 0
     fi
 
@@ -130,7 +128,7 @@ function download_script() {
             if [[ -s "$script_path" ]]; then
                 chmod +x "$script_path"
                 echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
-                echo "$script_path" # 修改: 使用 echo 而不是 echo -n
+                echo "$script_path"
                 return 0
             else
                 echo "下载 $script_name 后文件为空，下载失败。" >&2
@@ -152,7 +150,6 @@ function download_script() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] 下载失败: URL=$url, 错误码=$?" >> "$LOG_FILE"
     return 1
 }
-
 
 # 运行脚本
 function run_script() {
