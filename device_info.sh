@@ -1,6 +1,6 @@
 #!/bin/bash
 
-### 配置常量 (恢复详细信息) ###
+### 配置常量 ###
 LOG_FILE="/var/log/device_info.log"
 WEBHOOK_URL=""
 DEPENDENCIES="curl ethtool ip"
@@ -13,28 +13,28 @@ MAX_RETRIES=10
 RETRY_INTERVAL=5
 STABILIZATION_WAIT=20
 
-### 错误处理
+### 错误处理 ###
 set -euo pipefail
 
-### 彩色输出函数 (完整) ###
+### 彩色输出函数 ###
 red() { echo -e "\033[31m$*\033[0m"; }
 yellow() { echo -e "\033[33m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
 blue() { echo -e "\033[34m$*\033[0m"; }
 
-### 日志记录函数 (完整) ###
+### 日志记录函数 ###
 log_info() {
     if [ ! -d "$(dirname "$LOG_FILE")" ]; then mkdir -p "$(dirname "$LOG_FILE")"; fi
     if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE")" -ge "$MAX_LOG_SIZE" ]; then
         truncate -s 0 "$LOG_FILE"
-        if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 日志已清空" >> "$LOG_FILE"; then echo "ERROR: 日志清空后写入失败" >&2; fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 日志已清空" >> "$LOG_FILE" || echo "ERROR: 日志清空后写入失败" >&2
     fi
-    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $@" >> "$LOG_FILE"; then echo "ERROR: 日志写入失败: $@" >&2; fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $@" >> "$LOG_FILE" || echo "ERROR: 日志写入失败: $@" >&2
 }
 
 log_error() {
     if [ ! -d "$(dirname "$LOG_FILE")" ]; then mkdir -p "$(dirname "$LOG_FILE")"; fi
-    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $@" >> "$LOG_FILE"; then echo "ERROR: 错误日志写入失败: $@" >&2; fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $@" >> "$LOG_FILE" || echo "ERROR: 错误日志写入失败: $@" >&2
     red "$@"
 }
 
@@ -43,7 +43,7 @@ log_debug() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $@" >> "$LOG_FILE"
 }
 
-### 检查依赖 (精简，移除 jq 依赖) ###
+### 检查依赖 ###
 check_dependencies() {
     log_info "开始检查依赖..."
     local missing_deps=""
@@ -60,19 +60,29 @@ check_dependencies() {
     else green "所有依赖已满足。"; log_info "所有依赖已满足。"; fi
 }
 
-### 配置 (完整) ###
+### 配置 ###
 save_config() { echo "WEBHOOK_URL=\"$WEBHOOK_URL\"" > "$CONFIG_FILE"; log_info "配置已保存到 $CONFIG_FILE"; }
-load_config() { if [ -f "$CONFIG_FILE" ]; then . "$CONFIG_FILE"; log_info "加载配置文件 $CONFIG_FILE"; else log_info "未检测到配置文件，首次运行需配置。"; configure_script; fi }
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+        log_info "加载配置文件 $CONFIG_FILE"
+    else
+        log_info "未检测到配置文件，首次运行需配置。"
+        configure_script
+    fi
+}
 configure_script() {
     echo "是否启用企业微信机器人通知？(y/n)"; read -r ENABLE_WEBHOOK
     if [ "$ENABLE_WEBHOOK" = "y" ]; then
         while [ -z "$WEBHOOK_URL" ]; do echo "请输入企业微信机器人 Webhook URL："; read -r WEBHOOK_URL; done
         echo "企业微信机器人已启用。"; log_info "企业微信机器人已启用。"
-    else echo "企业微信机器人通知已跳过。"; log_info "企业微信机器人通知已跳过。"; fi
+    else
+        echo "企业微信机器人通知已跳过。"; log_info "企业微信机器人通知已跳过。"
+    fi
     save_config
 }
 
-### 获取系统信息 (最终修复，移除 jq 依赖，使用 grep/sed 解析 JSON) ###
+### 获取系统信息 ###
 get_system_info() {
     local runtime=$(uptime -p | sed 's/up //; s/hours/小时/g; s/hour/小时/g; s/minutes/分钟/g; s/minute/分钟/g; s/,/，/g; s/,//g')
     local lan_ips_formatted=$(get_lan_ip)
@@ -128,7 +138,7 @@ IPv4地址: $public_ip
 EOF
 }
 
-### 获取局域网 IPv4 地址 (改进版) ###
+### 获取局域网 IPv4 地址 ###
 get_lan_ip() {
     local ip_addresses=""
     local interfaces=$(ip link show | awk '{print $2}' | tr -d ':' | grep -vE '^(lo|docker|veth|tun|br-)')
@@ -150,7 +160,7 @@ get_lan_ip() {
     echo -e "$ip_addresses"; log_debug "最终局域网 IP:\n$ip_addresses"; return 0
 }
 
-### 获取接口类型 (有线/无线) ###
+### 获取接口类型 ###
 get_interface_type() {
     local interface=$1
     if command -v ethtool >/dev/null 2>&1; then
@@ -160,15 +170,16 @@ get_interface_type() {
     elif command -v iwconfig >/dev/null 2>&1 && iwconfig "$interface" 2>&1 | grep -q "ESSID:"; then echo "无线"; else echo "未知类型"; fi
 }
 
-### 获取公网信息 (简化，统一返回完整 JSON) ###
+### 获取公网信息 ###
 get_public_info() {
     curl -s ipinfo.io
 }
 
-### 检测网络连接 (增强网络检测) ###
+### 检测网络连接（增强稳定性） ###
 wait_for_network() {
     local retries=0
-    while [ "$retries" -lt "$MAX_RETRIES" ]; do
+    local max_extended_retries=30  # 延长重试次数，确保网络有足够时间就绪
+    while [ "$retries" -lt "$max_extended_retries" ]; do
         ping -c 1 "$PING_TARGET" >/dev/null 2>&1
         local ping_target_result=$?
         ping -c 1 223.5.5.5 >/dev/null 2>&1
@@ -176,8 +187,10 @@ wait_for_network() {
         ping -c 1 baidu.com >/dev/null 2>&1
         local ping_baidu_result=$?
         if [ "$ping_target_result" -eq 0 ] || [ "$ping_google_result" -eq 0 ] || [ "$ping_baidu_result" -eq 0 ]; then
-            log_info "网络已连接。"
-            rm -f "$STATUS_FILE"
+            log_info "网络已连接，开始稳定等待 $STABILIZATION_WAIT 秒..."
+            sleep "$STABILIZATION_WAIT"  # 确保网络稳定
+            rm -f "$STATUS_FILE"  # 重启后强制清除状态文件
+            log_info "状态文件 $STATUS_FILE 已清除，准备发送通知。"
             return 0
         else
             log_info "网络未连接，等待 $RETRY_INTERVAL 秒后重试... (第 $((retries + 1)) 次)"
@@ -185,11 +198,11 @@ wait_for_network() {
             retries=$((retries + 1))
         fi
     done
-    log_error "网络连接检测失败，已达到最大重试次数。"
+    log_error "网络连接检测失败，已达到最大重试次数 ($max_extended_retries)。"
     return 1
 }
 
-### 发送企业微信通知 (完整) ###
+### 发送企业微信通知 ###
 send_wechat_notification() {
     if [ -z "$WEBHOOK_URL" ]; then
         log_info "WEBHOOK_URL 为空，尝试从配置文件加载。"
@@ -202,18 +215,16 @@ send_wechat_notification() {
             yellow "未找到配置文件，跳过通知"; log_info "未找到配置文件，跳过通知"; return
         fi
     fi
-    if [ -f "$STATUS_FILE" ]; then
-        log_info "状态文件 $STATUS_FILE 存在，跳过发送通知。"
-        return 0
-    fi
+
+    # 不检查状态文件存在与否，重启时已清除，确保每次都尝试发送
     local system_info=$(get_system_info)
     local retries=0
     while [ "$retries" -lt "$MAX_RETRIES" ]; do
         curl -sSf -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"[设备: $(hostname)] 系统信息:\\n$system_info\"}}" "$WEBHOOK_URL" >/dev/null
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"[设备: $(hostname)] 系统启动通知:\\n$system_info\"}}" "$WEBHOOK_URL" >/dev/null
         if [ $? -eq 0 ]; then
             green "通知发送成功。"; log_info "通知发送成功。"
-            touch "$STATUS_FILE"
+            touch "$STATUS_FILE"  # 发送成功后创建状态文件，避免重复发送
             return 0
         else
             red "通知发送失败，重试中...（第 $((retries + 1)) 次）"; log_error "通知失败，重试...（$((retries + 1)) 次）"
@@ -224,18 +235,18 @@ send_wechat_notification() {
     red "通知发送失败次数达上限（$MAX_RETRIES 次）。"; log_error "通知失败次数达上限（$MAX_RETRIES 次）。"; return 1
 }
 
-### 设置自启动 (增强 Systemd 配置) ###
+### 设置自启动（增强可靠性） ###
 setup_autostart() {
     if command -v systemctl >/dev/null 2>&1; then
         local service_file="/etc/systemd/system/device_info.service"
-        if [ ! -f "$service_file" ]; then
+        if [ ! -f "$service_file" ] || ! grep -q "$SCRIPT_PATH" "$service_file"; then
             echo "[Unit]
-Description=Device Info Logger
+Description=Device Info Logger and Notifier
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=/root/one-click-scripts/
+WorkingDirectory=$(dirname "$SCRIPT_PATH")
 Type=simple
 ExecStart=$SCRIPT_PATH
 Restart=on-failure
@@ -244,39 +255,32 @@ RestartSec=30
 [Install]
 WantedBy=multi-user.target" | sudo tee "$service_file" >/dev/null
             if [ $? -ne 0 ]; then log_error "创建 systemd 服务文件失败: $service_file"; return 1; fi
-            log_info "已创建 systemd 服务文件: $service_file"
+            log_info "已创建或更新 systemd 服务文件: $service_file"
         fi
-        sudo systemctl enable device_info.service
-        if [ $? -ne 0 ]; then log_error "启用 systemd 服务失败: $service_file"; return 1; fi
         sudo systemctl daemon-reload
         if [ $? -ne 0 ]; then log_error "重新加载 systemd 配置失败"; return 1; fi
+        sudo systemctl enable device_info.service
+        if [ $? -ne 0 ]; then log_error "启用 systemd 服务失败: $service_file"; return 1; fi
         sudo systemctl is-enabled device_info.service >/dev/null
         if [ $? -eq 0 ]; then log_info "systemd 服务已成功设置为自启动"; else log_error "systemd 服务自启动设置失败"; return 1; fi
         log_info "已设置 systemd 自启动服务"
     elif [ -f "/etc/rc.local" ]; then
         if ! grep -q "$SCRIPT_PATH" /etc/rc.local; then
-            sudo sed -i -e "\$i $SCRIPT_PATH &\n" /etc/rc.local
-            log_info "已设置 rc.local 自启动"
+            sudo sed -i -e "\$i rm -f $STATUS_FILE && $SCRIPT_PATH &\n" /etc/rc.local
+            log_info "已设置 rc.local 自启动并清除状态文件"
         fi
     else
         log_error "未找到 systemd 或 rc.local，无法设置自启动"
         return 1
     fi
-    echo "请手动检查设备重启后，该脚本是否自动运行。"
-    echo "如果未自动运行，请检查 systemd 服务状态或 rc.local 文件。"
+    echo "自启动已设置，请重启设备验证脚本是否自动运行。"
+    echo "若未运行，请检查日志 $LOG_FILE 或 systemd 状态：systemctl status device_info.service"
 }
 
-### 检查状态文件是否存在，不存在则创建 ###
-check_status_file() {
-    if [ ! -f "$STATUS_FILE" ]; then
-        touch "$STATUS_FILE"
-        log_info "状态文件 $STATUS_FILE 不存在，已创建。"
-    fi
-}
-
-### 主函数 (完整) ###
+### 主函数 ###
 main() {
     set -euo pipefail
+    log_info "脚本启动..."
     load_config
     check_dependencies
     wait_for_network
