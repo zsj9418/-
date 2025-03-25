@@ -11,18 +11,18 @@ CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"  # 自定义菜单配置文件
 
 # ------------------------- 初始化 -------------------------
 mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
+mkdir -p "$SCRIPT_DIR/core_scripts" || { echo "无法创建核心脚本目录：$SCRIPT_DIR/core_scripts"; exit 1; } # 创建 core_scripts 目录
+mkdir -p "$SCRIPT_DIR/user_scripts" || { echo "无法创建用户脚本目录：$SCRIPT_DIR/user_scripts"; exit 1; }   # 创建 user_scripts 目录
 touch "$LOG_FILE" || { echo "无法创建日志文件"; exit 1; }
 touch "$CUSTOM_MENU_FILE" || { echo "无法创建自定义菜单文件"; exit 1; }
 
-# ------------------------- 默认脚本列表 (已排序和分组) -------------------------
+# ------------------------- 默认脚本列表 (取消分组，美化命名) -------------------------
 DEFAULT_OPTIONS=(
-    "----- 基础系统工具 -----"
     "1.  安装 Docker"
-    "2.  ssh工具和测速容器"
+    "2.  SSH 工具 & 测速容器"
     "3.  安装常用工具"
     "4.  清理系统垃圾"
     "5.  获取设备信息"
-    "----- 网络服务 -----"
     "6.  安装 AdGuard Home"
     "7.  安装 Alist"
     "8.  安装 NexTerm"
@@ -32,15 +32,12 @@ DEFAULT_OPTIONS=(
     "12. 设置 DNS"
     "13. 安装 MosDNS"
     "14. 安装 cloudflared"
-    "----- 应用服务 -----"
     "15. 部署 Sub-Store"
     "16. 安装 思源笔记"
     "17. 安装 Sun-Panel"
-    "----- 系统增强 -----"
     "18. 配置定时任务"
     "19. 设置 WiFi 热点"
     "20. 4G-UFI 切卡管理"
-    "----- 管理功能 -----"
     "98. 快捷键管理"
 )
 
@@ -64,7 +61,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["16"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_siyuan.sh"
     ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
     ["18"]="https://raw.githubusercontent.com/zsj9418/-/main/setup_cronjob.sh"
-    ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
+    ["19"]="https://raw.githubusercontent.com/zsj9418/-/main/wifi-hotspot.sh"
     ["20"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
 )
 
@@ -101,7 +98,6 @@ function check_network() {
 }
 
 # 下载脚本（支持直连和代理下载）
-# 下载脚本（支持直连和代理下载）
 function download_script() {
     local choice="$1"
     local url="${DEFAULT_SCRIPTS[$choice]}"
@@ -113,7 +109,8 @@ function download_script() {
     # 构建新的文件名，例如 "4-clean-system.sh"
     script_name="${choice}-${script_name}"
 
-    script_path="$SCRIPT_DIR/$script_name"
+    # 修改脚本保存路径为 core_scripts 目录
+    script_path="$SCRIPT_DIR/core_scripts/$script_name"
 
     # 检查是否已存在，如果存在则直接返回路径
     if [[ -f "$script_path" ]]; then
@@ -392,6 +389,7 @@ function manage_custom_menu() {
         read -rp "按回车键继续..."
     done
 }
+
 # 获取下一个自定义菜单 ID
 function get_next_custom_menu_id() {
     local max_default_id=0
@@ -415,39 +413,53 @@ function get_next_custom_menu_id() {
     done < "$CUSTOM_MENU_FILE"
     echo $((max_custom_id + 1))
 }
+
 # 加载菜单选项
 function load_menu() {
     OPTIONS=() # Reset OPTIONS array to avoid duplicate entries
-    OPTIONS=("${DEFAULT_OPTIONS[@]}")
     SCRIPTS=()
     CUSTOM_SCRIPT_NAMES=()  # 清空自定义脚本名缓存
 
     # 加载默认脚本
-    for key in "${!DEFAULT_SCRIPTS[@]}"; do
-        SCRIPTS["$key"]="${DEFAULT_SCRIPTS[$key]}"
+    for option_text in "${DEFAULT_OPTIONS[@]}"; do
+        local option_number=$(echo "$option_text" | awk -F '.' '{print $1}') # 提取选项编号
+        if [[ "$option_number" =~ ^[0-9]+$ ]]; then # 确保是数字编号的选项
+            if [[ -v DEFAULT_SCRIPTS["$option_number"] ]]; then # 检查 DEFAULT_SCRIPTS 中是否存在该编号的 URL
+                OPTIONS+=("$option_text") # 直接使用 DEFAULT_OPTIONS 中的文本
+                SCRIPTS["$option_number"]="${DEFAULT_SCRIPTS[$option_number]}" # 使用选项编号作为 key
+                CUSTOM_SCRIPT_NAMES["$option_number"]=$(basename "${DEFAULT_SCRIPTS[$option_number]}")
+            else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出 1-20 范围，或者 DEFAULT_SCRIPTS 定义不完整)
+                OPTIONS+=("$option_text") # 仍然添加菜单项，但不关联脚本 URL
+                SCRIPTS["$option_number"]="" #  不关联脚本URL，设置为空
+            fi
+        else # 非数字编号的选项 (例如 "98. 快捷键管理")
+            OPTIONS+=("$option_text") # 添加非数字编号的选项
+            if [[ "$option_text" == "98. 快捷键管理" ]]; then
+                SCRIPTS["98"]="" # 快捷键管理等功能项不需要关联脚本URL
+            elif [[ "$option_text" == "99. 管理自定义菜单" ]]; then
+                SCRIPTS["99"]="" # 自定义菜单管理功能项不需要关联脚本URL
+            elif [[ "$option_text" == "0. 退出" ]]; then
+                SCRIPTS["0"]="" # 退出选项不需要关联脚本URL
+            fi
+        fi
     done
 
-    # 加载自定义菜单并按编号排序
+    # 加载自定义菜单项 (保持不变)
     local custom_options=()
     while IFS= read -r line; do
         if [[ -n "$line" && "$line" != \#* ]]; then
             IFS='|' read -r id name url script_name <<< "$line"
-            custom_options+=("$id|$name|$url|$script_name")
+            OPTIONS+=("$id. $name")
+            SCRIPTS["$id"]="$url"
+            CUSTOM_SCRIPT_NAMES["$id"]="$script_name"
         fi
     done < "$CUSTOM_MENU_FILE"
-    # 按编号排序
-    IFS=$'\n' sorted_custom_options=($(sort -n <<< "${custom_options[*]}"))
+    # 按编号排序 (确保包括自定义菜单项)
+    IFS=$'\n' sorted_custom_options=($(sort -n <<< "${OPTIONS[*]}"))
+    OPTIONS=("${sorted_custom_options[@]}")
     unset IFS
 
-    # 添加排序后的自定义菜单项
-    for line in "${sorted_custom_options[@]}"; do
-        IFS='|' read -r id name url script_name <<< "$line"
-        OPTIONS+=("$id. $name")
-        SCRIPTS["$id"]="$url"
-        CUSTOM_SCRIPT_NAMES["$id"]="$script_name"  # 存储自定义脚本名
-    done
-
-    # 确保“管理自定义菜单”和“退出”选项在最后
+    # 确保“管理自定义菜单”和“退出”选项在最后 (固定编号 - 再次添加以确保在最后)
     OPTIONS+=("99. 管理自定义菜单" "0. 退出")
 }
 
@@ -461,15 +473,9 @@ function print_menu() {
     echo "请输入选项编号并按回车键执行："
     echo "----------------------------------------"
     for option in "${OPTIONS[@]}"; do
-        if [[ "$option" =~ ^-----+ ]]; then
-            echo "  ${option}"
-        elif [[ -z "$option" ]]; then
-            echo ""
-        else
-            echo "  $option"
-        fi
+        echo "  $option"
     done
-    echo "----------------------------------------" # 只需要一个分隔线
+    echo "----------------------------------------"
 }
 
 # 主函数
@@ -489,7 +495,7 @@ function main() {
                 manage_custom_menu
                 ;;
             [1-9]|[1-9][0-9])  # 数字选项 (1-99)
-                if [[ "$choice" -le 20 ]]; then # 限制默认脚本为 1-20
+                if [[ "$choice" -le 99 ]]; then # 限制选项为 1-99 (包括自定义菜单)
                     manage_logs
                     script_path=$(download_script "$choice")
                     if [[ $? -eq 0 ]]; then # 检查 download_script 是否成功
