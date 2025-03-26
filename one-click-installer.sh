@@ -35,9 +35,10 @@ DEFAULT_OPTIONS=(
     "15. 部署 Sub-Store"
     "16. 安装 思源笔记"
     "17. 安装 Sun-Panel"
-    "18. 配置定时任务"
-    "19. 设置 WiFi 热点"
-    "20. 4G-UFI 切卡管理"
+    "18. 安装 OpenWrt Docker"
+    "19. 配置定时任务"
+    "20. 设置 WiFi 热点"
+    "21. 4G-UFI 切卡管理"
     "98. 快捷键管理"
 )
 
@@ -60,9 +61,10 @@ declare -A DEFAULT_SCRIPTS=(
     ["15"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/sub-store-deploy.sh"
     ["16"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_siyuan.sh"
     ["17"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/docker_sunpanel.sh"
-    ["18"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_cronjob.sh"
-    ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
-    ["20"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
+    ["18"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/manage_openwrt.sh"
+    ["19"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_cronjob.sh"
+    ["20"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/wifi-hotspot.sh"
+    ["21"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
 )
 
 # 声明全局变量
@@ -428,7 +430,7 @@ function load_menu() {
                 OPTIONS+=("$option_text") # 直接使用 DEFAULT_OPTIONS 中的文本
                 SCRIPTS["$option_number"]="${DEFAULT_SCRIPTS[$option_number]}" # 使用选项编号作为 key
                 CUSTOM_SCRIPT_NAMES["$option_number"]=$(basename "${DEFAULT_SCRIPTS[$option_number]}")
-            else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出 1-20 范围，或者 DEFAULT_SCRIPTS 定义不完整)
+            else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出 1-21 范围，或者 DEFAULT_SCRIPTS 定义不完整)
                 OPTIONS+=("$option_text") # 仍然添加菜单项，但不关联脚本 URL
                 SCRIPTS["$option_number"]="" #  不关联脚本URL，设置为空
             fi
