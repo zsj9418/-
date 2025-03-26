@@ -43,7 +43,7 @@ DEFAULT_OPTIONS=(
 
 # 默认脚本对应的 URL (已排序并与 DEFAULT_OPTIONS 对应)
 declare -A DEFAULT_SCRIPTS=(
-    ["1"]="https://raw.githubusercontent.com/zsj9418/-/main/install_docker.sh"
+    ["1"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker.sh"
     ["2"]="https://raw.githubusercontent.com/zsj9418/-/main/deploy_containers.sh"
     ["3"]="https://raw.githubusercontent.com/zsj9418/-/main/install_tools.sh"
     ["4"]="https://raw.githubusercontent.com/zsj9418/-/main/clean-system.sh"
