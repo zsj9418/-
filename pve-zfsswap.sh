@@ -41,7 +41,6 @@ create_zfs_swap() {
     # rpool/swap 数据集已存在
     echo "警告: 发现已存在名为 '$zfs_dataset' 的 ZFS 数据集。"
 
-    # 检查是否已经启用
     if swapon -s | grep "$swap_zvol" > /dev/null; then
       echo "虚拟内存 '$swap_zvol' 已经启用。"
       check_swap_status
@@ -55,7 +54,7 @@ create_zfs_swap() {
     read -p "请选择 (1-3): " existing_dataset_choice
 
     case "$existing_dataset_choice" in
-      1) # 尝试重新启用 (激活)
+      1) 
          echo "尝试激活已存在的虚拟内存卷 '$swap_zvol'..."
          if swapon "$swap_zvol" ; then
            echo "虚拟内存激活成功。"
@@ -64,14 +63,14 @@ create_zfs_swap() {
            echo "激活虚拟内存失败，请检查 '$swap_zvol' 是否为有效的交换卷。"
          fi
          return 0 ;;
-      2) # 删除并重新创建
+      2) 
          echo "您选择了删除已存在的 '$zfs_dataset' 数据集并重新创建。"
          delete_zfs_swap
          if [[ $? -ne 0 ]]; then
            echo "删除现有数据集失败，操作终止。"
            return 0 # 返回主菜单
          fi
-         ;; # 删除成功后，继续执行下面的创建流程
+         ;;
       3) echo "取消创建虚拟内存操作。"; return 0 ;;
       *) echo "无效的选项，操作取消。"; return 0 ;;
     esac
@@ -102,6 +101,12 @@ create_zfs_swap() {
   fi
   echo "虚拟内存启用成功。"
   echo "虚拟内存已设置为 ${swap_size_gb}GB，并已启用。"
+
+  # 持久化 (添加到 /etc/fstab)
+  echo "$swap_zvol none swap sw 0 0" >> /etc/fstab  # 移除 sudo
+  if [[ $? -ne 0 ]]; then
+      echo "警告：无法将交换卷添加到 /etc/fstab，请手动添加。"
+  fi
 }
 
 # 函数: 删除 ZFS 虚拟内存 (ZFS 专用)
