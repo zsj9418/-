@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # 检查是否以 root 用户运行
 if [[ $EUID -ne 0 ]]; then
   echo "错误: 请以 root 用户身份运行此脚本。"
@@ -17,6 +18,17 @@ check_swap_status() {
   echo "当前虚拟内存状态:"
   swapon -s
   free -h
+}
+
+# 函数: 卸载虚拟内存
+disable_swap() {
+  echo "开始卸载虚拟内存..."
+  swapoff /dev/zvol/rpool/swap
+  if [[ $? -ne 0 ]]; then
+    echo "卸载虚拟内存失败，请检查错误信息。"
+    return 1
+  fi
+  echo "虚拟内存卸载成功。"
 }
 
 # 函数: 创建 ZFS 虚拟内存 (ZFS 专用)
@@ -65,7 +77,6 @@ create_zfs_swap() {
     esac
   fi
 
-  # 如果 rpool/swap 不存在，或者用户选择了删除后重新创建，则执行以下创建流程
   echo "开始创建 ${swap_size_gb}GB ZFS 虚拟内存..."
   zfs create -V ${swap_size_gb}G -b 8k "$zfs_dataset"
   if [[ $? -ne 0 ]]; then
@@ -105,20 +116,24 @@ delete_zfs_swap() {
     return 0 # 返回主菜单
   fi
 
-  # 卸载交换空间 (如果已启用)
-  echo "开始卸载虚拟内存..."
-  swapoff "$swap_zvol"
-  swapoff_result=$?
-  if [[ $swapoff_result -ne 0 ]]; then
-    echo "卸载虚拟内存失败，错误代码: ${swapoff_result}。"
-    if [[ $swapoff_result -eq 255 ]]; then # 假设 255 是 "Invalid argument" 错误码
-      echo "可能是因为虚拟内存未正确激活或存在其他问题。"
-      echo "建议您先手动检查 '$swap_zvol' 的状态，并尝试重启系统后再试。"
+  # 检查是否已经启用
+  if swapon -s | grep "$swap_zvol" > /dev/null; then
+    echo "开始卸载虚拟内存..."
+    swapoff "$swap_zvol"
+    swapoff_result=$?
+    if [[ $swapoff_result -ne 0 ]]; then
+      echo "卸载虚拟内存失败，错误代码: ${swapoff_result}。"
+      if [[ $swapoff_result -eq 255 ]]; then # 假设 255 是 "Invalid argument" 错误码
+        echo "可能是因为虚拟内存未正确激活或存在其他问题。"
+        echo "建议您先手动检查 '$swap_zvol' 的状态，并尝试重启系统后再试。"
+      fi
+      echo "无法继续删除操作，请手动检查或稍后重试。"
+      return 0 # 返回主菜单
     fi
-    echo "无法继续删除操作，请手动检查或稍后重试。"
-    return 0 # 返回主菜单
+    echo "虚拟内存卸载成功。"
+  else
+    echo "虚拟内存 '$swap_zvol' 未启用，直接删除。"
   fi
-  echo "虚拟内存卸载成功。"
 
   # 删除 ZFS 卷，加入重试机制
   local retry_count=3
@@ -153,7 +168,6 @@ delete_zfs_swap() {
 create_file_swap() {
   local swap_size_gb="$1"
   local swap_file="/swapfile"  # 交换文件路径
-  #local swap_file="/swap/swapfile" # 也可以在 /swap 目录下创建
 
   echo "开始创建 ${swap_size_gb}GB 文件交换空间..."
   # 检查是否已经存在交换文件
@@ -234,7 +248,6 @@ create_file_swap() {
 # 函数: 删除文件交换空间 (ext4/XFS/etc. 专用)
 delete_file_swap() {
   local swap_file="/swapfile"
-  #local swap_file="/swap/swapfile" # 交换文件路径
 
   echo "警告: 您将要彻底删除文件交换空间 '$swap_file'，数据将无法恢复。"
   read -p "请再次输入 'yes' 确认删除: " confirm_delete
@@ -308,7 +321,7 @@ while true; do
   read -p "请选择操作 (1-5): " choice
 
   case "$choice" in
-    1) 
+    1)
       # 进入创建虚拟内存的子菜单
       echo "创建并启用虚拟内存"
       echo "-------------------"
@@ -325,10 +338,11 @@ while true; do
             continue
           fi
           "$create_swap_func" "$swap_size_gb" ;;
-        2) 
+        2)
           echo "使用默认大小 (${default_swap_gb}GB) 创建..."
           "$create_swap_func" "$default_swap_gb" ;;
-        3) continue ;;
+        3)
+          continue ;;
         *) 
           echo "无效的选项，操作取消。" ;;
       esac ;;
