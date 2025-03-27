@@ -28,9 +28,23 @@ check_root() {
     fi
 }
 
-# 检测系统类型
+# OpenWrt 系统检测
+detect_openwrt() {
+    if [ -f /etc/openwrt_release ]; then
+        OS_TYPE="openwrt"
+        PKG_MANAGER="opkg"
+        echo -e "${GREEN}检测到 OpenWrt 系统${NC}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 常规系统检测
 detect_os() {
-    if [ -f /etc/debian_version ]; then
+    if detect_openwrt; then
+        return
+    elif [ -f /etc/debian_version ]; then
         OS_TYPE="debian"
         PKG_MANAGER="apt-get"
     elif [ -f /etc/redhat-release ]; then
@@ -58,7 +72,45 @@ detect_arch() {
     echo -e "${GREEN}检测到设备架构: $ARCH_NAME${NC}"
 }
 
-# 检查并安装依赖
+# 修复 OpenWrt 防火墙规则
+fix_openwrt_firewall() {
+    if [ "$OS_TYPE" != "openwrt" ]; then
+        return
+    fi
+
+    echo -e "${BLUE}正在修复 OpenWrt 防火墙配置...${NC}"
+    
+    # 1. 确保转发规则开启
+    local forward_status=$(uci -q get firewall.@defaults[0].forward)
+    if [[ "$forward_status" != "ACCEPT" ]]; then
+        echo -e "${YELLOW}修复防火墙转发规则 (当前: ${forward_status:-未设置})${NC}"
+        uci set firewall.@defaults[0].forward='ACCEPT'
+        uci commit firewall
+    fi
+
+    # 2. 添加 Docker 网桥到 LAN 区域
+    if ! uci -q get network.docker0 >/dev/null; then
+        echo -e "${YELLOW}添加 docker0 到 LAN 防火墙区域${NC}"
+        uci set network.docker0=interface
+        uci set network.docker0.type='bridge'
+        uci set network.docker0.proto='none'
+        uci set network.docker0.firewall_zone='lan'
+        uci commit network
+    fi
+
+    # 3. 添加 NAT 规则
+    if ! iptables -t nat -C POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null; then
+        echo -e "${YELLOW}添加 Docker NAT 规则${NC}"
+        iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+    fi
+
+    # 4. 应用配置
+    /etc/init.d/firewall restart 2>/dev/null || fw3 reload
+    /etc/init.d/network reload
+    echo -e "${GREEN}OpenWrt 网络配置已优化${NC}"
+}
+
+# 检查并安装依赖 (OpenWrt 特化版)
 check_dependencies() {
     if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
         echo -e "${GREEN}依赖已检查过，跳过重复检测${NC}"
@@ -68,48 +120,57 @@ check_dependencies() {
     echo -e "${BLUE}检查依赖...${NC}"
     local deps_installed=0
 
-    if ! command -v docker &> /dev/null; then
-        echo -e "${YELLOW}Docker 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian)
-                $PKG_MANAGER update && $PKG_MANAGER install -y docker.io
-                systemctl start docker
-                systemctl enable docker
-                ;;
-            redhat)
-                $PKG_MANAGER install -y docker
-                systemctl start docker
-                systemctl enable docker
-                ;;
-            macos)
-                if ! command -v brew &> /dev/null; then
-                    echo -e "${YELLOW}Homebrew 未安装，正在安装...${NC}"
-                    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-                fi
-                brew install docker
-                ;;
-        esac
-        deps_installed=1
-    fi
+    # OpenWrt 特殊处理
+    if [ "$OS_TYPE" == "openwrt" ]; then
+        if ! command -v docker &> /dev/null; then
+            echo -e "${YELLOW}安装 Docker for OpenWrt...${NC}"
+            opkg update
+            opkg install dockerd docker luci-app-dockerman
+            /etc/init.d/dockerd enable
+            /etc/init.d/dockerd start
+            deps_installed=1
+        fi
 
-    if ! command -v curl &> /dev/null; then
-        echo -e "${YELLOW}curl 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian) $PKG_MANAGER install -y curl;;
-            redhat) $PKG_MANAGER install -y curl;;
-            macos) brew install curl;;
-        esac
-        deps_installed=1
-    fi
+        if ! command -v curl &> /dev/null; then
+            echo -e "${YELLOW}安装 curl for OpenWrt...${NC}"
+            opkg install curl
+            deps_installed=1
+        fi
+    else
+        # 其他系统保持原逻辑
+        if ! command -v docker &> /dev/null; then
+            echo -e "${YELLOW}Docker 未安装，正在安装...${NC}"
+            case $OS_TYPE in
+                debian)
+                    $PKG_MANAGER update && $PKG_MANAGER install -y docker.io
+                    systemctl start docker
+                    systemctl enable docker
+                    ;;
+                redhat)
+                    $PKG_MANAGER install -y docker
+                    systemctl start docker
+                    systemctl enable docker
+                    ;;
+                macos)
+                    if ! command -v brew &> /dev/null; then
+                        echo -e "${YELLOW}Homebrew 未安装，正在安装...${NC}"
+                        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                    fi
+                    brew install docker
+                    ;;
+            esac
+            deps_installed=1
+        fi
 
-    if ! command -v ss &> /dev/null; then
-        echo -e "${YELLOW}ss 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian) $PKG_MANAGER install -y iproute2;;
-            redhat) $PKG_MANAGER install -y iproute;;
-            macos) echo -e "${YELLOW}macOS 不支持 ss，使用 netstat 替代${NC}";;
-        esac
-        deps_installed=1
+        if ! command -v curl &> /dev/null; then
+            echo -e "${YELLOW}curl 未安装，正在安装...${NC}"
+            case $OS_TYPE in
+                debian) $PKG_MANAGER install -y curl;;
+                redhat) $PKG_MANAGER install -y curl;;
+                macos) brew install curl;;
+            esac
+            deps_installed=1
+        fi
     fi
 
     if [ $deps_installed -eq 0 ]; then
@@ -118,11 +179,11 @@ check_dependencies() {
     touch "$DEPENDENCY_CHECK_FILE"
 }
 
-# 获取可用镜像版本
+# 修复版获取可用镜像版本
 get_available_tags() {
     echo -e "${BLUE}正在从 Docker Hub 获取可用版本...${NC}"
     TAGS=$(curl -s "https://hub.docker.com/v2/repositories/b3log/siyuan/tags/?page_size=100" | \
-           grep -o '"name":"[^"]*"' | sed 's/"name":"\(.*\)"/\1/' | grep -v "latest" | sort -r)
+           grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -v "latest" | sort -r)
     TAGS="latest $TAGS"
     if [ -z "$TAGS" ]; then
         echo -e "${RED}无法获取版本列表，使用默认版本 $DEFAULT_TAG${NC}"
@@ -171,9 +232,20 @@ get_user_input() {
     HOST_PORT=${HOST_PORT:-$DEFAULT_PORT}
 }
 
+# OpenWrt 端口检测
+check_port_openwrt() {
+    while netstat -tuln | grep -q ":$HOST_PORT "; do
+        echo -e "${YELLOW}端口 $HOST_PORT 已被占用${NC}"
+        read -p "请输入新的主机端口: " HOST_PORT
+    done
+    echo -e "${GREEN}使用端口: $HOST_PORT${NC}"
+}
+
 # 动态检测端口
 check_port() {
-    if [ "$OS_TYPE" == "macos" ]; then
+    if [ "$OS_TYPE" == "openwrt" ]; then
+        check_port_openwrt
+    elif [ "$OS_TYPE" == "macos" ]; then
         while netstat -an | grep -q ":$HOST_PORT "; do
             echo -e "${YELLOW}端口 $HOST_PORT 已被占用${NC}"
             read -p "请输入新的主机端口: " HOST_PORT
@@ -187,17 +259,31 @@ check_port() {
     echo -e "${GREEN}使用端口: $HOST_PORT${NC}"
 }
 
-# 选择网络模式
+# 选择网络模式 (OpenWrt 优化)
 select_network_mode() {
     echo -e "${BLUE}请选择网络模式:${NC}"
     echo "1) bridge (默认)"
-    echo "2) host"
-    echo "3) macvlan"
+    echo "2) host (高性能，推荐 OpenWrt 使用)"
+    echo "3) macvlan (高级)"
     read -p "请输入选项 (1-3，直接回车使用默认值 1): " NETWORK_CHOICE
+    
     case $NETWORK_CHOICE in
-        2) NETWORK_MODE="--network host";;
-        3) NETWORK_MODE="--network macvlan";;
-        *) NETWORK_MODE="--network bridge";;
+        2) 
+            NETWORK_MODE="--network host"
+            if [ "$OS_TYPE" == "openwrt" ]; then
+                echo -e "${YELLOW}警告：Host 模式在 OpenWrt 上可能导致端口冲突${NC}"
+            fi
+            ;;
+        3) 
+            NETWORK_MODE="--network macvlan"
+            echo -e "${YELLOW}注意：macvlan 需要手动配置网络${NC}"
+            ;;
+        *) 
+            NETWORK_MODE="--network bridge"
+            if [ "$OS_TYPE" == "openwrt" ]; then
+                fix_openwrt_firewall
+            fi
+            ;;
     esac
     echo -e "${GREEN}网络模式: $NETWORK_MODE${NC}"
 }
@@ -323,12 +409,14 @@ main_menu() {
     detect_os
     detect_arch
     while true; do
-        echo -e "${BLUE}=== 思源部署脚本 ===${NC}"
+        echo -e "${BLUE}=== 思源笔记部署脚本 (OpenWrt 优化版) ===${NC}"
         echo "1) 安装并启动思源"
         echo "2) 查看容器状态"
         echo "3) 卸载思源"
-        echo "4) 退出"
-        read -p "请选择操作 (1-4): " CHOICE
+        echo "4) 修复 OpenWrt 网络"
+        echo "5) 退出"
+        read -p "请选择操作 (1-5): " CHOICE
+        
         case $CHOICE in
             1)
                 check_root
@@ -348,6 +436,13 @@ main_menu() {
                 uninstall
                 ;;
             4)
+                if [ "$OS_TYPE" == "openwrt" ]; then
+                    fix_openwrt_firewall
+                else
+                    echo -e "${RED}此功能仅适用于 OpenWrt 系统${NC}"
+                fi
+                ;;
+            5)
                 echo -e "${GREEN}退出脚本${NC}"
                 exit 0
                 ;;
