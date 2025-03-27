@@ -279,12 +279,14 @@ main() {
         log "未启用 flock 锁。"
       fi
 
-
-      if ! check_duplicate "$final_job"; then
-        continue
+      existing_cron=$(crontab -l 2>/dev/null) # 获取现有 crontab 内容
+      if [[ -z "$existing_cron" ]]; then
+        new_cron_content="$final_job" # 如果 crontab 为空，则新内容就是新任务
+      else
+        new_cron_content="$existing_cron"$'\n'"$final_job" # 否则，将新任务追加到现有内容末尾，并添加换行符
       fi
+      echo "$new_cron_content" | crontab - # 使用 echo 和管道更新 crontab
 
-      (crontab -l 2>/dev/null || true; echo "$final_job") | crontab -
       log "添加 cron 任务: '$final_job'"
       green "任务已成功添加。"
       ;;
