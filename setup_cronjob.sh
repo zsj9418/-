@@ -252,7 +252,12 @@ main() {
       fi
 
       while true; do
-        read -p "请输入 cron 时间表达式 (例如 '0 5 * * *' 表示每天凌晨 5 点): " cron_time
+        read -p "请输入 cron 时间表达式 (例如 '0 5 * * *' 表示每天凌晨 5 点, 回车使用默认 '0 5 * * *'): " cron_time
+        if [[ -z "$cron_time" ]]; then
+          cron_time="0 5 * * *"
+          green "使用默认 cron 时间表达式: $cron_time"
+          break
+        fi
         if validate_cron_time "$cron_time"; then
           break
         fi
