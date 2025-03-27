@@ -5,6 +5,7 @@ set -euo pipefail
 
 # 初始化变量
 LOG_FILE="/var/log/cron_script_manager.log"
+USE_FLOCK=false # 默认不使用 flock
 
 # 日志路径检查和设置
 setup_logging() {
@@ -68,9 +69,14 @@ detect_system_and_architecture() {
         CRON_PACKAGE="cron"
         PACKAGE_MANAGER="brew"
         ;;
+      openwrt | immortalwrt) # 添加 immortalwrt 的识别
+        SYSTEM_TYPE="OpenWRT/ImmortalWrt" # 修改系统类型名称更准确
+        CRON_PACKAGE="cron" # OpenWRT 默认使用 cron
+        PACKAGE_MANAGER="opkg"
+        ;;
       *)
         red "不支持的系统: $ID"
-        log "警告: 不支持的系统: $ID，请手动安装 cron 和 flock。"
+        log "警告: 不支持的系统: $ID，请手动安装 cron 和 flock (如果需要)."
         return
         ;;
     esac
@@ -86,6 +92,9 @@ detect_system_and_architecture() {
       aarch64 | arm64)
         PLATFORM="linux/arm64"
         ;;
+      mipsel) # 补充 OpenWRT 常见的 MIPS EL 架构
+        PLATFORM="linux/mips-el"
+        ;;
       *)
         red "当前设备架构 ($ARCH) 未被支持，请确认镜像是否兼容。"
         exit 1
@@ -97,7 +106,7 @@ detect_system_and_architecture() {
     # 安装所需依赖
     install_dependencies
   else
-    red "无法确定操作系统类型，请确保手动安装 cron 和 flock。"
+    red "无法确定操作系统类型，请确保手动安装 cron 和 flock (如果需要)."
     exit 1
   fi
 }
@@ -123,14 +132,19 @@ install_dependencies() {
       brew)
         brew install "$CRON_PACKAGE" || { red "安装 $CRON_PACKAGE 失败。"; exit 1; }
         ;;
+      opkg) # OpenWRT 使用 opkg
+        opkg update
+        opkg install "$CRON_PACKAGE" || { red "安装 $CRON_PACKAGE 失败。"; exit 1; }
+        ;;
     esac
     log "成功安装 $CRON_PACKAGE。"
   else
     log "已安装 cron，跳过安装。"
   fi
 
+  # flock 在 OpenWRT 上可能默认不安装，但 util-linux 包通常包含 flock
   if ! command -v flock &>/dev/null; then
-    log "未检测到 flock，尝试使用 '$PACKAGE_MANAGER' 安装..."
+    log "未检测到 flock，尝试使用 '$PACKAGE_MANAGER' 安装 util-linux (包含 flock)..."
     case "$PACKAGE_MANAGER" in
       apt)
         sudo apt install -y util-linux || { red "安装 util-linux 失败。"; exit 1; }
@@ -146,6 +160,10 @@ install_dependencies() {
         ;;
       brew)
         brew install util-linux || { red "安装 util-linux 失败。"; exit 1; }
+        ;;
+      opkg) # OpenWRT 使用 opkg 安装 util-linux
+        opkg update
+        opkg install util-linux || { red "安装 util-linux 失败。"; exit 1; }
         ;;
     esac
     log "成功安装 util-linux（包含 flock）。"
@@ -192,7 +210,8 @@ cancel_cron_job() {
   fi
 
   log "当前的 cron 任务:"
-  echo "$crontab_content" | nl -n ln
+  # 替换 nl 命令为 awk 实现行号
+  awk '{printf "%3d  %s\n", NR, $0}' <<< "$crontab_content"
 
   read -p "请输入要删除的任务编号（或输入 'n' 退出）: " index
   if [[ "$index" == "n" ]]; then
@@ -239,15 +258,30 @@ main() {
         fi
       done
 
-      lock_file="/tmp/$(basename "$script_path").lock"
-      final_job="$cron_time flock -xn $lock_file -c '$script_path'"
+      read -p "是否启用 flock 锁 (防止并发执行)? [回车=否, y=是]: " use_flock_input
+      if [[ "$use_flock_input" == "y" ]]; then
+        USE_FLOCK=true
+      else
+        USE_FLOCK=false # 显式设置，虽然默认已经是 false
+      fi
+
+      if $USE_FLOCK; then
+        lock_file="/tmp/$(basename "$script_path").lock"
+        final_job="$cron_time flock -xn $lock_file -c '$script_path'"
+        log "已启用 flock 锁，锁文件路径: $lock_file"
+      else
+        final_job="$cron_time $script_path"
+        log "未启用 flock 锁。"
+      fi
+
+
       if ! check_duplicate "$final_job"; then
         continue
       fi
 
       (crontab -l 2>/dev/null || true; echo "$final_job") | crontab -
       log "添加 cron 任务: '$final_job'"
-      green "任务已成功添加，锁文件路径: $lock_file"
+      green "任务已成功添加。"
       ;;
 
     2)
