@@ -167,7 +167,42 @@ install_dependencies() {
 
 # 部署 Watchtower
 install_watchtower() {
-  log "INFO" "正在部署 Watchtower..."
+  log "INFO" "正在查询所有正在运行的容器..."
+  
+  # 获取所有运行中的容器名称
+  local containers=($(docker ps --format "{{.Names}}"))
+  
+  if [ ${#containers[@]} -eq 0 ]; then
+    log "WARN" "没有找到运行中的容器，无法部署 Watchtower"
+    return
+  fi
+  
+  echo "请选择要更新的容器（多个容器用空格分隔）："
+  for i in "${!containers[@]}"; do
+    echo "$((i + 1)). ${containers[$i]}"
+  done
+  
+  read -p "请输入容器编号（例如: 1 2 3）: " user_input
+  local selected_indices=($user_input)
+  
+  # 构造容器名称列表
+  local selected_containers=()
+  for index in "${selected_indices[@]}"; do
+    if [[ $index =~ ^[0-9]+$ ]] && [ $index -ge 1 ] && [ $index -le ${#containers[@]} ]; then
+      selected_containers+=("${containers[$((index - 1))]}")
+    else
+      log "WARN" "无效的选择: $index"
+    fi
+  done
+
+  if [ ${#selected_containers[@]} -eq 0 ]; then
+    log "WARN" "没有有效的容器选择，取消更新"
+    return
+  fi
+
+  log "INFO" "正在部署 Watchtower 更新 ${selected_containers[*]} 容器..."
+
+  # 启动 Watchtower
   docker run -d \
     --name $WATCHTOWER_CONTAINER_NAME \
     --restart=always \
@@ -175,11 +210,13 @@ install_watchtower() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     $WATCHTOWER_IMAGE_NAME \
     --cleanup \
-    -i 3600 || {
+    -i 3600 \
+    ${selected_containers[*]} || {
       log "ERROR" "Watchtower 部署失败"
       exit 1
     }
-  log "INFO" "Watchtower 部署成功"
+  
+  log "INFO" "Watchtower 部署成功，监控容器: ${selected_containers[*]}"
 }
 
 # 获取 Sub-Store 版本列表
