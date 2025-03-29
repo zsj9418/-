@@ -325,7 +325,11 @@ source "$ENV_FILE"
 message="📡 sing-box 定时更新报告 (设备: $DEVICE_NAME)"
 success=1
 
-for url in \$SUBSCRIBE_URLS; do
+# 将 SUBSCRIBE_URLS 转换为数组
+read -r -a urls <<< "\$SUBSCRIBE_URLS"
+
+# 顺序下载配置
+for url in "\${urls[@]}"; do
     if curl -sSL --max-time 60 "\$url" -o "$CONFIG_FILE.new" && "$BIN_DIR/sing-box" check -c "$CONFIG_FILE.new"; then
         mv "$CONFIG_FILE" "$CONFIG_FILE.bak"
         mv "$CONFIG_FILE.new" "$CONFIG_FILE"
@@ -336,6 +340,7 @@ for url in \$SUBSCRIBE_URLS; do
             echo "[$(date)] sing-box 已启动: \$url" >> "$LOG_FILE"
             message="\$message\n✅ 更新成功: \$url"
             success=0
+            break  # 成功后退出循环
         else
             echo "[$(date)] sing-box 启动失败: \$url" >> "$LOG_FILE"
             message="\$message\n❌ 启动失败: \$url"
