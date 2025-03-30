@@ -228,39 +228,29 @@ get_system_info() {
 
     # 格式化输出
     cat <<EOF
-[设备: $hostname] 系统信息:
---------------------------------------
-主机名    : $hostname
-系统版本  : $os_version
-Linux 内核: $kernel_version
-CPU 架构  : $architecture
-CPU 型号  : $cpu_model
-CPU 核心数: $cpu_cores
-CPU 频率  : $cpu_freq MHz
---------------------------------------
-局域网 IP :
+[设备: $(hostname)] 系统信息:
+主机名: $(hostname)
+系统版本: $os_version
+Linux版本: $(uname -r)
+CPU架构: $(uname -m)
+CPU型号: $cpu_model
+CPU核心数: $cpu_cores
+CPU频率: $cpu_freq
+局域网 IP:
 $lan_ips_formatted
---------------------------------------
-公网信息  :
-  运营商  : $operator
-  IPv4 地址: $public_ip
-  地理位置: $location
---------------------------------------
-资源使用  :
-  CPU 占用 : $cpu_usage
-  系统负载 : $(uptime | awk -F'load average:' '{print $2}' | xargs || echo '未知')
-  物理内存 : $mem_usage
-  虚拟内存 : $swap_usage
-  硬盘占用 : $disk_usage (/)
---------------------------------------
-网络状态  :
-  总接收量 : $total_rx
-  总发送量 : $total_tx
-  TCP 算法 : $network_algo
---------------------------------------
-系统时间  : $(date '+%Z %Y-%m-%d %I:%M:%S %p')
-运行时长  : $runtime
---------------------------------------
+CPU占用: $cpu_usage
+系统负载: $(uptime | awk -F'load average:' '{print $2}' | xargs || echo '未知')
+物理内存: $mem_info
+虚拟内存: $swap_usage
+硬盘占用: $disk_usage
+总接收: $total_rx
+总发送: $total_tx
+网络算法: $network_algo
+运营商: $operator
+IPv4地址: $public_ip
+地理位置: $location
+系统时间: $(date '+%Z %Y-%m-%d %I:%M %p')
+运行时长: $runtime
 EOF
 }
 
