@@ -518,7 +518,7 @@ generate_daemon_config() {
         "https://registry.cn-chengdu.aliyuncs.com"
         "https://mirror.ccs.tencentyun.com"
         "https://docker.mirrors.huaweicloud.com"
-        "https://hub-mirror.c.163.com"
+        "https://dockerproxy.net"
     )
     local DEFAULT_LOG_MAX_SIZE="5m"
     local DEFAULT_LOG_MAX_FILE="3"
