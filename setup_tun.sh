@@ -50,6 +50,14 @@ install_dependencies() {
     done
 }
 
+# 检查 TUN/TAP 支持
+check_tun_support() {
+    if [ ! -c /dev/net/tun ]; then
+        echo -e "\033[31m错误: 设备不支持 TUN/TAP 功能，/dev/net/tun 不存在。\033[0m"
+        exit 1
+    fi
+}
+
 # 函数：记录日志
 log_message() {
     # 限制日志文件大小为 1MB
@@ -72,9 +80,28 @@ check_existing_tun_interfaces() {
     fi
 }
 
+# 配置防火墙规则
+configure_firewall() {
+    echo -e "\033[33m正在配置防火墙以允许 TUN 接口流量...\033[0m"
+    
+    # 检测操作系统
+    if [[ "$OS_NAME" == *"Ubuntu"* || "$OS_NAME" == *"Debian"* ]]; then
+        # 使用 UFW
+        sudo ufw allow in on $TUN_INTERFACE
+        sudo ufw allow out on $TUN_INTERFACE
+    elif [[ "$OS_NAME" == *"CentOS"* || "$OS_NAME" == *"RHEL"* ]]; then
+        # 使用 firewalld
+        sudo firewall-cmd --zone=public --add-interface=$TUN_INTERFACE --permanent
+        sudo firewall-cmd --reload
+    else
+        echo -e "\033[31m警告: 防火墙配置未处理，手动配置可能是必要的。\033[0m"
+    fi
+}
+
 # 主程序
 main() {
     install_dependencies    # 检查并安装缺失的依赖
+    check_tun_support       # 检查 TUN/TAP 支持
     check_existing_tun_interfaces
 
     # 提示用户决定是否继续
@@ -96,6 +123,7 @@ main() {
     check_and_remove_tun_interface
     create_service
     enable_service
+    configure_firewall  # 配置防火墙规则
 
     # 检查TUN接口状态
     if ip a show $TUN_INTERFACE &> /dev/null; then
