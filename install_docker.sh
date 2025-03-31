@@ -44,7 +44,7 @@ detect_package_manager() {
 # 函数: 安装依赖
 install_dependencies() {
     echo "正在检测并安装缺失的依赖..."
-    local installed_deps=($(dpkg-query -f '${binary:Package}\n' -W | grep -Fxf <(printf "%s\n" "${DEPS[@]}") 2>/dev/null))
+    local installed_deps=($(dpkg-query -f '${binary:Package}\n' -W | grep -Fxf <(printf "%s\n" "${DEPS[@]}") 2>/dev/null || true))
     local needs_install=()
 
     for DEP in "${DEPS[@]}"; do
@@ -197,31 +197,49 @@ fetch_docker_versions() {
 # 函数: 选择 Docker 版本（美化 fzf 界面）
 select_docker_version() {
     local VERSIONS=($(fetch_docker_versions))
+    
+    if [ ${#VERSIONS[@]} -eq 0 ]; then
+        echo -e "${RED}无法获取可用的Docker版本列表${NC}"
+        exit 1
+    fi
 
     if command -v fzf >/dev/null 2>&1; then
         local HEADER="选择 Docker 版本 (架构: $ARCH)"
-        local INFO="使用 ↑↓ 导航，Enter 确认，Ctrl+C 取消"
         local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
             --prompt="请选择版本 > " \
             --header="$HEADER" \
-            --header-lines=1 \
-            --info=inline:"$INFO" \
             --height=20 \
             --reverse \
-            --border \
-            --color="header:blue,bg+:black,pointer:green" \
-            --preview="echo '预览: Docker v{}'")
-        SELECTED_VERSION=$(echo "$SELECTED_VERSION" | tr -d '[:space:]')
+            --border)
+        
         if [ -n "$SELECTED_VERSION" ]; then
             echo "$SELECTED_VERSION"
             return
         else
-            echo -e "${YELLOW}未选择版本，跳过...${NC}"
+            echo -e "${YELLOW}未选择版本，将安装最新版本...${NC}"
+            echo "${VERSIONS[0]}"  # 返回第一个(最新)版本
             return
         fi
     fi
 
-    echo ""
+    # 如果没有fzf，则使用简单的选择菜单
+    echo "可用 Docker 版本列表:"
+    PS3="请选择版本 (默认1将安装最新版本): "
+    select VERSION in "${VERSIONS[@]}" "取消"; do
+        case $REPLY in
+            [1-9]|[1-9][0-9])
+                if [ $REPLY -le ${#VERSIONS[@]} ]; then
+                    echo "${VERSIONS[$((REPLY-1))]}"
+                    return
+                fi
+                ;;
+            *)
+                echo -e "${YELLOW}未选择版本，将安装最新版本...${NC}"
+                echo "${VERSIONS[0]}"
+                return
+                ;;
+        esac
+    done
 }
 
 # 函数: 获取 Docker Compose 版本列表
@@ -261,13 +279,24 @@ select_docker_compose_version() {
             return
         fi
     fi
-    echo ""
+    
+    # 如果没有fzf，则使用简单的选择菜单
+    echo "可用 Docker Compose 版本列表:"
+    select VERSION in "${VERSIONS[@]}"; do
+        if [ -n "$VERSION" ]; then
+            echo "$VERSION"
+            return
+        else
+            echo -e "${YELLOW}未选择版本，跳过...${NC}"
+            return
+        fi
+    done
 }
 
 # 函数: 安装 Docker
 install_docker() {
     if check_docker_installed; then
-        read -r -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
+        read -r -p "Docker 已安装，版本信息如下：$(docker --version) 是否重新安装？(y/n): " REINSTALL
         if [[ "$REINSTALL" != "y" ]]; then
             echo -e "${YELLOW}跳过 Docker 安装。${NC}"
             return
@@ -280,23 +309,34 @@ install_docker() {
     check_and_set_install_dir
 
     if [ -z "$VERSION" ]; then
-        echo -e "${YELLOW}未选择版本，安装最新版本的 Docker...${NC}"
-        DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker.tgz"
-    else
-        echo -e "${GREEN}您选择安装的 Docker 版本为：$VERSION${NC}"
-        VERSION=$(echo "$VERSION" | tr -d '[:space:]')
-        DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
+        echo -e "${RED}无法获取Docker版本号${NC}"
+        exit 1
     fi
 
+    echo -e "${GREEN}您选择安装的 Docker 版本为：$VERSION${NC}"
+    DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
+
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || { echo -e "${RED}下载失败，请检查版本号或网络状态。${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || {
+        echo -e "${RED}下载失败，请检查版本号或网络状态。${NC}"
+        echo -e "${YELLOW}尝试的URL: $DOCKER_URL${NC}"
+        rm -rf "$DOCKER_INSTALL_DIR"
+        exit 1
+    }
 
     echo "正在解压 Docker 包到临时文件夹..."
-    tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo -e "${RED}解压失败，可能是空间不足或权限问题。${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+    if ! tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR"; then
+        echo -e "${RED}解压失败，可能是空间不足或权限问题。${NC}"
+        rm -rf "$DOCKER_INSTALL_DIR"
+        exit 1
+    fi
 
     echo "正在安装 Docker 二进制文件..."
     sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
-    sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || { echo -e "${RED}移动 Docker 文件失败，请检查权限或磁盘空间。${NC}"; exit 1; }
+    if ! sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/; then
+        echo -e "${RED}移动 Docker 文件失败，请检查权限或磁盘空间。${NC}"
+        exit 1
+    fi
 
     echo "创建 Docker 用户组..."
     sudo groupadd -f docker
@@ -350,7 +390,7 @@ EOF
 # 函数: 安装 Docker Compose
 install_docker_compose() {
     if check_docker_compose_installed; then
-        read -r -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
+        read -r -p "Docker Compose 已安装，版本信息如下：$(docker-compose --version) 是否重新安装？(y/n): " REINSTALL
         if [[ "$REINSTALL" != "y" ]]; then
             echo -e "${YELLOW}跳过 Docker Compose 安装。${NC}"
             return
@@ -375,10 +415,10 @@ install_docker_compose() {
     case "$os_name" in
         Linux)
             case "$arch_name" in
-                x86_64) compose_file="docker-compose-Linux-x86_64" ;;
-                aarch64) compose_file="docker-compose-Linux-aarch64" ;;
-                armv7l) compose_file="docker-compose-Linux-armv7l" ;; # 适用于32位ARM
-                armv6l) compose_file="docker-compose-Linux-armv6l" ;; # 早期树莓派
+                x86_64) compose_file="docker-compose-linux-x86_64" ;;
+                aarch64) compose_file="docker-compose-linux-aarch64" ;;
+                armv7l) compose_file="docker-compose-linux-armv7" ;;
+                armv6l) compose_file="docker-compose-linux-armv6" ;;
                 *)
                     echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"
                     exit 1
@@ -387,8 +427,8 @@ install_docker_compose() {
             ;;
         Darwin) # macOS
             case "$arch_name" in
-                x86_64) compose_file="docker-compose-Darwin-x86_64" ;;
-                arm64) compose_file="docker-compose-Darwin-arm64" ;; # Apple Silicon
+                x86_64) compose_file="docker-compose-darwin-x86_64" ;;
+                arm64) compose_file="docker-compose-darwin-aarch64" ;; # Apple Silicon
                 *)
                     echo -e "${RED}不支持的 macOS 架构: $arch_name${NC}"
                     exit 1
@@ -404,6 +444,12 @@ install_docker_compose() {
     echo "正在安装 Docker Compose 版本：$COMPOSE_VERSION"
     sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" -o /usr/local/bin/docker-compose || { echo -e "${RED}下载 Docker Compose 失败${NC}"; exit 1; }
     sudo chmod +x /usr/local/bin/docker-compose
+    
+    # 创建符号链接 docker-compose -> docker compose (v2)
+    if [[ ! -f /usr/local/bin/docker-compose ]]; then
+        sudo ln -s /usr/local/bin/docker-compose /usr/local/bin/docker-compose
+    fi
+    
     echo -e "${GREEN}Docker Compose 安装完成。${NC}"
 }
 
@@ -454,7 +500,6 @@ uninstall_docker() {
 
     echo -e "${GREEN}Docker 已卸载，残留文件已清理。${NC}"
 }
-
 
 # 函数: 卸载 Docker Compose
 uninstall_docker_compose() {
@@ -568,5 +613,4 @@ main() {
 }
 
 main
-
 rm -f "$INSTALL_STATUS"
