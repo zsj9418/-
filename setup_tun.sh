@@ -11,12 +11,44 @@ LOG_FILE="/var/log/setup_tun.log"
 # 检测所需的命令
 REQUIRED_COMMANDS=("ip" "modprobe" "systemctl")
 
-for cmd in "${REQUIRED_COMMANDS[@]}"; do
-    if ! command -v $cmd &> /dev/null; then
-        echo -e "\033[31m错误: 未找到命令 $cmd，请安装相关包。\033[0m" | tee -a $LOG_FILE
+# 检查并安装缺失的依赖
+install_dependencies() {
+    echo -e "\033[33m正在检查并安装缺失的依赖...\033[0m"
+    
+    # 检测操作系统
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_NAME=$NAME
+        OS_VERSION=$VERSION_ID
+    else
+        echo -e "\033[31m错误: 无法检测操作系统。\033[0m"
         exit 1
     fi
-done
+
+    # 根据不同的操作系统安装依赖
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        if ! command -v $cmd &> /dev/null; then
+            case $OS_NAME in
+                *Ubuntu*|*Debian*)
+                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
+                    sudo apt update && sudo apt install -y iproute2
+                    ;;
+                *CentOS*|*RHEL*)
+                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
+                    sudo yum install -y iproute
+                    ;;
+                *macOS*)
+                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
+                    brew install iproute2mac
+                    ;;
+                *)
+                    echo -e "\033[31m错误: 不支持的操作系统 $OS_NAME。\033[0m"
+                    exit 1
+                    ;;
+            esac
+        fi
+    done
+}
 
 # 函数：记录日志
 log_message() {
@@ -42,6 +74,7 @@ check_existing_tun_interfaces() {
 
 # 主程序
 main() {
+    install_dependencies    # 检查并安装缺失的依赖
     check_existing_tun_interfaces
 
     # 提示用户决定是否继续
