@@ -16,7 +16,7 @@ mkdir -p "$SCRIPT_DIR/user_scripts" || { echo "无法创建用户脚本目录：
 touch "$LOG_FILE" || { echo "无法创建日志文件"; exit 1; }
 touch "$CUSTOM_MENU_FILE" || { echo "无法创建自定义菜单文件"; exit 1; }
 
-# ------------------------- 默认脚本列表 (取消分组，美化命名) -------------------------
+# ------------------------- 默认脚本列表  -------------------------
 DEFAULT_OPTIONS=(
     "1.  安装 Docker"
     "2.  SSH 工具 & 测速容器"
