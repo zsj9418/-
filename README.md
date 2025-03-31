@@ -1,12 +1,12 @@
 ## 一键脚本：(请自行安装curl和bash，如果缺少的话)
 ```
-wget https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
+wget -O one-click-installer.sh https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
 chmod +x one-click-installer.sh && \
 bash one-click-installer.sh
 
 ```
 ```
-wget https://ghfast.top/https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
+wget -O one-click-installer.sh https://ghfast.top/https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
 chmod +x one-click-installer.sh && \
 bash one-click-installer.sh
 ```
