@@ -24,14 +24,16 @@ manage_log() {
 check_dependencies() {
     local dependencies=("dosfstools" "e2fsprogs" "ntfs-3g")
     local missing=()
+    local installed=1
 
     for pkg in "${dependencies[@]}"; do
         if ! command -v $pkg &> /dev/null; then
             missing+=($pkg)
+            installed=0
         fi
     done
 
-    if [ ${#missing[@]} -ne 0 ]; then
+    if [ $installed -eq 0 ]; then
         echo -e "${YELLOW}正在安装缺失的依赖: ${missing[@]}...${NC}"
         if command -v apt-get &> /dev/null; then
             sudo apt-get update
