@@ -1,26 +1,42 @@
 #!/bin/bash
 
-# 定义 auto_block 脚本和 udev 规则文件的路径
-AUTO_BLOCK_PATH="/bin/auto_block"
-UDEV_RULES_PATH="/etc/udev/rules.d/10-auto_block.rules"
+# 定义 auto_block 脚本和 udev 规则文件的内容
+AUTO_BLOCK_CONTENT="#!/bin/bash
+[ \"\$DEVTYPE\" = \"partition\" ]||exit 0
+suuid=(\${ID_FS_UUID//-/ })
+gzpath=\"/mnt/\${suuid:0:8}\"
+devpaths=\${DEVPATH%\/*}
+get_sys_fs=\"\$(df 2>/dev/null|awk '\$1~/'\${devpaths##*\/}'/{print \$6}')\"
+[ \"\$get_sys_fs\" = '/' ]&&exit 0
+case \"\$ACTION\" in
+add)
+[ -d \"\$gzpath\" ]||mkdir \$gzpath
+systemd-mount --no-block --collect \$devnode \"\$DEVNAME\" \"\$gzpath\"
+;;
+remove)
+systemd-mount -u \"\$gzpath\" 2>/dev/null
+sync
+rmdir \$gzpath
+;;
+esac"
+
+UDEV_RULES_CONTENT="KERNEL!=\"sd[a-z][0-9]|hd[a-z][0-9]|mmcblk[0-9]p[0-9]\", GOTO=\"uuid_auto_mount_end\"
+SUBSYSTEM!=\"block\", GOTO=\"uuid_auto_mount_end\"
+IMPORT{program}=\"/sbin/blkid -o udev -p %N\"
+ENV{ID_FS_TYPE}==\"\", GOTO=\"uuid_auto_mount_end\"
+ENV{ID_FS_UUID}==\"\", GOTO=\"uuid_auto_mount_end\"
+ACTION==\"add|remove\", RUN+=\"/bin/auto_block\"
+LABEL=\"uuid_auto_mount_end\""
 
 # 函数：完整安装自动挂载功能
 install_full() {
     echo "安装自动挂载功能..."
-    # 复制 auto_block 文件到 /bin 并设置权限
-    cp /path/to/auto_block "$AUTO_BLOCK_PATH"
-    chmod +x "$AUTO_BLOCK_PATH"
+    # 创建 auto_block 脚本
+    echo "$AUTO_BLOCK_CONTENT" > /bin/auto_block
+    chmod +x /bin/auto_block
 
     # 创建 udev 规则文件
-    cat << EOF > "$UDEV_RULES_PATH"
-KERNEL!="sd[a-z][0-9]|hd[a-z][0-9]|mmcblk[0-9]p[0-9]", GOTO="uuid_auto_mount_end"
-SUBSYSTEM!="block", GOTO="uuid_auto_mount_end"
-IMPORT{program}="/sbin/blkid -o udev -p %N"
-ENV{ID_FS_TYPE}=="", GOTO="uuid_auto_mount_end"
-ENV{ID_FS_UUID}=="", GOTO="uuid_auto_mount_end"
-ACTION=="add|remove", RUN+="$AUTO_BLOCK_PATH"
-LABEL="uuid_auto_mount_end"
-EOF
+    echo "$UDEV_RULES_CONTENT" > /etc/udev/rules.d/10-auto_block.rules
 
     # 重新加载 udev 规则
     udevadm control --reload
@@ -31,35 +47,26 @@ EOF
 # 函数：仅创建 auto_block 脚本
 create_auto_block() {
     echo "创建 auto_block 脚本..."
-    cp /path/to/auto_block "$AUTO_BLOCK_PATH"
-    chmod +x "$AUTO_BLOCK_PATH"
+    echo "$AUTO_BLOCK_CONTENT" > /bin/auto_block
+    chmod +x /bin/auto_block
     echo "auto_block 脚本创建完成。"
 }
 
 # 函数：仅创建 udev 规则
 create_udev_rules() {
     echo "创建 udev 规则..."
-    cat << EOF > "$UDEV_RULES_PATH"
-KERNEL!="sd[a-z][0-9]|hd[a-z][0-9]|mmcblk[0-9]p[0-9]", GOTO="uuid_auto_mount_end"
-SUBSYSTEM!="block", GOTO="uuid_auto_mount_end"
-IMPORT{program}="/sbin/blkid -o udev -p %N"
-ENV{ID_FS_TYPE}=="", GOTO="uuid_auto_mount_end"
-ENV{ID_FS_UUID}=="", GOTO="uuid_auto_mount_end"
-ACTION=="add|remove", RUN+="$AUTO_BLOCK_PATH"
-LABEL="uuid_auto_mount_end"
-EOF
-
-    # 重新加载 udev 规则
+    echo "$UDEV_RULES_CONTENT" > /etc/udev/rules.d/10-auto_block.rules
     udevadm control --reload
-
     echo "udev 规则创建完成。"
 }
 
 # 函数：测试当前配置
 test_current_config() {
     echo "测试当前配置..."
-    if [ -x "$AUTO_BLOCK_PATH" ] && [ -f "$UDEV_RULES_PATH" ]; then
+    if [ -x /bin/auto_block ] && [ -f /etc/udev/rules.d/10-auto_block.rules ]; then
         echo "配置正常: auto_block 脚本和 udev 规则均已存在。"
+        echo "请插入设备并等待，监控 udev 事件..."
+        udevadm monitor --udev --subsystem-match=block
     else
         echo "配置异常: 请检查 auto_block 脚本和 udev 规则是否存在。"
     fi
@@ -68,8 +75,8 @@ test_current_config() {
 # 函数：卸载自动挂载功能
 uninstall() {
     echo "卸载自动挂载功能..."
-    rm -f "$AUTO_BLOCK_PATH"
-    rm -f "$UDEV_RULES_PATH"
+    rm -f /bin/auto_block
+    rm -f /etc/udev/rules.d/10-auto_block.rules
     udevadm control --reload
     echo "自动挂载功能已卸载。"
 }
