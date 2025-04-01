@@ -41,7 +41,7 @@ DEFAULT_OPTIONS=(
     "21. 4G-UFI 切卡管理"
     "22. 设置 虚拟内存"
     "23. 开启 tun模式"
-    "24. 飞牛硬盘挂载"
+    "24. 自动挂载外置硬盘"
     "98. 快捷键管理"
 )
 
@@ -70,7 +70,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["21"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
     ["22"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/pve-zfsswap.sh"
     ["23"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_tun.sh"
-    ["24"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/fnos-mount.sh"
+    ["24"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/auto_disk_mounter.sh"
 )
 
 # 声明全局变量
