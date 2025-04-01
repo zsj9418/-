@@ -436,7 +436,7 @@ function load_menu() {
                 OPTIONS+=("$option_text") # 直接使用 DEFAULT_OPTIONS 中的文本
                 SCRIPTS["$option_number"]="${DEFAULT_SCRIPTS[$option_number]}" # 使用选项编号作为 key
                 CUSTOM_SCRIPT_NAMES["$option_number"]=$(basename "${DEFAULT_SCRIPTS[$option_number]}")
-            else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出 1-23 范围，或者 DEFAULT_SCRIPTS 定义不完整)
+            else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出范围，或者 DEFAULT_SCRIPTS 定义不完整)
                 OPTIONS+=("$option_text") # 仍然添加菜单项，但不关联脚本 URL
                 SCRIPTS["$option_number"]="" #  不关联脚本URL，设置为空
             fi
