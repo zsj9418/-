@@ -12,7 +12,7 @@ SUB_CONVERTER_NAME="SubConverter"
 SUB_CONVERTER_PORT_DEFAULT=25500
 SUB_CONVERTER_CONTAINER_PORT=25500  # 容器内部服务监听端口
 
-SING_BOX_IMAGE="jwy8645/sing-box-subscribe:latest"
+SING_BOX_IMAGE="jwy8645/sing-box-subscribe:latest" # 默认值，arm64
 SING_BOX_NAME="sing-box-subscribe"
 SING_BOX_PORT_DEFAULT=5000
 SING_BOX_CONTAINER_PORT=5000  # 容器内部服务监听端口
@@ -134,6 +134,19 @@ deploy_sing_box() {
         esac
     done
 
+    # 根据架构设置 SING_BOX_IMAGE 变量
+    architecture=$(uname -m)
+    case "$architecture" in
+        x86_64* | amd64*)
+            SING_BOX_IMAGE="jwy8645/sing-box-subscribe:amd64"
+            ;;
+        aarch64* | arm64*)
+            SING_BOX_IMAGE="jwy8645/sing-box-subscribe:latest" # 保持 arm64 默认 latest
+            ;;
+        *)
+            red "不支持的架构: $architecture，将尝试拉取默认 arm64 镜像。"
+            ;;
+    esac
     deploy_container "$SING_BOX_NAME" "$port" "$SING_BOX_CONTAINER_PORT" "$SING_BOX_IMAGE" "$network_mode"
 }
 
