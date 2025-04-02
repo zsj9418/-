@@ -34,9 +34,9 @@ LOG_FILE=""             # 日志文件路径
 DEFAULT_TZ="Asia/Shanghai" # 默认时区
 
 # --- 服务配置常量 ---
-DEFAULT_PORT=3000
+DEFAULT_PORT=1314
 # One-API 镜像
-ONE_API_IMAGE_SPECIFIC="justsong/one-api:v0.6.11-preview.1" # 保留特定版本
+ONE_API_IMAGE_SPECIFIC="justsong/one-api:v0.6.11-preview.1" 
 LATEST_ONE_API_IMAGE="ghcr.io/songquanpeng/one-api:latest"
 # Duck2API 镜像
 DUCK2API_IMAGE="ghcr.io/aurora-develop/duck2api:latest"
