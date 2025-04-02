@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # -----------------------------------------------------------------------------
-# Docker 服务管理脚本 (增强通用性，适配 OpenWrt)
+# Docker 服务管理脚本 (增强通用性，适配 OpenWrt/LibWRT)
 #
 # 功能:
 # - 部署 One-API (SQLite/MySQL), Duck2API 等 Docker 服务
-# - 自动检测系统架构和操作系统 (包括 OpenWrt)
+# - 自动检测系统架构和操作系统 (包括 OpenWrt/LibWRT)
 # - 自动处理依赖安装 (apt, yum, dnf, pacman, opkg)
 # - 端口自动建议与验证
 # - 网络模式选择 (bridge/host)
@@ -44,22 +44,33 @@ DUCK2API_IMAGE="ghcr.io/aurora-develop/duck2api:latest"
 # --- 日志设置 ---
 function setup_logging() {
   # 根据系统决定日志路径
-  if [[ "$OS" == "openwrt" ]]; then
-    LOG_FILE="/tmp/deploy_script.log" # OpenWrt 使用 /tmp
-    yellow "提示: OpenWrt 系统日志将写入 /tmp，重启后会丢失。"
+  # OS 变量在 detect_os 中设置，所以这里可能还未设置，先用临时判断
+  local temp_os_check=""
+  if [[ -f /etc/os-release ]]; then
+      temp_os_check=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+  fi
+
+  if [[ "$temp_os_check" == "openwrt" ]] || [[ "$temp_os_check" == "libwrt" ]]; then
+    LOG_FILE="/tmp/deploy_script.log" # OpenWrt/LibWRT 使用 /tmp
+    yellow "提示: OpenWrt/LibWRT 系统日志将写入 /tmp，重启后会丢失。"
   else
     LOG_FILE="$HOME/.deploy_script.log"
   fi
 
   local LOG_MAX_SIZE=3145728 # 3MB
   # 检查日志文件大小，如果超过限制则清空
-  if [[ -f "$LOG_FILE" ]] && [[ "$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)" -ge "$LOG_MAX_SIZE" ]]; then
+  # 使用兼容性更好的方式获取文件大小
+  local current_size=0
+  if [[ -f "$LOG_FILE" ]]; then
+      current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  fi
+  if [[ "$current_size" -ge "$LOG_MAX_SIZE" ]]; then
     echo "日志文件 $LOG_FILE 超过 ${LOG_MAX_SIZE} bytes，正在清空..." > "$LOG_FILE"
   fi
   # 确保日志文件存在且可写
   touch "$LOG_FILE" || { red "错误：无法创建或访问日志文件 $LOG_FILE"; exit 1; }
   # 将标准输出和标准错误都重定向到日志文件，并同时在终端显示
-  # 注意：如果系统不支持 process substitution，此行会报错
+  # 注意：如果系统不支持 process substitution，此行会报错，但 OpenWrt 通常支持
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
@@ -84,34 +95,38 @@ function detect_architecture() {
   fi
 }
 
-# 检测操作系统和包管理器
+# 检测操作系统和包管理器 (已修改)
 function detect_os() {
   if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
     source /etc/os-release
-    OS="${ID,,}" # 转小写
-    case "$OS" in
+    local detected_id="${ID,,}" # 转小写
+    case "$detected_id" in
       ubuntu | debian | raspbian)
+        OS="debian" # 统一归类
         PACKAGE_MANAGER="apt"
         ;;
       centos | rhel | fedora | rocky | almalinux)
-        # CentOS 7 使用 yum，更高版本及 Fedora 使用 dnf
+        OS="$detected_id" # 保留具体名称
         if [[ -f /usr/bin/dnf ]]; then
             PACKAGE_MANAGER="dnf"
         elif [[ -f /usr/bin/yum ]]; then
             PACKAGE_MANAGER="yum"
         else
-            red "错误：在 $ID 系统上未找到 yum 或 dnf。" && exit 1
+            red "错误：在 $detected_id 系统上未找到 yum 或 dnf。" && exit 1
         fi
         ;;
       arch | manjaro)
+        OS="arch" # 统一归类
         PACKAGE_MANAGER="pacman"
         ;;
-      openwrt)
+      openwrt | libwrt | nwrt | qwrt | hwrt | libwrt | LEDE | ImmortalWRT | X-WRT | iStoreOS) # <--- 修改点：添加 libwrt
+        OS="openwrt" # <--- 关键：统一识别为 openwrt
         PACKAGE_MANAGER="opkg"
         ;;
       *)
-        yellow "警告：检测到未明确支持的操作系统 ($ID)，将尝试通用方法。"
+        OS="$detected_id" # 记录未明确支持的ID
+        yellow "警告：检测到未明确支持的操作系统 ($OS)，将尝试通用方法。"
         # 尝试猜测包管理器
         if command -v apt &>/dev/null; then PACKAGE_MANAGER="apt";
         elif command -v dnf &>/dev/null; then PACKAGE_MANAGER="dnf";
@@ -123,6 +138,7 @@ function detect_os() {
     esac
   elif [[ "$(uname -s)" == "Linux" ]]; then
       # 备用检测，如果 /etc/os-release 不存在
+      yellow "警告：未找到 /etc/os-release 文件，尝试备用检测。"
       if command -v apt &>/dev/null; then OS="debian"; PACKAGE_MANAGER="apt";
       elif command -v dnf &>/dev/null; then OS="fedora"; PACKAGE_MANAGER="dnf";
       elif command -v yum &>/dev/null; then OS="centos"; PACKAGE_MANAGER="yum";
@@ -132,7 +148,8 @@ function detect_os() {
   else
       red "错误：不支持的操作系统 ($(uname -s))" && exit 1
   fi
-  green "操作系统：$OS (包管理器: $PACKAGE_MANAGER)"
+  # 输出时，即使检测到 libwrt，也会显示 openwrt
+  green "操作系统识别为：$OS (包管理器: $PACKAGE_MANAGER)"
 }
 
 # --- 依赖管理函数 ---
@@ -157,28 +174,33 @@ function install_dependency() {
       install_cmd="sudo apt install $install_options $package_name"
       ;;
     yum)
-      # yum 不需要单独的 update 命令，install 会处理
       install_cmd="sudo yum install $install_options $package_name"
       ;;
     dnf)
-      # dnf 也不需要单独的 update
       install_cmd="sudo dnf install $install_options $package_name"
       ;;
     pacman)
-      update_cmd="sudo pacman -Syu --noconfirm" # Arch 推荐更新整个系统
+      update_cmd="sudo pacman -Syu --noconfirm"
       install_cmd="sudo pacman -S --noconfirm $package_name"
-      install_options="" # pacman 的 --noconfirm 在 -S 后面
+      install_options=""
       ;;
     opkg)
       update_cmd="opkg update"
       install_cmd="opkg install $package_name" # opkg 通常在 root 下运行，无需 sudo
-      install_options="" # opkg 没有统一的 -y 选项
+      install_options=""
       ;;
     *)
       red "错误：不支持的包管理器：$PACKAGE_MANAGER"
       exit 1
       ;;
   esac
+
+  # 如果不是 OpenWrt 且不是 root 用户，则添加 sudo
+  if [[ "$OS" != "openwrt" ]] && [[ "$EUID" -ne 0 ]]; then
+      update_cmd=$(echo "$update_cmd" | sed 's/^/sudo /')
+      install_cmd=$(echo "$install_cmd" | sed 's/^/sudo /')
+  fi
+
 
   # 执行更新命令（如果需要）
   if [[ -n "$update_cmd" ]]; then
@@ -213,23 +235,20 @@ function check_base_dependencies() {
     # 检查端口检查工具 ss 或 netstat
     if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
         yellow "端口检查工具 ss 和 netstat 都未安装。"
+        local ss_pkg="iproute2" # 默认 ss 包名
+        local netstat_pkg="net-tools" # 默认 netstat 包名
         if [[ "$PACKAGE_MANAGER" == "opkg" ]]; then
-            yellow "尝试安装 ip-full (提供 ss)..."
-            install_dependency "ss" "ip-full" # OpenWrt 上 ss 在 ip-full 包
-        elif [[ "$PACKAGE_MANAGER" == "apt" ]]; then
-             yellow "尝试安装 net-tools (提供 netstat) 和 iproute2 (提供 ss)..."
-             install_dependency "netstat" "net-tools" || true # 允许失败
-             install_dependency "ss" "iproute2" || yellow "警告: 安装端口检查工具失败，端口检查可能无法工作。"
+            ss_pkg="ip-full" # OpenWrt 上 ss 在 ip-full 包
+            netstat_pkg="netstat" # OpenWrt 上 netstat 可能在单独包
         elif [[ "$PACKAGE_MANAGER" == "yum" ]] || [[ "$PACKAGE_MANAGER" == "dnf" ]]; then
-             yellow "尝试安装 net-tools (提供 netstat) 和 iproute (提供 ss)..."
-             install_dependency "netstat" "net-tools" || true
-             install_dependency "ss" "iproute" || yellow "警告: 安装端口检查工具失败，端口检查可能无法工作。"
-        elif [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
-             yellow "尝试安装 net-tools (提供 netstat) 和 iproute2 (提供 ss)..."
-             install_dependency "netstat" "net-tools" || true
-             install_dependency "ss" "iproute2" || yellow "警告: 安装端口检查工具失败，端口检查可能无法工作。"
-        else
-             yellow "警告: 无法自动安装端口检查工具 (ss/netstat)，端口检查可能无法工作。"
+             ss_pkg="iproute"
+        fi
+
+        yellow "尝试安装 $netstat_pkg (提供 netstat)..."
+        install_dependency "netstat" "$netstat_pkg" || true # 允许失败
+        if ! command -v netstat &>/dev/null; then # 如果 netstat 没装上，再尝试 ss
+            yellow "尝试安装 $ss_pkg (提供 ss)..."
+            install_dependency "ss" "$ss_pkg" || yellow "警告: 安装端口检查工具失败，端口检查可能无法工作。"
         fi
     elif command -v ss &>/dev/null; then
         green "端口检查工具 ss 已安装。"
@@ -266,30 +285,37 @@ function check_docker_dependencies() {
       ;;
   esac
 
-  # 添加 Docker 官方仓库 (如果需要)
-  if [[ "$needs_repo" == true ]]; then
+  # 添加 Docker 官方仓库 (如果需要且不是 OpenWrt)
+  if [[ "$needs_repo" == true ]] && [[ "$OS" != "openwrt" ]]; then
       yellow "为 CentOS/RHEL/Fedora 添加 Docker CE 仓库..."
-      install_dependency "yum-config-manager" "yum-utils" # RHEL/CentOS
-      install_dependency "dnf-plugins-core" "dnf-plugins-core" # Fedora
-      if command -v yum-config-manager &>/dev/null; then
-         sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || red "添加 Docker repo 失败 (yum)"
-      elif command -v dnf &>/dev/null; then
-         sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo || red "添加 Docker repo 失败 (dnf)"
+      local repo_manager_pkg=""
+      local repo_add_cmd=""
+      if command -v dnf &>/dev/null; then # Fedora, newer CentOS/RHEL
+          repo_manager_pkg="dnf-plugins-core"
+          repo_add_cmd="sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo"
+          # Adjust for CentOS/RHEL if needed
+          if [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]] || [[ "$OS" == "rocky" ]] || [[ "$OS" == "almalinux" ]]; then
+             repo_add_cmd="sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+          fi
+      elif command -v yum &>/dev/null; then # Older CentOS/RHEL
+          repo_manager_pkg="yum-utils"
+          repo_add_cmd="sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+      fi
+
+      if [[ -n "$repo_manager_pkg" ]]; then
+          install_dependency "config-manager" "$repo_manager_pkg" # 安装工具
+          yellow "执行: $repo_add_cmd"
+          eval "$repo_add_cmd" || red "添加 Docker repo 失败"
+      else
+          yellow "警告：无法确定用于添加仓库的命令。"
       fi
   fi
 
   # 安装 Docker
   install_dependency "docker" "$docker_package"
 
-  # 启动并启用 Docker 服务 (Linux only)
-  if [[ "$OS" != "openwrt" ]] && [[ "$(uname -s)" == "Linux" ]]; then
-      if ! systemctl is-active --quiet docker &>/dev/null; then
-          yellow "尝试启动并启用 Docker 服务 (systemd)..."
-          sudo systemctl enable --now docker || yellow "警告：无法自动启动或启用 Docker 服务，请手动操作。"
-      else
-           green "Docker 服务已运行 (systemd)。"
-      fi
-  elif [[ "$OS" == "openwrt" ]]; then
+  # 启动并启用 Docker 服务
+  if [[ "$OS" == "openwrt" ]]; then
       # OpenWrt 使用 init.d
       if ! /etc/init.d/dockerd status &>/dev/null || ! /etc/init.d/dockerd status | grep -q "running"; then
            yellow "尝试启动并启用 Docker 服务 (OpenWrt init.d)..."
@@ -298,8 +324,21 @@ function check_docker_dependencies() {
       else
            green "Docker 服务已运行 (OpenWrt init.d)。"
       fi
+  # 其他使用 systemd 的 Linux 系统
+  elif command -v systemctl &>/dev/null; then
+      if ! systemctl is-active --quiet docker &>/dev/null; then
+          yellow "尝试启动并启用 Docker 服务 (systemd)..."
+          local systemctl_cmd="systemctl enable --now docker"
+          if [[ "$EUID" -ne 0 ]]; then systemctl_cmd="sudo $systemctl_cmd"; fi
+          eval "$systemctl_cmd" || yellow "警告：无法自动启动或启用 Docker 服务，请手动操作。"
+      else
+           green "Docker 服务已运行 (systemd)。"
+      fi
+  else
+      yellow "警告：未知的服务管理器，请确保 Docker 服务已手动启动。"
   fi
-   # 再次检查 Docker 是否真的在运行
+
+   # 最终检查 Docker 是否真的在运行
    if ! docker info &>/dev/null; then
        red "错误：Docker 服务未能成功启动或无法连接。请手动检查 Docker 安装和状态。"
        exit 1
@@ -312,14 +351,20 @@ function check_docker_dependencies() {
   elif command -v docker-compose &>/dev/null; then
       green "Docker Compose (独立版) 已安装。"
   else
+      # 如果 opkg 安装了 docker-compose 但命令不存在，提示一下
+      if [[ "$PACKAGE_MANAGER" == "opkg" ]] && opkg list-installed | grep -q "docker-compose"; then
+          yellow "警告：opkg 显示 docker-compose 已安装，但命令未找到。请检查 PATH 或安装是否完整。"
+      fi
+
       yellow "Docker Compose 未找到，尝试安装独立版..."
       local compose_version="v2.29.2" # 可以更新为最新稳定版
       local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-$(uname -s)-$(uname -m)"
       local install_path="/usr/local/bin/docker-compose" # 优先安装到这里
-      # 如果 /usr/local/bin 不存在或不可写，尝试 /usr/bin
+      # 如果 /usr/local/bin 不存在或不可写，尝试 /usr/bin (通常需要 root)
       if ! [[ -d "/usr/local/bin" ]] || ! [[ -w "/usr/local/bin" ]]; then
-          if [[ -w "/usr/bin" ]]; then
+          if [[ -d "/usr/bin" ]] && [[ -w "/usr/bin" ]]; then
              install_path="/usr/bin/docker-compose"
+             yellow "将尝试安装到 /usr/bin/docker-compose"
           else
              red "错误：无法找到合适的位置安装 docker-compose (尝试了 /usr/local/bin 和 /usr/bin)。请检查权限或手动安装。"
              exit 1
@@ -330,6 +375,7 @@ function check_docker_dependencies() {
       # 使用 curl 或 wget 下载
       local download_cmd=""
       if command -v curl &>/dev/null; then
+          # 添加 -L 以处理重定向
           download_cmd="curl -sSL \"$compose_url\" -o /tmp/docker-compose"
       elif command -v wget &>/dev/null; then
           download_cmd="wget -q \"$compose_url\" -O /tmp/docker-compose"
@@ -340,19 +386,23 @@ function check_docker_dependencies() {
 
       if eval "$download_cmd"; then
           # 移动并设置权限
-          if [[ "$OS" == "openwrt" ]] || [[ "$EUID" -eq 0 ]]; then
-              # OpenWrt 或已经是 root
-              mv /tmp/docker-compose "$install_path"
-              chmod +x "$install_path"
-          else
-              sudo mv /tmp/docker-compose "$install_path"
-              sudo chmod +x "$install_path"
+          local mv_cmd="mv /tmp/docker-compose \"$install_path\""
+          local chmod_cmd="chmod +x \"$install_path\""
+          if [[ "$EUID" -ne 0 ]]; then # 如果不是 root
+              mv_cmd="sudo $mv_cmd"
+              chmod_cmd="sudo $chmod_cmd"
           fi
 
-          if command -v docker-compose &>/dev/null; then
-              green "docker-compose 安装成功。"
+          if eval "$mv_cmd" && eval "$chmod_cmd"; then
+              if command -v docker-compose &>/dev/null; then
+                  green "docker-compose 安装成功。"
+              else
+                  red "docker-compose 文件已移动，但命令仍未找到。请检查 PATH 环境变量。"
+                  exit 1
+              fi
           else
-              red "docker-compose 安装失败，请手动安装。"
+              red "移动或设置 docker-compose 权限失败。请检查 /tmp/docker-compose 文件和目标路径 $install_path 的权限。"
+              rm -f /tmp/docker-compose # 清理下载的文件
               exit 1
           fi
       else
@@ -366,7 +416,12 @@ function check_docker_dependencies() {
 function check_user_permission() {
   # OpenWrt 通常以 root 运行，无需检查
   if [[ "$OS" == "openwrt" ]]; then
-      green "在 OpenWrt 上，通常以 root 运行，跳过 Docker 用户组检查。"
+      # 即使是 OpenWrt，也确认下是否真的是 root
+      if [[ "$EUID" -eq 0 ]]; then
+         green "当前用户是 root，拥有 Docker 权限。"
+      else
+         yellow "警告：在 OpenWrt 上但未使用 root 用户 ($USER)。后续 Docker 命令可能需要手动添加 'sudo' (如果已安装) 或切换到 root。"
+      fi
       return 0
   fi
 
@@ -378,18 +433,22 @@ function check_user_permission() {
 
   # 检查是否在 docker 组
   if groups "$USER" | grep -q '\bdocker\b'; then
-    green "当前用户已在 Docker 用户组中。"
+    green "当前用户 ($USER) 已在 Docker 用户组中。"
   else
     yellow "警告：当前用户 ($USER) 未加入 Docker 用户组。"
-    yellow "尝试将用户添加到 docker 组..."
-    if sudo usermod -aG docker "$USER"; then
-        green "已将用户 $USER 添加到 docker 组。"
-        red "请完全注销并重新登录，或者运行 'newgrp docker' 命令以使组成员资格生效，否则后续 Docker 命令可能失败！"
-        read -n 1 -s -r -p "按任意键继续，或按 Ctrl+C 退出并重新登录..."
-        echo
+    if command -v sudo &>/dev/null; then
+        yellow "尝试将用户添加到 docker 组..."
+        if sudo usermod -aG docker "$USER"; then
+            green "已将用户 $USER 添加到 docker 组。"
+            red "请完全注销并重新登录，或者运行 'newgrp docker' 命令以使组成员资格生效，否则后续 Docker 命令可能失败！"
+            read -n 1 -s -r -p "按任意键继续，或按 Ctrl+C 退出并重新登录..."
+            echo
+        else
+            red "错误：无法将用户添加到 docker 组。请手动添加或使用 sudo 运行 Docker 命令。"
+            # 允许继续，但可能会失败
+        fi
     else
-        red "错误：无法将用户添加到 docker 组。请手动添加或使用 sudo 运行 Docker 命令。"
-        # 允许继续，但可能会失败
+        red "错误：缺少 sudo 命令，无法自动将用户添加到 docker 组。请切换到 root 或手动添加。"
     fi
   fi
 }
@@ -402,8 +461,10 @@ function find_available_port() {
 
   # 选择可用的端口检查命令
   if command -v ss &>/dev/null; then
+      # ss -tuln: TCP listening, UDP listening, numeric ports, no resolve
       check_cmd="ss -tuln"
   elif command -v netstat &>/dev/null; then
+      # netstat -tuln: TCP, UDP, listening, numeric, no resolve
       check_cmd="netstat -tuln"
   else
       yellow "警告：未找到 ss 或 netstat 命令，无法自动检查端口占用。将直接使用建议端口。"
@@ -412,23 +473,31 @@ function find_available_port() {
   fi
 
   # 循环查找未被占用的端口
-  while $check_cmd | grep -q ":$start_port "; do
+  # 使用更健壮的 grep 模式，匹配 ":port " 或 ".port " 或 "[::]:port "
+  while $check_cmd | grep -Eq "[:.\[]${start_port}[[:space:]]+"; do
     ((start_port++))
+    # 防止无限循环（例如所有端口都被占用或命令出错）
+    if [[ "$start_port" -gt 65535 ]]; then
+        red "错误：无法找到 65535 以下的可用端口。"
+        start_port=${1:-$DEFAULT_PORT} # 重置为初始建议值
+        break
+    fi
   done
   echo $start_port
 }
 
 # 验证端口
 function validate_port() {
+  local initial_suggestion=${1:-$DEFAULT_PORT}
   local suggested_port
-  suggested_port=$(find_available_port "${1:-$DEFAULT_PORT}")
+  suggested_port=$(find_available_port "$initial_suggestion")
   green "建议使用的端口：$suggested_port"
   read -p "请输入您希望使用的端口（留空使用 $suggested_port）： " user_port
   PORT=${user_port:-$suggested_port} # 设置全局 PORT
 
   if ! [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1 && "$PORT" -le 65535 ]]; then
     red "端口号无效，请输入 1 到 65535 范围内的数字。"
-    validate_port "$suggested_port" # 重新验证
+    validate_port "$initial_suggestion" # 重新验证时传递原始建议值
     return
   fi
 
@@ -437,9 +506,9 @@ function validate_port() {
   if command -v ss &>/dev/null; then check_cmd="ss -tuln";
   elif command -v netstat &>/dev/null; then check_cmd="netstat -tuln"; fi
 
-  if [[ -n "$check_cmd" ]] && $check_cmd | grep -q ":$PORT "; then
+  if [[ -n "$check_cmd" ]] && $check_cmd | grep -Eq "[:.\[]${PORT}[[:space:]]+"; then
       red "端口 $PORT 已被占用，请选择其他端口。"
-      validate_port "$suggested_port" # 重新验证
+      validate_port "$initial_suggestion" # 重新验证
       return
   fi
   green "将使用端口: $PORT"
@@ -450,9 +519,10 @@ function choose_network_mode() {
   echo "请选择 Docker 网络模式："
   echo "  1. bridge (推荐, 容器有独立 IP, 通过端口映射访问)"
   echo "  2. host (容器共享主机网络, 性能稍好, 但端口冲突风险高)"
-  read -p "请输入选项 (1-2, 默认 1): " mode
-  NETWORK_MODE=${mode:-1} # 设置全局 NETWORK_MODE
-  case $NETWORK_MODE in
+  read -p "请输入选项 (1-2, 默认 1): " mode_choice
+  # 使用临时变量存储选择
+  local chosen_mode=${mode_choice:-1}
+  case $chosen_mode in
     1) NETWORK_MODE="bridge"; green "选择的网络模式：bridge"; ;;
     2) NETWORK_MODE="host"; green "选择的网络模式：host"; ;;
     *) red "无效选项，将使用默认 bridge 模式。" && NETWORK_MODE="bridge" ;;
@@ -492,8 +562,8 @@ function pull_image_with_retry() {
     # shellcheck disable=SC2086 # platform_arg 可能为空，需要 unquoted
     if ! docker pull $platform_arg "$image"; then
         red "镜像 $image 拉取失败。"
-        read -p "是否重试？(y/n，默认 n): " retry
-        if [[ "$retry" =~ ^[Yy]$ ]]; then
+        read -p "是否重试？(y/n，默认 n): " retry_pull
+        if [[ "${retry_pull:-n}" =~ ^[Yy]$ ]]; then
             pull_image_with_retry "$image" # 递归调用
         else
             red "放弃拉取镜像 $image。"
@@ -528,30 +598,42 @@ function deploy_service_sqlite() {
   # 4. 创建数据目录（使用绝对路径）
   # OpenWrt 警告
   if [[ "$OS" == "openwrt" ]]; then
-      yellow "警告：OpenWrt 存储空间有限，数据将存放在 $HOME/$data_dir_name。"
+      yellow "警告：OpenWrt/LibWRT 存储空间有限，数据将存放在 $HOME/$data_dir_name。"
       yellow "强烈建议将数据映射到外部存储！"
-      read -p "按 Enter 继续使用默认路径，或按 Ctrl+C 退出以修改脚本..."
+      read -p "按 Enter 继续使用默认路径，或按 Ctrl+C 退出以修改脚本..." </dev/tty # 从终端读取确认
   fi
   data_dir="$HOME/$data_dir_name" # 将数据目录放在用户主目录下
   yellow "确保数据目录存在: $data_dir"
   mkdir -p "$data_dir"
   # 检查目录是否可写
-  if ! [[ -w "$data_dir" ]]; then
+  if ! touch "$data_dir/.writable_test" 2>/dev/null; then
       red "错误：数据目录 $data_dir 不可写，请检查权限。"
       # 尝试修复权限 (如果是 root 或 sudo)
       if [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null; then
           yellow "尝试修复目录权限..."
-          chown "$(id -u):$(id -g)" "$data_dir" || sudo chown "$(id -u):$(id -g)" "$data_dir" || true
-          chmod u+rwx "$data_dir" || true
-          if ! [[ -w "$data_dir" ]]; then
+          local chown_cmd="chown $(id -u):$(id -g) \"$data_dir\""
+          local chmod_cmd="chmod u+rwx \"$data_dir\""
+          if [[ "$EUID" -ne 0 ]]; then
+              chown_cmd="sudo $chown_cmd"
+              chmod_cmd="sudo $chmod_cmd"
+          fi
+          eval "$chown_cmd" || true
+          eval "$chmod_cmd" || true
+          # 再次测试
+          if ! touch "$data_dir/.writable_test" 2>/dev/null ; then
               red "自动修复权限失败，请手动检查 $data_dir"
               return 1
+          else
+              rm -f "$data_dir/.writable_test" # 清理测试文件
+              green "目录权限已尝试修复。"
           fi
-          green "目录权限已尝试修复。"
       else
           red "请手动检查 $data_dir 的权限。"
           return 1
       fi
+  else
+       rm -f "$data_dir/.writable_test" # 清理测试文件
+       green "数据目录 $data_dir 可写。"
   fi
 
 
@@ -573,10 +655,6 @@ function deploy_service_sqlite() {
   # 添加数据卷和时区
   docker_run_cmd+=(-v "$data_dir:/data")
   docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
-  # 添加平台参数（如果支持）
-  # if [[ -n "$PLATFORM" ]]; then
-  #    docker_run_cmd+=(--platform "$PLATFORM") # run 命令通常不需要 platform
-  # fi
   docker_run_cmd+=("$image")
 
   # 执行命令
@@ -592,12 +670,11 @@ function deploy_service_sqlite() {
   # 6. 部署成功后的提示
   green "$name 部署成功！"
   local access_ip="<您的服务器IP>"
-  # 尝试获取 IP (可能不准确，尤其是在 NAT 或多网卡环境下)
-  if command -v ip &>/dev/null; then
-      access_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^127\.' | head -n 1 || echo "$access_ip")
-  elif command -v hostname &>/dev/null && hostname -I &>/dev/null; then
-      access_ip=$(hostname -I | awk '{print $1}' || echo "$access_ip")
-  fi
+  # 尝试获取 IP (更健壮的方式)
+  access_ip=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+' || \
+              ip -4 addr show scope global | grep -oP 'inet \K[\d.]+' | head -n 1 || \
+              hostname -I | awk '{print $1}' || \
+              echo "$access_ip")
 
   local access_port=$PORT
   if [[ "$NETWORK_MODE" == "host" ]]; then
@@ -632,15 +709,15 @@ function deploy_one_api_mysql() {
   choose_network_mode # 设置全局 NETWORK_MODE
   validate_network_mode
 
-  # 3. 获取 MySQL 连接信息
+  # 3. 获取 MySQL 连接信息 (从终端读取)
   yellow "请输入 MySQL 数据库连接信息:"
-  read -p "  数据库主机 (例如: localhost, 192.168.1.10): " db_host
-  read -p "  数据库端口 (默认 3306): " db_port
+  read -p "  数据库主机 (例如: localhost, 192.168.1.10): " db_host </dev/tty
+  read -p "  数据库端口 (默认 3306): " db_port </dev/tty
   db_port=${db_port:-3306}
-  read -p "  数据库用户名 (例如: root, oneapi_user): " db_user
-  read -sp "  数据库密码: " db_pass # -s 静默输入
+  read -p "  数据库用户名 (例如: root, oneapi_user): " db_user </dev/tty
+  read -sp "  数据库密码: " db_pass </dev/tty
   echo # 换行
-  read -p "  数据库名称 (例如: oneapi): " db_name
+  read -p "  数据库名称 (例如: oneapi): " db_name </dev/tty
 
   # 基本验证
   if [[ -z "$db_host" || -z "$db_user" || -z "$db_name" ]]; then
@@ -663,25 +740,29 @@ function deploy_one_api_mysql() {
   # 5. 创建数据目录 (用于存储非数据库数据，如日志)
   # OpenWrt 警告
   if [[ "$OS" == "openwrt" ]]; then
-      yellow "警告：OpenWrt 存储空间有限，日志等数据将存放在 $HOME/$data_dir_name。"
-      read -p "按 Enter 继续，或按 Ctrl+C 退出..."
+      yellow "警告：OpenWrt/LibWRT 存储空间有限，日志等数据将存放在 $HOME/$data_dir_name。"
+      read -p "按 Enter 继续，或按 Ctrl+C 退出..." </dev/tty
   fi
   data_dir="$HOME/$data_dir_name"
   yellow "确保日志/数据目录存在: $data_dir"
   mkdir -p "$data_dir"
-   if ! [[ -w "$data_dir" ]]; then
+   if ! touch "$data_dir/.writable_test" 2>/dev/null; then
       red "错误：数据目录 $data_dir 不可写，请检查权限。"
       # 尝试修复
       if [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null; then
-          chown "$(id -u):$(id -g)" "$data_dir" || sudo chown "$(id -u):$(id -g)" "$data_dir" || true
-          chmod u+rwx "$data_dir" || true
-          if ! [[ -w "$data_dir" ]]; then red "自动修复权限失败！"; return 1; fi
-          green "目录权限已尝试修复。"
+          local chown_cmd="chown $(id -u):$(id -g) \"$data_dir\""
+          local chmod_cmd="chmod u+rwx \"$data_dir\""
+          if [[ "$EUID" -ne 0 ]]; then chown_cmd="sudo $chown_cmd"; chmod_cmd="sudo $chmod_cmd"; fi
+          eval "$chown_cmd" || true; eval "$chmod_cmd" || true
+          if ! touch "$data_dir/.writable_test" 2>/dev/null; then red "自动修复权限失败！"; return 1; fi
+          rm -f "$data_dir/.writable_test"; green "目录权限已尝试修复。"
       else
           red "请手动检查 $data_dir 权限。"
           return 1
       fi
-  fi
+   else
+       rm -f "$data_dir/.writable_test"; green "日志/数据目录 $data_dir 可写。"
+   fi
 
   # 6. 构建并执行 docker run 命令
   green "正在部署 $name (MySQL 模式)..."
@@ -716,11 +797,10 @@ function deploy_one_api_mysql() {
   # 7. 部署成功提示
   green "$name 部署成功！(使用 MySQL)"
   local access_ip="<您的服务器IP>"
-  if command -v ip &>/dev/null; then
-      access_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^127\.' | head -n 1 || echo "$access_ip")
-  elif command -v hostname &>/dev/null && hostname -I &>/dev/null; then
-      access_ip=$(hostname -I | awk '{print $1}' || echo "$access_ip")
-  fi
+  access_ip=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+' || \
+              ip -4 addr show scope global | grep -oP 'inet \K[\d.]+' | head -n 1 || \
+              hostname -I | awk '{print $1}' || \
+              echo "$access_ip")
   local access_port=$PORT
   if [[ "$NETWORK_MODE" == "host" ]]; then
       access_port=$internal_port
@@ -768,12 +848,13 @@ function uninstall_service() {
 
   if [[ -n "$image_pattern" ]]; then
       local images_to_remove
-      images_to_remove=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "$image_pattern" || true)
+      # 使用更精确的 grep 匹配仓库名开头
+      images_to_remove=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^${image_pattern}:" || true)
       if [[ -n "$images_to_remove" ]]; then
            yellow "发现可能相关的镜像:"
            echo "$images_to_remove"
-           read -p "是否尝试移除这些镜像？(y/n，默认 n): " confirm_rmi
-           if [[ "$confirm_rmi" =~ ^[Yy]$ ]]; then
+           read -p "是否尝试移除这些镜像？(y/n，默认 n): " confirm_rmi </dev/tty
+           if [[ "${confirm_rmi:-n}" =~ ^[Yy]$ ]]; then
                # shellcheck disable=SC2086 # images_to_remove 可能包含多个镜像
                if docker rmi $images_to_remove; then
                    green "相关镜像已尝试移除。"
@@ -792,27 +873,30 @@ function uninstall_service() {
   # 处理数据目录
   if [[ -d "$data_dir" ]]; then
     yellow "发现数据目录: $data_dir"
-    read -p "是否删除此数据目录及其所有内容？警告：此操作不可逆！(y/n，默认 n): " confirm_rm_data
-    if [[ "$confirm_rm_data" =~ ^[Yy]$ ]]; then
+    read -p "是否删除此数据目录及其所有内容？警告：此操作不可逆！(y/n，默认 n): " confirm_rm_data </dev/tty
+    if [[ "${confirm_rm_data:-n}" =~ ^[Yy]$ ]]; then
       # 提供备份选项
-      read -p "删除前是否备份数据目录 $data_dir？(y/n，默认 n): " backup
-      if [[ "$backup" =~ ^[Yy]$ ]]; then
+      read -p "删除前是否备份数据目录 $data_dir？(y/n，默认 n): " backup_choice </dev/tty
+      local do_delete=true # 默认执行删除
+      if [[ "${backup_choice:-n}" =~ ^[Yy]$ ]]; then
         local backup_dir="${data_dir}-backup-$(date +%Y%m%d_%H%M%S)"
         yellow "正在备份数据到 $backup_dir ..."
-        if mv "$data_dir" "$backup_dir"; then
+        # 使用 cp -a 保留权限和属性，比 mv 更安全
+        if cp -a "$data_dir" "$backup_dir"; then
             green "数据目录已备份到 $backup_dir。"
         else
-            red "错误：备份数据目录失败！请检查权限。"
+            red "错误：备份数据目录失败！请检查权限和磁盘空间。"
             yellow "数据目录未被删除。"
-            # 如果备份失败，则不进行删除
-            confirm_rm_data="n"
+            do_delete=false # 备份失败则不删除
         fi
       fi
 
-      # 再次确认备份后是否删除 (如果用户选了备份且备份成功)
-      if [[ "$confirm_rm_data" =~ ^[Yy]$ ]]; then
+      # 如果需要删除 (没有选择备份，或者选择了备份且备份成功)
+      if [[ "$do_delete" == true ]]; then
           yellow "正在删除数据目录 $data_dir ..."
-          if rm -rf "$data_dir"; then
+          local rm_cmd="rm -rf \"$data_dir\""
+          if [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null; then rm_cmd="sudo $rm_cmd"; fi
+          if eval "$rm_cmd"; then
               green "数据目录 $data_dir 已删除。"
           else
               red "错误：删除数据目录 $data_dir 失败！请检查权限。"
@@ -853,7 +937,7 @@ function uninstall_project() {
   echo "  3. One-API 最新版 (MySQL, 容器名: one-api-mysql, 日志/数据: $HOME/one-api-mysql-logs)"
   echo "  4. Duck2API (容器名: duck2api, 数据: $HOME/duck2api-data)"
   echo "  0. 返回主菜单"
-  read -p "请输入选择（0-4）： " project_choice
+  read -p "请输入选择（0-4）： " project_choice </dev/tty
   case $project_choice in
     1) uninstall_service "one-api" "one-api-data" ;;
     2) uninstall_service "one-api-latest" "one-api-latest-data" ;;
@@ -872,6 +956,9 @@ function view_container_status() {
   elif [[ $(docker ps -a --format '{{.Names}}' | wc -l) -eq 0 ]]; then
       yellow "当前没有 Docker 容器。"
   else
+      # 尝试获取更宽的终端输出
+      local term_width=$(stty size 2>/dev/null | cut -d' ' -f2 || echo 80)
+      docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" --size "$((term_width - 5))" 2>/dev/null || \
       docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
   fi
   echo "-----------------------------"
@@ -881,30 +968,37 @@ function view_container_status() {
 function main_menu() {
   # 初始化检查
   detect_architecture
-  detect_os
-  setup_logging # 在检测到 OS 后设置日志
+  detect_os # 检测 OS 必须在 setup_logging 之前
+  setup_logging # 设置日志路径和重定向
   check_base_dependencies # 检查 curl/wget, ss/netstat
   check_docker_dependencies # 检查并安装 Docker 和 Compose
   check_user_permission # 检查 Docker 用户组权限
 
   # OpenWrt 特定提示
   if [[ "$OS" == "openwrt" ]]; then
-      yellow "==== OpenWrt 环境提示 ===="
+      yellow "==== OpenWrt/LibWRT 环境提示 ===="
       yellow " - 脚本使用 Bash，如果报错请先安装: opkg install bash"
-      yellow " - 设备存储有限，默认数据目录在 /root 下，建议映射到外部存储。"
-      yellow " - Docker 服务可能需要手动启动: /etc/init.d/dockerd start"
-      yellow "=========================="
-      sleep 2 # 短暂暂停让用户看到
+      yellow " - 设备存储有限，默认数据目录在 $HOME 下，建议映射到外部存储。"
+      yellow " - Docker 服务管理使用 /etc/init.d/dockerd"
+      yellow "================================"
+      sleep 1 # 短暂暂停让用户看到
   fi
 
 
   while true; do
+    # 获取 Docker 和 Compose 版本信息（如果可用）
+    local docker_version_info="未运行"
+    if docker --version &>/dev/null; then docker_version_info=$(docker --version); fi
+    local compose_version_info="未安装"
+    if docker compose version &>/dev/null; then compose_version_info=$(docker compose version | head -n 1);
+    elif command -v docker-compose &>/dev/null; then compose_version_info=$(docker-compose --version); fi
+
     echo ""
     echo "========================================"
     echo "        Docker 服务管理脚本"
-    echo "       (支持 Linux & OpenWrt)"
+    echo "       (支持 Linux & OpenWrt/LibWRT)"
     echo "========================================"
-    echo " 系统: $OS ($ARCH) | Docker: $(docker --version || echo 未运行) | Compose: $(docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo 未安装)"
+    echo " 系统: $OS ($ARCH) | Docker: $docker_version_info | Compose: $compose_version_info"
     echo "----------------------------------------"
     echo "请选择要执行的操作："
     echo "  1. 部署 One-API 特定版本 (SQLite)"
@@ -917,7 +1011,8 @@ function main_menu() {
     echo "----------------------------------------"
     echo "  0. 退出脚本"
     echo "========================================"
-    read -p "请输入选项编号 (0-6): " choice
+    # 从终端读取用户输入，即使 stdout 被重定向
+    read -p "请输入选项编号 (0-6): " choice </dev/tty
 
     # 添加换行增加可读性
     echo ""
@@ -936,7 +1031,7 @@ function main_menu() {
     # 在每次操作后暂停，让用户看到输出
     if [[ "$choice" != "0" ]]; then
         echo ""
-        read -n 1 -s -r -p "按任意键返回主菜单..."
+        read -n 1 -s -r -p "按任意键返回主菜单..." </dev/tty
         echo "" # 换行
     fi
     # clear # 清屏使菜单更清晰 (可选，根据喜好取消注释)
