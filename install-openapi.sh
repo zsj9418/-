@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # -----------------------------------------------------------------------------
-# Docker 服务管理脚本 (增强通用性，适配 OpenWrt/LibWRT)
+# Docker 服务管理脚本
 #
 # 功能:
 # - 部署 One-API (SQLite/MySQL), Duck2API 等 Docker 服务
-# - 自动检测系统架构和操作系统 (包括 OpenWrt/LibWRT)
+# - 自动检测系统架构和操作系统 (包括 OpenWrt)
 # - 自动处理依赖安装 (apt, yum, dnf, pacman, opkg)
 # - 端口自动建议与验证
 # - 网络模式选择 (bridge/host)
