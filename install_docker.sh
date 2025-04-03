@@ -194,17 +194,12 @@ fetch_docker_versions() {
     echo "$VERSIONS"
 }
 
-# 函数: 选择 Docker 版本（美化 fzf 界面）
-select_docker_version() {
-    local VERSIONS=($(fetch_docker_versions))
+# 函数: 选择版本（通用函数）
+select_version() {
+    local VERSIONS=("$@")
     
-    if [ ${#VERSIONS[@]} -eq 0 ]; then
-        echo -e "${RED}无法获取可用的Docker版本列表${NC}"
-        exit 1
-    fi
-
     if command -v fzf >/dev/null 2>&1; then
-        local HEADER="选择 Docker 版本 (架构: $ARCH)"
+        local HEADER="选择版本"
         local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
             --prompt="请选择版本 > " \
             --header="$HEADER" \
@@ -223,7 +218,7 @@ select_docker_version() {
     fi
 
     # 如果没有fzf，则使用简单的选择菜单
-    echo "可用 Docker 版本列表:"
+    echo "可用版本列表:"
     PS3="请选择版本 (默认1将安装最新版本): "
     select VERSION in "${VERSIONS[@]}" "取消"; do
         case $REPLY in
@@ -253,46 +248,6 @@ fetch_docker_compose_versions() {
     echo "$VERSIONS"
 }
 
-# 函数: 选择 Docker Compose 版本 (美化 fzf 界面)
-select_docker_compose_version() {
-    local VERSIONS=($(fetch_docker_compose_versions))
-
-    if command -v fzf >/dev/null 2>&1; then
-        local HEADER="选择 Docker Compose 版本"
-        local INFO="使用 ↑↓ 导航，Enter 确认，Ctrl+C 取消"
-        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
-            --prompt="请选择版本 > " \
-            --header="$HEADER" \
-            --header-lines=1 \
-            --info=inline:"$INFO" \
-            --height=20 \
-            --reverse \
-            --border \
-            --color="header:blue,bg+:black,pointer:green" \
-            --preview="echo '预览: Docker Compose v{}'")
-        SELECTED_VERSION=$(echo "$SELECTED_VERSION" | tr -d '[:space:]')
-        if [ -n "$SELECTED_VERSION" ]; then
-            echo "$SELECTED_VERSION"
-            return
-        else
-            echo -e "${YELLOW}未选择版本，跳过...${NC}"
-            return
-        fi
-    fi
-    
-    # 如果没有fzf，则使用简单的选择菜单
-    echo "可用 Docker Compose 版本列表:"
-    select VERSION in "${VERSIONS[@]}"; do
-        if [ -n "$VERSION" ]; then
-            echo "$VERSION"
-            return
-        else
-            echo -e "${YELLOW}未选择版本，跳过...${NC}"
-            return
-        fi
-    done
-}
-
 # 函数: 安装 Docker
 install_docker() {
     if check_docker_installed; then
@@ -305,7 +260,8 @@ install_docker() {
 
     ARCH=$(get_architecture)
     echo "正在获取可用的 Docker 版本列表..."
-    local VERSION=$(select_docker_version)
+    local VERSION=$(fetch_docker_versions)
+    VERSION=$(select_version $VERSION)
     check_and_set_install_dir
 
     if [ -z "$VERSION" ]; then
@@ -398,7 +354,8 @@ install_docker_compose() {
     fi
 
     echo "正在获取可用的 Docker Compose 版本列表..."
-    local COMPOSE_VERSION=$(select_docker_compose_version)
+    local COMPOSE_VERSIONS=$(fetch_docker_compose_versions)
+    local COMPOSE_VERSION=$(select_version $COMPOSE_VERSIONS)
 
     if [ -z "$COMPOSE_VERSION" ]; then
         echo -e "${YELLOW}未选择版本，安装最新版本的 Docker Compose...${NC}"
