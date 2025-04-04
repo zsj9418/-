@@ -296,9 +296,9 @@ install_mosdns() {
     read -p "> " DOMESTIC_DNS
     DOMESTIC_DNS=${DOMESTIC_DNS:-https://223.5.5.5/dns-query}
 
-    echo -e "\n${YELLOW}请输入国外DNS地址（默认 https://dns64.dns.google/dns-query）：${RESET}"
+    echo -e "\n${YELLOW}请输入国外DNS地址（默认 1.1.1.1）：${RESET}"
     read -p "> " FOREIGN_DNS
-    FOREIGN_DNS=${FOREIGN_DNS:-https://dns64.dns.google/dns-query}
+    FOREIGN_DNS=${FOREIGN_DNS:-1.1.1.1}
 
     BASE_GITHUB_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
     BASE_RULES_URL1="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
