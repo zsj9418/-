@@ -38,7 +38,7 @@ else
 fi
 
 # 核心依赖（必装）
-CORE_DEPS=("curl" "unzip" "sed" "awk" "lsof")
+CORE_DEPS=("curl" "unzip" "sed" "awk" "lsof" "dig")
 # 可选依赖（非必需）
 OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron")
 INSTALLED_DEPS=()
@@ -65,11 +65,20 @@ check_install_deps() {
 download_with_retry() {
     local url="$1"
     local output="$2"
+    local proxy_url="$3"  # 代理 URL
     local retries=3
     local attempt=1
+
     while [ $attempt -le $retries ]; do
         echo -e "${YELLOW}下载 $url (尝试 $attempt/$retries)...${RESET}"
         curl -L -# -o "$output" "$url" && return 0
+
+        # 如果下载失败，检查是否可以使用代理
+        if [[ -n "$proxy_url" ]]; then
+            echo -e "${RED}直连下载失败，尝试使用代理下载...${RESET}"
+            curl -L -# -o "$output" --proxy "$proxy_url" "$url" && return 0
+        fi
+
         echo -e "${RED}下载失败，重试中...${RESET}"
         sleep 2
         ((attempt++))
@@ -108,109 +117,73 @@ release_port_53() {
     fi
 }
 
-configure_dual_adg() {
-    echo -e "\n${YELLOW}配置双AdGuard Home分流${RESET}"
-    echo -e "请输入国内ADG地址（默认 127.0.0.1:530）："
-    read -p "> " LOCAL_ADG
-    LOCAL_ADG=${LOCAL_ADG:-127.0.0.1:530}
-    if ! [[ "$LOCAL_ADG" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
-        echo -e "${RED}错误：格式无效${RESET}"
-        exit 1
+lock_resolv_conf() {
+    echo -e "${YELLOW}正在固化 /etc/resolv.conf 为 MosDNS 解析...${RESET}"
+
+    # 备份原有的 resolv.conf
+    if [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        echo -e "${GREEN}已备份原有 DNS 配置${RESET}"
     fi
 
-    echo -e "请输入国外ADG地址（默认 127.0.0.1:531）："
-    read -p "> " REMOTE_ADG
-    REMOTE_ADG=${REMOTE_ADG:-127.0.0.1:531}
-    if ! [[ "$REMOTE_ADG" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
-        echo -e "${RED}错误：格式无效${RESET}"
-        exit 1
+    # 设置 resolv.conf 指向 MosDNS
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chmod 644 /etc/resolv.conf
+
+    # 使 resolv.conf 为只读，防止被覆盖
+    chmod 444 /etc/resolv.conf
+    echo -e "${GREEN}成功：/etc/resolv.conf 已固化为 MosDNS 解析${RESET}"
+}
+
+restore_resolv_conf() {
+    echo -e "${YELLOW}正在还原 /etc/resolv.conf 为系统默认设置...${RESET}"
+
+    if [ -f /etc/resolv.conf.bak ]; then
+        # 如果备份文件存在，恢复备份
+        mv /etc/resolv.conf.bak /etc/resolv.conf
+        echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
+    else
+        # 如果备份不存在，设置为默认的 DNS 服务器
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        chmod 644 /etc/resolv.conf
+        echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
     fi
 
-    CONFIG_PATH="/etc/mosdns"
-    cat > "$CONFIG_PATH/config.yaml" <<EOF
-log:
-  level: info
-  file: "$CONFIG_PATH/mosdns.log"
+    # 恢复文件为可写状态
+    chmod 644 /etc/resolv.conf
+}
 
-plugins:
-  - tag: "direct_domain"
-    type: domain_set
-    args:
-      files:
-        - "$CONFIG_PATH/cn_domains.txt"
-
-  - tag: "remote_domain"
-    type: domain_set
-    args:
-      files:
-        - "$CONFIG_PATH/non_cn_domains.txt"
-
-  - tag: "local_forward"
-    type: forward
-    args:
-      concurrent: 4
-      upstreams:
-        - addr: "$LOCAL_ADG"
-
-  - tag: "remote_forward"
-    type: forward
-    args:
-      concurrent: 2
-      upstreams:
-        - addr: "$REMOTE_ADG"
-
-  - tag: "local_sequence"
-    type: sequence
-    args:
-      - exec: \$local_forward
-
-  - tag: "remote_sequence"
-    type: sequence
-    args:
-      - exec: \$remote_forward
-
-  - tag: "main_sequence"
-    type: sequence
-    args:
-      - matches: "qname \$direct_domain"
-        exec: goto local_sequence
-      - matches: "qname \$remote_domain"
-        exec: goto remote_sequence
-      - exec: goto remote_sequence
-
-  - type: udp_server
-    args:
-      entry: main_sequence
-      listen: 127.0.0.1:53
-EOF
-
-    # 启动 MosDNS
-    TEMP_LOG=$(mktemp)
-    /usr/local/bin/mosdns start -c "$CONFIG_PATH/config.yaml" >"$TEMP_LOG" 2>&1 &
-    MOSDNS_PID=$!
-    sleep 2
-    if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
-        echo -e "${RED}错误：新配置文件无效${RESET}"
-        cat "$TEMP_LOG"
-        rm -f "$TEMP_LOG"
-        exit 1
-    fi
-    kill "$MOSDNS_PID"
-    rm -f "$TEMP_LOG"
-
+check_mosdns_status() {
+    echo -e "${YELLOW}检查 MosDNS 运行状态...${RESET}"
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart mosdns
-        sleep 3
-        if systemctl status mosdns.service | grep -q "running"; then
-            echo -e "${GREEN}成功：MosDNS已重启并应用新配置${RESET}"
+        if systemctl is-active --quiet mosdns.service; then
+            echo -e "${GREEN}MosDNS 服务正在运行${RESET}"
         else
-            echo -e "${RED}错误：MosDNS 重启失败${RESET}"
-            systemctl status mosdns.service
-            exit 1
+            echo -e "${RED}MosDNS 服务未运行${RESET}"
+            return
         fi
     else
-        echo -e "${YELLOW}无 systemd，跳过服务重启，请手动重启 MosDNS${RESET}"
+        if pgrep -x "mosdns" > /dev/null; then
+            echo -e "${GREEN}MosDNS 正在运行（通过进程检查）${RESET}"
+        else
+            echo -e "${RED}MosDNS 未运行（通过进程检查）${RESET}"
+            return
+        fi
     fi
+
+    # 测试 DNS 解析
+    echo -e "${YELLOW}测试通过 MosDNS 解析 www.example.com...${RESET}"
+    RESOLVED_IP=$(dig @127.0.0.1 www.example.com +short)
+    if [[ -n "$RESOLVED_IP" ]]; then
+        echo -e "${GREEN}解析成功：www.example.com 的 IP 地址是 $RESOLVED_IP${RESET}"
+    else
+        echo -e "${RED}解析失败：无法通过 MosDNS 解析 www.example.com${RESET}"
+    fi
+}
+
+view_resolv_conf() {
+    echo -e "${YELLOW}当前 /etc/resolv.conf 的内容：${RESET}"
+    cat /etc/resolv.conf
 }
 
 install_mosdns() {
@@ -513,30 +486,49 @@ EOF
     fi
 }
 
-echo -e "${YELLOW}MosDNS 安装与管理脚本${RESET}"
-PS3="请选择操作（输入数字）："
-OPTIONS=("安装MosDNS" "卸载清理MosDNS" "更新规则" "退出")
-select opt in "${OPTIONS[@]}"; do
-    case $opt in
-        "安装MosDNS")
-            check_install_deps
-            install_mosdns
-            break
-            ;;
-        "卸载清理MosDNS")
-            uninstall_mosdns
-            break
-            ;;
-        "更新规则")
-            update_rules
-            break
-            ;;
-        "退出")
-            echo -e "${GREEN}退出脚本${RESET}"
-            exit 0
-            ;;
-        *) echo -e "${RED}无效选项${RESET}" ;;
-    esac
+# 主菜单循环
+while true; do
+    echo -e "${YELLOW}MosDNS 安装与管理脚本${RESET}"
+    PS3="请选择操作（输入数字）："
+    OPTIONS=("安装MosDNS" "卸载清理MosDNS" "更新规则" "固化 DNS 配置" "还原系统 DNS 配置" "查看 MosDNS 状态" "查看 /etc/resolv.conf" "退出")
+    select opt in "${OPTIONS[@]}"; do
+        case $opt in
+            "安装MosDNS")
+                check_install_deps
+                install_mosdns
+                break
+                ;;
+            "卸载清理MosDNS")
+                uninstall_mosdns
+                break
+                ;;
+            "更新规则")
+                update_rules
+                break
+                ;;
+            "固化 DNS 配置")
+                lock_resolv_conf
+                break
+                ;;
+            "还原系统 DNS 配置")
+                restore_resolv_conf
+                break
+                ;;
+            "查看 MosDNS 状态")
+                check_mosdns_status
+                break
+                ;;
+            "查看 /etc/resolv.conf")
+                view_resolv_conf
+                break
+                ;;
+            "退出")
+                echo -e "${GREEN}退出脚本${RESET}"
+                exit 0
+                ;;
+            *) echo -e "${RED}无效选项${RESET}" ;;
+        esac
+    done
 done
 
 echo "日志记录结束：$(date)"
