@@ -5,14 +5,14 @@ set -euo pipefail  # 严格错误处理
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
 LOG_MAX_SIZE=1048576  # 日志文件最大大小，1MB = 1048576 字节
-PROXY_PREFIX="https://ghfast.top/"  # GitHub 代理地址
+PROXY_PREFIXES=("https://ghfast.top/" "https://ghproxy.com/")  # 可用的代理地址
 RETRY_COUNT=3  # 下载重试次数
 CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"  # 自定义菜单配置文件
 
 # ------------------------- 初始化 -------------------------
 mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
-mkdir -p "$SCRIPT_DIR/core_scripts" || { echo "无法创建核心脚本目录：$SCRIPT_DIR/core_scripts"; exit 1; } # 创建 core_scripts 目录
-mkdir -p "$SCRIPT_DIR/user_scripts" || { echo "无法创建用户脚本目录：$SCRIPT_DIR/user_scripts"; exit 1; }   # 创建 user_scripts 目录
+mkdir -p "$SCRIPT_DIR/core_scripts" || { echo "无法创建核心脚本目录：$SCRIPT_DIR/core_scripts"; exit 1; }
+mkdir -p "$SCRIPT_DIR/user_scripts" || { echo "无法创建用户脚本目录：$SCRIPT_DIR/user_scripts"; exit 1; }
 touch "$LOG_FILE" || { echo "无法创建日志文件"; exit 1; }
 touch "$CUSTOM_MENU_FILE" || { echo "无法创建自定义菜单文件"; exit 1; }
 
@@ -107,7 +107,7 @@ function check_network() {
     fi
 }
 
-# 下载脚本（支持直连和代理下载）
+# 下载脚本（支持直连和多个代理下载）
 function download_script() {
     local choice="$1"
     local url="${DEFAULT_SCRIPTS[$choice]}"
@@ -145,9 +145,26 @@ function download_script() {
         else
             echo "下载 $script_name 失败，重试中 ($i/$RETRY_COUNT)..." >&2
             # 如果是 GitHub 资源且未使用代理，切换到代理
-            if [[ "$url" == https://raw.githubusercontent.com/* && "$url" != "${PROXY_PREFIX}"* ]]; then
-                url="${PROXY_PREFIX}${url#https://raw.githubusercontent.com/}"
-                echo "切换到代理 URL: $url" >&2
+            if [[ "$url" == https://raw.githubusercontent.com/* ]]; then
+                for proxy in "${PROXY_PREFIXES[@]}"; do
+                    # 使用代理格式
+                    proxy_url="${proxy}${url#https://}"
+                    echo "切换到代理 URL: $proxy_url" >&2
+                    if curl -fsSL "$proxy_url" -o "$script_path"; then
+                        if [[ -s "$script_path" ]]; then
+                            chmod +x "$script_path"
+                            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 已通过代理下载脚本到 $script_path，并赋予执行权限。" >> "$LOG_FILE"
+                            echo "$script_path"
+                            return 0
+                        else
+                            echo "下载 $script_name 后文件为空，下载失败。" >&2
+                            rm -f "$script_path"
+                            return 1
+                        fi
+                    else
+                        echo "代理下载失败: $proxy_url" >&2
+                    fi
+                done
             fi
             sleep 2
         fi
@@ -440,7 +457,7 @@ function load_menu() {
                 CUSTOM_SCRIPT_NAMES["$option_number"]=$(basename "${DEFAULT_SCRIPTS[$option_number]}")
             else # 如果 DEFAULT_SCRIPTS 中没有该编号的 URL (例如，编号超出范围，或者 DEFAULT_SCRIPTS 定义不完整)
                 OPTIONS+=("$option_text") # 仍然添加菜单项，但不关联脚本 URL
-                SCRIPTS["$option_number"]="" #  不关联脚本URL，设置为空
+                SCRIPTS["$option_number"]="" # 不关联脚本URL，设置为空
             fi
         else # 非数字编号的选项 (例如 "98. 快捷键管理")
             OPTIONS+=("$option_text") # 添加非数字编号的选项
@@ -512,11 +529,11 @@ function main() {
                         run_script "$script_path"
                     else
                         echo "脚本下载失败，请检查日志。" | tee -a "$LOG_FILE"
+                        read -rp "按回车键返回主菜单..."
                     fi
                 else
                     echo "无效选项，请重新输入。" | tee -a "$LOG_FILE"
                 fi
-                read -rp "按回车键返回主菜单..."
                 ;;
             *)
                 echo "无效选项，请重新输入。" | tee -a "$LOG_FILE"
