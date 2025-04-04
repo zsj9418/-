@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MosDNS 一键安装与管理脚本（通用版）
+# MosDNS 一键安装与管理脚本（修复版）
 
 RED='\e[31m'
 GREEN='\e[32m'
@@ -37,11 +37,13 @@ else
     PKG_MANAGER="none"
 fi
 
-# 核心依赖（必装）
+# 核心依赖和可选依赖
 CORE_DEPS=("curl" "unzip" "sed" "awk" "lsof" "dig")
-# 可选依赖（非必需）
-OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron" "resolvconf")
+OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron" "resolvconf" "dnsmasq")
 INSTALLED_DEPS=()
+
+# 代理前缀数组
+PROXY_PREFIXES=("https://ghfast.top/" "https://ghproxy.com/")
 
 check_install_deps() {
     echo -e "${YELLOW}检查并安装依赖...${RESET}"
@@ -66,7 +68,7 @@ install_resolvconf_if_needed() {
     if ! command -v resolvconf >/dev/null 2>&1; then
         echo -e "${YELLOW}正在安装 resolvconf 工具...${RESET}"
         if [ "$PKG_MANAGER" != "none" ]; then
-            $INSTALL_CMD resolvconf || { echo -e "${RED}安装 resolvconf 失败，请检查您的包管理器配置${RESET}"; exit 1; }
+            $INSTALL_CMD resolvconf || { echo -e "${RED}安装 resolvconf 失败，请检查包管理器配置${RESET}"; exit 1; }
             echo -e "${GREEN}resolvconf 安装成功${RESET}"
         else
             echo -e "${RED}错误：未找到包管理器，无法安装 resolvconf${RESET}"
@@ -80,142 +82,138 @@ install_resolvconf_if_needed() {
 download_with_retry() {
     local url="$1"
     local output="$2"
-    local proxy_url="$3"  # 代理 URL
     local retries=3
     local attempt=1
 
     while [ $attempt -le $retries ]; do
         echo -e "${YELLOW}下载 $url (尝试 $attempt/$retries)...${RESET}"
         curl -L -# -o "$output" "$url" && return 0
-
-        # 如果下载失败，检查是否可以使用代理
-        if [[ -n "$proxy_url" ]]; then
-            echo -e "${RED}直连下载失败，尝试使用代理下载...${RESET}"
-            curl -L -# -o "$output" --proxy "$proxy_url" "$url" && return 0
-        fi
-
-        echo -e "${RED}下载失败，重试中...${RESET}"
+        echo -e "${RED}直连下载失败${RESET}"
         sleep 2
         ((attempt++))
     done
-    echo -e "${RED}错误：下载 $url 失败${RESET}"
+
+    for prefix in "${PROXY_PREFIXES[@]}"; do
+        attempt=1
+        local proxy_url="${prefix}${url}"
+        while [ $attempt -le $retries ]; do
+            echo -e "${YELLOW}通过代理 $prefix 下载 $url (尝试 $attempt/$retries)...${RESET}"
+            curl -L -# -o "$output" "$proxy_url" && return 0
+            echo -e "${RED}代理 $prefix 下载失败${RESET}"
+            sleep 2
+            ((attempt++))
+        done
+    done
+
+    echo -e "${RED}错误：下载 $url 失败，所有代理均不可用${RESET}"
     return 1
 }
 
-release_port_53() {
-    echo -e "${YELLOW}检查并释放53端口...${RESET}"
-    if command -v netstat >/dev/null 2>&1 && netstat -tuln | grep -q ":53 "; then
-        if command -v lsof >/dev/null 2>&1; then
-            PIDS=$(lsof -i :53 | awk 'NR>1 {print $2}' | sort -u)
-            for PID in $PIDS; do
-                SERVICE=$(ps -p "$PID" -o comm=)
-                echo -e "${YELLOW}找到占用53端口的服务：$SERVICE (PID: $PID)${RESET}"
-                if command -v systemctl >/dev/null 2>&1 && systemctl is-active "systemd-resolved" >/dev/null 2>&1 && [[ "$SERVICE" =~ systemd ]]; then
-                    systemctl stop systemd-resolved
-                    systemctl disable systemd-resolved
+configure_dnsmasq_for_mosdns() {
+    echo -e "${YELLOW}配置 dnsmasq 以转发 DNS 请求到 MosDNS...${RESET}"
+    if command -v nmcli >/dev/null 2>&1; then
+        ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
+        if [ -n "$ACTIVE_CON" ]; then
+            METHOD=$(nmcli -t -f ipv4.method con show "$ACTIVE_CON" | cut -d: -f2)
+            if [ "$METHOD" = "shared" ]; then
+                # 配置 NetworkManager 的 dnsmasq
+                mkdir -p /etc/NetworkManager/dnsmasq.d
+                echo "server=127.0.0.1#53" > /etc/NetworkManager/dnsmasq.d/mosdns.conf
+                systemctl restart NetworkManager
+                sleep 3
+                if netstat -tuln | grep -q "10.42.0.1:53"; then
+                    echo -e "${GREEN}成功：NetworkManager 的 dnsmasq 已配置并运行${RESET}"
                 else
-                    kill -9 "$PID"
+                    echo -e "${RED}错误：NetworkManager 的 dnsmasq 未正确重启，尝试独立 dnsmasq${RESET}"
+                    # 如果 NetworkManager 失败，尝试独立 dnsmasq
+                    if command -v dnsmasq >/dev/null 2>&1; then
+                        echo "no-resolv" > /etc/dnsmasq.d/mosdns.conf
+                        echo "server=127.0.0.1#53" >> /etc/dnsmasq.d/mosdns.conf
+                        echo "interface=wlan0" >> /etc/dnsmasq.d/mosdns.conf
+                        systemctl restart dnsmasq
+                        sleep 2
+                        if netstat -tuln | grep -q "10.42.0.1:53"; then
+                            echo -e "${GREEN}成功：独立 dnsmasq 已配置并运行${RESET}"
+                        else
+                            echo -e "${RED}错误：独立 dnsmasq 启动失败，请检查日志${RESET}"
+                            journalctl -u dnsmasq | tail -n 20
+                            exit 1
+                        fi
+                    else
+                        echo -e "${RED}错误：未安装 dnsmasq，无法配置${RESET}"
+                        exit 1
+                    fi
                 fi
-            done
+            else
+                echo -e "${YELLOW}警告：未检测到 'shared' 模式，跳过 dnsmasq 配置${RESET}"
+            fi
         else
-            echo -e "${YELLOW}未安装 lsof，无法精确释放端口，尝试直接杀进程${RESET}"
-            kill -9 $(netstat -tuln | grep ":53 " | awk '{print $NF}') 2>/dev/null
-        fi
-        sleep 1
-        if netstat -tuln | grep -q ":53 "; then
-            echo -e "${RED}错误：无法释放53端口${RESET}"
+            echo -e "${RED}错误：未找到活动 NetworkManager 连接${RESET}"
             exit 1
         fi
-        echo -e "${GREEN}53端口已释放${RESET}"
     else
-        echo -e "${GREEN}53端口未被占用或 netstat 未安装${RESET}"
+        echo -e "${YELLOW}未安装 nmcli，尝试独立 dnsmasq 配置${RESET}"
+        if command -v dnsmasq >/dev/null 2>&1; then
+            mkdir -p /etc/dnsmasq.d
+            echo "no-resolv" > /etc/dnsmasq.d/mosdns.conf
+            echo "server=127.0.0.1#53" >> /etc/dnsmasq.d/mosdns.conf
+            echo "interface=wlan0" >> /etc/dnsmasq.d/mosdns.conf
+            systemctl restart dnsmasq
+            sleep 2
+            if netstat -tuln | grep -q "10.42.0.1:53"; then
+                echo -e "${GREEN}成功：独立 dnsmasq 已配置并运行${RESET}"
+            else
+                echo -e "${RED}错误：独立 dnsmasq 启动失败，请检查日志${RESET}"
+                journalctl -u dnsmasq | tail -n 20
+                exit 1
+            fi
+        else
+            echo -e "${RED}错误：未安装 dnsmasq 和 nmcli，无法配置${RESET}"
+            exit 1
+        fi
     fi
 }
 
 lock_resolv_conf() {
     echo -e "${YELLOW}正在固化 /etc/resolv.conf 为 MosDNS 解析...${RESET}"
+    LAN_IP=$(ip -4 addr show dev wlan0 | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -n1)
+    [ -z "$LAN_IP" ] && { echo -e "${RED}错误：未检测到 wlan0 的 LAN IP，使用 127.0.0.1${RESET}"; LAN_IP="127.0.0.1"; }
 
-    # 备份原始 resolv.conf
     if [ -f /etc/resolv.conf ] && [ ! -f /etc/resolv.conf.bak ]; then
         cp /etc/resolv.conf /etc/resolv.conf.bak
         echo -e "${GREEN}已备份原始 /etc/resolv.conf${RESET}"
     fi
 
-    # 检查是否由 NetworkManager 管理
     if grep -q "Generated by NetworkManager" /etc/resolv.conf; then
         echo -e "${YELLOW}检测到 NetworkManager 管理 DNS，正在调整配置...${RESET}"
         if command -v nmcli >/dev/null 2>&1; then
-            # 获取当前活动连接名称
             ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
-            if [ -z "$ACTIVE_CON" ]; then
-                echo -e "${RED}错误：未找到活动网络连接${RESET}"
-                return 1
-            fi
-
-            # 检查连接的 ipv4.method 是否支持设置 DNS
-            METHOD=$(nmcli -t -f ipv4.method con show "$ACTIVE_CON" | cut -d: -f2)
-            if [ "$METHOD" = "shared" ]; then
-                echo -e "${YELLOW}警告：当前连接 '$ACTIVE_CON' 使用 'shared' 模式，无法通过 nmcli 设置 DNS${RESET}"
-                echo -e "${YELLOW}尝试直接修改并锁定 /etc/resolv.conf...${RESET}"
-                echo "nameserver 127.0.0.1" > /etc/resolv.conf
-                chattr +i /etc/resolv.conf 2>/dev/null || {
-                    echo -e "${RED}警告：无法锁定 /etc/resolv.conf，可能会被覆盖${RESET}"
-                }
-                echo -e "${GREEN}成功：已直接设置并尝试锁定 /etc/resolv.conf${RESET}"
-            else
-                # 尝试设置 DNS 并忽略自动 DNS
-                nmcli con mod "$ACTIVE_CON" ipv4.dns "127.0.0.1" 2>/dev/null
-                nmcli con mod "$ACTIVE_CON" ipv4.ignore-auto-dns yes 2>/dev/null
-                nmcli con up "$ACTIVE_CON" >/dev/null 2>&1
-                if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}成功：通过 NetworkManager 设置 DNS 为 127.0.0.1${RESET}"
-                else
-                    echo -e "${RED}错误：通过 nmcli 设置 DNS 失败${RESET}"
-                    echo -e "${YELLOW}尝试直接修改并锁定 /etc/resolv.conf...${RESET}"
-                    echo "nameserver 127.0.0.1" > /etc/resolv.conf
-                    chattr +i /etc/resolv.conf 2>/dev/null || {
-                        echo -e "${RED}警告：无法锁定 /etc/resolv.conf，可能会被覆盖${RESET}"
-                    }
-                    echo -e "${GREEN}成功：已直接设置并尝试锁定 /etc/resolv.conf${RESET}"
-                fi
-            fi
-        else
-            echo -e "${RED}错误：未安装 nmcli，无法通过 NetworkManager 配置 DNS${RESET}"
-            echo -e "${YELLOW}尝试直接修改并锁定 /etc/resolv.conf...${RESET}"
-            echo "nameserver 127.0.0.1" > /etc/resolv.conf
-            chattr +i /etc/resolv.conf 2>/dev/null || {
-                echo -e "${RED}警告：无法锁定 /etc/resolv.conf，可能会被覆盖${RESET}"
+            [ -z "$ACTIVE_CON" ] && { echo -e "${RED}错误：未找到活动连接${RESET}"; return 1; }
+            nmcli con mod "$ACTIVE_CON" ipv4.dns "$LAN_IP" 2>/dev/null
+            nmcli con mod "$ACTIVE_CON" ipv4.ignore-auto-dns yes 2>/dev/null
+            nmcli con up "$ACTIVE_CON" >/dev/null 2>&1 || {
+                echo "nameserver $LAN_IP" > /etc/resolv.conf
+                chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
             }
-            echo -e "${GREEN}成功：已直接设置并尝试锁定 /etc/resolv.conf${RESET}"
+        else
+            echo "nameserver $LAN_IP" > /etc/resolv.conf
+            chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
         fi
     else
-        # 如果没有 NetworkManager，直接使用 resolvconf 或手动设置
         if command -v resolvconf >/dev/null 2>&1; then
-            if [ ! -d /etc/resolvconf/resolv.conf.d ]; then
-                mkdir -p /etc/resolvconf/resolv.conf.d || {
-                    echo -e "${RED}错误：无法创建目录 /etc/resolvconf/resolv.conf.d${RESET}"
-                    return 1
-                }
-            fi
-            echo "nameserver 127.0.0.1" > /etc/resolvconf/resolv.conf.d/head
-            resolvconf -u && echo -e "${GREEN}成功：通过 resolvconf 设置 DNS 为 127.0.0.1${RESET}" || {
-                echo -e "${RED}错误：resolvconf 更新失败${RESET}"
-                return 1
-            }
+            mkdir -p /etc/resolvconf/resolv.conf.d
+            echo "nameserver $LAN_IP" > /etc/resolvconf/resolv.conf.d/head
+            resolvconf -u || { echo -e "${RED}错误：resolvconf 更新失败${RESET}"; return 1; }
         else
-            echo "nameserver 127.0.0.1" > /etc/resolv.conf
+            echo "nameserver $LAN_IP" > /etc/resolv.conf
             chmod 644 /etc/resolv.conf
-            chattr +i /etc/resolv.conf 2>/dev/null || {
-                echo -e "${YELLOW}警告：无法锁定 /etc/resolv.conf，可能会被覆盖${RESET}"
-            }
-            echo -e "${GREEN}成功：已直接设置并尝试锁定 /etc/resolv.conf${RESET}"
+            chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
         fi
     fi
 
-    # 验证是否成功
-    sleep 1  # 等待文件更新
-    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
-        echo -e "${GREEN}验证成功：/etc/resolv.conf 已固化为 MosDNS 解析${RESET}"
+    sleep 1
+    if grep -q "nameserver $LAN_IP" /etc/resolv.conf; then
+        echo -e "${GREEN}成功：已将 DNS 固化为 $LAN_IP${RESET}"
     else
         echo -e "${RED}错误：固化失败，请检查系统配置${RESET}"
         return 1
@@ -224,36 +222,19 @@ lock_resolv_conf() {
 
 restore_resolv_conf() {
     echo -e "${YELLOW}正在还原 /etc/resolv.conf 为系统默认设置...${RESET}"
-
-    # 解锁文件（如果被锁定）
     chattr -i /etc/resolv.conf 2>/dev/null
 
     if grep -q "Generated by NetworkManager" /etc/resolv.conf; then
         if command -v nmcli >/dev/null 2>&1; then
             ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
-            if [ -z "$ACTIVE_CON" ]; then
-                echo -e "${RED}错误：未找到活动网络连接${RESET}"
-                return 1
-            fi
-            # 清除自定义 DNS 并恢复自动 DNS
+            [ -z "$ACTIVE_CON" ] && { echo -e "${RED}错误：未找到活动连接${RESET}"; return 1; }
             nmcli con mod "$ACTIVE_CON" ipv4.dns "" 2>/dev/null
             nmcli con mod "$ACTIVE_CON" ipv4.ignore-auto-dns no 2>/dev/null
             nmcli con up "$ACTIVE_CON" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                echo -e "${GREEN}成功：已通过 NetworkManager 恢复默认 DNS 配置${RESET}"
-            else
-                echo -e "${RED}错误：通过 nmcli 恢复 DNS 失败${RESET}"
-                if [ -f /etc/resolv.conf.bak ]; then
-                    mv /etc/resolv.conf.bak /etc/resolv.conf
-                    echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
-                else
-                    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-                    chmod 644 /etc/resolv.conf
-                    echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
-                fi
-            fi
+            rm -f /etc/NetworkManager/dnsmasq.d/mosdns.conf 2>/dev/null
+            systemctl restart NetworkManager
+            echo -e "${GREEN}成功：已通过 NetworkManager 恢复默认 DNS${RESET}"
         else
-            echo -e "${YELLOW}未安装 nmcli，尝试直接恢复备份或设置默认 DNS${RESET}"
             if [ -f /etc/resolv.conf.bak ]; then
                 mv /etc/resolv.conf.bak /etc/resolv.conf
                 echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
@@ -273,14 +254,6 @@ restore_resolv_conf() {
             echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
         fi
     fi
-
-    # 验证还原结果
-    sleep 1  # 等待文件更新
-    if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
-        echo -e "${GREEN}验证成功：已移除 MosDNS 的 DNS 设置${RESET}"
-    else
-        echo -e "${RED}警告：还原后仍包含 127.0.0.1，请手动检查${RESET}"
-    fi
 }
 
 check_mosdns_status() {
@@ -290,18 +263,17 @@ check_mosdns_status() {
             echo -e "${GREEN}MosDNS 服务正在运行${RESET}"
         else
             echo -e "${RED}MosDNS 服务未运行${RESET}"
-            return
+            return 1
         fi
     else
         if pgrep -x "mosdns" > /dev/null; then
             echo -e "${GREEN}MosDNS 正在运行（通过进程检查）${RESET}"
         else
             echo -e "${RED}MosDNS 未运行（通过进程检查）${RESET}"
-            return
+            return 1
         fi
     fi
 
-    # 测试 DNS 解析
     echo -e "${YELLOW}测试通过 MosDNS 解析 www.example.com...${RESET}"
     RESOLVED_IP=$(dig @127.0.0.1 www.example.com +short)
     if [[ -n "$RESOLVED_IP" ]]; then
@@ -354,7 +326,6 @@ install_mosdns() {
         VERSION=${VERSION:-latest}
     fi
 
-    release_port_53
     PORT=53
 
     echo -e "\n${YELLOW}请输入国内DNS地址（默认 https://223.5.5.5/dns-query）：${RESET}"
@@ -365,12 +336,13 @@ install_mosdns() {
     read -p "> " FOREIGN_DNS
     FOREIGN_DNS=${FOREIGN_DNS:-1.1.1.1}
 
-    DOWNLOAD_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
+    BASE_GITHUB_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
+    BASE_RULES_URL1="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
+    BASE_RULES_URL2="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt"
     
-    # 下载 MosDNS
-    download_with_retry "$DOWNLOAD_URL" "mosdns.zip" || exit 1
-    download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || exit 1
-    download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" "$CONFIG_PATH/non_cn_domains.txt" || exit 1
+    download_with_retry "$BASE_GITHUB_URL" "mosdns.zip" || exit 1
+    download_with_retry "$BASE_RULES_URL1" "$CONFIG_PATH/cn_domains.txt" || exit 1
+    download_with_retry "$BASE_RULES_URL2" "$CONFIG_PATH/non_cn_domains.txt" || exit 1
 
     if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ]; then
         echo -e "${RED}错误：规则文件为空${RESET}"
@@ -445,19 +417,23 @@ EOF
     MOSDNS_PID=$!
     sleep 2
     if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
-        echo -e "${RED}错误：配置文件无效${RESET}"
+        echo -e "${RED}错误：配置文件无效或端口被占用${RESET}"
         cat "$TEMP_LOG"
         rm -f "$TEMP_LOG"
+        echo -e "${YELLOW}请检查53端口占用情况：${RESET}"
+        netstat -tuln | grep :53 || ss -tuln | grep :53
         exit 1
     fi
     kill "$MOSDNS_PID"
     rm -f "$TEMP_LOG"
 
+    configure_dnsmasq_for_mosdns
+
     if command -v systemctl >/dev/null 2>&1; then
         cat > /etc/systemd/system/mosdns.service <<EOF
 [Unit]
 Description=MosDNS Service
-After=network.target
+After=network.target NetworkManager.service
 
 [Service]
 ExecStart=$INSTALL_PATH/mosdns start -c $CONFIG_PATH/config.yaml
@@ -470,7 +446,6 @@ EOF
         systemctl daemon-reload
         systemctl enable mosdns.service
         systemctl start mosdns.service
-
         sleep 3
         if systemctl status mosdns.service | grep -q "running"; then
             echo -e "${GREEN}成功：MosDNS正常运行${RESET}"
@@ -495,13 +470,7 @@ EOF
         fi
     fi
 
-    echo -e "\n${YELLOW}是否配置双AdGuard Home分流？(y/n)：${RESET}"
-    read -p "> " CONFIG_ADG
-    if [ "${CONFIG_ADG:-n}" = "y" ]; then
-        configure_dual_adg
-    fi
-
-    echo -e "\n${GREEN}MosDNS 已启动并监听 127.0.0.1:53${RESET}"
+    echo -e "${GREEN}MosDNS 已启动并监听 127.0.0.1:53，dnsmasq 将转发请求${RESET}"
 }
 
 uninstall_mosdns() {
@@ -516,17 +485,18 @@ uninstall_mosdns() {
     fi
     rm -f /usr/local/bin/mosdns
     rm -rf /etc/mosdns
+    rm -f /etc/NetworkManager/dnsmasq.d/mosdns.conf 2>/dev/null
+    rm -f /etc/dnsmasq.d/mosdns.conf 2>/dev/null
 
     if [ -f /etc/resolv.conf.bak ]; then
         mv /etc/resolv.conf.bak /etc/resolv.conf
         echo -e "${GREEN}已还原DNS配置${RESET}"
     else
-        echo "nameserver 223.5.5.5" > /etc/resolv.conf
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
         chmod 644 /etc/resolv.conf
-        echo -e "${GREEN}未找到备份，使用默认DNS 223.5.5.5${RESET}"
+        echo -e "${GREEN}未找到备份，使用默认DNS 8.8.8.8${RESET}"
     fi
-
-    crontab -l 2>/dev/null | grep -v "update_mosdns_rules.sh" | crontab -
+    systemctl restart NetworkManager 2>/dev/null || systemctl restart dnsmasq 2>/dev/null
     echo -e "${GREEN}MosDNS 已卸载${RESET}"
 }
 
@@ -540,11 +510,11 @@ update_rules() {
     cp "$CONFIG_PATH/cn_domains.txt" "$CONFIG_PATH/cn_domains.txt.bak" 2>/dev/null
     cp "$CONFIG_PATH/non_cn_domains.txt" "$CONFIG_PATH/non_cn_domains.txt.bak" 2>/dev/null
 
-    download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || {
+    download_with_retry "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || {
         [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
         exit 1
     }
-    download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" "$CONFIG_PATH/non_cn_domains.txt" || {
+    download_with_retry "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" "$CONFIG_PATH/non_cn_domains.txt" || {
         [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
         exit 1
     }
@@ -581,82 +551,22 @@ update_rules() {
             exit 1
         fi
     fi
-
-    if command -v cron >/dev/null 2>&1; then
-        cat > /usr/local/bin/update_mosdns_rules.sh <<EOF
-#!/bin/bash
-CONFIG_PATH="/etc/mosdns"
-cp "\$CONFIG_PATH/cn_domains.txt" "\$CONFIG_PATH/cn_domains.txt.bak" 2>/dev/null
-cp "\$CONFIG_PATH/non_cn_domains.txt" "\$CONFIG_PATH/non_cn_domains.txt.bak" 2>/dev/null
-curl -L -o "\$CONFIG_PATH/cn_domains.txt" "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" || {
-    [ -f "\$CONFIG_PATH/cn_domains.txt.bak" ] && mv "\$CONFIG_PATH/cn_domains.txt.bak" "\$CONFIG_PATH/cn_domains.txt"
-    exit 1
-}
-curl -L -o "\$CONFIG_PATH/non_cn_domains.txt" "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" || {
-    [ -f "\$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "\$CONFIG_PATH/non_cn_domains.txt.bak" "\$CONFIG_PATH/non_cn_domains.txt"
-    exit 1
-}
-if [ ! -s "\$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "\$CONFIG_PATH/non_cn_domains.txt" ]; then
-    [ -f "\$CONFIG_PATH/cn_domains.txt.bak" ] && mv "\$CONFIG_PATH/cn_domains.txt.bak" "\$CONFIG_PATH/cn_domains.txt"
-    [ -f "\$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "\$CONFIG_PATH/non_cn_domains.txt.bak" "\$CONFIG_PATH/non_cn_domains.txt"
-    exit 1
-fi
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart mosdns
-else
-    killall mosdns 2>/dev/null
-    /usr/local/bin/mosdns start -c "\$CONFIG_PATH/config.yaml" &
-fi
-EOF
-        chmod +x /usr/local/bin/update_mosdns_rules.sh
-        (crontab -l 2>/dev/null | grep -v "update_mosdns_rules.sh"; echo "0 0 * * 5 /usr/local/bin/update_mosdns_rules.sh") | crontab -
-        echo -e "${GREEN}已设置每周五自动更新${RESET}"
-    else
-        echo -e "${YELLOW}无 cron，跳过自动更新设置${RESET}"
-    fi
 }
 
-# 主菜单循环
 while true; do
     echo -e "${YELLOW}MosDNS 安装与管理脚本${RESET}"
     PS3="请选择操作（输入数字）："
     OPTIONS=("安装MosDNS" "卸载清理MosDNS" "更新规则" "固化 DNS 配置" "还原系统 DNS 配置" "查看 MosDNS 状态" "查看 /etc/resolv.conf" "退出")
     select opt in "${OPTIONS[@]}"; do
         case $opt in
-            "安装MosDNS")
-                check_install_deps
-                install_mosdns
-                break
-                ;;
-            "卸载清理MosDNS")
-                uninstall_mosdns
-                break
-                ;;
-            "更新规则")
-                update_rules
-                break
-                ;;
-            "固化 DNS 配置")
-                install_resolvconf_if_needed
-                lock_resolv_conf
-                break
-                ;;
-            "还原系统 DNS 配置")
-                restore_resolv_conf
-                break
-                ;;
-            "查看 MosDNS 状态")
-                check_mosdns_status
-                break
-                ;;
-            "查看 /etc/resolv.conf")
-                view_resolv_conf
-                break
-                ;;
-            "退出")
-                echo -e "${GREEN}退出脚本${RESET}"
-                exit 0
-                ;;
+            "安装MosDNS") check_install_deps; install_mosdns; break ;;
+            "卸载清理MosDNS") uninstall_mosdns; break ;;
+            "更新规则") update_rules; break ;;
+            "固化 DNS 配置") install_resolvconf_if_needed; lock_resolv_conf; break ;;
+            "还原系统 DNS 配置") restore_resolv_conf; break ;;
+            "查看 MosDNS 状态") check_mosdns_status; break ;;
+            "查看 /etc/resolv.conf") view_resolv_conf; break ;;
+            "退出") echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
             *) echo -e "${RED}无效选项${RESET}" ;;
         esac
     done
