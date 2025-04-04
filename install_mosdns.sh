@@ -184,6 +184,7 @@ plugins:
       listen: 127.0.0.1:53
 EOF
 
+    # 启动 MosDNS
     TEMP_LOG=$(mktemp)
     /usr/local/bin/mosdns start -c "$CONFIG_PATH/config.yaml" >"$TEMP_LOG" 2>&1 &
     MOSDNS_PID=$!
@@ -262,6 +263,8 @@ install_mosdns() {
     FOREIGN_DNS=${FOREIGN_DNS:-1.1.1.1}
 
     DOWNLOAD_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
+    
+    # 下载 MosDNS
     download_with_retry "$DOWNLOAD_URL" "mosdns.zip" || exit 1
     download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || exit 1
     download_with_retry "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" "$CONFIG_PATH/non_cn_domains.txt" || exit 1
@@ -277,8 +280,6 @@ install_mosdns() {
     echo -e "${GREEN}MosDNS 版本：$MOSDNS_VERSION${RESET}"
     rm -f mosdns.zip
 
-    dial_addr="${DOMESTIC_DNS#https://}"
-    dial_addr="${dial_addr%/dns-query}"
     cat > "$CONFIG_PATH/config.yaml" <<EOF
 log:
   level: info
@@ -303,9 +304,6 @@ plugins:
       concurrent: 4
       upstreams:
         - addr: "$DOMESTIC_DNS"
-          enable_http3: true
-          enable_pipeline: true
-          dial_addr: "$dial_addr"
 
   - tag: "remote_forward"
     type: forward
