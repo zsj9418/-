@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MosDNS 一键安装与管理脚本（修复版）
+# MosDNS 一键安装与管理脚本
 
 RED='\e[31m'
 GREEN='\e[32m'
@@ -64,21 +64,6 @@ check_install_deps() {
     [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装核心依赖：${INSTALLED_DEPS[*]}${RESET}"
 }
 
-install_resolvconf_if_needed() {
-    if ! command -v resolvconf >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 resolvconf 工具...${RESET}"
-        if [ "$PKG_MANAGER" != "none" ]; then
-            $INSTALL_CMD resolvconf || { echo -e "${RED}安装 resolvconf 失败，请检查包管理器配置${RESET}"; exit 1; }
-            echo -e "${GREEN}resolvconf 安装成功${RESET}"
-        else
-            echo -e "${RED}错误：未找到包管理器，无法安装 resolvconf${RESET}"
-            exit 1
-        fi
-    else
-        echo -e "${GREEN}resolvconf 已安装，跳过安装${RESET}"
-    fi
-}
-
 download_with_retry() {
     local url="$1"
     local output="$2"
@@ -109,6 +94,19 @@ download_with_retry() {
     return 1
 }
 
+process_adblock_file() {
+    local input_file="$1"
+    local output_file="$2"
+    echo -e "${YELLOW}处理 adblock 文件格式以适配 MosDNS...${RESET}"
+    sed 's/||//; s/\^.*$//; /^$/d; /^#/d; /^\[/d; s/\s.*$//; /^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$/d' "$input_file" > "$output_file"
+    if [ -s "$output_file" ]; then
+        echo -e "${GREEN}成功：adblock 文件已处理并保存到 $output_file${RESET}"
+    else
+        echo -e "${RED}错误：处理后的 adblock 文件为空${RESET}"
+        exit 1
+    fi
+}
+
 configure_dnsmasq_for_mosdns() {
     echo -e "${YELLOW}配置 dnsmasq 以转发 DNS 请求到 MosDNS...${RESET}"
     if command -v nmcli >/dev/null 2>&1; then
@@ -116,33 +114,45 @@ configure_dnsmasq_for_mosdns() {
         if [ -n "$ACTIVE_CON" ]; then
             METHOD=$(nmcli -t -f ipv4.method con show "$ACTIVE_CON" | cut -d: -f2)
             if [ "$METHOD" = "shared" ]; then
-                # 配置 NetworkManager 的 dnsmasq
+                # 禁用 NetworkManager 的默认 DNS 管理
+                mkdir -p /etc/NetworkManager/conf.d
+                cat > /etc/NetworkManager/conf.d/no-dns.conf <<EOF
+[main]
+dns=none
+EOF
+                # 配置 dnsmasq
                 mkdir -p /etc/NetworkManager/dnsmasq.d
-                echo "server=127.0.0.1#53" > /etc/NetworkManager/dnsmasq.d/mosdns.conf
+                cat > /etc/NetworkManager/dnsmasq.d/mosdns.conf <<EOF
+no-resolv
+server=127.0.0.1#53
+no-poll
+log-queries
+EOF
+                # 重启 NetworkManager 并验证
                 systemctl restart NetworkManager
                 sleep 3
                 if netstat -tuln | grep -q "10.42.0.1:53"; then
                     echo -e "${GREEN}成功：NetworkManager 的 dnsmasq 已配置并运行${RESET}"
-                else
-                    echo -e "${RED}错误：NetworkManager 的 dnsmasq 未正确重启，尝试独立 dnsmasq${RESET}"
-                    # 如果 NetworkManager 失败，尝试独立 dnsmasq
-                    if command -v dnsmasq >/dev/null 2>&1; then
-                        echo "no-resolv" > /etc/dnsmasq.d/mosdns.conf
-                        echo "server=127.0.0.1#53" >> /etc/dnsmasq.d/mosdns.conf
-                        echo "interface=wlan0" >> /etc/dnsmasq.d/mosdns.conf
-                        systemctl restart dnsmasq
-                        sleep 2
-                        if netstat -tuln | grep -q "10.42.0.1:53"; then
-                            echo -e "${GREEN}成功：独立 dnsmasq 已配置并运行${RESET}"
-                        else
-                            echo -e "${RED}错误：独立 dnsmasq 启动失败，请检查日志${RESET}"
-                            journalctl -u dnsmasq | tail -n 20
-                            exit 1
-                        fi
+                    sleep 2
+                    # 检查 dnsmasq 是否转发到 127.0.0.1
+                    if journalctl -u NetworkManager | tail -n 50 | grep -q "using nameserver 127.0.0.1"; then
+                        echo -e "${GREEN}确认：dnsmasq 已转发到 MosDNS${RESET}"
                     else
-                        echo -e "${RED}错误：未安装 dnsmasq，无法配置${RESET}"
+                        echo -e "${RED}错误：dnsmasq 未正确转发到 MosDNS${RESET}"
+                        echo -e "${YELLOW}检查配置文件：${RESET}"
+                        cat /etc/NetworkManager/dnsmasq.d/mosdns.conf
+                        echo -e "${YELLOW}NetworkManager 日志：${RESET}"
+                        journalctl -u NetworkManager | tail -n 50
+                        echo -e "${YELLOW}建议：${RESET}"
+                        echo "1. 确认 /etc/NetworkManager/dnsmasq.d/mosdns.conf 权限为 644"
+                        echo "2. 检查是否存在其他 dnsmasq 配置文件干扰"
+                        echo "3. 手动运行 'nmcli con reload' 并重启 NetworkManager"
                         exit 1
                     fi
+                else
+                    echo -e "${RED}错误：NetworkManager 的 dnsmasq 未正确重启${RESET}"
+                    journalctl -u NetworkManager | tail -n 20
+                    exit 1
                 fi
             else
                 echo -e "${YELLOW}警告：未检测到 'shared' 模式，跳过 dnsmasq 配置${RESET}"
@@ -152,71 +162,28 @@ configure_dnsmasq_for_mosdns() {
             exit 1
         fi
     else
-        echo -e "${YELLOW}未安装 nmcli，尝试独立 dnsmasq 配置${RESET}"
-        if command -v dnsmasq >/dev/null 2>&1; then
-            mkdir -p /etc/dnsmasq.d
-            echo "no-resolv" > /etc/dnsmasq.d/mosdns.conf
-            echo "server=127.0.0.1#53" >> /etc/dnsmasq.d/mosdns.conf
-            echo "interface=wlan0" >> /etc/dnsmasq.d/mosdns.conf
-            systemctl restart dnsmasq
-            sleep 2
-            if netstat -tuln | grep -q "10.42.0.1:53"; then
-                echo -e "${GREEN}成功：独立 dnsmasq 已配置并运行${RESET}"
-            else
-                echo -e "${RED}错误：独立 dnsmasq 启动失败，请检查日志${RESET}"
-                journalctl -u dnsmasq | tail -n 20
-                exit 1
-            fi
-        else
-            echo -e "${RED}错误：未安装 dnsmasq 和 nmcli，无法配置${RESET}"
-            exit 1
-        fi
+        echo -e "${RED}错误：未安装 nmcli，无法配置${RESET}"
+        exit 1
     fi
 }
 
 lock_resolv_conf() {
     echo -e "${YELLOW}正在固化 /etc/resolv.conf 为 MosDNS 解析...${RESET}"
-    LAN_IP=$(ip -4 addr show dev wlan0 | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -n1)
-    [ -z "$LAN_IP" ] && { echo -e "${RED}错误：未检测到 wlan0 的 LAN IP，使用 127.0.0.1${RESET}"; LAN_IP="127.0.0.1"; }
-
     if [ -f /etc/resolv.conf ] && [ ! -f /etc/resolv.conf.bak ]; then
         cp /etc/resolv.conf /etc/resolv.conf.bak
         echo -e "${GREEN}已备份原始 /etc/resolv.conf${RESET}"
     fi
 
-    if grep -q "Generated by NetworkManager" /etc/resolv.conf; then
-        echo -e "${YELLOW}检测到 NetworkManager 管理 DNS，正在调整配置...${RESET}"
-        if command -v nmcli >/dev/null 2>&1; then
-            ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
-            [ -z "$ACTIVE_CON" ] && { echo -e "${RED}错误：未找到活动连接${RESET}"; return 1; }
-            nmcli con mod "$ACTIVE_CON" ipv4.dns "$LAN_IP" 2>/dev/null
-            nmcli con mod "$ACTIVE_CON" ipv4.ignore-auto-dns yes 2>/dev/null
-            nmcli con up "$ACTIVE_CON" >/dev/null 2>&1 || {
-                echo "nameserver $LAN_IP" > /etc/resolv.conf
-                chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
-            }
-        else
-            echo "nameserver $LAN_IP" > /etc/resolv.conf
-            chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
-        fi
-    else
-        if command -v resolvconf >/dev/null 2>&1; then
-            mkdir -p /etc/resolvconf/resolv.conf.d
-            echo "nameserver $LAN_IP" > /etc/resolvconf/resolv.conf.d/head
-            resolvconf -u || { echo -e "${RED}错误：resolvconf 更新失败${RESET}"; return 1; }
-        else
-            echo "nameserver $LAN_IP" > /etc/resolv.conf
-            chmod 644 /etc/resolv.conf
-            chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件${RESET}"
-        fi
-    fi
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chmod 644 /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件，可能会被覆盖${RESET}"
 
     sleep 1
-    if grep -q "nameserver $LAN_IP" /etc/resolv.conf; then
-        echo -e "${GREEN}成功：已将 DNS 固化为 $LAN_IP${RESET}"
+    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+        echo -e "${GREEN}成功：已将 DNS 固化为 127.0.0.1${RESET}"
     else
         echo -e "${RED}错误：固化失败，请检查系统配置${RESET}"
-        return 1
+        exit 1
     fi
 }
 
@@ -224,35 +191,24 @@ restore_resolv_conf() {
     echo -e "${YELLOW}正在还原 /etc/resolv.conf 为系统默认设置...${RESET}"
     chattr -i /etc/resolv.conf 2>/dev/null
 
-    if grep -q "Generated by NetworkManager" /etc/resolv.conf; then
-        if command -v nmcli >/dev/null 2>&1; then
-            ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
-            [ -z "$ACTIVE_CON" ] && { echo -e "${RED}错误：未找到活动连接${RESET}"; return 1; }
+    if [ -f /etc/resolv.conf.bak ]; then
+        mv /etc/resolv.conf.bak /etc/resolv.conf
+        echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
+    else
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        chmod 644 /etc/resolv.conf
+        echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
+    fi
+
+    if command -v nmcli >/dev/null 2>&1; then
+        rm -f /etc/NetworkManager/conf.d/no-dns.conf
+        ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
+        if [ -n "$ACTIVE_CON" ]; then
             nmcli con mod "$ACTIVE_CON" ipv4.dns "" 2>/dev/null
             nmcli con mod "$ACTIVE_CON" ipv4.ignore-auto-dns no 2>/dev/null
             nmcli con up "$ACTIVE_CON" >/dev/null 2>&1
-            rm -f /etc/NetworkManager/dnsmasq.d/mosdns.conf 2>/dev/null
-            systemctl restart NetworkManager
-            echo -e "${GREEN}成功：已通过 NetworkManager 恢复默认 DNS${RESET}"
-        else
-            if [ -f /etc/resolv.conf.bak ]; then
-                mv /etc/resolv.conf.bak /etc/resolv.conf
-                echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
-            else
-                echo "nameserver 8.8.8.8" > /etc/resolv.conf
-                chmod 644 /etc/resolv.conf
-                echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
-            fi
         fi
-    else
-        if [ -f /etc/resolv.conf.bak ]; then
-            mv /etc/resolv.conf.bak /etc/resolv.conf
-            echo -e "${GREEN}成功：已恢复原有 DNS 配置${RESET}"
-        else
-            echo "nameserver 8.8.8.8" > /etc/resolv.conf
-            chmod 644 /etc/resolv.conf
-            echo -e "${GREEN}未找到备份，已设置为默认 DNS 8.8.8.8${RESET}"
-        fi
+        systemctl restart NetworkManager
     fi
 }
 
@@ -280,6 +236,14 @@ check_mosdns_status() {
         echo -e "${GREEN}解析成功：www.example.com 的 IP 地址是 $RESOLVED_IP${RESET}"
     else
         echo -e "${RED}解析失败：无法通过 MosDNS 解析 www.example.com${RESET}"
+    fi
+
+    echo -e "${YELLOW}测试广告拦截 doubleclick.net...${RESET}"
+    BLOCK_TEST=$(dig @127.0.0.1 doubleclick.net +short)
+    if [[ -z "$BLOCK_TEST" ]]; then
+        echo -e "${GREEN}广告拦截成功：doubleclick.net 未解析${RESET}"
+    else
+        echo -e "${RED}广告拦截失败：doubleclick.net 仍解析为 $BLOCK_TEST${RESET}"
     fi
 }
 
@@ -339,12 +303,17 @@ install_mosdns() {
     BASE_GITHUB_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
     BASE_RULES_URL1="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
     BASE_RULES_URL2="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt"
+    ADBLOCK_URL="https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
     
     download_with_retry "$BASE_GITHUB_URL" "mosdns.zip" || exit 1
     download_with_retry "$BASE_RULES_URL1" "$CONFIG_PATH/cn_domains.txt" || exit 1
     download_with_retry "$BASE_RULES_URL2" "$CONFIG_PATH/non_cn_domains.txt" || exit 1
+    download_with_retry "$ADBLOCK_URL" "$CONFIG_PATH/adblock_raw.txt" || exit 1
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ]; then
+    process_adblock_file "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/adblock.txt"
+    rm -f "$CONFIG_PATH/adblock_raw.txt"
+
+    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ]; then
         echo -e "${RED}错误：规则文件为空${RESET}"
         exit 1
     fi
@@ -373,6 +342,12 @@ plugins:
       files:
         - "$CONFIG_PATH/non_cn_domains.txt"
 
+  - tag: "block_list"
+    type: domain_set
+    args:
+      files:
+        - "$CONFIG_PATH/adblock.txt"
+
   - tag: "local_forward"
     type: forward
     args:
@@ -400,6 +375,8 @@ plugins:
   - tag: "main_sequence"
     type: sequence
     args:
+      - matches: "qname \$block_list"
+        exec: reject
       - matches: "qname \$direct_domain"
         exec: goto local_sequence
       - matches: "qname \$remote_domain"
@@ -427,6 +404,8 @@ EOF
     kill "$MOSDNS_PID"
     rm -f "$TEMP_LOG"
 
+    # 先固化 resolv.conf，再配置 dnsmasq
+    lock_resolv_conf
     configure_dnsmasq_for_mosdns
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -449,8 +428,6 @@ EOF
         sleep 3
         if systemctl status mosdns.service | grep -q "running"; then
             echo -e "${GREEN}成功：MosDNS正常运行${RESET}"
-            echo "nameserver 127.0.0.1" > /etc/resolv.conf
-            chmod 644 /etc/resolv.conf
         else
             echo -e "${RED}错误：MosDNS 服务未运行${RESET}"
             systemctl status mosdns.service
@@ -462,8 +439,6 @@ EOF
         sleep 3
         if ps -ef | grep -q "[m]osdns start"; then
             echo -e "${GREEN}成功：MosDNS已在后台运行${RESET}"
-            echo "nameserver 127.0.0.1" > /etc/resolv.conf
-            chmod 644 /etc/resolv.conf
         else
             echo -e "${RED}错误：MosDNS 启动失败${RESET}"
             exit 1
@@ -486,17 +461,9 @@ uninstall_mosdns() {
     rm -f /usr/local/bin/mosdns
     rm -rf /etc/mosdns
     rm -f /etc/NetworkManager/dnsmasq.d/mosdns.conf 2>/dev/null
-    rm -f /etc/dnsmasq.d/mosdns.conf 2>/dev/null
+    rm -f /etc/NetworkManager/conf.d/no-dns.conf 2>/dev/null
 
-    if [ -f /etc/resolv.conf.bak ]; then
-        mv /etc/resolv.conf.bak /etc/resolv.conf
-        echo -e "${GREEN}已还原DNS配置${RESET}"
-    else
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf
-        chmod 644 /etc/resolv.conf
-        echo -e "${GREEN}未找到备份，使用默认DNS 8.8.8.8${RESET}"
-    fi
-    systemctl restart NetworkManager 2>/dev/null || systemctl restart dnsmasq 2>/dev/null
+    restore_resolv_conf
     echo -e "${GREEN}MosDNS 已卸载${RESET}"
 }
 
@@ -509,6 +476,7 @@ update_rules() {
 
     cp "$CONFIG_PATH/cn_domains.txt" "$CONFIG_PATH/cn_domains.txt.bak" 2>/dev/null
     cp "$CONFIG_PATH/non_cn_domains.txt" "$CONFIG_PATH/non_cn_domains.txt.bak" 2>/dev/null
+    cp "$CONFIG_PATH/adblock.txt" "$CONFIG_PATH/adblock.txt.bak" 2>/dev/null
 
     download_with_retry "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || {
         [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
@@ -518,11 +486,18 @@ update_rules() {
         [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
         exit 1
     }
+    download_with_retry "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt" "$CONFIG_PATH/adblock_raw.txt" || {
+        [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
+        exit 1
+    }
+    process_adblock_file "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/adblock.txt"
+    rm -f "$CONFIG_PATH/adblock_raw.txt"
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ]; then
+    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ]; then
         echo -e "${RED}规则文件为空，回滚...${RESET}"
         [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
         [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+        [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
         exit 1
     fi
 
@@ -535,6 +510,7 @@ update_rules() {
             echo -e "${RED}重启失败，回滚规则...${RESET}"
             [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
             [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+            [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
             systemctl restart mosdns
             exit 1
         fi
@@ -548,6 +524,7 @@ update_rules() {
             echo -e "${RED}重启失败，回滚规则...${RESET}"
             [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
             [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
+            [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
             exit 1
         fi
     fi
@@ -562,7 +539,7 @@ while true; do
             "安装MosDNS") check_install_deps; install_mosdns; break ;;
             "卸载清理MosDNS") uninstall_mosdns; break ;;
             "更新规则") update_rules; break ;;
-            "固化 DNS 配置") install_resolvconf_if_needed; lock_resolv_conf; break ;;
+            "固化 DNS 配置") lock_resolv_conf; break ;;
             "还原系统 DNS 配置") restore_resolv_conf; break ;;
             "查看 MosDNS 状态") check_mosdns_status; break ;;
             "查看 /etc/resolv.conf") view_resolv_conf; break ;;
