@@ -14,10 +14,11 @@ touch "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # 常量
-DEFAULT_PORT=3000
+DEFAULT_PORT=100
 LOBE_CHAT_IMAGE="lobehub/lobe-chat:latest"
 WEBSSH_IMAGE="jrohy/webssh"
 LOOKING_GLASS_IMAGE="wikihostinc/looking-glass-server"
+SPEEDTEST_IMAGE="ghcr.io/librespeed/speedtest"
 
 # 彩色输出
 function green() { echo -e "\e[32m$1\e[0m"; }
@@ -197,6 +198,11 @@ function deploy_looking_glass() {
   deploy_service "looking-glass" $LOOKING_GLASS_IMAGE 80
 }
 
+# 部署 Speedtest
+function deploy_speedtest() {
+  deploy_service "speedtest" $SPEEDTEST_IMAGE 8080
+}
+
 # 主菜单
 function main_menu() {
   detect_architecture
@@ -209,21 +215,25 @@ function main_menu() {
     echo "1. 部署 Lobe Chat"
     echo "2. 部署 WebSSH"
     echo "3. 部署 Looking Glass Server"
-    echo "4. 卸载 Lobe Chat"
-    echo "5. 卸载 WebSSH"
-    echo "6. 卸载 Looking Glass Server"
-    echo "7. 查看所有容器状态"
-    echo "8. 退出脚本"
-    read -p "请输入选择（1-8）： " choice
+    echo "4. 部署 Speedtest"
+    echo "5. 卸载 Lobe Chat"
+    echo "6. 卸载 WebSSH"
+    echo "7. 卸载 Looking Glass Server"
+    echo "8. 卸载 Speedtest"
+    echo "9. 查看所有容器状态"
+    echo "10. 退出脚本"
+    read -p "请输入选择（1-10）： " choice
     case $choice in
       1) deploy_lobe_chat ;;
       2) deploy_webssh ;;
       3) deploy_looking_glass ;;
-      4) uninstall_service "lobe-chat" ;;
-      5) uninstall_service "webssh" ;;
-      6) uninstall_service "looking-glass" ;;
-      7) check_all_containers_status ;;
-      8) green "感谢您的使用！脚本退出。" && exit 0 ;;
+      4) deploy_speedtest ;;
+      5) uninstall_service "lobe-chat" ;;
+      6) uninstall_service "webssh" ;;
+      7) uninstall_service "looking-glass" ;;
+      8) uninstall_service "speedtest" ;;
+      9) check_all_containers_status ;;
+      10) green "感谢您的使用！脚本退出。" && exit 0 ;;
       *) red "无效选项，请重新选择。" ;;
     esac
   done
