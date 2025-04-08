@@ -75,10 +75,15 @@ check_system() {
 
     echo -e "${YELLOW}安装依赖...${NC}"
     if [ "$PKG_MANAGER" = "apt" ]; then
-        apt update -y
-        apt install -y wget curl unzip nano iproute2
+        apt update -y && apt install -y wget curl unzip nano iproute2 || {
+            echo -e "${RED}依赖安装失败，请检查网络或包管理器${NC}"
+            exit 1
+        }
     elif [ "$PKG_MANAGER" = "yum" ]; then
-        yum install -y wget curl unzip nano iproute2
+        yum install -y wget curl unzip nano iproute2 || {
+            echo -e "${RED}依赖安装失败，请检查网络或包管理器${NC}"
+            exit 1
+        }
     fi
     mkdir -p /etc/dae
     touch /etc/dae/.setup_done
@@ -89,10 +94,9 @@ check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         echo -e "${YELLOW}Docker未安装，正在安装...${NC}"
         if [ -f /etc/debian_version ]; then
-            apt update -y
-            apt install -y docker.io
+            apt update -y && apt install -y docker.io || return 1
         elif [ -f /etc/redhat-release ]; then
-            yum install -y docker
+            yum install -y docker || return 1
         fi
         systemctl start docker
         systemctl enable docker
@@ -107,7 +111,7 @@ check_docker() {
 # 检查日志大小并清空
 check_log_size() {
     if [ -f "$LOG_FILE" ]; then
-        LOG_SIZE=$(stat -c%s "$LOG_FILE")
+        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if [ "$LOG_SIZE" -gt "$LOG_SIZE_LIMIT" ]; then
             echo -e "${YELLOW}日志文件超过1MB，正在清空...${NC}"
             > "$LOG_FILE"
@@ -128,12 +132,61 @@ save_env() {
     local value=$2
     if [ ! -f "$ENV_FILE" ]; then
         touch "$ENV_FILE"
+        chmod 0600 "$ENV_FILE"
     fi
     if grep -q "^$key=" "$ENV_FILE"; then
         sed -i "s|^$key=.*|$key=\"$value\"|" "$ENV_FILE"
     else
         echo "$key=\"$value\"" >> "$ENV_FILE"
     fi
+}
+
+# 清理网络资源
+clean_network_resources() {
+    echo -e "${YELLOW}清理现有网络资源以避免冲突...${NC}"
+    sudo ip rule del fwmark 114514 2>/dev/null
+    sudo ip route flush table 114514 2>/dev/null
+    sudo ip link delete dae 2>/dev/null
+    # 检查是否有其他dae相关进程
+    if pgrep -f "/usr/bin/dae" >/dev/null; then
+        echo -e "${YELLOW}检测到残留dae进程，正在终止...${NC}"
+        sudo pkill -9 -f "/usr/bin/dae"
+    fi
+}
+
+# 设置订阅地址
+set_subscription() {
+    load_env
+    if [ -n "$SUB_URL" ]; then
+        echo -e "${YELLOW}当前订阅地址: $SUB_URL${NC}"
+        echo -e "是否使用已有地址？(y/n，默认y)"
+        read -r use_existing
+        if [ "$use_existing" != "n" ] && [ "$use_existing" != "N" ]; then
+            echo -e "${GREEN}将使用现有订阅地址${NC}"
+        else
+            SUB_URL=""
+        fi
+    fi
+
+    while [ -z "$SUB_URL" ]; do
+        echo -e "${YELLOW}请输入你的代理订阅地址（URL）：${NC}"
+        read -r SUB_URL
+        if [ -z "$SUB_URL" ]; then
+            echo -e "${RED}订阅地址不能为空，请重新输入${NC}"
+        else
+            save_env "SUB_URL" "$SUB_URL"
+            break
+        fi
+    done
+
+    # 更新配置文件
+    if [ -f "$CONFIG_FILE" ]; then
+        sed -i "s|subscription {.*|subscription {\n  \"$SUB_URL\"\n}|" "$CONFIG_FILE"
+    else
+        echo -e "${RED}配置文件 $CONFIG_FILE 不存在${NC}"
+        return 1
+    fi
+    sudo chmod 0600 "$CONFIG_FILE"
 }
 
 # 安装dae（非Docker）
@@ -164,19 +217,35 @@ install_dae() {
         echo -e "${RED}解压dae失败，请检查unzip命令${NC}"
         return 1
     }
-    # 增强文件移动逻辑
+
+    echo -e "${YELLOW}解压后的文件：${NC}"
+    ls -l /tmp/dae*
+
     if [ -f /tmp/dae-linux-"$ARCH_TYPE" ]; then
-        sudo mv /tmp/dae-linux-"$ARCH_TYPE" /usr/bin/dae
+        echo -e "${YELLOW}移动 /tmp/dae-linux-$ARCH_TYPE 到 /usr/bin/dae...${NC}"
+        sudo mv /tmp/dae-linux-"$ARCH_TYPE" /usr/bin/dae || {
+            echo -e "${RED}移动 /tmp/dae-linux-$ARCH_TYPE 失败${NC}"
+            return 1
+        }
     elif [ -f /tmp/dae ]; then
-        sudo mv /tmp/dae /usr/bin/dae
+        echo -e "${YELLOW}移动 /tmp/dae 到 /usr/bin/dae...${NC}"
+        sudo mv /tmp/dae /usr/bin/dae || {
+            echo -e "${RED}移动 /tmp/dae 失败${NC}"
+            return 1
+        }
     else
         echo -e "${RED}未找到dae二进制文件（预期为 /tmp/dae-linux-$ARCH_TYPE 或 /tmp/dae）${NC}"
         return 1
     fi
+
     sudo chmod +x /usr/bin/dae
     sudo mkdir -p /etc/dae
-    sudo mv /tmp/geoip.dat /etc/dae/geoip.dat 2>/dev/null || wget -O /etc/dae/geoip.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
-    sudo mv /tmp/geosite.dat /etc/dae/geosite.dat 2>/dev/null || wget -O /etc/dae/geosite.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
+    sudo mv /tmp/geoip.dat /etc/dae/geoip.dat 2>/dev/null || wget -O /etc/dae/geoip.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat || {
+        echo -e "${RED}下载geoip.dat失败${NC}"
+    }
+    sudo mv /tmp/geosite.dat /etc/dae/geosite.dat 2>/dev/null || wget -O /etc/dae/geosite.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat || {
+        echo -e "${RED}下载geosite.dat失败${NC}"
+    }
     sudo mv /tmp/dae.service /etc/systemd/system/dae.service 2>/dev/null || cat <<EOF | sudo tee /etc/systemd/system/dae.service
 [Unit]
 Description=dae Service
@@ -192,16 +261,62 @@ PIDFile=/var/run/dae.pid
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo mv /tmp/example.dae /etc/dae/config.dae 2>/dev/null || true
+
+    # 生成初始配置文件
+    echo -e "${YELLOW}生成初始配置文件...${NC}"
+    cat <<EOF | sudo tee "$CONFIG_FILE"
+global {
+  lan_interface: ""
+  wan_interface: auto
+  log_level: info
+  allow_insecure: false
+  auto_config_kernel_parameter: true
+}
+
+subscription {
+}
+
+group {
+  proxy {
+    policy: min_moving_avg
+  }
+}
+
+routing {
+  dip(geoip:private) -> direct
+  dip(geoip:cn) -> direct
+  domain(geosite:cn) -> direct
+  fallback: proxy
+}
+EOF
+    sudo chmod 0600 "$CONFIG_FILE"
+
+    # 设置订阅地址
+    echo -e "${YELLOW}设置订阅地址...${NC}"
+    set_subscription || {
+        echo -e "${RED}订阅设置失败，请手动编辑 $CONFIG_FILE${NC}"
+        return 1
+    }
+
+    # 清理网络资源
+    clean_network_resources
+
+    # 启动服务
     sudo systemctl daemon-reload
     sudo systemctl enable dae
-    systemctl start dae
+    systemctl start dae || {
+        echo -e "${RED}dae启动失败，请检查日志：journalctl -u dae${NC}"
+        return 1
+    }
     if systemctl is-active dae >/dev/null; then
         echo -e "${GREEN}dae安装并启动成功${NC}"
     else
         echo -e "${RED}dae启动失败，请检查日志：journalctl -u dae${NC}"
         return 1
     fi
+
+    # 清理临时文件
+    rm -f /tmp/dae* 2>/dev/null
 }
 
 # 在Docker中安装和配置dae
@@ -261,105 +376,6 @@ install_dae_docker() {
     echo -e "${YELLOW}运行dae：docker run -d --name dae --privileged --network=host --dns 8.8.8.8 -v /sys:/sys -v /dev:/dev -v $DOCKER_CONFIG_DIR:/etc/dae $DOCKER_IMAGE /usr/bin/dae run --config /etc/dae/config.dae${NC}"
 }
 
-# 设置订阅地址（非Docker）
-set_subscription() {
-    load_env
-    if ! [ -f /usr/bin/dae ]; then
-        echo -e "${RED}dae未安装，请先选择选项1安装${NC}"
-        return 1
-    fi
-    if ! systemctl is-active dae >/dev/null; then
-        echo -e "${YELLOW}dae未运行，尝试启动...${NC}"
-        systemctl start dae || {
-            echo -e "${RED}dae启动失败，请检查日志：journalctl -u dae${NC}"
-            return 1
-        }
-    fi
-
-    if [ -n "$SUB_URL" ]; then
-        echo -e "${YELLOW}当前订阅地址: $SUB_URL${NC}"
-        echo -e "是否使用已有地址？(y/n，默认y)"
-        read -r use_existing
-        if [ "$use_existing" != "n" ] && [ "$use_existing" != "N" ]; then
-            echo -e "${GREEN}将使用现有订阅地址${NC}"
-        else
-            SUB_URL=""
-        fi
-    fi
-
-    if [ -z "$SUB_URL" ]; then
-        echo -e "${YELLOW}请输入你的代理订阅地址（URL）：${NC}"
-        read -r SUB_URL
-        if [ -z "$SUB_URL" ]; then
-            echo -e "${RED}订阅地址不能为空${NC}"
-            return 1
-        fi
-        save_env "SUB_URL" "$SUB_URL"
-    fi
-
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}创建默认配置文件...${NC}"
-        cat <<EOF > "$CONFIG_FILE"
-global {
-  lan_interface: ""
-  wan_interface: auto
-  log_level: info
-  allow_insecure: false
-  auto_config_kernel_parameter: true
-}
-
-subscription {
-  "$SUB_URL"
-}
-
-group {
-  proxy {
-    policy: min_moving_avg
-  }
-}
-
-routing {
-  dip(geoip:private) -> direct
-  dip(geoip:cn) -> direct
-  domain(geosite:cn) -> direct
-  fallback: proxy
-}
-EOF
-    else
-        sed -i "s|subscription {.*|subscription {\n  \"$SUB_URL\"\n}|" "$CONFIG_FILE"
-    fi
-
-    dae reload || {
-        echo -e "${RED}配置重载失败，请检查日志：journalctl -u dae${NC}"
-        return 1
-    }
-    systemctl restart dae
-    if systemctl is-active dae >/dev/null; then
-        echo -e "${GREEN}dae已成功更新并启动${NC}"
-        if [ -n "$WEBHOOK_URL" ]; then
-            echo -e "${YELLOW}当前企业微信Webhook地址: $WEBHOOK_URL${NC}"
-            echo -e "是否使用已有地址？(y/n，默认y)"
-            read -r use_existing_webhook
-            if [ "$use_existing_webhook" = "n" ] || [ "$use_existing_webhook" = "N" ]; then
-                WEBHOOK_URL=""
-            fi
-        fi
-        if [ -z "$WEBHOOK_URL" ]; then
-            echo -e "${YELLOW}请输入企业微信机器人Webhook地址（留空跳过）：${NC}"
-            read -r WEBHOOK_URL
-            if [ -n "$WEBHOOK_URL" ]; then
-                save_env "WEBHOOK_URL" "$WEBHOOK_URL"
-            fi
-        fi
-        if [ -n "$WEBHOOK_URL" ]; then
-            curl -s -X POST -H 'Content-Type: application/json' -d '{"msgtype": "text", "text": {"content": "dae已成功更新并启动"}}' "$WEBHOOK_URL" >/dev/null
-            echo -e "${GREEN}企业微信通知已发送${NC}"
-        fi
-    else
-        echo -e "${RED}dae启动失败，请检查日志：journalctl -u dae${NC}"
-    fi
-}
-
 # 设置订阅地址（Docker）
 set_subscription_docker() {
     load_env
@@ -374,18 +390,19 @@ set_subscription_docker() {
         fi
     fi
 
-    if [ -z "$SUB_URL" ]; then
+    while [ -z "$SUB_URL" ]; do
         echo -e "${YELLOW}请输入你的代理订阅地址（URL）：${NC}"
         read -r SUB_URL
         if [ -z "$SUB_URL" ]; then
-            echo -e "${RED}订阅地址不能为空${NC}"
-            return 1
+            echo -e "${RED}订阅地址不能为空，请重新输入${NC}"
+        else
+            save_env "SUB_URL" "$SUB_URL"
+            break
         fi
-        save_env "SUB_URL" "$SUB_URL"
-    fi
+    done
 
     echo -e "${YELLOW}生成Docker配置文件...${NC}"
-    cat <<EOF > "$DOCKER_CONFIG_DIR/config.dae"
+    cat <<EOF | sudo tee "$DOCKER_CONFIG_DIR/config.dae"
 global {
   lan_interface: ""
   wan_interface: auto
@@ -411,6 +428,7 @@ routing {
   fallback: proxy
 }
 EOF
+    sudo chmod 0600 "$DOCKER_CONFIG_DIR/config.dae"
 }
 
 # 管理dae运行状态（非Docker）
@@ -425,8 +443,11 @@ manage_dae() {
         read -n 1 -r choice
         echo ""
         case $choice in
-            1) systemctl start dae; echo -e "${GREEN}dae已启动${NC}" ;;
-            2) systemctl stop dae; echo -e "${GREEN}dae已停止${NC}" ;;
+            1)
+                clean_network_resources
+                systemctl start dae && echo -e "${GREEN}dae已启动${NC}" || echo -e "${RED}启动失败，请检查日志${NC}"
+                ;;
+            2) systemctl stop dae && echo -e "${GREEN}dae已停止${NC}" ;;
             3) systemctl status dae ;;
             4) break ;;
             *) echo -e "${RED}无效选项${NC}" ;;
@@ -439,6 +460,7 @@ uninstall_dae() {
     echo -e "${YELLOW}正在卸载dae并清理文件...${NC}"
     systemctl stop dae 2>/dev/null
     systemctl disable dae 2>/dev/null
+    clean_network_resources
     rm -rf /usr/bin/dae /etc/dae /var/log/dae.log /etc/systemd/system/dae.service
     systemctl daemon-reload
     echo -e "${GREEN}dae已卸载并清理完成${NC}"
