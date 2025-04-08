@@ -43,6 +43,7 @@ DEFAULT_OPTIONS=(
     "23. 开启 tun模式"
     "24. 硬盘格式化"
     "25. 自动挂载外置硬盘"
+    "26. 安装dae(大鹅代理)"
     "98. 快捷键管理"
 )
 
@@ -73,6 +74,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["23"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_tun.sh"
     ["24"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/format_disk_script.sh"
     ["25"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/auto_disk_mounter.sh"
+    ["26"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/dae_manager.sh"
 )
 
 # 声明全局变量
