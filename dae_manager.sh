@@ -9,6 +9,9 @@ LOG_SIZE_LIMIT=$((1 * 1024 * 1024)) # 1MB
 ENV_FILE="$HOME/.dae_env"
 DOCKER_CONFIG_DIR="/etc/dae"
 
+# 全局变量
+ARCH_TYPE=""
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -35,12 +38,15 @@ check_container() {
 
 # 检查eBPF支持
 check_ebpf_support() {
-    if ! lsmod | grep -q bpf; then
+    if [ -f /sys/kernel/debug/tracing/events/bpf ] || command -v bpftool >/dev/null 2>&1; then
+        return 0
+    elif grep -q "CONFIG_BPF=y" /boot/config-$(uname -r) 2>/dev/null; then
+        return 0
+    else
         echo -e "${RED}主机内核不支持eBPF，dae可能无法运行！${NC}"
-        echo -e "${YELLOW}请确保内核模块bpf已加载${NC}"
+        echo -e "${YELLOW}请确保内核支持eBPF（CONFIG_BPF=y）${NC}"
         return 1
     fi
-    return 0
 }
 
 # 检查系统架构和依赖
@@ -158,10 +164,15 @@ install_dae() {
         echo -e "${RED}解压dae失败，请检查unzip命令${NC}"
         return 1
     }
-    sudo mv /tmp/dae-linux-"${ARCH_TYPE}" /usr/bin/dae 2>/dev/null || sudo mv /tmp/dae /usr/bin/dae || {
-        echo -e "${RED}移动dae二进制文件失败${NC}"
+    # 增强文件移动逻辑
+    if [ -f /tmp/dae-linux-"$ARCH_TYPE" ]; then
+        sudo mv /tmp/dae-linux-"$ARCH_TYPE" /usr/bin/dae
+    elif [ -f /tmp/dae ]; then
+        sudo mv /tmp/dae /usr/bin/dae
+    else
+        echo -e "${RED}未找到dae二进制文件（预期为 /tmp/dae-linux-$ARCH_TYPE 或 /tmp/dae）${NC}"
         return 1
-    }
+    fi
     sudo chmod +x /usr/bin/dae
     sudo mkdir -p /etc/dae
     sudo mv /tmp/geoip.dat /etc/dae/geoip.dat 2>/dev/null || wget -O /etc/dae/geoip.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
