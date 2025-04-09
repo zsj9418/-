@@ -16,6 +16,21 @@ mkdir -p "$SCRIPT_DIR/user_scripts" || { echo "无法创建用户脚本目录：
 touch "$LOG_FILE" || { echo "无法创建日志文件"; exit 1; }
 touch "$CUSTOM_MENU_FILE" || { echo "无法创建自定义菜单文件"; exit 1; }
 
+# 检测是否为OpenWrt系统
+function is_openwrt() {
+    [[ -f /etc/openwrt_release ]] && return 0 || return 1
+}
+
+# 获取当前脚本的真实路径
+function get_current_script_path() {
+    # 尝试多种方法获取真实路径
+    local path
+    path="$(realpath "$0" 2>/dev/null)" || \
+    path="$(readlink -f "$0" 2>/dev/null)" || \
+    path="$0"
+    echo "$path"
+}
+
 # ------------------------- 默认脚本列表  -------------------------
 DEFAULT_OPTIONS=(
     "1.  安装 Docker"
@@ -226,29 +241,61 @@ function manage_symlink() {
     done
 }
 
-# 管理当前脚本快捷键
+# 管理当前脚本快捷键 (完全兼容版)
 function manage_current_script_symlink() {
-    local current_script="$1"
+    local current_script=$(get_current_script_path)
+    
+    # 自动检测最佳目录
+    local symlink_dirs=()
+    if is_openwrt; then
+        # OpenWrt优先尝试这些目录
+        symlink_dirs=("/usr/bin" "/bin" "$HOME/.local/bin")
+    else
+        # 普通Linux系统优先尝试这些目录
+        symlink_dirs=("/usr/local/bin" "/usr/bin" "/bin" "$HOME/.local/bin")
+    fi
+    
+    # 查找第一个可写的目录
+    local symlink_dir=""
+    for dir in "${symlink_dirs[@]}"; do
+        # 确保目录存在
+        mkdir -p "$dir" 2>/dev/null || continue
+        
+        # 检查是否可写
+        if [[ -w "$dir" ]]; then
+            symlink_dir="$dir"
+            break
+        fi
+    done
+    
+    if [[ -z "$symlink_dir" ]]; then
+        echo "错误: 没有找到可写的目录来创建快捷方式"
+        echo "尝试的目录: ${symlink_dirs[*]}"
+        read -rp "按回车键返回..."
+        return 1
+    fi
+
     while true; do
         clear
         echo "========================================"
-        echo "    管理当前脚本快捷键"
+        echo "    管理当前脚本快捷键 (完全兼容版)"
         echo "========================================"
         echo "当前脚本路径: $current_script"
+        echo "快捷键存储目录: $symlink_dir"
         echo "当前已创建的快捷键："
 
-        # 检查 /usr/local/bin 中的符号链接
+        # 查找所有指向当前脚本的链接
         local found_links=0
-        for link in /usr/local/bin/*; do
-            if [[ -L "$link" ]]; then  # 只处理符号链接
-                local target=$(readlink -f "$link")
+        if [[ -d "$symlink_dir" ]]; then
+            while IFS= read -r -d $'\0' link; do
+                local target
+                target="$(readlink -f "$link" 2>/dev/null)" || continue
                 if [[ "$target" == "$current_script" || "$target" == "$SCRIPT_DIR"/* ]]; then
-                    local link_name=$(basename "$link")
-                    echo "$link_name -> $target"
+                    echo "$(basename "$link") -> $target"
                     found_links=1
                 fi
-            fi
-        done
+            done < <(find "$symlink_dir" -maxdepth 1 -type l -print0 2>/dev/null)
+        fi
 
         if [[ $found_links -eq 0 ]]; then
             echo "暂无相关快捷键"
@@ -256,79 +303,98 @@ function manage_current_script_symlink() {
 
         echo "----------------------------------------"
         echo "请选择操作："
-        echo "1. 创建 **新** 快捷键"
+        echo "1. 创建新快捷键"
         echo "2. 删除快捷键"
         echo "0. 返回上一级菜单"
         echo "----------------------------------------"
         read -rp "请输入选项编号: " choice
+        
         case "$choice" in
             1)
-                echo "请输入快捷键（例如 q）："
+                echo "请输入快捷键名称（仅字母数字，不要带空格或特殊字符）："
                 read -r shortcut
-                local link="/usr/local/bin/$shortcut"
+                
+                # 验证输入
+                if [[ ! "$shortcut" =~ ^[a-zA-Z0-9]+$ ]]; then
+                    echo "错误: 快捷键只能包含字母和数字"
+                    read -rp "按回车键继续..."
+                    continue
+                fi
+                
+                local link="$symlink_dir/$shortcut"
 
-                # 检查快捷键是否已存在
+                # 检查是否已存在
                 if [[ -e "$link" ]]; then
-                    echo "错误: 快捷键已存在，请使用其他名称。"
+                    echo "错误: '$shortcut' 已存在，请使用其他名称"
                     read -rp "按回车键继续..."
                     continue
                 fi
 
-                sudo ln -s "$current_script" "$link"
-
-                if [[ $? -eq 0 ]]; then
-                    echo "快捷键 $shortcut 已创建。"
+                # 创建链接 (使用绝对路径)
+                if ln -s "$current_script" "$link" 2>/dev/null; then
+                    echo "快捷键 '$shortcut' 已成功创建到:"
+                    echo "$link -> $current_script"
+                    echo "现在您可以直接在终端输入 '$shortcut' 来运行脚本"
                 else
-                    echo "错误: 创建快捷键失败.  请确保您有足够的权限 (sudo)."
+                    echo "创建失败，可能原因："
+                    echo "1. 磁盘空间不足"
+                    echo "2. 文件系统只读"
+                    echo "3. 权限不足"
+                    echo "请尝试其他目录或检查系统状态"
                 fi
-
+                
                 read -rp "按回车键继续..."
                 ;;
             2)
-                echo "请输入要删除的快捷键（例如 q）："
+                echo "请输入要删除的快捷键名称："
                 read -r shortcut
-                local link="/usr/local/bin/$shortcut"
-                 # 检查快捷键是否存在，并且目标是否为当前脚本或脚本目录下的脚本
+                local link="$symlink_dir/$shortcut"
+                
                 if [[ -L "$link" ]]; then
-                    local target=$(readlink -f "$link")
+                    local target
+                    target="$(readlink -f "$link" 2>/dev/null)" || target=""
                     if [[ "$target" == "$current_script" || "$target" == "$SCRIPT_DIR"/* ]]; then
-                        sudo rm -f "$link"
-                        if [[ $? -eq 0 ]]; then
-                            echo "快捷键 $shortcut 已删除。"
+                        if rm -f "$link"; then
+                            echo "快捷键 '$shortcut' 已删除"
                         else
-                            echo "错误: 删除快捷键失败. 请确保您有足够的权限 (sudo)."
+                            echo "删除失败，请尝试手动删除: rm -f '$link'"
                         fi
                     else
-                        echo "快捷键 '$shortcut' 存在，但未绑定到当前脚本或脚本目录，无法删除。" # 更准确的提示信息
+                        echo "安全提示: 该快捷键指向 '$target'"
+                        echo "未绑定到当前脚本，不予删除"
                     fi
                 else
-                    echo "快捷键 $shortcut 不存在。"
+                    echo "快捷键 '$shortcut' 不存在"
                 fi
+                
                 read -rp "按回车键继续..."
                 ;;
             0)
                 break
                 ;;
             *)
-                echo "无效选项，请重新输入。"
+                echo "无效选项，请重新输入"
                 read -rp "按回车键继续..."
                 ;;
         esac
     done
 }
 
-# 指定脚本绑定快捷键
+# 指定脚本绑定快捷键 (完全兼容版)
 function bind_script_to_shortcut() {
     while true; do
         clear
         echo "========================================"
-        echo "    绑定指定脚本到快捷键"
+        echo "    绑定指定脚本到快捷键 (完全兼容版)"
         echo "========================================"
         echo " "
         echo "----------------------------------------"
         echo "请输入脚本的完整路径: "
         read -r script_path
 
+        # 获取绝对路径
+        script_path="$(realpath "$script_path" 2>/dev/null || echo "$script_path")"
+        
         # 路径验证
         if [[ ! -f "$script_path" ]]; then
             echo "错误: 脚本文件不存在: $script_path"
@@ -336,29 +402,55 @@ function bind_script_to_shortcut() {
             continue
         fi
 
-        echo "请输入要绑定的快捷键 (例如: myscript): "
+        echo "请输入要绑定的快捷键 (仅字母数字): "
         read -r shortcut
 
         # 快捷键验证
-        if [[ -z "$shortcut" ]]; then
-            echo "错误: 快捷键不能为空."
+        if [[ ! "$shortcut" =~ ^[a-zA-Z0-9]+$ ]]; then
+            echo "错误: 快捷键只能包含字母和数字"
             read -rp "按回车键继续..."
             continue
         fi
 
-        local link="/usr/local/bin/$shortcut"
+        # 自动选择目录
+        local symlink_dirs=()
+        if is_openwrt; then
+            symlink_dirs=("/usr/bin" "/bin" "$HOME/.local/bin")
+        else
+            symlink_dirs=("/usr/local/bin" "/usr/bin" "/bin" "$HOME/.local/bin")
+        fi
+        
+        local symlink_dir=""
+        for dir in "${symlink_dirs[@]}"; do
+            mkdir -p "$dir" 2>/dev/null || continue
+            if [[ -w "$dir" ]]; then
+                symlink_dir="$dir"
+                break
+            fi
+        done
+        
+        if [[ -z "$symlink_dir" ]]; then
+            echo "错误: 没有可写的目录来创建快捷方式"
+            read -rp "按回车键继续..."
+            continue
+        fi
+
+        local link="$symlink_dir/$shortcut"
         if [[ -e "$link" ]]; then
             echo "错误: 快捷键已存在，请使用其他名称。"
             read -rp "按回车键继续..."
             continue
         fi
 
-        sudo ln -s "$script_path" "$link"
-
-        if [[ $? -eq 0 ]]; then
-            echo "快捷键 '$shortcut' 已成功绑定到 '$script_path'."
+        # 创建链接
+        if ln -s "$script_path" "$link"; then
+            echo "成功创建快捷键:"
+            echo "$link -> $script_path"
         else
-            echo "错误: 绑定快捷键失败.  请确保您有足够的权限 (sudo) ."
+            echo "创建失败，可能原因:"
+            echo "1. 权限不足 (尝试: chmod +x '$script_path')"
+            echo "2. 目标文件系统只读"
+            echo "3. 磁盘空间不足"
         fi
 
         echo "----------------------------------------"
