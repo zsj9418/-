@@ -468,7 +468,6 @@ Description=Sing-Box Service
 After=network.target network-online.target nss-lookup.target
 
 [Service]
-User=root # 或者非 root 用户（如果配置允许）
 WorkingDirectory=$BASE_DIR
 ExecStart=$start_cmd_raw
 Restart=on-failure
