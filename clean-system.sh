@@ -112,35 +112,61 @@ setup_cron() {
     local cron_job="0 0 */2 * * /bin/bash $(realpath "$0") --cron"
     (crontab -l 2>/dev/null | grep -v "$(realpath "$0")"; echo "$cron_job") | crontab -
     green "定时任务已设置！"
+    yellow "当前的定时任务如下："
+    crontab -l
 }
 
 # 创建快捷方式
 create_symlink() {
-    yellow "请输入您希望的快捷键名称（例如：clean）："
-    read -r shortcut
+    while true; do
+        yellow "请输入您希望的快捷键名称（例如：clean）："
+        read -r shortcut
 
-    # 验证快捷键名称
-    if [[ ! "$shortcut" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        red "快捷键名称无效，仅允许字母、数字、下划线或连字符。"
-        return 1
-    fi
+        # 验证快捷键名称
+        if [[ ! "$shortcut" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            red "快捷键名称无效，仅允许字母、数字、下划线或连字符。"
+            continue
+        fi
 
-    local target_path="/usr/local/bin/$shortcut"
-    if [[ -e "$target_path" ]]; then
-        red "快捷键 '$shortcut' 已存在，请选择其他名称。"
-        return 1
-    fi
-
-    sudo ln -s "$(realpath "$0")" "$target_path"
-    green "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
+        local target_path="/usr/local/bin/$shortcut"
+        if [[ -e "$target_path" ]]; then
+            yellow "快捷键 '$shortcut' 已存在。您想要取消还是更改它？"
+            select action in "取消" "更改" "退出"; do
+                case $action in
+                    "取消")
+                        red "快捷键 '$shortcut' 已保留。"
+                        return 1
+                        ;;
+                    "更改")
+                        sudo rm -f "$target_path"
+                        break
+                        ;;
+                    "退出")
+                        exit 0
+                        ;;
+                    *)
+                        red "无效选项，请重试。"
+                        ;;
+                esac
+            done
+        else
+            # 如果快捷键不存在，创建它
+            sudo ln -s "$(realpath "$0")" "$target_path"
+            green "快捷键 '$shortcut' 已创建！现在可以直接在命令行输入 '$shortcut' 运行脚本。"
+            break
+        fi
+    done
 }
 
 # 主流程
 main() {
     init_log
-    if [[ $# -gt 0 && $1 == "--cron" ]]; then
-        clean_system
-    else
+    while true; do
+        if [[ $# -gt 0 && $1 == "--cron" ]]; then
+            clean_system
+            exit 0
+        fi
+
         echo "请选择要执行的操作："
         select option in "执行清理" "设置定时任务" "创建快捷键" "退出"; do
             case $option in
@@ -164,7 +190,7 @@ main() {
                     ;;
             esac
         done
-    fi
+    done
 }
 
 main "$@"
