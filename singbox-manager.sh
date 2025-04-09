@@ -360,24 +360,39 @@ send_wx_notification() {
 stop_singbox() {
     log "尝试停止 sing-box 进程..."
     # 使用 pkill 查找并杀死包含特定路径的进程，更精确
-    if pkill -f "$BIN_DIR/sing-box run -c $CONFIG_FILE"; then
+    # 添加 || true 防止在进程未找到时 set -e 退出脚本
+    if pkill -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true; then
         # 等待一小段时间让进程退出
+        log "等待 sing-box 进程退出..."
         sleep 2
         # 再次检查确认
-        if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-             yellow "第一次 pkill 后进程仍在运行，尝试强制杀死 (SIGKILL)..."
-             pkill -9 -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true # 强制杀死
-             sleep 1
-             if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-                  red "强制杀死 sing-box 失败！"
-                  return 1
+        # 添加 || true 防止在进程已退出时 set -e 退出脚本
+        if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1 || true; then
+             # 只有在 pgrep 真的找到进程 (退出码0) 时才尝试 kill -9
+             if [ $? -eq 0 ]; then
+                 yellow "第一次 pkill 后进程仍在运行，尝试强制杀死 (SIGKILL)..."
+                 pkill -9 -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true # 强制杀死
+                 sleep 1
+                 # 最后检查一次
+                 if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
+                      red "强制杀死 sing-box 失败！"
+                      return 1 # 明确返回失败
+                 fi
              fi
         fi
-        green "sing-box 进程已终止"
+        green "sing-box 进程已终止 (或未运行)"
     else
-        yellow "sing-box 未运行 (或未找到匹配 '$BIN_DIR/sing-box run -c $CONFIG_FILE' 的进程)"
+        # 如果 pkill 本身出错 (不是未找到进程)，记录错误
+        if [ $? -ne 0 ]; then
+            red "执行 pkill 时发生错误 (退出码: $?)"
+            return 1
+        fi
+        # 如果 pkill 返回0但未杀死，或者返回非0但不是错误（上面 || true 处理了）
+        # 这里逻辑有点绕，之前的if分支已处理大部分情况
+        # 保留原始yellow信息
+         yellow "sing-box 未运行 (或 pkill 未找到匹配进程)"
     fi
-    return 0
+    return 0 # 明确返回成功
 }
 
 # 启动 sing-box 服务（使用 nohup 在后台运行）
@@ -393,29 +408,47 @@ start_singbox() {
         return 1
     fi
 
-    # 先确保已停止
-    stop_singbox || { red "启动前停止旧进程失败，中断启动"; return 1; }
+    # 先确保已停止 - 调用修改后的 stop_singbox
+    # 不需要 || true 了，因为 stop_singbox 现在会返回 0 即使进程未运行
+    if ! stop_singbox; then
+        red "启动前停止旧进程失败，中断启动";
+        return 1;
+    fi
+    # 短暂延时确保端口释放等
+    sleep 1
 
     log "尝试使用 nohup 启动 sing-box..."
     start_cmd="nohup $BIN_DIR/sing-box run -c $CONFIG_FILE >/dev/null 2>&1 &"
     # 使用 eval 执行命令，确保 & 后台符号正确处理
     eval "$start_cmd"
     # 等待一小段时间让进程启动
+    log "等待 sing-box 启动..."
     sleep 3
 
     # 检查进程是否已启动
-    if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-        pid=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE")
-        green "sing-box 已通过 nohup 启动 (PID: $pid)，使用配置文件: $CONFIG_FILE"
-        return 0
+    # 添加 || true 防止在进程未启动时 set -e 退出脚本
+    if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1 || true; then
+        # 再次检查退出码确保是真的找到了进程
+        if [ $? -eq 0 ]; then
+            pid=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE")
+            green "sing-box 已通过 nohup 启动 (PID: $pid)，使用配置文件: $CONFIG_FILE"
+            return 0 # 明确返回成功
+        else
+            red "sing-box 启动失败，请检查配置文件 $CONFIG_FILE 或使用 'sing-box run -c $CONFIG_FILE' 手动运行查看错误"
+            log "sing-box 启动失败，命令: $BIN_DIR/sing-box run -c $CONFIG_FILE"
+            # 尝试读取 sing-box 自身日志？（如果配置了）
+            return 1 # 明确返回失败
+        fi
     else
-        red "sing-box 启动失败，请检查配置文件 $CONFIG_FILE 或使用 'sing-box run -c $CONFIG_FILE' 手动运行查看错误"
-        log "sing-box 启动失败，命令: $BIN_DIR/sing-box run -c $CONFIG_FILE"
-        # 尝试读取 sing-box 自身日志？（如果配置了）
-        return 1
+        # pgrep 出错 (不是未找到进程)
+         if [ $? -ne 0 ] && [ $? -ne 1 ]; then # $?=1 是没找到，其他是非零错误
+            red "检查进程状态时 pgrep 命令出错 (退出码: $?)"
+         fi
+         red "sing-box 启动失败，请检查配置文件 $CONFIG_FILE 或使用 'sing-box run -c $CONFIG_FILE' 手动运行查看错误"
+         log "sing-box 启动失败，命令: $BIN_DIR/sing-box run -c $CONFIG_FILE"
+         return 1 # 明确返回失败
     fi
 }
-
 
 # 设置开机自启动 (尝试多种方式)
 setup_autostart() {
@@ -1216,20 +1249,26 @@ setup_scheduled_update() {
 }
 
 
-# 选项 4: 查看状态并控制运行 (启动/停止)
+# 选项 4: 查看状态并控制运行 (启动/停止/重启)
 manage_service() {
     check_root
     status="未知"
     pid=""
     # 使用 pgrep 查找进程
-    pid=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" 2>/dev/null)
+    # 添加 || true 防止在进程未找到时 set -e 退出脚本
+    pgrep_output=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true)
+    pgrep_status=$? # 保存 pgrep 的退出状态
 
-    if [ -n "$pid" ]; then
+    if [ $pgrep_status -eq 0 ] && [ -n "$pgrep_output" ]; then
+        pid=$pgrep_output
         status="active (running)"
         green "sing-box 当前状态: $status (PID: $pid)"
-    else
+    elif [ $pgrep_status -eq 1 ]; then # pgrep 退出码 1 表示未找到
         status="inactive (dead)"
         red "sing-box 当前状态: $status"
+    else # 其他非零退出码表示 pgrep 命令本身出错
+        status="error (pgrep failed with status $pgrep_status)"
+        red "无法确定 sing-box 状态 (pgrep 错误)"
     fi
 
     # 提供操作选项
@@ -1241,44 +1280,51 @@ manage_service() {
                 yellow "sing-box 已经在运行 (PID: $pid)。"
             else
                 log "手动启动 sing-box..."
+                # 调用修改后的 start_singbox
                 if start_singbox; then
-                     green "sing-box 启动成功。"
+                     green "sing-box 启动命令已执行，请稍后再次检查状态。"
                 else
                      red "sing-box 启动失败。"
+                     # start_singbox 内部会打印更详细的日志
                 fi
             fi
             ;;
         2) # 停止
             if [ "$status" = "inactive (dead)" ]; then
                 yellow "sing-box 已经停止。"
-            else
+            elif [ "$status" = "active (running)" ]; then
                 log "手动停止 sing-box..."
+                # 调用修改后的 stop_singbox
                 if stop_singbox; then
                      green "sing-box 停止成功。"
                 else
                      red "sing-box 停止失败。"
                 fi
+            else
+                yellow "sing-box 状态未知或错误，无法执行停止操作。"
             fi
             ;;
         3) # 重启
              log "手动重启 sing-box..."
+             # 调用修改后的函数
              if stop_singbox; then
+                  log "旧进程已停止，等待后启动新进程..."
                   sleep 1 # 短暂等待
                   if start_singbox; then
-                      green "sing-box 重启成功。"
+                      green "sing-box 重启命令已执行，请稍后再次检查状态。"
                   else
                       red "sing-box 重启失败（停止后未能启动）。"
                   fi
              else
-                  red "sing-box 重启失败（未能停止）。"
+                  red "sing-box 重启失败（未能停止旧进程）。"
              fi
             ;;
         *) # 返回
             yellow "返回主菜单。"
             ;;
     esac
+    # 不需要显式 return 0 或 1 了，函数自然结束即可
 }
-
 
 # 选项 5: 卸载 sing-box
 uninstall_singbox() {
@@ -1371,45 +1417,61 @@ main_menu() {
         printf "请输入选项 [1-6]: "
         read choice
 
+        exit_code=0 # 用于记录函数执行结果
         case "$choice" in
             1)
-                install_singbox
+                install_singbox || exit_code=$?
                 ;;
             2)
-                update_config_and_run
+                update_config_and_run || exit_code=$?
                 ;;
             3)
-                setup_scheduled_update
+                setup_scheduled_update || exit_code=$?
                 ;;
             4)
-                manage_service
+                manage_service || exit_code=$? # 虽然 manage_service 不明确返回错误码，但可以捕获 set -e 的退出
                 ;;
             5)
-                uninstall_singbox
+                uninstall_singbox || exit_code=$?
                 ;;
             6)
                 green "正在退出脚本..."
-                exit 0
+                exit 0 # 正常退出
                 ;;
             *)
                 red "无效选项 '$choice'，请输入 1 到 6 之间的数字。"
+                exit_code=1 # 无效选项也算一种“失败”
                 ;;
         esac
-        # 在每个操作后暂停，等待用户按 Enter 继续，改善体验
-        printf "\n按 [Enter] 键返回主菜单..."
-        read -r dummy_input
+
+        # 如果函数执行失败 (非0退出码)，打印提示信息
+        if [ "$exit_code" -ne 0 ] && [ "$choice" -ne 6 ]; then
+             yellow "操作执行期间可能遇到问题 (退出码: $exit_code)，请检查日志: $LOG_FILE"
+        fi
+
+        # 在每个操作后暂停，等待用户按 Enter 继续 (选项6除外)
+        if [ "$choice" -ne 6 ]; then
+            printf "\n按 [Enter] 键返回主菜单..."
+            read -r dummy_input
+        fi
     done
 }
 
 # --- 脚本入口 ---
 # 确保日志文件可写
-touch "$LOG_FILE" 2>/dev/null || { echo "无法写入日志文件 $LOG_FILE，请检查权限。"; exit 1; }
+# 检查日志目录是否存在
+log_dir=$(dirname "$LOG_FILE")
+if [ ! -d "$log_dir" ]; then
+    mkdir -p "$log_dir" || { echo "错误: 无法创建日志目录 $log_dir"; exit 1; }
+fi
+touch "$LOG_FILE" 2>/dev/null || { echo "错误: 无法写入日志文件 $LOG_FILE，请检查权限。"; exit 1; }
+
 # 记录脚本启动
 log "=== 主脚本启动 ==="
 
 # 运行主菜单
 main_menu
 
-# 脚本正常退出时记录日志
+# 脚本正常退出时记录日志 (理论上 main_menu 的 exit 0 会先执行)
 log "=== 主脚本正常退出 ==="
 exit 0
