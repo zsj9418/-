@@ -45,18 +45,17 @@ DEFAULT_GATEWAY="192.168.1.1"
 
 # --- Helper Function to get Host IP ---
 get_host_ip() {
-    # Try various methods to get a non-loopback LAN IP
+    # 尝试获取非回环的 LAN IP
     local ip_addr
-    ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1) # Exclude docker bridges typically starting with 172
+    ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1) # 排除以172开头的docker桥接网络
     if [[ -z "$ip_addr" ]]; then
-       ip_addr=$(hostname -I | awk '{print $1}')
+        ip_addr=$(hostname -I | awk '{print $1}')
     fi
-     if [[ -z "$ip_addr" ]]; then
-       ip_addr="<无法自动获取宿主机IP>"
+    if [[ -z "$ip_addr" ]]; then
+        ip_addr="<无法自动获取宿主机IP>"
     fi
     echo "$ip_addr"
 }
-
 
 # 输出系统信息
 clear
@@ -113,7 +112,7 @@ while true; do
                 fi
                 NET_NAME="openwrt_net"
             else
-                 # 检查并尝试创建Bridge网络
+                # 检查并尝试创建Bridge网络
                 if ! docker network inspect openwrt_bridge >/dev/null 2>&1; then
                     echo "正在创建 Bridge 网络 'openwrt_bridge'..."
                     if ! docker network create openwrt_bridge >/dev/null 2>&1; then
@@ -174,7 +173,7 @@ while true; do
 
             echo -e "\n\033[36m正在启动 OpenWrt 容器...\033[0m"
             # 使用 eval 来正确处理可能为空的 $PORT_MAP 和 $VOLUME_MAP
-             if eval docker run -d --name openwrt \
+            if eval docker run -d --name openwrt \
                 --network "$NET_NAME" \
                 --restart unless-stopped \
                 --privileged \
@@ -184,9 +183,9 @@ while true; do
                 echo -e "\033[32m容器启动成功！\033[0m"
                 echo -e "管理命令：\ndocker exec -it openwrt /bin/sh"
                 # 启动后立即尝试显示登录信息
-                 echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
-                 sleep 5 # 等待容器网络初始化
-                 bash "$0" 5 # 调用自身脚本执行选项5
+                echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
+                sleep 5 # 等待容器网络初始化
+                bash "$0" 5 # 调用自身脚本执行选项5
             else
                 echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
                 echo "尝试运行: docker logs openwrt"
@@ -202,7 +201,7 @@ while true; do
                 docker rm openwrt >/dev/null 2>&1
                 docker network rm openwrt_net >/dev/null 2>&1
                 docker network rm openwrt_bridge >/dev/null 2>&1
-                 # 可选：询问是否删除挂载的配置目录
+                # 可选：询问是否删除挂载的配置目录
                 read -rp "是否同时删除挂载的配置目录（如果之前设置过）？[y/N]: " DELETE_VOLUME_DIR
                 if [[ "$DELETE_VOLUME_DIR" =~ [Yy] ]]; then
                     # 需要找到之前设置的 CONFIG_PATH，脚本当前状态无法直接获取，提示用户手动删除
@@ -224,7 +223,7 @@ while true; do
         4)
             echo -e "\n\033[36m实时日志查看（Ctrl+C退出）\033[0m"
             if ! docker logs -f openwrt; then
-                 echo -e "\033[31m无法获取日志，容器 'openwrt' 可能不存在或未运行。\033[0m"
+                echo -e "\033[31m无法获取日志，容器 'openwrt' 可能不存在或未运行。\033[0m"
             fi
             ;;
 
@@ -248,10 +247,10 @@ while true; do
                 WEB_HOST_PORT=$(echo "$INSPECT_JSON" | jq -r '.[0].HostConfig.PortBindings."80/tcp"[0].HostPort // empty')
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | jq -r '.[0].HostConfig.PortBindings."22/tcp"[0].HostPort // empty')
             else
-                 echo -e "\033[33m提示：未安装 jq，将使用 grep/awk 尝试解析，结果可能不精确。建议安装 jq (例: apt install jq)。\033[0m"
+                echo -e "\033[33m提示：未安装 jq，将使用 grep/awk 尝试解析，结果可能不精确。建议安装 jq (例: apt install jq)。\033[0m"
                 # 使用 grep/awk 尝试解析 (兼容性更好，但可能不够健壮)
                 # 查找第一个非空的 IP 地址及其网络名
-                 NET_INFO=$(echo "$INSPECT_JSON" | grep -E '"IPAddress":\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' -B 5 | grep -Eo '"(openwrt_net|openwrt_bridge)":|"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | sed 's/"//g' | tr '\n' ':' | sed 's/:$//' | head -n 1)
+                NET_INFO=$(echo "$INSPECT_JSON" | grep -E '"IPAddress":\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' -B 5 | grep -Eo '"(openwrt_net|openwrt_bridge)":|"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | sed 's/"//g' | tr '\n' ':' | sed 's/:$//' | head -n 1)
                 # 解析端口 (这种方式比较脆弱)
                 WEB_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"80/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"22/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
@@ -279,10 +278,10 @@ while true; do
             echo -e "\n\033[34m--- OpenWrt 登录信息 ---\033[0m"
             echo -e "网络模式 : \033[33m$ACCESS_MODE\033[0m"
             if [ "$NETWORK_NAME" == "openwrt_bridge" ]; then
-                 echo -e "宿主机 IP : \033[32m$HOST_IP\033[0m"
-                 echo -e "容器桥接IP: \033[37m$CONTAINER_IP (通常仅用于容器间通信)\033[0m"
+                echo -e "宿主机 IP : \033[32m$HOST_IP\033[0m"
+                echo -e "容器桥接IP: \033[37m$CONTAINER_IP (通常仅用于容器间通信)\033[0m"
             else
-                 echo -e "容器 IP  : \033[32m$ACCESS_IP\033[0m"
+                echo -e "容器 IP  : \033[32m$ACCESS_IP\033[0m"
             fi
 
             if [ -n "$WEB_HOST_PORT" ]; then
