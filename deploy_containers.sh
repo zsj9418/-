@@ -32,6 +32,7 @@ function detect_architecture() {
     x86_64 | amd64) PLATFORM="linux/amd64" ;;
     armv7l | armhf) PLATFORM="linux/arm/v7" ;;
     aarch64 | arm64) PLATFORM="linux/arm64" ;;
+    mips | mipsel) PLATFORM="linux/mips" ;;
     *) red "不支持的架构 ($ARCH)" && exit 1 ;;
   esac
   green "设备架构：$ARCH，适配平台：$PLATFORM"
@@ -39,12 +40,18 @@ function detect_architecture() {
 
 # 检测操作系统
 function detect_os() {
-  if [[ -f /etc/debian_version ]]; then
+  if [[ -f /etc/openwrt_release ]]; then
+    OS="OpenWrt"
+    PACKAGE_MANAGER="opkg"
+    IS_OPENWRT=true
+  elif [[ -f /etc/debian_version ]]; then
     OS="Debian/Ubuntu"
     PACKAGE_MANAGER="apt"
+    IS_OPENWRT=false
   elif [[ -f /etc/redhat-release ]]; then
     OS="CentOS/RHEL"
     PACKAGE_MANAGER="yum"
+    IS_OPENWRT=false
   else
     red "不支持的操作系统" && exit 1
   fi
@@ -70,30 +77,63 @@ function install_dependency() {
 # 检查依赖（仅首次运行时检查）
 function check_dependencies() {
   if [[ ! -f "/var/log/deploy_dependencies_checked" ]]; then
-    install_dependency "docker" "sudo $PACKAGE_MANAGER install -y docker.io"
-    install_dependency "lsof" "sudo $PACKAGE_MANAGER install -y lsof"
+    if $IS_OPENWRT; then
+      # OpenWrt 特殊处理
+      install_dependency "docker" "opkg install docker"
+      install_dependency "lsof" "opkg install lsof"
+      # OpenWrt 需要额外配置 Docker
+      /etc/init.d/dockerd enable
+      /etc/init.d/dockerd start
+    else
+      install_dependency "docker" "sudo $PACKAGE_MANAGER install -y docker.io"
+      install_dependency "lsof" "sudo $PACKAGE_MANAGER install -y lsof"
+    fi
     touch "/var/log/deploy_dependencies_checked"
   else
     green "依赖已安装，跳过检查。"
   fi
 }
 
-# 检查用户权限
+# 检查用户权限 - OpenWrt 兼容版本
 function check_user_permission() {
-  if ! groups | grep -q docker; then
-    yellow "当前用户未加入 Docker 用户组，尝试解决权限问题..."
-    sudo usermod -aG docker $USER
-    red "已将当前用户加入 Docker 用户组，请重新登录后再运行脚本，或使用 'sudo' 运行脚本。"
-    exit 1
+  if $IS_OPENWRT; then
+    # OpenWrt 通常直接使用 root 用户，无需检查用户组
+    if [[ $(id -u) -ne 0 ]]; then
+      red "OpenWrt 系统建议直接使用 root 用户运行此脚本。"
+      exit 1
+    fi
+    green "检测到 root 用户权限，继续执行..."
+  else
+    # 非 OpenWrt 系统使用原有检查逻辑
+    if ! id -nG "$(whoami)" | grep -qw "docker"; then
+      yellow "当前用户未加入 Docker 用户组，尝试解决权限问题..."
+      sudo usermod -aG docker "$(whoami)"
+      red "已将当前用户加入 Docker 用户组，请重新登录后再运行脚本，或使用 'sudo' 运行脚本。"
+      exit 1
+    fi
   fi
 }
 
-# 自动分配可用端口
+# 自动分配可用端口 - OpenWrt 兼容版本
 function find_available_port() {
   local start_port=${1:-$DEFAULT_PORT}
-  while lsof -i:$start_port &>/dev/null; do
+  
+  # 兼容性端口检查
+  while :; do
+    if $IS_OPENWRT; then
+      # OpenWrt 使用 netstat 检查端口
+      if ! netstat -tuln | grep -q ":$start_port "; then
+        break
+      fi
+    else
+      # 其他系统使用 lsof 检查端口
+      if ! lsof -i:$start_port &>/dev/null; then
+        break
+      fi
+    fi
     ((start_port++))
   done
+  
   echo $start_port
 }
 
