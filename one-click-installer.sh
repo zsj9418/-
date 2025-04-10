@@ -59,6 +59,7 @@ DEFAULT_OPTIONS=(
     "24. 硬盘格式化"
     "25. 自动挂载外置硬盘"
     "26. 安装dae(大鹅代理)"
+    "27. openwrt网口配置"
     "98. 快捷键管理"
 )
 
@@ -90,6 +91,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["24"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/format_disk_script.sh"
     ["25"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/auto_disk_mounter.sh"
     ["26"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/dae_manager.sh"
+    ["27"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/netconfig.sh"
 )
 
 # 声明全局变量
