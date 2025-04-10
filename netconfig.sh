@@ -1,14 +1,16 @@
 #!/bin/sh
 
 # OpenWRT 多网口高级配置脚本
-# 终极优化版 v3.0
-# 功能：支持任意数量网口的WAN/LAN/VLAN配置，含智能检测与容错机制
+# 终极优化版 v3.1
+# 更新：修复VLAN配置/增强兼容性/优化输入验证
 
 # 全局变量
-VERSION="3.0"
+VERSION="3.1"
 CONFIG_DIR="/etc/config"
 BACKUP_DIR="/etc/backups"
 LOG_FILE="/tmp/netconfig.log"
+SWITCH_DEVICE=""
+SWPORT_MAP=""
 
 # 颜色定义
 RED='\033[1;31m'
@@ -32,7 +34,7 @@ init_check() {
     }
 
     # 检查OpenWRT系统
-    ! grep -q "OpenWrt" /etc/os-release 2>/dev/null && {
+    ! grep -qi "OpenWrt" /etc/os-release 2>/dev/null && {
         echo -e "${RED}错误: 此脚本仅适用于OpenWRT系统！${NC}"
         log "系统检查失败"
         exit 1
@@ -42,25 +44,48 @@ init_check() {
     mkdir -p $BACKUP_DIR
     touch $LOG_FILE
     log "===== 脚本初始化 ====="
+    
+    # 检测SSH连接警告
+    [ -n "$SSH_CONNECTION" ] && {
+        echo -e "${YELLOW}警告: 当前通过SSH连接，配置网络可能导致连接中断！${NC}"
+        read -p "按回车键继续或Ctrl+C退出..." dummy
+    }
 }
 
 # 获取系统信息
 get_system_info() {
     ARCH=$(uname -m)
     MODEL=$(cat /proc/cpuinfo | grep -i 'model name' | head -1 | cut -d':' -f2 | sed 's/^[ \t]*//')
-    SWITCH_INFO=$(swconfig dev switch0 help 2>/dev/null | head -1)
+    SWITCH_DEVICE=$(swconfig list 2>/dev/null | awk '{print $2}' | head -n1)
     
     echo -e "${BLUE}系统架构: ${ARCH}${NC}"
     echo -e "${BLUE}设备型号: ${MODEL}${NC}"
-    [ -n "$SWITCH_INFO" ] && echo -e "${BLUE}交换机信息: ${SWITCH_INFO}${NC}"
+    [ -n "$SWITCH_DEVICE" ] && {
+        echo -e "${BLUE}交换机设备: ${SWITCH_DEVICE}${NC}"
+        SWITCH_INFO=$(swconfig dev $SWITCH_DEVICE help 2>/dev/null | head -1)
+        echo -e "${BLUE}交换机信息: ${SWITCH_INFO}${NC}"
+    }
     
     log "系统信息收集完成"
 }
 
+# 初始化交换机端口映射
+init_switch_port_map() {
+    SWPORT_MAP=""
+    [ -n "$SWITCH_DEVICE" ] && {
+        for port in $(swconfig dev $SWITCH_DEVICE show | grep -oE 'Port [0-9]+:' | cut -d' ' -f2 | tr -d :); do
+            iface=$(swconfig dev $SWITCH_DEVICE port $port show | grep -Eo 'link: port:[^ ]+' | cut -d':' -f3)
+            [ -n "$iface" ] && SWPORT_MAP="$SWPORT_MAP ${iface}:${port}"
+        done
+        log "交换机端口映射: $SWPORT_MAP"
+    }
+}
+
 # 网络接口检测
 detect_interfaces() {
-    # 物理接口检测
-    PHYSICAL_IFACES=$(ls -1 /sys/class/net/ | grep -E 'eth[0-9]+|enp[0-9]+s[0-9]+|wan[0-9]*|lan[0-9]*' | sort | uniq)
+    # 物理接口检测（排除虚拟接口）
+    PHYSICAL_IFACES=$(find /sys/class/net -mindepth 1 -maxdepth 1 \
+        ! -name lo ! -name 'br*' ! -name 'veth*' -exec basename {} \; | sort)
     [ -z "$PHYSICAL_IFACES" ] && {
         echo -e "${RED}错误: 未检测到物理网络接口！${NC}"
         log "接口检测失败"
@@ -69,7 +94,7 @@ detect_interfaces() {
 
     # VLAN能力检测
     VLAN_CAPABLE=0
-    [ -n "$(command -v swconfig)" ] && VLAN_CAPABLE=1
+    [ -n "$SWITCH_DEVICE" ] && VLAN_CAPABLE=1
     
     log "检测到物理接口: $PHYSICAL_IFACES"
     log "VLAN支持: $VLAN_CAPABLE"
@@ -109,7 +134,7 @@ show_current_config() {
     # VLAN配置
     [ $VLAN_CAPABLE -eq 1 ] && {
         echo -e "\n${GREEN}VLAN配置:${NC}"
-        swconfig dev switch0 show | grep -E 'vid|ports'
+        swconfig dev $SWITCH_DEVICE show | grep -E 'vid|ports'
     }
     
     # 防火墙配置
@@ -181,6 +206,12 @@ select_interfaces() {
     # 返回选择结果
     SELECTED_RESULT=$selected
     return 0
+}
+
+# 端口到接口转换
+port_iface_to_switch() {
+    local iface=$1
+    echo $(echo "$SWPORT_MAP" | grep -E "$iface:" | cut -d':' -f2)
 }
 
 # WAN接口配置
@@ -259,8 +290,17 @@ configure_wan() {
                 echo -e "${RED}错误: 无效的子网掩码格式！${NC}"
             done
             
-            read -p "输入网关地址: " static_gw
-            read -p "输入DNS服务器: " static_dns
+            while true; do
+                read -p "输入网关地址: " static_gw
+                [ -z "$static_gw" ] || validate_ip "$static_gw" && break
+                echo -e "${RED}错误: 无效的网关地址格式！${NC}"
+            done
+            
+            while true; do
+                read -p "输入DNS服务器: " static_dns
+                [ -z "$static_dns" ] || validate_ip "$static_dns" && break
+                echo -e "${RED}错误: 无效的DNS地址格式！${NC}"
+            done
             
             uci set network.wan=interface
             uci set network.wan.ifname="$wan_iface"
@@ -276,7 +316,6 @@ configure_wan() {
     
     # 防火墙配置
     uci set firewall.@zone[1].network='wan'
-    uci commit firewall
     
     echo -e "${GREEN}WAN接口配置完成！${NC}"
     return 0
@@ -308,9 +347,7 @@ configure_lan() {
     # 多接口桥接处理
     if [ $(echo "$lan_ifaces" | wc -w) -gt 1 ]; then
         uci set network.lan.type='bridge'
-        for iface in $lan_ifaces; do
-            uci add_list network.lan.ifname="$iface"
-        done
+        uci set network.lan.ifname="$lan_ifaces"
         log "配置桥接LAN接口: $lan_ifaces"
     else
         uci set network.lan.ifname="$lan_ifaces"
@@ -382,7 +419,7 @@ configure_vlan() {
     
     echo -e "\n${YELLOW}=== 配置VLAN ===${NC}"
     echo -e "当前VLAN配置:"
-    swconfig dev switch0 show | grep -E 'vid|ports'
+    swconfig dev $SWITCH_DEVICE show | grep -E 'vid|ports'
     
     # VLAN操作选择
     echo -e "\n${GREEN}选择操作:${NC}"
@@ -410,7 +447,7 @@ create_vlan() {
         read -p "输入VLAN ID (2-4094): " vlan_id
         if [[ "$vlan_id" =~ ^[0-9]+$ ]] && [ "$vlan_id" -ge 2 ] && [ "$vlan_id" -le 4094 ]; then
             # 检查是否已存在
-            swconfig dev switch0 show | grep -q "vid: $vlan_id" && {
+            swconfig dev $SWITCH_DEVICE show | grep -q "vid: $vlan_id" && {
                 echo -e "${RED}错误: VLAN $vlan_id 已存在！${NC}"
                 continue
             }
@@ -425,21 +462,25 @@ create_vlan() {
     fi
     local vlan_members=$SELECTED_RESULT
     
-    # 标记端口
+    # 转换为交换机端口
     local tagged_ports=""
     for iface in $vlan_members; do
-        port=${iface#eth}
-        tagged_ports="$tagged_ports ${port}t"
+        port=$(port_iface_to_switch $iface)
+        [ -z "$port" ] && {
+            echo -e "${RED}错误: 无法找到接口 $iface 对应的交换机端口！${NC}"
+            return 1
+        }
+        tagged_ports="$tagged_ports $port"
     done
     
     # 配置交换机VLAN
-    uci set network.vlan$vlan_id=switch_vlan
-    uci set network.vlan$vlan_id.device='switch0'
-    uci set network.vlan$vlan_id.vlan='$vlan_id'
-    uci set network.vlan$vlan_id.ports="$tagged_ports"
+    uci set network.vlan${vlan_id}_switch="switch_vlan"
+    uci set network.vlan${vlan_id}_switch.device="$SWITCH_DEVICE"
+    uci set network.vlan${vlan_id}_switch.vlan="$vlan_id"
+    uci set network.vlan${vlan_id}_switch.ports="$(echo $tagged_ports | xargs)"
     
     # 配置VLAN接口
-    uci set network.vlan$vlan_id=interface
+    uci set network.vlan$vlan_id="interface"
     uci set network.vlan$vlan_id.ifname="eth0.$vlan_id"
     uci set network.vlan$vlan_id.proto='static'
     
@@ -457,13 +498,13 @@ create_vlan() {
     fi
     
     echo -e "${GREEN}VLAN $vlan_id 创建成功！${NC}"
-    log "创建VLAN: id=$vlan_id 成员=$vlan_members IP=${vlan_ip:-未配置}"
+    log "创建VLAN: id=$vlan_id 成员=$vlan_members 端口=$tagged_ports IP=${vlan_ip:-未配置}"
 }
 
 # 删除VLAN
 delete_vlan() {
     # 获取现有VLAN列表
-    local existing_vlans=$(swconfig dev switch0 show | grep 'vid:' | awk '{print $2}')
+    local existing_vlans=$(swconfig dev $SWITCH_DEVICE show | grep 'vid:' | awk '{print $2}')
     [ -z "$existing_vlans" ] && {
         echo -e "${YELLOW}没有可删除的VLAN配置！${NC}"
         return
@@ -471,7 +512,7 @@ delete_vlan() {
     
     echo -e "\n${GREEN}现有VLAN列表:${NC}"
     for vlan in $existing_vlans; do
-        ports=$(swconfig dev switch0 show | grep "vid: $vlan" | awk -F'ports: ' '{print $2}')
+        ports=$(swconfig dev $SWITCH_DEVICE show | grep "vid: $vlan" | awk -F'ports: ' '{print $2}')
         echo "VLAN $vlan: 端口 $ports"
     done
     
@@ -493,7 +534,7 @@ delete_vlan() {
     
     # 执行删除
     uci delete network.vlan$del_vlan >/dev/null 2>&1
-    uci delete network.@switch_vlan[$(uci show network | grep -n "vlan='$del_vlan'" | cut -d':' -f1)] >/dev/null 2>&1
+    uci delete network.vlan${del_vlan}_switch >/dev/null 2>&1
     
     echo -e "${GREEN}VLAN $del_vlan 已删除！${NC}"
     log "删除VLAN: id=$del_vlan"
@@ -507,13 +548,13 @@ backup_config() {
     mkdir -p "$BACKUP_DIR/$backup_name"
     
     # 备份关键配置文件
-    cp $CONFIG_DIR/network "$BACKUP_DIR/$backup_name/network"
-    cp $CONFIG_DIR/firewall "$BACKUP_DIR/$backup_name/firewall"
-    cp $CONFIG_DIR/dhcp "$BACKUP_DIR/$backup_name/dhcp"
+    cp $CONFIG_DIR/network "$BACKUP_DIR/$backup_name/"
+    cp $CONFIG_DIR/firewall "$BACKUP_DIR/$backup_name/"
+    cp $CONFIG_DIR/dhcp "$BACKUP_DIR/$backup_name/"
     
     # 备份VLAN配置
     [ $VLAN_CAPABLE -eq 1 ] && {
-        swconfig dev switch0 show > "$BACKUP_DIR/$backup_name/vlan_config"
+        swconfig dev $SWITCH_DEVICE show > "$BACKUP_DIR/$backup_name/vlan_config"
     }
     
     # 创建恢复脚本
@@ -586,14 +627,25 @@ restore_config() {
     log "恢复配置从: $(basename $selected_backup)"
 }
 
+# 配置预验证
+validate_config() {
+    echo -e "${BLUE}正在验证配置...${NC}"
+    if ! uci -q validate; then
+        echo -e "${RED}配置错误: 请检查以下问题：\n$(uci changes)${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}配置验证通过${NC}"
+    return 0
+}
+
 # 应用配置
 apply_configuration() {
     echo -e "\n${YELLOW}=== 应用配置 ===${NC}"
     
-    # 提交所有更改
-    uci commit network
-    uci commit firewall
-    uci commit dhcp
+    # 验证配置
+    if ! validate_config; then
+        return 1
+    fi
     
     # 显示待应用的更改
     echo -e "${GREEN}以下配置将被应用:${NC}"
@@ -609,6 +661,10 @@ apply_configuration() {
     
     # 执行应用
     echo -e "${BLUE}应用配置中，请稍候...${NC}"
+    uci commit network
+    uci commit firewall
+    uci commit dhcp
+    
     /etc/init.d/network restart
     /etc/init.d/firewall restart >/dev/null 2>&1
     /etc/init.d/dnsmasq restart >/dev/null 2>&1
@@ -667,5 +723,6 @@ main_loop() {
 # 主程序
 init_check
 get_system_info
+init_switch_port_map
 detect_interfaces
 main_loop
