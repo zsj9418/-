@@ -595,7 +595,6 @@ update_casaos() {
     fi
 }
 
-
 # 函数：查看 CasaOS 状态和信息
 view_casaos_info() {
     check_casaos_status
@@ -669,24 +668,12 @@ pre_flight_check() {
     # 2. 架构检查
     detect_arch
 
-    # 3. 内存检查 (示例: 至少 1GB)
+    # 3. 内存检查 (示例: 显示内存大小)
     local total_mem=$(free -m | awk '/^Mem:/{print $2}')
-    local min_mem=900 # MB
-    if [ "$total_mem" -lt "$min_mem" ]; then
-        log "${YELLOW}  [!] 警告: 系统内存 (${total_mem}MB) 可能不足，推荐至少 1GB。${NC}"
+    if [ -z "$total_mem" ]; then
+        log "${RED}  [!] 无法获取系统内存信息${NC}"
     else
         log "${GREEN}  [+] 系统内存: ${total_mem}MB${NC}"
-    fi
-
-    # 4. 磁盘空间检查 (示例: 检查 / 根分区至少 5GB 可用)
-    local avail_disk=$(df -h / | awk 'NR==2{print $4}')
-    local avail_disk_bytes=$(df -k / | awk 'NR==2{print $4}')
-    local min_disk_kb=$((5 * 1024 * 1024)) # 5GB in KB
-    if [ "$avail_disk_bytes" -lt "$min_disk_kb" ]; then
-        log "${RED}  [!] 错误: 根分区可用空间 (${avail_disk}) 不足，至少需要 5GB。${NC}"
-        check_passed=false
-    else
-        log "${GREEN}  [+] 根分区可用空间: ${avail_disk}${NC}"
     fi
 
     # 5. 网络连接检查
@@ -714,7 +701,6 @@ pre_flight_check() {
         check_passed=false
     fi
 
-
     if ! $check_passed; then
         log "${RED}[!] 环境检查未通过，请解决上述错误后重试。${NC}"
         exit 1
@@ -722,7 +708,6 @@ pre_flight_check() {
         log "${GREEN}[+] 环境检查通过!${NC}"
     fi
 }
-
 
 # 函数：主菜单
 show_menu() {
