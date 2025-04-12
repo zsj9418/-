@@ -1,5 +1,5 @@
 #!/bin/bash
-# CasaOS 全架构部署脚本 v2.7
+# CasaOS 全架构部署脚本
 
 # 定义颜色输出
 RED='\033[0;31m'
@@ -351,8 +351,8 @@ install_casaos_docker() {
     log "${CYAN}[+] 使用镜像标签: ${YELLOW}${casaos_tag}${NC}"
 
 
-    log "${YELLOW}[-] 拉取 CasaOS Docker 镜像 (casaos/casaos:${casaos_tag})...${NC}"
-    docker pull "casaos/casaos:${casaos_tag}"
+    log "${YELLOW}[-] 拉取 CasaOS Docker 镜像 (dockurr/casa:${casaos_tag})...${NC}"
+    docker pull "dockurr/casa:${casaos_tag}"
     if [ $? -ne 0 ]; then
         log "${RED}❌ 拉取镜像失败! 请检查网络或镜像标签 (${casaos_tag}) 是否存在。${NC}"
         return 1
@@ -376,7 +376,7 @@ install_casaos_docker() {
       -v ${CASAOS_CONF_DIR}:/etc/casaos \
       -v ${CASAOS_DATA_DIR}:/var/lib/casaos \
       -v ${CASAOS_LOG_DIR}:/var/log/casaos \
-      casaos/casaos:${casaos_tag}
+      dockurr/casa:${casaos_tag}
 
     if [ $? -ne 0 ]; then
          log "${RED}❌ 创建或运行 CasaOS Docker 容器失败! 请检查 Docker 日志 (docker logs casaos)。${NC}"
@@ -540,8 +540,8 @@ update_casaos() {
         read -p "${CYAN}  [?] 输入要更新到的镜像标签 (默认为 ${latest_tag}): ${NC}" update_tag
         update_tag=${update_tag:-$latest_tag}
 
-        log "${YELLOW}    [*] 拉取新镜像 (casaos/casaos:${update_tag})...${NC}"
-        docker pull "casaos/casaos:${update_tag}"
+        log "${YELLOW}    [*] 拉取新镜像 (dockurr/casa:${update_tag})...${NC}"
+        docker pull "dockurr/casa:${update_tag}"
         if [ $? -ne 0 ]; then
             log "${RED}    [!] 拉取新镜像失败! 请检查标签或网络。${NC}"
             return 1
@@ -563,7 +563,7 @@ update_casaos() {
           -v /etc/casaos:/etc/casaos \
           -v /var/lib/casaos:/var/lib/casaos \
           -v /var/log/casaos:/var/log/casaos \
-          casaos/casaos:${update_tag}"
+          dockurr/casa:${update_tag}"
 
         log "${CYAN}    执行命令: ${run_cmd}${NC}"
         eval "$run_cmd" # 使用 eval 执行命令
