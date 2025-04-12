@@ -161,33 +161,35 @@ install_dependencies() {
 
 # 配置 Docker 镜像源
 config_docker_mirror() {
-    log "${BLUE}[+] 配置 Docker 镜像加速源...${NC}"
-    if [ -f "$DOCKER_CONFIG_FILE" ]; then
-        backup_file "$DOCKER_CONFIG_FILE"
-    else
-        sudo mkdir -p /etc/docker
-    fi
+    read -p "${YELLOW}您希望配置 Docker 镜像加速源吗？ (y/N): ${NC}" configure_mirror
+    if [[ "$configure_mirror" =~ ^[Yy]$ ]]; then
+        log "${BLUE}[+] 配置 Docker 镜像加速源...${NC}"
+        if [ -f "$DOCKER_CONFIG_FILE" ]; then
+            backup_file "$DOCKER_CONFIG_FILE"
+        else
+            sudo mkdir -p /etc/docker
+        fi
 
-    # 国内常用镜像源列表
-    local mirrors=(
-        "https://dockerproxy.com"
-        "https://hub-mirror.c.163.com"
-        "https://mirror.baidubce.com"
-        "https://docker.mirrors.ustc.edu.cn"
-        "https://docker.nju.edu.cn"
-    )
-    # 构建 JSON 格式的镜像源
-    local mirror_json="\"registry-mirrors\": ["
-    for mirror in "${mirrors[@]}"; do
-        mirror_json+="\"$mirror\", "
-    done
-    # 移除最后的逗号和空格
-    mirror_json="${mirror_json%, }"
-    mirror_json+="]"
+        # 国内常用镜像源列表
+        local mirrors=(
+            "https://dockerproxy.com"
+            "https://hub-mirror.c.163.com"
+            "https://mirror.baidubce.com"
+            "https://docker.mirrors.ustc.edu.cn"
+            "https://docker.nju.edu.cn"
+        )
+        # 构建 JSON 格式的镜像源
+        local mirror_json="\"registry-mirrors\": ["
+        for mirror in "${mirrors[@]}"; do
+            mirror_json+="\"$mirror\", "
+        done
+        # 移除最后的逗号和空格
+        mirror_json="${mirror_json%, }"
+        mirror_json+="]"
 
-    # 使用 jq 处理 JSON 会更健壮，但避免增加新依赖，这里用简单方式
-    # 注意：这会覆盖已有的 daemon.json 内容，如果需要保留其他配置请手动合并
-    cat << EOF | sudo tee "$DOCKER_CONFIG_FILE" > /dev/null
+        # 使用 jq 处理 JSON 会更健壮，但避免增加新依赖，这里用简单方式
+        # 注意：这会覆盖已有的 daemon.json 内容，如果需要保留其他配置请手动合并
+        cat << EOF | sudo tee "$DOCKER_CONFIG_FILE" > /dev/null
 {
     $mirror_json,
     "log-driver": "json-file",
@@ -199,19 +201,22 @@ config_docker_mirror() {
 }
 EOF
 
-    if [ $? -ne 0 ]; then
-        log "${RED}  [!] 写入 Docker 配置文件失败!${NC}"
-        return 1
-    fi
+        if [ $? -ne 0 ]; then
+            log "${RED}  [!] 写入 Docker 配置文件失败!${NC}"
+            return 1
+        fi
 
-    log "${BLUE}  [*] 重启 Docker 服务以应用配置...${NC}"
-    sudo systemctl daemon-reload
-    sudo systemctl restart docker
-    if [ $? -ne 0 ]; then
-        log "${RED}  [!] 重启 Docker 服务失败! 请检查配置文件 ${DOCKER_CONFIG_FILE}${NC}"
-        return 1
+        log "${BLUE}  [*] 重启 Docker 服务以应用配置...${NC}"
+        sudo systemctl daemon-reload
+        sudo systemctl restart docker
+        if [ $? -ne 0 ]; then
+            log "${RED}  [!] 重启 Docker 服务失败! 请检查配置文件 ${DOCKER_CONFIG_FILE}${NC}"
+            return 1
+        fi
+        log "${GREEN}  [+] Docker 镜像源配置完成并已重启${NC}"
+    else
+        log "${YELLOW}[!] 未配置 Docker 镜像加速源，跳过该步骤。${NC}"
     fi
-    log "${GREEN}  [+] Docker 镜像源配置完成并已重启${NC}"
 }
 
 # 架构特定预处理
@@ -314,6 +319,12 @@ install_casaos_docker() {
         return 1
     fi
 
+    # 检查并创建 /DATA 目录
+    if [ ! -d "/DATA" ]; then
+        sudo mkdir -p /DATA
+        log "${GREEN}[+] 创建目录 /DATA${NC}"
+    fi
+
     # 检查同名容器
     if docker ps -a --format '{{.Names}}' | grep -q "^casaos$"; then
         log "${YELLOW}[!] 检测到已存在名为 'casaos' 的 Docker 容器。${NC}"
@@ -350,7 +361,6 @@ install_casaos_docker() {
     fi
     log "${CYAN}[+] 使用镜像标签: ${YELLOW}${casaos_tag}${NC}"
 
-
     log "${YELLOW}[-] 拉取 CasaOS Docker 镜像 (dockurr/casa:${casaos_tag})...${NC}"
     docker pull "dockurr/casa:${casaos_tag}"
     if [ $? -ne 0 ]; then
@@ -360,23 +370,24 @@ install_casaos_docker() {
 
     log "${YELLOW}[-] 创建并运行 CasaOS Docker 容器...${NC}"
     # 定义数据卷路径
-    CASAOS_DATA_DIR="/var/lib/casaos" # 主数据目录
+    CASAOS_DATA_DIR="/DATA" # 主数据目录
     CASAOS_CONF_DIR="/etc/casaos"     # 配置目录
     CASAOS_LOG_DIR="/var/log/casaos"  # 日志目录 (容器内)
 
     # 创建宿主机目录 (如果不存在)
     sudo mkdir -p "$CASAOS_DATA_DIR" "$CASAOS_CONF_DIR" # 不创建日志目录，让容器自己管理
 
+    # 创建并运行 Docker 容器
     docker run -d \
       --name casaos \
       --restart=always \
       -p ${CASAOS_PORT}:80 \
       --privileged \
       -v /var/run/docker.sock:/var/run/docker.sock \
-      -v ${CASAOS_CONF_DIR}:/etc/casaos \
-      -v ${CASAOS_DATA_DIR}:/var/lib/casaos \
-      -v ${CASAOS_LOG_DIR}:/var/log/casaos \
-      dockurr/casa:${casaos_tag}
+      -v "${CASAOS_CONF_DIR}:/etc/casaos" \
+      -v "${CASAOS_DATA_DIR}:/DATA" \
+      -v "${CASAOS_LOG_DIR}:/var/log/casaos" \
+      "dockurr/casa:${casaos_tag}"
 
     if [ $? -ne 0 ]; then
          log "${RED}❌ 创建或运行 CasaOS Docker 容器失败! 请检查 Docker 日志 (docker logs casaos)。${NC}"
@@ -400,7 +411,6 @@ install_casaos_docker() {
     fi
     return 0
 }
-
 
 # 函数：卸载 CasaOS
 uninstall_casaos() {
