@@ -412,6 +412,71 @@ install_casaos_docker() {
     return 0
 }
 
+# 函数：安装 CasaOS Toolbox
+install_casaos_toolbox() {
+    log "${GREEN}[+] 安装 CasaOS Toolbox...${NC}"
+
+    # 检查 Docker 是否安装并运行
+    if ! command_exists docker || ! sudo systemctl is-active --quiet docker; then
+        log "${RED}[!] Docker 未安装或未运行，请先安装并启动 Docker。${NC}"
+        return 1
+    fi
+
+    # 检查同名容器
+    if docker ps -a --format '{{.Names}}' | grep -q "^casaos-toolbox$"; then
+        log "${YELLOW}[!] 检测到已存在名为 'casaos-toolbox' 的 Docker 容器。${NC}"
+        read -p "${CYAN}  [?] 是否停止并移除现有容器以继续安装? (y/N): ${NC}" remove_existing
+        if [[ "$remove_existing" =~ ^[Yy]$ ]]; then
+            log "${YELLOW}  [*] 停止并移除现有 'casaos-toolbox' 容器...${NC}"
+            docker stop casaos-toolbox >/dev/null 2>&1
+            docker rm casaos-toolbox >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                 log "${RED}  [!] 移除现有容器失败，请手动处理!${NC}"
+                 return 1
+            fi
+            log "${GREEN}  [+] 现有容器已移除${NC}"
+        else
+            log "${YELLOW}[-] 操作取消。${NC}"
+            return 1
+        fi
+    fi
+
+    # 拉取 CasaOS Toolbox 镜像
+    log "${YELLOW}[-] 拉取 CasaOS Toolbox Docker 镜像 (wisdomsky/casaos-toolbox:latest)...${NC}"
+    docker pull wisdomsky/casaos-toolbox:latest
+    if [ $? -ne 0 ]; then
+        log "${RED}❌ 拉取 CasaOS Toolbox 镜像失败! 请检查网络或镜像标签。${NC}"
+        return 1
+    fi
+
+    # 创建并运行 CasaOS Toolbox Docker 容器
+    log "${YELLOW}[-] 创建并运行 CasaOS Toolbox Docker 容器...${NC}"
+    docker run -d \
+      --name casaos-toolbox \
+      --restart=always \
+      -p 8080:80 \
+      --privileged \
+      wisdomsky/casaos-toolbox:latest
+
+    if [ $? -ne 0 ]; then
+         log "${RED}❌ 创建或运行 CasaOS Toolbox Docker 容器失败! 请检查 Docker 日志 (docker logs casaos-toolbox)。${NC}"
+         return 1
+    fi
+
+    # 验证 Docker 容器是否运行
+    sleep 5 # 等待容器启动
+    if docker ps -a --format '{{.Names}} {{.Status}}' | grep -q "^casaos-toolbox\s*Up"; then
+        local IP=$(hostname -I | awk '{print $1}')
+        log "\n${GREEN}✅ CasaOS Toolbox 部署成功！${NC}"
+        log "${GREEN}✅ 访问地址：http://${IP}:8080${NC}"
+    else
+        log "${RED}❌ CasaOS Toolbox Docker 部署后容器未能正常运行，请检查 Docker 日志 (docker logs casaos-toolbox)${NC}"
+        docker logs casaos-toolbox 2>&1 | tee -a "$SCRIPT_LOG_FILE" # 输出日志方便排查
+        return 1
+    fi
+    return 0
+}
+
 # 函数：卸载 CasaOS
 uninstall_casaos() {
     check_casaos_status
@@ -724,31 +789,30 @@ show_menu() {
     echo -e " ${YELLOW}安装选项:${NC}"
     echo -e "  1. 检查环境并安装 CasaOS (推荐: 标准方式)"
     echo -e "  2. 检查环境并使用 Docker 部署 CasaOS (可指定端口/版本)"
+    echo -e "  3. 安装 CasaOS Toolbox" # 新增选项
     echo -e " ${YELLOW}管理选项:${NC}"
     if $is_installed; then
-        echo -e "  3. ${GREEN}更新 CasaOS${NC}"
-        echo -e "  4. ${CYAN}查看 CasaOS 状态和信息${NC}"
-        echo -e "  5. ${RED}卸载 CasaOS${NC}"
+        echo -e "  4. ${GREEN}更新 CasaOS${NC}"
+        echo -e "  5. ${CYAN}查看 CasaOS 状态和信息${NC}"
+        echo -e "  6. ${RED}卸载 CasaOS${NC}"
     else
-        echo -e "  3. (需要先安装)"
         echo -e "  4. (需要先安装)"
         echo -e "  5. (需要先安装)"
+        echo -e "  6. (需要先安装)"
     fi
     echo -e " ${YELLOW}其他选项:${NC}"
-    echo -e "  6. 配置 Docker 国内镜像加速"
-    echo -e "  7. (TODO: 切换系统 APT/YUM 镜像源)" # 占位符
-    echo -e "  8. (TODO: 备份/恢复 CasaOS 配置)" # 占位符
-    echo -e "  9. 清理脚本日志 (${SCRIPT_LOG_FILE})"
+    echo -e "  7. 配置 Docker 国内镜像加速"
+    echo -e "  8. (TODO: 切换系统 APT/YUM 镜像源)" # 占位符
+    echo -e "  9. (TODO: 备份/恢复 CasaOS 配置)" # 占位符
+    echo -e "  10. 清理脚本日志 (${SCRIPT_LOG_FILE})"
     echo -e "  0. 退出脚本"
     echo -e "${BLUE}--------------------------------------------${NC}"
 
     # 计算有效选项范围
-    local max_option=9
-    # local valid_options_msg="0, 1, 2, 6, 7, 8, 9" # Base options
-    local valid_options_msg="0, 1, 2, 6, 9" # Base options without TODOs
+    local max_option=10
+    local valid_options_msg="0, 1, 2, 3, 10" # Base options without TODOs
     if $is_installed; then
-        # valid_options_msg+=", 3, 4, 5"
-        valid_options_msg+=", 3, 4, 5"
+        valid_options_msg+=", 4, 5, 6"
     fi
 
     read -p "请输入操作选项 [${valid_options_msg}]: " choice
@@ -768,39 +832,40 @@ show_menu() {
             install_casaos_docker
             ;;
         3)
+            install_casaos_toolbox # 调用新选项
+            ;;
+        4)
             if $is_installed; then
                 update_casaos
             else
                 log "${YELLOW}[!] CasaOS 未安装，无法执行此操作${NC}"
             fi
             ;;
-        4)
+        5)
             if $is_installed; then
                 view_casaos_info
             else
                 log "${YELLOW}[!] CasaOS 未安装，无法执行此操作${NC}"
             fi
             ;;
-        5)
+        6)
             if $is_installed; then
                 uninstall_casaos
             else
                 log "${YELLOW}[!] CasaOS 未安装，无法执行此操作${NC}"
             fi
             ;;
-        6)
+        7)
             install_dependencies # 确保 docker 命令存在
             config_docker_mirror
             ;;
-        7)
-            log "${YELLOW}[!] 功能“切换系统镜像源”尚未实现。${NC}"
-            # TODO: 添加切换系统镜像源的功能
-            ;;
         8)
-            log "${YELLOW}[!] 功能“备份/恢复 CasaOS 配置”尚未实现。${NC}"
-             # TODO: 添加备份恢复功能，例如打包 /etc/casaos 和 /var/lib/casaos (需要小心处理大小和权限)
+            log "${YELLOW}[!] 功能“切换系统镜像源”尚未实现。${NC}"
             ;;
         9)
+            log "${YELLOW}[!] 功能“备份/恢复 CasaOS 配置”尚未实现。${NC}"
+            ;;
+        10)
             if [ -f "$SCRIPT_LOG_FILE" ]; then
                 log "${YELLOW}[-] 清理脚本日志文件: ${SCRIPT_LOG_FILE}${NC}"
                 sudo rm -f "$SCRIPT_LOG_FILE"
