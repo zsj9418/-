@@ -8,6 +8,8 @@ NC="\033[0m" # 无色
 
 # 日志文件路径
 LOG_FILE="/var/log/format_script.log"
+# 状态文件路径
+STATUS_FILE="/var/lib/format_script_status.txt"
 
 # 限制日志文件大小为 1M
 manage_log() {
@@ -27,7 +29,7 @@ check_dependencies() {
     local installed=1
 
     for pkg in "${dependencies[@]}"; do
-        if ! command -v $pkg &> /dev/null; then
+        if ! dpkg -l | grep -q "^ii  $pkg"; then
             missing+=($pkg)
             installed=0
         fi
@@ -46,6 +48,8 @@ check_dependencies() {
             echo -e "${RED}不支持的操作系统，请手动安装依赖。${NC}" >> "$LOG_FILE"
             exit 1
         fi
+        # 更新状态文件，记录已安装的依赖
+        echo "${missing[@]}" >> "$STATUS_FILE"
     else
         echo -e "${GREEN}所有依赖已安装，无需更新。${NC}"
     fi
