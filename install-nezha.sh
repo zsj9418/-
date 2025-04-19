@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 用途: 一键部署 lsposed/nezha 项目到 Docker
-# 依赖: curl, jq, fzf, Docker, Docker Compose
+# 依赖: curl, jq, fzf, Docker, Docker Compose, ss (或 net-tools)
 
 # 项目相关常量
 REPO="lsposed/nezha"
@@ -15,8 +15,8 @@ DEPENDENCY_CHECK_FILE="${PROJECT_DIR}/.dependency_checked"
 # 默认环境变量
 DEFAULT_TZ="Asia/Shanghai"
 DEFAULT_NODE_ENV="production"
-DEFAULT_NEZHA_PORT="5555"
-DEFAULT_HOST_PORT="5555"
+DEFAULT_NEZHA_PORT="8008"
+DEFAULT_HOST_PORT="8008"
 
 # 颜色输出函数
 print_info() { echo -e "\033[1;34m[INFO]\033[0m $1"; }
@@ -34,6 +34,7 @@ check_architecture() {
         *) print_error "不支持的架构: $ARCH"; exit 1 ;;
     esac
     print_info "检测到架构: $ARCH"
+    export HOST_ARCH=$ARCH
 }
 
 # 检查和安装依赖
@@ -122,6 +123,27 @@ check_dependencies() {
         sudo chmod +x /usr/local/bin/docker-compose
     fi
 
+    # 安装 ss（或 net-tools）
+    if ! command -v ss &>/dev/null; then
+        print_info "未找到 ss，正在安装 net-tools..."
+        if [[ -f /etc/os-release ]]; then
+            . /etc/os-release
+            case $ID in
+                ubuntu|debian)
+                    sudo apt-get update
+                    sudo apt-get install -y net-tools
+                    ;;
+                centos|rhel)
+                    sudo yum install -y net-tools
+                    ;;
+                *)
+                    print_error "不支持的系统: $ID，无法安装 net-tools"
+                    exit 1
+                    ;;
+            esac
+        fi
+    fi
+
     # 标记依赖已检查
     mkdir -p "$PROJECT_DIR"
     touch "$DEPENDENCY_CHECK_FILE"
@@ -141,17 +163,24 @@ check_network() {
 # 获取最新的 10 个镜像版本
 get_image_versions() {
     print_info "正在获取最新的镜像版本..."
-    # 捕获 curl 响应和状态码
+    # 尝试主 API
     RESPONSE=$(curl -s -w "%{http_code}" "https://hub.docker.com/v2/repositories/lsposed/nezha/tags?page_size=100" -o /tmp/nezha_tags.json)
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-    
-    # 检查 HTTP 状态码
+
+    # 检查主 API 结果
     if [[ "$HTTP_CODE" -ne 200 ]]; then
-        print_error "Docker Hub API 返回错误，HTTP 状态码: $HTTP_CODE"
+        print_info "主 API 失败（HTTP 状态码: $HTTP_CODE），尝试备用 API..."
+        RESPONSE=$(curl -s -w "%{http_code}" "https://registry.hub.docker.com/v2/lsposed/nezha/tags/list?page_size=100" -o /tmp/nezha_tags.json)
+        HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    fi
+
+    # 检查最终结果
+    if [[ "$HTTP_CODE" -ne 200 ]]; then
+        print_error "无法获取镜像版本列表，HTTP 状态码: $HTTP_CODE"
         if [[ "$HTTP_CODE" -eq 429 ]]; then
-            print_error "可能触发了速率限制，请稍后重试或手动输入版本"
+            print_error "触发了 Docker Hub 速率限制，将使用 latest 版本"
         elif [[ "$HTTP_CODE" -eq 403 ]]; then
-            print_error "访问被拒绝，可能需要 Docker Hub 认证"
+            print_error "访问被拒绝，可能需要 Docker Hub 认证，将使用 latest 版本"
         fi
         echo "API 响应内容："
         cat /tmp/nezha_tags.json
@@ -159,15 +188,14 @@ get_image_versions() {
         return 1
     fi
 
-    # 解析标签
-    VERSIONS=$(cat /tmp/nezha_tags.json | jq -r '.results[].name' 2>/dev/null | sort -V -r | head -n 10)
+    # 解析标签，排除非稳定版本
+    VERSIONS=$(cat /tmp/nezha_tags.json | jq -r '.results[].name // .tags[]' 2>/dev/null | grep -vE 'dev|beta|test' | sort -V -r | head -n 10)
     rm -f /tmp/nezha_tags.json
 
     if [[ -z "$VERSIONS" ]]; then
-        print_error "无法获取镜像版本列表，可能的原因："
+        print_error "无法解析镜像版本列表，可能的原因："
         echo "  - 仓库没有可用标签"
         echo "  - API 返回了意外格式"
-        echo "  - jq 解析失败"
         return 1
     fi
     print_success "成功获取版本列表"
@@ -185,10 +213,19 @@ select_image_version() {
             print_info "已选择版本: $SELECTED_VERSION"
         fi
     else
-        print_prompt "无法获取版本列表，请手动输入版本 (默认: latest，建议: latest, v0.16.8, v0.16.7): "
-        read -r USER_VERSION
-        SELECTED_VERSION=${USER_VERSION:-latest}
+        print_prompt "无法获取版本列表，使用默认版本 latest"
+        SELECTED_VERSION="latest"
         print_info "使用版本: $SELECTED_VERSION"
+    fi
+    # 验证镜像架构
+    print_info "验证镜像 ${REPO}:${SELECTED_VERSION} 的架构兼容性..."
+    MANIFEST=$(docker manifest inspect "${REPO}:${SELECTED_VERSION}" 2>/dev/null)
+    if [[ -n "$MANIFEST" ]]; then
+        SUPPORTS_ARCH=$(echo "$MANIFEST" | jq -r ".manifests[] | select(.platform.architecture == \"$HOST_ARCH\")")
+        if [[ -z "$SUPPORTS_ARCH" ]]; then
+            print_error "镜像 ${REPO}:${SELECTED_VERSION} 不支持 $HOST_ARCH 架构，将使用 latest"
+            SELECTED_VERSION="latest"
+        fi
     fi
 }
 
@@ -204,27 +241,23 @@ prompt_user_inputs() {
     NODE_ENV=${USER_NODE_ENV:-$DEFAULT_NODE_ENV}
     print_info "使用 Node.js 环境: $NODE_ENV"
 
-    print_prompt "请输入容器内服务端口 (默认: $DEFAULT_NEZHA_PORT，留空回车使用默认值): "
-    read -r USER_NEZHA_PORT
-    NEZHA_PORT=${USER_NEZHA_PORT:-$DEFAULT_NEZHA_PORT}
-    print_info "使用容器内端口: $NEZHA_PORT"
-
     print_prompt "请输入主机映射端口 (默认: $DEFAULT_HOST_PORT，留空回车使用默认值): "
     read -r USER_HOST_PORT
     HOST_PORT=${USER_HOST_PORT:-$DEFAULT_HOST_PORT}
-    print_info "使用主机端口: $HOST_PORT"
+    print_info "使用主机端口: $HOST_PORT (容器内端口固定为 $DEFAULT_NEZHA_PORT)"
 }
 
 # 生成 docker-compose.yml
 generate_compose_file() {
     mkdir -p "$DATA_DIR" "$DB_DIR" "$LOG_DIR"
+    chmod -R 777 "$DATA_DIR" "$DB_DIR" "$LOG_DIR"
     cat > "$COMPOSE_FILE" << EOF
 services:
   nezha:
     image: ${REPO}:${SELECTED_VERSION}
     container_name: nezha
     ports:
-      - "${HOST_PORT}:${NEZHA_PORT}"
+      - "${HOST_PORT}:${DEFAULT_NEZHA_PORT}"
     volumes:
       - ${DATA_DIR}:/dashboard/data
       - ${DB_DIR}:/dashboard/database
@@ -234,7 +267,8 @@ services:
     environment:
       - TZ=${TZ}
       - NODE_ENV=${NODE_ENV}
-      - NEZHA_PORT=${NEZHA_PORT}
+      - NEZHA_PORT=${DEFAULT_NEZHA_PORT}
+    user: root
     restart: unless-stopped
   watchtower:
     image: containrrr/watchtower
@@ -255,16 +289,47 @@ deploy_service() {
     check_network
     select_image_version
     prompt_user_inputs
+    # 检查端口占用
+    if command -v ss &>/dev/null; then
+        if ss -tuln | grep -q ":${HOST_PORT}\b"; then
+            print_error "主机端口 ${HOST_PORT} 已被占用，请选择其他端口或释放端口"
+            exit 1
+        fi
+    elif command -v netstat &>/dev/null; then
+        if netstat -tuln | grep -q ":${HOST_PORT}\b"; then
+            print_error "主机端口 ${HOST_PORT} 已被占用，请选择其他端口或释放端口"
+            exit 1
+        fi
+    else
+        print_info "未找到 ss 或 netstat，跳过端口占用检查"
+    fi
     generate_compose_file
     print_info "正在启动服务..."
     cd "$PROJECT_DIR" || { print_error "无法进入项目目录"; exit 1; }
     docker-compose up -d
-    print_success "服务已部署，访问 http://localhost:${HOST_PORT}"
+    print_success "服务已部署，访问 http://<宿主机IP>:${HOST_PORT}"
     print_info "最终配置："
     echo "  镜像: ${REPO}:${SELECTED_VERSION}"
     echo "  时区: $TZ"
     echo "  Node.js 环境: $NODE_ENV"
-    echo "  端口映射: $HOST_PORT -> $NEZHA_PORT"
+    echo "  端口映射: ${HOST_PORT} -> ${DEFAULT_NEZHA_PORT}"
+    print_info "服务状态："
+    docker-compose ps
+    print_info "容器日志（最近 10 行）："
+    docker-compose logs --tail=10
+    print_info "测试 UI 访问..."
+    if curl -s -I "http://localhost:${HOST_PORT}" >/dev/null; then
+        print_success "UI 访问测试成功"
+    else
+        print_error "UI 访问测试失败，请检查日志和网络配置"
+    fi
+    print_info "请确保防火墙或云服务器安全组已开放 ${HOST_PORT} 端口"
+    # 检查防火墙状态
+    if command -v ufw &>/dev/null; then
+        print_info "检查 UFW 防火墙状态..."
+        sudo ufw status
+        print_info "若 ${HOST_PORT} 未开放，运行: sudo ufw allow ${HOST_PORT}"
+    fi
 }
 
 # 查看服务状态
