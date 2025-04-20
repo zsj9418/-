@@ -8,19 +8,18 @@ BLUE='\033[0;34m'
 NC='\033[0m' # 无颜色
 
 # 默认参数
-IMAGE_NAME="nap0o/nezha"
+IMAGE_NAME="nezhahq/dashboard"
 DEFAULT_TAG="latest"
-DEFAULT_WEB_PORT="80"
+DEFAULT_WEB_PORT="8008"
 DEFAULT_AGENT_PORT="5555"
-DEFAULT_DATA_DIR="/nezha/data"
+DEFAULT_DATA_DIR="/opt/nezha/dashboard"
 DEFAULT_TIMEZONE="Asia/Shanghai"
-DEFAULT_ADMIN="admin"
-DEFAULT_PASSWORD="nezha_password"
-CONTAINER_NAME="nezha"
+CONTAINER_NAME="nezha-dashboard"
 MAX_LOG_SIZE="1m"
 RETRY_COUNT=3
 DEPENDENCY_CHECK_FILE="/tmp/nezha_dependency_check"
-ENV_FILE=".env"
+MIN_DISK_SPACE=1 # 最小磁盘空间（GB）
+MIN_MEMORY=256 # 最小内存（MB）
 
 # 检查是否以root权限运行
 check_root() {
@@ -60,6 +59,32 @@ detect_arch() {
     echo -e "${GREEN}检测到设备架构: $ARCH_NAME${NC}"
 }
 
+# 检查磁盘空间
+check_disk_space() {
+    local required_space=$1
+    local available_space=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
+    if [ -z "$available_space" ] || [ "$available_space" -lt "$required_space" ]; then
+        echo -e "${RED}错误：可用磁盘空间 (${available_space:-0} GB) 小于要求 ($required_space GB)${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}磁盘空间检查通过：可用 $available_space GB${NC}"
+}
+
+# 检查内存
+check_memory() {
+    # 首先尝试 free 命令
+    local available_memory=$(free -m | grep -i mem | awk '{print $7}')
+    if [ -z "$available_memory" ]; then
+        # 备用方法：从 /proc/meminfo 获取 Available
+        available_memory=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
+    fi
+    if [ -z "$available_memory" ] || [ "$available_memory" -lt "$MIN_MEMORY" ]; then
+        echo -e "${RED}错误：可用内存 (${available_memory:-0} MB) 小于要求 ($MIN_MEMORY MB)${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}内存检查通过：可用 $available_memory MB${NC}"
+}
+
 # 检查并安装依赖
 check_dependencies() {
     if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
@@ -85,8 +110,8 @@ check_dependencies() {
                 ;;
             macos)
                 if ! command -v brew &> /dev/null; then
-                    echo -e "${YELLOW}Homebrew 未安装，正在安装...${NC}"
-                    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                    echo -e "${YELLOW}Homebrew 未安装，请手动安装${NC}"
+                    exit 1
                 fi
                 brew install docker
                 ;;
@@ -100,6 +125,26 @@ check_dependencies() {
             debian) $PKG_MANAGER install -y curl;;
             redhat) $PKG_MANAGER install -y curl;;
             macos) brew install curl;;
+        esac
+        deps_installed=1
+    fi
+
+    if ! command -v unzip &> /dev/null; then
+        echo -e "${YELLOW}unzip 未安装，正在安装...${NC}"
+        case $OS_TYPE in
+            debian) $PKG_MANAGER install -y unzip;;
+            redhat) $PKG_MANAGER install -y unzip;;
+            macos) brew install unzip;;
+        esac
+        deps_installed=1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        echo -e "${YELLOW}jq 未安装，正在安装...${NC}"
+        case $OS_TYPE in
+            debian) $PKG_MANAGER install -y jq;;
+            redhat) $PKG_MANAGER install -y jq;;
+            macos) brew install jq;;
         esac
         deps_installed=1
     fi
@@ -123,7 +168,7 @@ check_dependencies() {
 # 获取可用镜像版本
 get_available_tags() {
     echo -e "${BLUE}正在从 Docker Hub 获取可用版本...${NC}"
-    TAGS=$(curl -s "https://hub.docker.com/v2/repositories/nap0o/nezha/tags?page_size=100" | \
+    TAGS=$(curl -s "https://hub.docker.com/v2/repositories/nezhahq/dashboard/tags?page_size=100" | \
            grep -o '"name":"[^"]*"' | sed 's/"name":"\(.*\)"/\1/' | grep -v "latest" | sort -r)
     TAGS="latest $TAGS"
     if [ -z "$TAGS" ]; then
@@ -167,23 +212,9 @@ get_user_input() {
     read -p "请输入 Web 端口（直接回车使用默认值 $DEFAULT_WEB_PORT）: " WEB_PORT
     WEB_PORT=${WEB_PORT:-$DEFAULT_WEB_PORT}
     read -p "请输入 Agent 端口（直接回车使用默认值 $DEFAULT_AGENT_PORT）: " AGENT_PORT
-    AGENT_PORT=${AGENT_PORT:-$DEFAULT_AGENT_PORT}
+    AGENT_PORT=${WEB_PORT:-$DEFAULT_AGENT_PORT}
     read -p "请输入时区（直接回车使用默认值 $DEFAULT_TIMEZONE）: " TIMEZONE
     TIMEZONE=${TIMEZONE:-$DEFAULT_TIMEZONE}
-    read -p "请输入管理员用户名（直接回车使用默认值 $DEFAULT_ADMIN）: " ADMIN
-    ADMIN=${ADMIN:-$DEFAULT_ADMIN}
-    read -p "请输入管理员密码（直接回车使用默认值 $DEFAULT_PASSWORD）: " PASSWORD
-    PASSWORD=${PASSWORD:-$DEFAULT_PASSWORD}
-    echo -e "${BLUE}是否使用 MySQL 数据库？（默认使用 SQLite）${NC}"
-    read -p "请输入 (y/n，直接回车使用默认值 n): " USE_MYSQL
-    if [ "$USE_MYSQL" == "y" ]; then
-        read -p "请输入 MySQL 主机地址（例如 localhost）: " DB_HOST
-        read -p "请输入 MySQL 端口（默认 3306）: " DB_PORT
-        DB_PORT=${DB_PORT:-3306}
-        read -p "请输入 MySQL 数据库名: " DB_NAME
-        read -p "请输入 MySQL 用户名: " DB_USER
-        read -p "请输入 MySQL 密码: " DB_PASSWORD
-    fi
 }
 
 # 动态检测端口
@@ -219,6 +250,22 @@ select_network_mode() {
     echo -e "${GREEN}网络模式: $NETWORK_MODE${NC}"
 }
 
+# 检查 Docker 配置
+check_docker_config() {
+    if [ -f "/etc/docker/daemon.json" ]; then
+        echo -e "${YELLOW}检测到 Docker 配置文件 /etc/docker/daemon.json${NC}"
+        echo -e "${BLUE}内容如下:${NC}"
+        cat /etc/docker/daemon.json
+        echo -e "${YELLOW}如果配置了私有注册表，可能导致拉取失败${NC}"
+        read -p "是否临时禁用 daemon.json？(y/n): " DISABLE_DAEMON
+        if [ "$DISABLE_DAEMON" == "y" ]; then
+            mv /etc/docker/daemon.json /etc/docker/daemon.json.bak
+            systemctl restart docker
+            echo -e "${GREEN}Docker 服务已重启${NC}"
+        fi
+    fi
+}
+
 # 拉取镜像并重试
 pull_image() {
     echo -e "${BLUE}正在拉取镜像 $IMAGE_NAME...${NC}"
@@ -230,7 +277,12 @@ pull_image() {
         echo -e "${YELLOW}第 $i 次拉取失败，重试中...${NC}"
         sleep 2
     done
-    echo -e "${RED}镜像拉取失败，请检查网络或镜像名称${NC}"
+    echo -e "${RED}镜像拉取失败，请检查以下问题：${NC}"
+    echo -e "1. 网络连接：运行 'ping registry-1.docker.io' 和 'curl -I https://registry-1.docker.io'。"
+    echo -e "2. DNS 配置：确保 /etc/resolv.conf 包含有效 DNS（如 8.8.8.8）。"
+    echo -e "3. Docker 配置：检查 /etc/docker/daemon.json 是否指定私有注册表。"
+    echo -e "4. 镜像名称：确保 nezhahq/dashboard 存在（可访问 https://hub.docker.com/r/nezhahq/dashboard）。"
+    echo -e "5. 尝试手动拉取：'docker pull registry-1.docker.io/nezhahq/dashboard:latest'。"
     exit 1
 }
 
@@ -260,35 +312,16 @@ start_container() {
     # 检查时区文件
     check_timezone_files
 
-    # 构建环境变量列表
-    local env_vars=(
-        "-e NEZHA_PORT=$WEB_PORT"
-        "-e TZ=$TIMEZONE"
-        "-e NEZHA_ADMIN=$ADMIN"
-        "-e NEZHA_PASSWORD=$PASSWORD"
-    )
-    if [ "$USE_MYSQL" == "y" ]; then
-        env_vars+=(
-            "-e DB_TYPE=mysql"
-            "-e DB_HOST=$DB_HOST"
-            "-e DB_PORT=$DB_PORT"
-            "-e DB_NAME=$DB_NAME"
-            "-e DB_USER=$DB_USER"
-            "-e DB_PASSWORD=$DB_PASSWORD"
-        )
-    else
-        env_vars+=("-e DB_TYPE=sqlite3")
-    fi
-
     # 启动容器，捕获详细错误日志
     local error_log=$(docker run -d \
         --name "$CONTAINER_NAME" \
         $NETWORK_MODE \
         -v "$DATA_DIR:/dashboard/data" \
         $LOCALTIME_MOUNT \
-        -p "$WEB_PORT:18080" \
+        -p "$WEB_PORT:8008" \
         -p "$AGENT_PORT:5555" \
-        "${env_vars[@]}" \
+        -e PORT="$WEB_PORT" \
+        -e TZ="$TIMEZONE" \
         --restart unless-stopped \
         --log-opt max-size="$MAX_LOG_SIZE" \
         "$IMAGE_NAME" 2>&1)
@@ -299,8 +332,8 @@ start_container() {
         echo -e "Agent 端口: $AGENT_PORT"
         echo -e "数据目录: $DATA_DIR"
         echo -e "时区: $TIMEZONE"
-        echo -e "管理员用户名: $ADMIN"
-        echo -e "管理员密码: $PASSWORD"
+        echo -e "${YELLOW}请在浏览器中访问 http://localhost:$WEB_PORT 进行初始配置（设置管理员账户等）${NC}"
+        echo -e "${YELLOW}参考文档: https://github.com/nezhahq/nezha${NC}"
     else
         echo -e "${RED}容器启动失败，请检查以下错误信息：${NC}"
         echo "$error_log"
@@ -308,8 +341,8 @@ start_container() {
         echo -e "1. 检查 Docker 服务是否正常运行（systemctl status docker）。"
         echo -e "2. 确保数据目录 $DATA_DIR 可写（chmod -R 777 $DATA_DIR）。"
         echo -e "3. 验证端口 $WEB_PORT 和 $AGENT_PORT 未被占用。"
-        echo -e "4. 检查环境变量是否正确（NEZHA_ADMIN、NEZHA_PASSWORD 等）。"
-        echo -e "5. 查看容器日志（docker logs $CONTAINER_NAME）以获取更多信息。"
+        echo -e "4. 查看容器日志（docker logs $CONTAINER_NAME）以获取更多信息。"
+        echo -e "5. 尝试使用其他版本（例如 v0.15.0），运行：docker run -e ... nezhahq/dashboard:v0.15.0"
         exit 1
     fi
 }
@@ -375,17 +408,6 @@ uninstall() {
         echo -e "${GREEN}依赖检查标记文件已删除${NC}"
     fi
 
-    # 删除 .env 文件
-    if [ -f "$ENV_FILE" ]; then
-        read -p "是否删除 .env 文件？(y/n): " DELETE_ENV
-        if [ "$DELETE_ENV" == "y" ]; then
-            rm -f "$ENV_FILE"
-            echo -e "${GREEN}.env 文件已删除${NC}"
-        else
-            echo -e "${YELLOW}保留 .env 文件${NC}"
-        fi
-    fi
-
     echo -e "${GREEN}卸载完成${NC}"
 }
 
@@ -393,6 +415,8 @@ uninstall() {
 main_menu() {
     detect_os
     detect_arch
+    check_disk_space $MIN_DISK_SPACE
+    check_memory
     while true; do
         echo -e "${BLUE}=== 哪吒探针部署脚本 ===${NC}"
         echo "1) 安装并启动哪吒探针"
@@ -404,6 +428,7 @@ main_menu() {
             1)
                 check_root
                 check_dependencies
+                check_docker_config
                 get_available_tags
                 get_user_input
                 setup_data_dir
