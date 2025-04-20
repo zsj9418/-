@@ -14,10 +14,13 @@ DEFAULT_WEB_PORT="80"
 DEFAULT_AGENT_PORT="5555"
 DEFAULT_DATA_DIR="/nezha/data"
 DEFAULT_TIMEZONE="Asia/Shanghai"
+DEFAULT_ADMIN="admin"
+DEFAULT_PASSWORD="nezha_password"
 CONTAINER_NAME="nezha"
 MAX_LOG_SIZE="1m"
 RETRY_COUNT=3
 DEPENDENCY_CHECK_FILE="/tmp/nezha_dependency_check"
+ENV_FILE=".env"
 
 # 检查是否以root权限运行
 check_root() {
@@ -154,7 +157,8 @@ setup_data_dir() {
     read -p "请输入数据目录路径（直接回车使用默认值 $DEFAULT_DATA_DIR）: " DATA_DIR
     DATA_DIR=${DATA_DIR:-$DEFAULT_DATA_DIR}
     mkdir -p "$DATA_DIR"
-    chown -R 1000:1000 "$DATA_DIR" # 哪吒探针默认使用 UID/GID 1000
+    chown -R 1000:1000 "$DATA_DIR"
+    chmod -R 755 "$DATA_DIR"
     echo -e "${GREEN}数据目录设置为: $DATA_DIR${NC}"
 }
 
@@ -166,6 +170,20 @@ get_user_input() {
     AGENT_PORT=${AGENT_PORT:-$DEFAULT_AGENT_PORT}
     read -p "请输入时区（直接回车使用默认值 $DEFAULT_TIMEZONE）: " TIMEZONE
     TIMEZONE=${TIMEZONE:-$DEFAULT_TIMEZONE}
+    read -p "请输入管理员用户名（直接回车使用默认值 $DEFAULT_ADMIN）: " ADMIN
+    ADMIN=${ADMIN:-$DEFAULT_ADMIN}
+    read -p "请输入管理员密码（直接回车使用默认值 $DEFAULT_PASSWORD）: " PASSWORD
+    PASSWORD=${PASSWORD:-$DEFAULT_PASSWORD}
+    echo -e "${BLUE}是否使用 MySQL 数据库？（默认使用 SQLite）${NC}"
+    read -p "请输入 (y/n，直接回车使用默认值 n): " USE_MYSQL
+    if [ "$USE_MYSQL" == "y" ]; then
+        read -p "请输入 MySQL 主机地址（例如 localhost）: " DB_HOST
+        read -p "请输入 MySQL 端口（默认 3306）: " DB_PORT
+        DB_PORT=${DB_PORT:-3306}
+        read -p "请输入 MySQL 数据库名: " DB_NAME
+        read -p "请输入 MySQL 用户名: " DB_USER
+        read -p "请输入 MySQL 密码: " DB_PASSWORD
+    fi
 }
 
 # 动态检测端口
@@ -216,6 +234,16 @@ pull_image() {
     exit 1
 }
 
+# 检查时区文件
+check_timezone_files() {
+    if [ ! -f "/etc/localtime" ]; then
+        echo -e "${YELLOW}警告：宿主机 /etc/localtime 不存在，跳过挂载，将依赖 TZ 环境变量设置时区${NC}"
+        LOCALTIME_MOUNT=""
+    else
+        LOCALTIME_MOUNT="-v /etc/localtime:/etc/localtime:ro"
+    fi
+}
+
 # 启动容器
 start_container() {
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -229,19 +257,41 @@ start_container() {
         fi
     fi
 
-    docker run -d \
+    # 检查时区文件
+    check_timezone_files
+
+    # 构建环境变量列表
+    local env_vars=(
+        "-e NEZHA_PORT=$WEB_PORT"
+        "-e TZ=$TIMEZONE"
+        "-e NEZHA_ADMIN=$ADMIN"
+        "-e NEZHA_PASSWORD=$PASSWORD"
+    )
+    if [ "$USE_MYSQL" == "y" ]; then
+        env_vars+=(
+            "-e DB_TYPE=mysql"
+            "-e DB_HOST=$DB_HOST"
+            "-e DB_PORT=$DB_PORT"
+            "-e DB_NAME=$DB_NAME"
+            "-e DB_USER=$DB_USER"
+            "-e DB_PASSWORD=$DB_PASSWORD"
+        )
+    else
+        env_vars+=("-e DB_TYPE=sqlite3")
+    fi
+
+    # 启动容器，捕获详细错误日志
+    local error_log=$(docker run -d \
         --name "$CONTAINER_NAME" \
         $NETWORK_MODE \
         -v "$DATA_DIR:/dashboard/data" \
-        -v /etc/timezone:/etc/timezone:ro \
-        -v /etc/localtime:/etc/localtime:ro \
+        $LOCALTIME_MOUNT \
         -p "$WEB_PORT:18080" \
         -p "$AGENT_PORT:5555" \
-        -e NEZHA_PORT="$WEB_PORT" \
-        -e TZ="$TIMEZONE" \
+        "${env_vars[@]}" \
         --restart unless-stopped \
         --log-opt max-size="$MAX_LOG_SIZE" \
-        "$IMAGE_NAME"
+        "$IMAGE_NAME" 2>&1)
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}容器 $CONTAINER_NAME 启动成功！${NC}"
@@ -249,8 +299,17 @@ start_container() {
         echo -e "Agent 端口: $AGENT_PORT"
         echo -e "数据目录: $DATA_DIR"
         echo -e "时区: $TIMEZONE"
+        echo -e "管理员用户名: $ADMIN"
+        echo -e "管理员密码: $PASSWORD"
     else
-        echo -e "${RED}容器启动失败，请检查配置${NC}"
+        echo -e "${RED}容器启动失败，请检查以下错误信息：${NC}"
+        echo "$error_log"
+        echo -e "${YELLOW}建议：${NC}"
+        echo -e "1. 检查 Docker 服务是否正常运行（systemctl status docker）。"
+        echo -e "2. 确保数据目录 $DATA_DIR 可写（chmod -R 777 $DATA_DIR）。"
+        echo -e "3. 验证端口 $WEB_PORT 和 $AGENT_PORT 未被占用。"
+        echo -e "4. 检查环境变量是否正确（NEZHA_ADMIN、NEZHA_PASSWORD 等）。"
+        echo -e "5. 查看容器日志（docker logs $CONTAINER_NAME）以获取更多信息。"
         exit 1
     fi
 }
@@ -314,6 +373,17 @@ uninstall() {
     if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
         rm -f "$DEPENDENCY_CHECK_FILE"
         echo -e "${GREEN}依赖检查标记文件已删除${NC}"
+    fi
+
+    # 删除 .env 文件
+    if [ -f "$ENV_FILE" ]; then
+        read -p "是否删除 .env 文件？(y/n): " DELETE_ENV
+        if [ "$DELETE_ENV" == "y" ]; then
+            rm -f "$ENV_FILE"
+            echo -e "${GREEN}.env 文件已删除${NC}"
+        else
+            echo -e "${YELLOW}保留 .env 文件${NC}"
+        fi
     fi
 
     echo -e "${GREEN}卸载完成${NC}"
