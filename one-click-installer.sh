@@ -63,6 +63,7 @@ DEFAULT_OPTIONS=(
     "28. casaos部署"
     "29. 硬盘测速"
     "30. 哪吒探针部署"
+    "31. 在docker部署sing-box"
     "98. 快捷键管理"
 )
 
@@ -98,6 +99,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["28"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/casaos_installer.sh"
     ["29"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/disk_speed_test.sh"
     ["30"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-nezha.sh"
+    ["31"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_singbox_docker.sh"
 )
 
 # 声明全局变量
