@@ -160,6 +160,28 @@ check_ip_occupied() {
     return 0
 }
 
+# 检查端口是否被占用
+check_port_usage() {
+    local port=$1
+    log "检查端口 $port 是否被占用..."
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tuln | grep -q ":$port"; then
+            echo -e "\033[31m端口 $port 已经被占用，请选择其他端口\033[0m"
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln | grep -q ":$port"; then
+            echo -e "\033[31m端口 $port 已经被占用，请选择其他端口\033[0m"
+            return 1
+        fi
+    else
+        echo -e "\033[33m缺少 ss 或 netstat 命令，无法检查端口占用情况\033[0m"
+        return 0
+    fi
+    log "端口 $port 未被占用"
+    return 0
+}
+
 # --- Helper Function to get Host IP ---
 get_host_ip() {
     local ip_addr
@@ -296,8 +318,16 @@ while true; do
             if [[ "$NEED_PORT" =~ [Yy] ]]; then
                 read -rp "输入映射到宿主机的 Web 管理端口 [默认: 8080 (对应容器80)]: " WEB_PORT
                 WEB_PORT=${WEB_PORT:-8080}
+                if ! check_port_usage "$WEB_PORT"; then
+                    echo -e "\033[31m安装中止\033[0m"
+                    continue
+                fi
                 read -rp "输入映射到宿主机的 SSH 管理端口 [默认: 2222 (对应容器22)]: " SSH_PORT
                 SSH_PORT=${SSH_PORT:-2222}
+                if ! check_port_usage "$SSH_PORT"; then
+                    echo -e "\033[31m安装中止\033[0m"
+                    continue
+                fi
                 PORT_MAP="-p $WEB_PORT:80 -p $SSH_PORT:22"
             else
                 PORT_MAP=""
@@ -369,8 +399,22 @@ while true; do
                 echo -e "容器 IP: $MACVLAN_IP"
             fi
             echo -e "管理命令：\ndocker exec -it openwrt /bin/sh"
-            echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
+
+            # 尝试启动 LuCI
+            log "尝试启动 LuCI Web 服务..."
             sleep 5
+            if docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable"; then
+                log "LuCI 服务启动成功"
+            else
+                echo -e "\033[33m警告：LuCI 服务启动失败，可能未安装或镜像不支持\033[0m"
+                echo -e "尝试手动进入容器安装 LuCI："
+                echo -e "  docker exec -it openwrt /bin/sh"
+                echo -e "  opkg update"
+                echo -e "  opkg install luci"
+                echo -e "  /etc/init.d/uhttpd start"
+            fi
+
+            echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
             bash "$0" 5
             ;;
 
@@ -403,6 +447,12 @@ while true; do
             if ! docker logs -f openwrt; then
                 echo -e "\033[31m无法获取日志，容器 'openwrt' 可能不存在或未运行。\033[0m"
             fi
+            echo -e "\033[33m提示：如果日志显示启动提示（如 'Press [f]'），无法直接交互。\033[0m"
+            echo -e "请进入容器检查状态："
+            echo -e "  docker exec -it openwrt /bin/sh"
+            echo -e "检查 LuCI："
+            echo -e "  ps | grep uhttpd"
+            echo -e "  /etc/init.d/uhttpd start"
             ;;
 
         5)
@@ -460,6 +510,9 @@ while true; do
             fi
             echo -e "SSH 密码  : \033[33m(与Web密码相同)\033[0m"
             echo -e "\033[34m------------------------\033[0m"
+            echo -e "\033[33m提示：如果无法访问 Web 界面，请进入容器检查 LuCI：\033[0m"
+            echo -e "  docker exec -it openwrt /bin/sh"
+            echo -e "  /etc/init.d/uhttpd start"
             ;;
 
         6)
