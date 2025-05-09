@@ -18,19 +18,38 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
+# 环境检查
+log() {
+    echo -e "\033[33m[$(date +'%Y-%m-%d %H:%M:%S')] $1\033[0m"
+}
+log "检查 shell 环境..."
+if [ -z "$BASH_VERSION" ]; then
+    echo -e "\033[31m脚本需要 bash 运行，请确保使用 /bin/bash 执行！\033[0m"
+    echo "尝试：bash $0"
+    exit 1
+fi
+log "Bash 版本：$BASH_VERSION"
+log "Grep 版本：$(grep --version | head -n1)"
+
 # 架构识别与镜像配置
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64)
-        DOCKER_IMAGE="sulinggg/openwrt:x86_64"
+        DOCKER_IMAGE="sulinggg/openwrt:latest"
+        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:latest"
+        FALLBACK_IMAGE="sulinggg/openwrt:openwrt-18.06-k5.4"
         ARCH_DESC="Intel/AMD 64位设备"
         ;;
     aarch64 | arm64)
-        DOCKER_IMAGE="unifreq/openwrt-aarch64:latest"
+        DOCKER_IMAGE="sulinggg/openwrt:latest" # 优先 latest，更通用
+        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:latest"
+        FALLBACK_IMAGE="sulinggg/openwrt:rpi4"
         ARCH_DESC="ARM64 设备（树莓派4B/N1等）"
         ;;
     armv7l)
-        DOCKER_IMAGE="zzsrv/openwrt:latest"
+        DOCKER_IMAGE="dickhub/openwrt:armv7"
+        ALIYUN_IMAGE=""
+        FALLBACK_IMAGE=""
         ARCH_DESC="ARMv7 设备（NanoPi R2S/R4S等）"
         ;;
     *)
@@ -42,11 +61,6 @@ esac
 # 网络配置参数
 DEFAULT_SUBNET="192.168.3.0/24"
 DEFAULT_GATEWAY="192.168.3.18"
-
-# 日志记录函数
-log() {
-    echo -e "\033[33m[$(date +'%Y-%m-%d %H:%M:%S')] $1\033[0m"
-}
 
 # 获取默认网络接口
 get_default_interface() {
@@ -124,18 +138,30 @@ validate_ip_in_subnet() {
     local subnet=$2
     local network=$(echo "$subnet" | cut -d'/' -f1)
     local cidr=$(echo "$subnet" | cut -d'/' -f2)
-    if ! echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        echo -e "\033[31m无效的 IP 地址格式: $ip\033[0m"
+
+    # 验证 IP 格式
+    IFS='.' read -r ip1 ip2 ip3 ip4 <<< "$ip"
+    if [ -z "$ip1" ] || [ -z "$ip2" ] || [ -z "$ip3" ] || [ -z "$ip4" ]; then
+        echo -e "\033[31m无效的 IP 地址格式: $ip (必须为 x.x.x.x)\033[0m"
         return 1
     fi
-    IFS='.' read -r ip1 ip2 ip3 ip4 <<< "$ip"
-    IFS='.' read -r net1 net2 net3 net4 <<< "$network"
-    for octet in $ip1 $ip2 $ip3 $ip4 $net1 $net2 $net3 $net4; do
-        if ! [[ $octet =~ ^[0-9]+$ ]] || (( octet < 0 || octet > 255 )); then
-            echo -e "\033[31m无效的 IP 或网络地址字节: $octet\033[0m"
+    for octet in $ip1 $ip2 $ip3 $ip4; do
+        if ! [[ "$octet" =~ ^[0-9]+$ ]] || [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            echo -e "\033[31m无效的 IP 字节: $octet (必须为 0-255)\033[0m"
             return 1
         fi
     done
+
+    # 验证子网
+    IFS='.' read -r net1 net2 net3 net4 <<< "$network"
+    for octet in $net1 $net2 $net3 $net4; do
+        if ! [[ "$octet" =~ ^[0-9]+$ ]] || [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            echo -e "\033[31m无效的网络地址字节: $octet\033[0m"
+            return 1
+        fi
+    done
+
+    # 检查 IP 是否在子网内
     local ip_int=$(( (ip1 << 24) + (ip2 << 16) + (ip3 << 8) + ip4 ))
     local network_int=$(( (net1 << 24) + (net2 << 16) + (net3 << 8) + net4 ))
     local mask=$(( 0xffffffff << (32 - cidr) ))
@@ -182,7 +208,7 @@ check_port_usage() {
     return 0
 }
 
-# --- Helper Function to get Host IP ---
+# 获取宿主机 IP
 get_host_ip() {
     local ip_addr
     ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1)
@@ -195,11 +221,83 @@ get_host_ip() {
     echo "$ip_addr"
 }
 
+# 检查 LuCI 和 uhttpd 状态
+check_luci_status() {
+    log "检查 LuCI 和 uhttpd 状态..."
+    if docker exec openwrt /bin/sh -c "opkg list-installed | grep -q luci"; then
+        log "LuCI 已安装"
+    else
+        log "LuCI 未安装，正在尝试安装..."
+        docker exec openwrt /bin/sh -c "opkg update && opkg install luci" || {
+            echo -e "\033[31mLuCI 安装失败，请检查网络或镜像源\033[0m"
+            return 1
+        }
+    fi
+    if docker exec openwrt /bin/sh -c "ps | grep -q uhttpd"; then
+        log "uhttpd 服务正在运行"
+    else
+        log "uhttpd 服务未运行，正在尝试启动..."
+        docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable" || {
+            echo -e "\033[31muhttpd 启动失败，请检查容器状态\033[0m"
+            return 1
+        }
+    fi
+    return 0
+}
+
+# 验证 Web 界面可访问性
+verify_web_access() {
+    local ip=$1
+    local port=$2
+    log "验证 Web 界面可访问性: http://$ip:$port..."
+    if curl -s -m 5 "http://$ip:$port" >/dev/null; then
+        log "Web 界面可访问"
+        return 0
+    else
+        echo -e "\033[31m无法访问 Web 界面 http://$ip:$port\033[0m"
+        echo -e "\033[33m可能原因：防火墙阻止、LuCI 未启动、或网络配置错误\033[0m"
+        return 1
+    fi
+}
+
+# 清理残留资源
+cleanup_residual() {
+    log "清理可能残留的资源..."
+    docker stop openwrt >/dev/null 2>&1
+    docker rm openwrt >/dev/null 2>&1
+    docker network rm openwrt_net >/dev/null 2>&1
+    docker network rm openwrt_bridge >/dev/null 2>&1
+    docker system prune -f >/dev/null 2>&1
+    log "残留资源已清理"
+}
+
+# 尝试拉取镜像
+pull_image() {
+    local image=$1
+    log "正在拉取镜像 '$image'..."
+    if docker pull "$image" 2>&1 | tee /tmp/docker-pull.log; then
+        return 0
+    else
+        echo -e "\033[31m镜像拉取失败：$image\033[0m"
+        cat /tmp/docker-pull.log
+        return 1
+    fi
+}
+
 # 输出系统信息
 clear
 echo -e "\033[34m====================================\033[0m"
 echo -e "系统架构：\033[32m$ARCH_DESC\033[0m"
-echo -e "使用镜像：\033[33m$DOCKER_IMAGE\033[0m"
+echo -e "默认镜像：\033[33m$DOCKER_IMAGE\033[0m"
+if [ -n "$ALIYUN_IMAGE" ]; then
+    echo -e "阿里云镜像：\033[33m$ALIYUN_IMAGE\033[0m"
+fi
+if [ -n "$FALLBACK_IMAGE" ]; then
+    echo -e "备选镜像：\033[33m$FALLBACK_IMAGE\033[0m"
+fi
+echo -e "内核版本：\033[32m$(uname -r)\033[0m"
+echo -e "Docker 版本：\033[32m$(docker --version)\033[0m"
+echo -e "\033[33m警告：内核版本 $(uname -r) 较旧，可能导致 OpenWrt 容器运行失败。建议升级到 5.4 或更高版本。\033[0m"
 echo -e "\033[34m====================================\033[0m"
 
 # 主控制菜单
@@ -217,14 +315,39 @@ while true; do
     case "$ACTION" in
         1)
             # --- 安装逻辑 ---
+            echo -e "\n\033[33m» 镜像源选择 «\033[0m"
+            echo "1) Docker Hub（默认）"
+            if [ -n "$ALIYUN_IMAGE" ]; then
+                echo "2) 阿里云镜像仓库（国内推荐）"
+            fi
+            read -rp "请选择镜像源 [1/2, 默认2]: " IMAGE_SOURCE
+            IMAGE_SOURCE=${IMAGE_SOURCE:-2}
+            if [ "$IMAGE_SOURCE" -eq 2 ] && [ -n "$ALIYUN_IMAGE" ]; then
+                SELECTED_IMAGE="$ALIYUN_IMAGE"
+            else
+                SELECTED_IMAGE="$DOCKER_IMAGE"
+            fi
+            log "使用镜像: $SELECTED_IMAGE"
+
             echo -e "\n\033[33m» 网络模式选择 «\033[0m"
             echo "1) Bridge 模式（默认Docker网络，适合测试）"
             echo "2) Macvlan 模式（独立IP，适合旁路由）"
-            read -rp "请选择网络类型 [1/2, 默认1]: " NET_MODE
-            NET_MODE=${NET_MODE:-1}
+            read -rp "请选择网络类型 [1/2, 默认2]: " NET_MODE
+            NET_MODE=${NET_MODE:-2}
 
-            DEFAULT_NIC=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+            DEFAULT_NIC=$(get_default_interface)
+            if [ -z "$DEFAULT_NIC" ]; then
+                echo -e "\033[31m无法检测默认网卡，请手动输入\033[0m"
+                ip link show
+                read -rp "请输入网卡名称（例如 eth0）： " DEFAULT_NIC
+                if [ -z "$DEFAULT_NIC" ] || ! ip link show "$DEFAULT_NIC" >/dev/null 2>&1; then
+                    echo -e "\033[31m无效网卡名称，安装中止\033[0m"
+                    continue
+                fi
+            fi
             MACVLAN_IP=""
+            WEB_PORT="8080"
+            SSH_PORT="2222"
 
             if [ "$NET_MODE" -eq 2 ]; then
                 echo -e "\n\033[33m» Macvlan 参数配置 «\033[0m"
@@ -256,7 +379,13 @@ while true; do
                     TARGET_NIC=${TARGET_NIC:-$DEFAULT_NIC}
                 fi
 
-                # 提示输入静态 IP
+                if ! ip link show "$TARGET_NIC" >/dev/null 2>&1; then
+                    echo -e "\033[31m网卡 $TARGET_NIC 不存在！\033[0m"
+                    ip link show
+                    echo -e "\033[33m请确认网卡名称并重试\033[0m"
+                    continue
+                fi
+
                 read -rp "请输入 OpenWrt 容器静态 IP 地址 (例如: 192.168.3.181, 确保在 $SUBNET 网段内且未被占用): " MACVLAN_IP
                 if ! validate_ip_in_subnet "$MACVLAN_IP" "$SUBNET"; then
                     echo -e "\033[31m安装中止\033[0m"
@@ -267,7 +396,6 @@ while true; do
                     continue
                 fi
 
-                # 检查子网冲突
                 if ! check_network_conflict "$SUBNET"; then
                     read -rp "是否尝试删除冲突网络 'openwrt_net'？[y/N]: " DELETE_NET
                     if [[ "$DELETE_NET" =~ [Yy] ]]; then
@@ -281,7 +409,6 @@ while true; do
                     fi
                 fi
 
-                # 检查并尝试创建Macvlan网络
                 if ! docker network inspect openwrt_net >/dev/null 2>&1; then
                     log "正在创建 Macvlan 网络 'openwrt_net'..."
                     if ! docker network create -d macvlan \
@@ -299,7 +426,6 @@ while true; do
                 fi
                 NET_NAME="openwrt_net"
             else
-                # 检查并尝试创建Bridge网络
                 if ! docker network inspect openwrt_bridge >/dev/null 2>&1; then
                     log "正在创建 Bridge 网络 'openwrt_bridge'..."
                     if ! docker network create openwrt_bridge >/dev/null 2>&1; then
@@ -313,27 +439,20 @@ while true; do
                 NET_NAME="openwrt_bridge"
             fi
 
-            echo -e "\n\033[33m» 端口映射配置 «\033[0m"
-            read -rp "是否需要映射Web和SSH访问端口？[y/N]: " NEED_PORT
-            if [[ "$NEED_PORT" =~ [Yy] ]]; then
-                read -rp "输入映射到宿主机的 Web 管理端口 [默认: 8080 (对应容器80)]: " WEB_PORT
-                WEB_PORT=${WEB_PORT:-8080}
-                if ! check_port_usage "$WEB_PORT"; then
-                    echo -e "\033[31m安装中止\033[0m"
-                    continue
-                fi
-                read -rp "输入映射到宿主机的 SSH 管理端口 [默认: 2222 (对应容器22)]: " SSH_PORT
-                SSH_PORT=${SSH_PORT:-2222}
-                if ! check_port_usage "$SSH_PORT"; then
-                    echo -e "\033[31m安装中止\033[0m"
-                    continue
-                fi
-                PORT_MAP="-p $WEB_PORT:80 -p $SSH_PORT:22"
-            else
-                PORT_MAP=""
-                WEB_PORT=""
-                SSH_PORT=""
+            echo -e "\n\033[33m» 端口映射配置（默认启用） «\033[0m"
+            read -rp "输入映射到宿主机的 Web 管理端口 [默认: 8080 (对应容器80)]: " WEB_PORT
+            WEB_PORT=${WEB_PORT:-8080}
+            if ! check_port_usage "$WEB_PORT"; then
+                echo -e "\033[31m安装中止\033[0m"
+                continue
             fi
+            read -rp "输入映射到宿主机的 SSH 管理端口 [默认: 2222 (对应容器22)]: " SSH_PORT
+            SSH_PORT=${SSH_PORT:-2222}
+            if ! check_port_usage "$SSH_PORT"; then
+                echo -e "\033[31m安装中止\033[0m"
+                continue
+            fi
+            PORT_MAP="-p $WEB_PORT:80 -p $SSH_PORT:22"
 
             echo -e "\n\033[33m» 数据持久化配置 «\033[0m"
             read -rp "是否需要挂载配置文件到宿主机？[y/N]: " NEED_VOLUME
@@ -341,12 +460,12 @@ while true; do
                 read -rp "输入宿主机配置存储路径 [默认: /opt/openwrt/config]: " CONFIG_PATH
                 CONFIG_PATH=${CONFIG_PATH:-/opt/openwrt/config}
                 mkdir -p "$CONFIG_PATH"
+                chmod 755 "$CONFIG_PATH"
                 VOLUME_MAP="-v $CONFIG_PATH:/etc/config"
             else
                 VOLUME_MAP=""
             fi
 
-            # 检查容器是否已存在
             if docker ps -a --format '{{.Names}}' | grep -q "^openwrt$"; then
                 echo -e "\n\033[33m警告：名为 'openwrt' 的容器已存在。\033[0m"
                 read -rp "是否要先删除现有容器再继续？[y/N]: " REMOVE_EXISTING
@@ -361,36 +480,76 @@ while true; do
                 fi
             fi
 
-            log "正在拉取镜像 '$DOCKER_IMAGE'..."
-            if ! docker pull "$DOCKER_IMAGE"; then
-                echo -e "\033[31m镜像拉取失败，请检查网络连接或镜像名称！\033[0m"
-                continue
+            if ! pull_image "$SELECTED_IMAGE"; then
+                echo -e "\033[33m尝试拉取备选镜像 '$FALLBACK_IMAGE'...\033[0m"
+                if [ -n "$FALLBACK_IMAGE" ] && pull_image "$FALLBACK_IMAGE"; then
+                    SELECTED_IMAGE="$FALLBACK_IMAGE"
+                else
+                    echo -e "\033[31m所有镜像拉取失败！\033[0m"
+                    echo -e "\033[33m可能原因：\033[0m"
+                    echo -e "  1. 网络问题：无法访问 Docker Hub 或阿里云镜像仓库"
+                    echo -e "  2. 镜像标签不可用：检查 https://hub.docker.com/r/sulinggg/openwrt/tags"
+                    echo -e "  3. Docker 配置错误：确保镜像加速器正确配置"
+                    echo -e "\033[33m建议：\033[0m"
+                    echo -e "  - 检查网络：ping hub.docker.com 或 ping registry.cn-shanghai.aliyuncs.com"
+                    echo -e "  - 配置阿里云加速器：编辑 /etc/docker/daemon.json"
+                    echo -e '    { "registry-mirrors": ["https://registry.cn-shanghai.aliyuncs.com"] }'
+                    echo -e "    然后重启 Docker：systemctl restart docker"
+                    echo -e "  - 尝试手动拉取：docker pull $SELECTED_IMAGE"
+                    cleanup_residual
+                    read -rp "是否重试拉取镜像？[y/N]: " RETRY_PULL
+                    if [[ "$RETRY_PULL" =~ [Yy] ]]; then
+                        continue
+                    else
+                        echo -e "\033[31m安装中止\033[0m"
+                        continue
+                    fi
+                fi
             fi
 
             log "正在启动 OpenWrt 容器..."
             if [ "$NET_MODE" -eq 2 ]; then
-                if ! eval docker run -d --name openwrt \
+                if ! docker run -d --name openwrt \
                     --network "$NET_NAME" \
                     --ip "$MACVLAN_IP" \
                     --restart unless-stopped \
                     --privileged \
                     $PORT_MAP \
                     $VOLUME_MAP \
-                    "$DOCKER_IMAGE"; then
-                    echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
-                    echo "尝试运行: docker logs openwrt"
+                    "$SELECTED_IMAGE" /sbin/init 2>&1 | tee /tmp/docker-run.log; then
+                    echo -e "\033[31m容器启动失败！\033[0m"
+                    cat /tmp/docker-run.log
+                    echo -e "\033[33m请检查以下可能原因：\033[0m"
+                    echo -e "  1. 内核不兼容：宿主机内核 $(uname -r) 可能不支持 OpenWrt"
+                    echo -e "  2. 权限问题：确保使用 --privileged"
+                    echo -e "  3. 网络配置错误：验证网卡 $TARGET_NIC 和 IP $MACVLAN_IP"
+                    echo -e "  4. 镜像问题：尝试其他标签，如 $FALLBACK_IMAGE"
+                    echo -e "\033[33m调试命令：\033[0m"
+                    echo -e "  - 查看日志：docker logs openwrt"
+                    echo -e "  - 检查状态：docker ps -a"
+                    echo -e "  - 手动运行：docker run -d --name test --privileged $SELECTED_IMAGE /sbin/init"
+                    cleanup_residual
                     continue
                 fi
             else
-                if ! eval docker run -d --name openwrt \
+                if ! docker run -d --name openwrt \
                     --network "$NET_NAME" \
                     --restart unless-stopped \
                     --privileged \
                     $PORT_MAP \
                     $VOLUME_MAP \
-                    "$DOCKER_IMAGE"; then
-                    echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
-                    echo "尝试运行: docker logs openwrt"
+                    "$SELECTED_IMAGE" /sbin/init 2>&1 | tee /tmp/docker-run.log; then
+                    echo -e "\033[31m容器启动失败！\033[0m"
+                    cat /tmp/docker-run.log
+                    echo -e "\033[33m请检查以下可能原因：\033[0m"
+                    echo -e "  1. 内核不兼容：宿主机内核 $(uname -r) 可能不支持 OpenWrt"
+                    echo -e "  2. 权限问题：确保使用 --privileged"
+                    echo -e "  3. 镜像问题：尝试其他标签，如 $FALLBACK_IMAGE"
+                    echo -e "\033[33m调试命令：\033[0m"
+                    echo -e "  - 查看日志：docker logs openwrt"
+                    echo -e "  - 检查状态：docker ps -a"
+                    echo -e "  - 手动运行：docker run -d --name test --privileged $SELECTED_IMAGE /sbin/init"
+                    cleanup_residual
                     continue
                 fi
             fi
@@ -400,18 +559,40 @@ while true; do
             fi
             echo -e "管理命令：\ndocker exec -it openwrt /bin/sh"
 
-            # 尝试启动 LuCI
-            log "尝试启动 LuCI Web 服务..."
+            log "检查容器状态..."
             sleep 5
-            if docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable"; then
-                log "LuCI 服务启动成功"
-            else
-                echo -e "\033[33m警告：LuCI 服务启动失败，可能未安装或镜像不支持\033[0m"
-                echo -e "尝试手动进入容器安装 LuCI："
+            if ! docker ps -q --filter name=openwrt >/dev/null; then
+                echo -e "\033[31m容器未运行！\033[0m"
+                docker ps -a
+                echo -e "\033[33m查看日志：\033[0m"
+                docker logs openwrt
+                cleanup_residual
+                continue
+            fi
+
+            log "配置 OpenWrt 环境..."
+            docker exec openwrt /bin/sh -c "sed -i 's/.*preinit.*//g' /etc/preinit" || log "警告：无法修改 preinit 配置"
+            if ! check_luci_status; then
+                echo -e "\033[31mLuCI 配置失败，请手动检查\033[0m"
+                echo -e "命令："
                 echo -e "  docker exec -it openwrt /bin/sh"
                 echo -e "  opkg update"
                 echo -e "  opkg install luci"
                 echo -e "  /etc/init.d/uhttpd start"
+            fi
+
+            log "验证容器部署..."
+            docker ps -a --filter name=openwrt --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+            if [ "$NET_MODE" -eq 2 ]; then
+                if ping -c 1 -W 2 "$MACVLAN_IP" >/dev/null 2>&1; then
+                    log "容器 IP $MACVLAN_IP 可 ping"
+                else
+                    echo -e "\033[31m无法 ping 容器 IP $MACVLAN_IP，请检查网络配置\033[0m"
+                fi
+                verify_web_access "$MACVLAN_IP" "$WEB_PORT"
+            else
+                HOST_IP=$(get_host_ip)
+                verify_web_access "$HOST_IP" "$WEB_PORT"
             fi
 
             echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
@@ -423,10 +604,7 @@ while true; do
             read -rp "确定要完全卸载吗？[y/N]: " CONFIRM_UNINSTALL
             if [[ "$CONFIRM_UNINSTALL" =~ [Yy] ]]; then
                 log "正在执行完全卸载..."
-                docker stop openwrt >/dev/null 2>&1
-                docker rm openwrt >/dev/null 2>&1
-                docker network rm openwrt_net >/dev/null 2>&1
-                docker network rm openwrt_bridge >/dev/null 2>&1
+                cleanup_residual
                 read -rp "是否同时删除挂载的配置目录（如果之前设置过）？[y/N]: " DELETE_VOLUME_DIR
                 if [[ "$DELETE_VOLUME_DIR" =~ [Yy] ]]; then
                     echo -e "\033[33m请手动删除您之前指定的配置目录 (例如: /opt/openwrt/config)\033[0m"
@@ -447,11 +625,11 @@ while true; do
             if ! docker logs -f openwrt; then
                 echo -e "\033[31m无法获取日志，容器 'openwrt' 可能不存在或未运行。\033[0m"
             fi
-            echo -e "\033[33m提示：如果日志显示启动提示（如 'Press [f]'），无法直接交互。\033[0m"
+            echo -e "\033[33m提示：如果日志显示启动提示（如 'Press [f]'），表示镜像未优化。\033[0m"
             echo -e "请进入容器检查状态："
             echo -e "  docker exec -it openwrt /bin/sh"
             echo -e "检查 LuCI："
-            echo -e "  ps | grep uhttpd"
+            echo -e "  opkg list-installed | grep luci"
             echo -e "  /etc/init.d/uhttpd start"
             ;;
 
@@ -510,9 +688,11 @@ while true; do
             fi
             echo -e "SSH 密码  : \033[33m(与Web密码相同)\033[0m"
             echo -e "\033[34m------------------------\033[0m"
-            echo -e "\033[33m提示：如果无法访问 Web 界面，请进入容器检查 LuCI：\033[0m"
-            echo -e "  docker exec -it openwrt /bin/sh"
-            echo -e "  /etc/init.d/uhttpd start"
+            echo -e "\033[33m提示：如果无法访问 Web 界面，请检查：\033[0m"
+            echo -e "  1. 进入容器：docker exec -it openwrt /bin/sh"
+            echo -e "  2. 检查 LuCI：opkg list-installed | grep luci"
+            echo -e "  3. 启动 uhttpd：/etc/init.d/uhttpd start"
+            echo -e "  4. 检查防火墙：iptables -L -n 或 ufw status"
             ;;
 
         6)
