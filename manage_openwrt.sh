@@ -40,14 +40,130 @@ case "$ARCH" in
 esac
 
 # 网络配置参数
-DEFAULT_SUBNET="192.168.1.0/24"
-DEFAULT_GATEWAY="192.168.1.1"
+DEFAULT_SUBNET="192.168.3.0/24"
+DEFAULT_GATEWAY="192.168.3.18"
+
+# 日志记录函数
+log() {
+    echo -e "\033[33m[$(date +'%Y-%m-%d %H:%M:%S')] $1\033[0m"
+}
+
+# 获取默认网络接口
+get_default_interface() {
+    ip route show default | awk '/default/ {print $5}'
+}
+
+# 计算网络地址
+calculate_network_address() {
+    local ip_cidr=$1
+    local ip_addr=$(echo "$ip_cidr" | cut -d'/' -f1)
+    local cidr_mask=$(echo "$ip_cidr" | cut -d'/' -f2)
+    IFS='.' read -r octet1 octet2 octet3 octet4 <<< "$ip_addr"
+    local mask=$(( 0xffffffff << (32 - cidr_mask) ))
+    local ip_int=$(( (octet1 << 24) + (octet2 << 16) + (octet3 << 8) + octet4 ))
+    local network_int=$(( ip_int & mask ))
+    local network_octet1=$(( (network_int >> 24) & 255 ))
+    local network_octet2=$(( (network_int >> 16) & 255 ))
+    local network_octet3=$(( (network_int >> 8) & 255 ))
+    local network_octet4=$(( network_int & 255 ))
+    echo "${network_octet1}.${network_octet2}.${network_octet3}.${network_octet4}/${cidr_mask}"
+}
+
+# 检测局域网段和网关
+detect_lan_subnet_gateway() {
+    log "检测局域网参数..."
+    local default_iface=$(get_default_interface)
+    if [[ -z "$default_iface" ]]; then
+        echo -e "\033[31m无法自动检测默认网络接口\033[0m"
+        return 1
+    fi
+    local ip_cidr=$(ip addr show dev "$default_iface" | awk '/inet / {print $2}' | head -n 1)
+    if [[ -z "$ip_cidr" ]]; then
+        echo -e "\033[31m无法获取接口 $default_iface 的 IP 信息\033[0m"
+        return 1
+    fi
+    log "检测到 IP CIDR: $ip_cidr"
+    if ! SUBNET=$(calculate_network_address "$ip_cidr"); then
+        echo -e "\033[31m计算子网失败\033[0m"
+        return 1
+    fi
+    GATEWAY=$(ip route show default | awk '/default/ {print $3}')
+    if [[ -z "$SUBNET" || -z "$GATEWAY" ]]; then
+        echo -e "\033[31m自动检测局域网信息失败\033[0m"
+        return 1
+    fi
+    log "检测到子网: $SUBNET"
+    log "检测到网关: $GATEWAY"
+    log "默认网络接口: $default_iface"
+    DETECTED_SUBNET="$SUBNET"
+    DETECTED_GATEWAY="$GATEWAY"
+    DETECTED_INTERFACE="$default_iface"
+    return 0
+}
+
+# 检查子网是否与现有 Docker 网络冲突
+check_network_conflict() {
+    local subnet=$1
+    log "检查子网 $subnet 是否与现有 Docker 网络冲突..."
+    local conflict_networks
+    conflict_networks=$(docker network ls --format '{{.Name}}' | while read -r net; do
+        docker network inspect "$net" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' | grep -q "$subnet" && echo "$net"
+    done)
+    if [[ -n "$conflict_networks" ]]; then
+        echo -e "\033[31m子网 $subnet 与以下网络冲突：\033[0m"
+        echo "$conflict_networks"
+        return 1
+    fi
+    log "子网 $subnet 无冲突"
+    return 0
+}
+
+# 验证 IP 是否在子网内
+validate_ip_in_subnet() {
+    local ip=$1
+    local subnet=$2
+    local network=$(echo "$subnet" | cut -d'/' -f1)
+    local cidr=$(echo "$subnet" | cut -d'/' -f2)
+    if ! echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        echo -e "\033[31m无效的 IP 地址格式: $ip\033[0m"
+        return 1
+    fi
+    IFS='.' read -r ip1 ip2 ip3 ip4 <<< "$ip"
+    IFS='.' read -r net1 net2 net3 net4 <<< "$network"
+    for octet in $ip1 $ip2 $ip3 $ip4 $net1 $net2 $net3 $net4; do
+        if ! [[ $octet =~ ^[0-9]+$ ]] || (( octet < 0 || octet > 255 )); then
+            echo -e "\033[31m无效的 IP 或网络地址字节: $octet\033[0m"
+            return 1
+        fi
+    done
+    local ip_int=$(( (ip1 << 24) + (ip2 << 16) + (ip3 << 8) + ip4 ))
+    local network_int=$(( (net1 << 24) + (net2 << 16) + (net3 << 8) + net4 ))
+    local mask=$(( 0xffffffff << (32 - cidr) ))
+    log "Debug: IP=$ip, Network=$network, CIDR=$cidr"
+    log "Debug: IP_int=$ip_int, Network_int=$network_int, Mask=$mask"
+    if (( (ip_int & mask) != (network_int & mask) )); then
+        echo -e "\033[31mIP $ip 不在子网 $subnet 内\033[0m"
+        return 1
+    fi
+    return 0
+}
+
+# 检查 IP 是否被占用
+check_ip_occupied() {
+    local ip=$1
+    log "检查 IP $ip 是否被占用..."
+    if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+        echo -e "\033[31mIP $ip 已被占用，请选择其他 IP\033[0m"
+        return 1
+    fi
+    log "IP $ip 未被占用"
+    return 0
+}
 
 # --- Helper Function to get Host IP ---
 get_host_ip() {
-    # 尝试获取非回环的 LAN IP
     local ip_addr
-    ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1) # 排除以172开头的docker桥接网络
+    ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1)
     if [[ -z "$ip_addr" ]]; then
         ip_addr=$(hostname -I | awk '{print $1}')
     fi
@@ -72,13 +188,13 @@ while true; do
     echo "2) 完全卸载 OpenWrt"
     echo "3) 查看容器状态"
     echo "4) 查看实时日志"
-    echo "5) 查看登录地址" # 新增选项
-    echo "6) 退出脚本"     # 原退出选项顺延
-    read -rp "请输入操作编号 (1-6): " ACTION # 修改提示范围
+    echo "5) 查看登录地址"
+    echo "6) 退出脚本"
+    read -rp "请输入操作编号 (1-6): " ACTION
 
     case "$ACTION" in
         1)
-            # --- 安装逻辑 (保持不变) ---
+            # --- 安装逻辑 ---
             echo -e "\n\033[33m» 网络模式选择 «\033[0m"
             echo "1) Bridge 模式（默认Docker网络，适合测试）"
             echo "2) Macvlan 模式（独立IP，适合旁路由）"
@@ -86,41 +202,91 @@ while true; do
             NET_MODE=${NET_MODE:-1}
 
             DEFAULT_NIC=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+            MACVLAN_IP=""
 
             if [ "$NET_MODE" -eq 2 ]; then
                 echo -e "\n\033[33m» Macvlan 参数配置 «\033[0m"
-                read -rp "输入子网地址 [默认: $DEFAULT_SUBNET]: " SUBNET
-                SUBNET=${SUBNET:-$DEFAULT_SUBNET}
-                read -rp "输入网关地址 [默认: $DEFAULT_GATEWAY]: " GATEWAY
-                GATEWAY=${GATEWAY:-$DEFAULT_GATEWAY}
-                read -rp "绑定物理网卡 [默认: $DEFAULT_NIC]: " TARGET_NIC
-                TARGET_NIC=${TARGET_NIC:-$DEFAULT_NIC}
+                if detect_lan_subnet_gateway; then
+                    echo -e "\033[32m自动检测到以下参数：\033[0m"
+                    echo "子网: $DETECTED_SUBNET"
+                    echo "网关: $DETECTED_GATEWAY"
+                    echo "父接口: $DETECTED_INTERFACE"
+                    read -rp "是否使用自动检测的参数？[Y/n]: " USE_DETECTED
+                    if [[ ! "$USE_DETECTED" =~ [Nn] ]]; then
+                        SUBNET="$DETECTED_SUBNET"
+                        GATEWAY="$DETECTED_GATEWAY"
+                        TARGET_NIC="$DETECTED_INTERFACE"
+                    else
+                        read -rp "输入子网地址 [默认: $DEFAULT_SUBNET]: " SUBNET
+                        SUBNET=${SUBNET:-$DEFAULT_SUBNET}
+                        read -rp "输入网关地址 [默认: $DEFAULT_GATEWAY]: " GATEWAY
+                        GATEWAY=${GATEWAY:-$DEFAULT_GATEWAY}
+                        read -rp "绑定物理网卡 [默认: $DEFAULT_NIC]: " TARGET_NIC
+                        TARGET_NIC=${TARGET_NIC:-$DEFAULT_NIC}
+                    fi
+                else
+                    echo -e "\033[33m自动检测失败，请手动输入参数\033[0m"
+                    read -rp "输入子网地址 [默认: $DEFAULT_SUBNET]: " SUBNET
+                    SUBNET=${SUBNET:-$DEFAULT_SUBNET}
+                    read -rp "输入网关地址 [默认: $DEFAULT_GATEWAY]: " GATEWAY
+                    GATEWAY=${GATEWAY:-$DEFAULT_GATEWAY}
+                    read -rp "绑定物理网卡 [默认: $DEFAULT_NIC]: " TARGET_NIC
+                    TARGET_NIC=${TARGET_NIC:-$DEFAULT_NIC}
+                fi
+
+                # 提示输入静态 IP
+                read -rp "请输入 OpenWrt 容器静态 IP 地址 (例如: 192.168.3.181, 确保在 $SUBNET 网段内且未被占用): " MACVLAN_IP
+                if ! validate_ip_in_subnet "$MACVLAN_IP" "$SUBNET"; then
+                    echo -e "\033[31m安装中止\033[0m"
+                    continue
+                fi
+                if ! check_ip_occupied "$MACVLAN_IP"; then
+                    echo -e "\033[31m安装中止\033[0m"
+                    continue
+                fi
+
+                # 检查子网冲突
+                if ! check_network_conflict "$SUBNET"; then
+                    read -rp "是否尝试删除冲突网络 'openwrt_net'？[y/N]: " DELETE_NET
+                    if [[ "$DELETE_NET" =~ [Yy] ]]; then
+                        docker network rm openwrt_net >/dev/null 2>&1 || {
+                            echo -e "\033[31m删除冲突网络失败，请手动删除后重试\033[0m"
+                            continue
+                        }
+                    else
+                        echo -e "\033[31m请手动删除冲突网络或选择其他子网后重试\033[0m"
+                        continue
+                    fi
+                fi
 
                 # 检查并尝试创建Macvlan网络
                 if ! docker network inspect openwrt_net >/dev/null 2>&1; then
-                    echo "正在创建 Macvlan 网络 'openwrt_net'..."
+                    log "正在创建 Macvlan 网络 'openwrt_net'..."
                     if ! docker network create -d macvlan \
                         --subnet="$SUBNET" \
                         --gateway="$GATEWAY" \
                         -o parent="$TARGET_NIC" \
                         openwrt_net; then
                         echo -e "\033[31mMacvlan网络创建失败！请检查参数或网卡名称。\033[0m"
-                        continue # 返回主菜单
+                        echo -e "\033[33m建议：运行 'docker network ls' 检查现有网络，或验证网卡 '$TARGET_NIC' 是否存在\033[0m"
+                        continue
                     fi
+                    log "Macvlan 网络 'openwrt_net' 创建成功"
                 else
-                    echo "Macvlan 网络 'openwrt_net' 已存在。"
+                    log "Macvlan 网络 'openwrt_net' 已存在"
                 fi
                 NET_NAME="openwrt_net"
             else
                 # 检查并尝试创建Bridge网络
                 if ! docker network inspect openwrt_bridge >/dev/null 2>&1; then
-                    echo "正在创建 Bridge 网络 'openwrt_bridge'..."
+                    log "正在创建 Bridge 网络 'openwrt_bridge'..."
                     if ! docker network create openwrt_bridge >/dev/null 2>&1; then
-                       echo -e "\033[31mBridge网络创建失败！\033[0m"
-                       continue # 返回主菜单
+                        echo -e "\033[31mBridge网络创建失败！\033[0m"
+                        continue
                     fi
+                    log "Bridge 网络 'openwrt_bridge' 创建成功"
                 else
-                     echo "Bridge 网络 'openwrt_bridge' 已存在。"
+                    log "Bridge 网络 'openwrt_bridge' 已存在"
                 fi
                 NET_NAME="openwrt_bridge"
             fi
@@ -135,8 +301,8 @@ while true; do
                 PORT_MAP="-p $WEB_PORT:80 -p $SSH_PORT:22"
             else
                 PORT_MAP=""
-                WEB_PORT="" # 清空变量以便后续判断
-                SSH_PORT="" # 清空变量以便后续判断
+                WEB_PORT=""
+                SSH_PORT=""
             fi
 
             echo -e "\n\033[33m» 数据持久化配置 «\033[0m"
@@ -155,63 +321,75 @@ while true; do
                 echo -e "\n\033[33m警告：名为 'openwrt' 的容器已存在。\033[0m"
                 read -rp "是否要先删除现有容器再继续？[y/N]: " REMOVE_EXISTING
                 if [[ "$REMOVE_EXISTING" =~ [Yy] ]]; then
-                    echo "正在停止并删除现有容器..."
+                    log "正在停止并删除现有容器..."
                     docker stop openwrt >/dev/null 2>&1
                     docker rm openwrt >/dev/null 2>&1
-                    echo "现有容器已删除。"
+                    log "现有容器已删除"
                 else
-                    echo "安装中止。"
-                    continue # 返回主菜单
+                    echo -e "\033[31m安装中止\033[0m"
+                    continue
                 fi
             fi
 
-            echo -e "\n\033[36m正在拉取镜像 '$DOCKER_IMAGE'，请稍候...\033[0m"
+            log "正在拉取镜像 '$DOCKER_IMAGE'..."
             if ! docker pull "$DOCKER_IMAGE"; then
                 echo -e "\033[31m镜像拉取失败，请检查网络连接或镜像名称！\033[0m"
-                continue # 返回主菜单
+                continue
             fi
 
-            echo -e "\n\033[36m正在启动 OpenWrt 容器...\033[0m"
-            # 使用 eval 来正确处理可能为空的 $PORT_MAP 和 $VOLUME_MAP
-            if eval docker run -d --name openwrt \
-                --network "$NET_NAME" \
-                --restart unless-stopped \
-                --privileged \
-                $PORT_MAP \
-                $VOLUME_MAP \
-                "$DOCKER_IMAGE"; then
-                echo -e "\033[32m容器启动成功！\033[0m"
-                echo -e "管理命令：\ndocker exec -it openwrt /bin/sh"
-                # 启动后立即尝试显示登录信息
-                echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
-                sleep 5 # 等待容器网络初始化
-                bash "$0" 5 # 调用自身脚本执行选项5
+            log "正在启动 OpenWrt 容器..."
+            if [ "$NET_MODE" -eq 2 ]; then
+                if ! eval docker run -d --name openwrt \
+                    --network "$NET_NAME" \
+                    --ip "$MACVLAN_IP" \
+                    --restart unless-stopped \
+                    --privileged \
+                    $PORT_MAP \
+                    $VOLUME_MAP \
+                    "$DOCKER_IMAGE"; then
+                    echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
+                    echo "尝试运行: docker logs openwrt"
+                    continue
+                fi
             else
-                echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
-                echo "尝试运行: docker logs openwrt"
+                if ! eval docker run -d --name openwrt \
+                    --network "$NET_NAME" \
+                    --restart unless-stopped \
+                    --privileged \
+                    $PORT_MAP \
+                    $VOLUME_MAP \
+                    "$DOCKER_IMAGE"; then
+                    echo -e "\033[31m容器启动失败！请检查 Docker 日志。\033[0m"
+                    echo "尝试运行: docker logs openwrt"
+                    continue
+                fi
             fi
+            echo -e "\033[32m容器启动成功！\033[0m"
+            if [ "$NET_MODE" -eq 2 ]; then
+                echo -e "容器 IP: $MACVLAN_IP"
+            fi
+            echo -e "管理命令：\ndocker exec -it openwrt /bin/sh"
+            echo -e "\n\033[36m正在尝试获取登录地址...\033[0m"
+            sleep 5
+            bash "$0" 5
             ;;
 
         2)
             echo -e "\n\033[33m警告：这将停止并删除 OpenWrt 容器及其相关的 Macvlan/Bridge 网络。\033[0m"
             read -rp "确定要完全卸载吗？[y/N]: " CONFIRM_UNINSTALL
             if [[ "$CONFIRM_UNINSTALL" =~ [Yy] ]]; then
-                echo -e "\n\033[33m正在执行完全卸载...\033[0m"
+                log "正在执行完全卸载..."
                 docker stop openwrt >/dev/null 2>&1
                 docker rm openwrt >/dev/null 2>&1
                 docker network rm openwrt_net >/dev/null 2>&1
                 docker network rm openwrt_bridge >/dev/null 2>&1
-                # 可选：询问是否删除挂载的配置目录
                 read -rp "是否同时删除挂载的配置目录（如果之前设置过）？[y/N]: " DELETE_VOLUME_DIR
                 if [[ "$DELETE_VOLUME_DIR" =~ [Yy] ]]; then
-                    # 需要找到之前设置的 CONFIG_PATH，脚本当前状态无法直接获取，提示用户手动删除
                     echo -e "\033[33m请手动删除您之前指定的配置目录 (例如: /opt/openwrt/config)\033[0m"
-                    # 或者，如果每次都用默认值，可以尝试删除默认值
-                    # rm -rf /opt/openwrt/config
                 fi
                 echo -e "\033[32mOpenWrt 容器及相关网络已清除！\033[0m"
             else
-                echo "卸载操作已取消。"
+                echo -e "\033[33m卸载操作已取消\033[0m"
             fi
             ;;
 
@@ -228,41 +406,27 @@ while true; do
             ;;
 
         5)
-            # --- 新增：查看登录地址逻辑 ---
             echo -e "\n\033[36m正在查询 OpenWrt 容器登录信息...\033[0m"
             CONTAINER_ID=$(docker ps -q --filter name=openwrt)
-
             if [ -z "$CONTAINER_ID" ]; then
                 echo -e "\033[31m错误：未找到正在运行的名为 'openwrt' 的容器。\033[0m"
                 continue
             fi
-
-            # 获取容器详细信息
             INSPECT_JSON=$(docker inspect "$CONTAINER_ID")
-
-            # 检查 jq 是否安装，jq 更方便解析 JSON
             if command -v jq &> /dev/null; then
-                # 使用 jq 解析
                 NET_INFO=$(echo "$INSPECT_JSON" | jq -r '.[0].NetworkSettings.Networks | keys[] as $k | if .[$k].IPAddress and .[$k].IPAddress != "" then "\($k):\(.[$k].IPAddress)" else empty end' | head -n 1)
                 WEB_HOST_PORT=$(echo "$INSPECT_JSON" | jq -r '.[0].HostConfig.PortBindings."80/tcp"[0].HostPort // empty')
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | jq -r '.[0].HostConfig.PortBindings."22/tcp"[0].HostPort // empty')
             else
                 echo -e "\033[33m提示：未安装 jq，将使用 grep/awk 尝试解析，结果可能不精确。建议安装 jq (例: apt install jq)。\033[0m"
-                # 使用 grep/awk 尝试解析 (兼容性更好，但可能不够健壮)
-                # 查找第一个非空的 IP 地址及其网络名
                 NET_INFO=$(echo "$INSPECT_JSON" | grep -E '"IPAddress":\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' -B 5 | grep -Eo '"(openwrt_net|openwrt_bridge)":|"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | sed 's/"//g' | tr '\n' ':' | sed 's/:$//' | head -n 1)
-                # 解析端口 (这种方式比较脆弱)
                 WEB_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"80/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"22/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
             fi
-
-            # 从 NET_INFO 中分离网络名和容器IP
             NETWORK_NAME=$(echo "$NET_INFO" | cut -d':' -f1)
             CONTAINER_IP=$(echo "$NET_INFO" | cut -d':' -f2)
-
             ACCESS_IP=""
             ACCESS_MODE=""
-
             if [ "$NETWORK_NAME" == "openwrt_net" ]; then
                 ACCESS_IP="$CONTAINER_IP"
                 ACCESS_MODE="Macvlan (独立IP)"
@@ -274,7 +438,6 @@ while true; do
                 echo -e "\033[31m错误：无法确定容器的网络模式或IP地址。\033[0m"
                 continue
             fi
-
             echo -e "\n\033[34m--- OpenWrt 登录信息 ---\033[0m"
             echo -e "网络模式 : \033[33m$ACCESS_MODE\033[0m"
             if [ "$NETWORK_NAME" == "openwrt_bridge" ]; then
@@ -283,7 +446,6 @@ while true; do
             else
                 echo -e "容器 IP  : \033[32m$ACCESS_IP\033[0m"
             fi
-
             if [ -n "$WEB_HOST_PORT" ]; then
                 echo -e "Web 访问 : \033[32mhttp://$ACCESS_IP:$WEB_HOST_PORT\033[0m"
             else
@@ -291,7 +453,6 @@ while true; do
             fi
             echo -e "Web 用户名: \033[32mroot\033[0m"
             echo -e "Web 密码  : \033[33m(通常为空，首次登录设置；或尝试 'password')\033[0m"
-
             if [ -n "$SSH_HOST_PORT" ]; then
                 echo -e "SSH 连接 : \033[32mssh root@$ACCESS_IP -p $SSH_HOST_PORT\033[0m"
             else
@@ -299,10 +460,9 @@ while true; do
             fi
             echo -e "SSH 密码  : \033[33m(与Web密码相同)\033[0m"
             echo -e "\033[34m------------------------\033[0m"
-
             ;;
 
-        6) # 原退出选项
+        6)
             echo -e "\n\033[33m感谢使用，再见！\033[0m"
             exit 0
             ;;
