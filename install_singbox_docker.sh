@@ -1023,7 +1023,7 @@ install_singbox() {
     if ! docker network inspect "$MACVLAN_NET_NAME" >/dev/null 2>&1; then
         log "网络 $MACVLAN_NET_NAME 不存在，正在创建..."
         if ! detect_lan_subnet_gateway; then
-            echo -e "${RED}自动员工信息失败，请手动配置网络参数${NC}"
+            echo -e "${RED}自动检测局域网信息失败，请手动配置网络参数${NC}"
             read -p "请输入局域网段(例如: 192.168.3.0/24): " SUBNET
             read -p "请输入网关地址(例如: 192.168.3.18): " GATEWAY
             read -p "请输入父接口(例如: eth0): " PARENT_INTERFACE
@@ -1085,7 +1085,7 @@ install_singbox() {
     DOWNLOAD_URL="ghcr.io/sagernet/sing-box:$VERSION"
     log "Sing-box Docker 镜像: ${YELLOW}$DOWNLOAD_URL${NC}"
 
-    DOCKER_RUN_CMD="docker run -d --name \"$CONTAINER_NAME\" --restart always --memory=128m --cpus=0.5 --network \"$MACVLAN_NET_NAME\" --ip \"$MACVLAN_IP\" --cap-add=NET_ADMIN --cap-add=NET_RAW -v \"$CONFIG_DIR\":/etc/sing-box $DOWNLOAD_URL run -c /etc/sing-box/config.json"
+    DOCKER_RUN_CMD="docker run -d --name \"$CONTAINER_NAME\" --restart always --memory=128m --cpus=0.5 --network \"$MACVLAN_NET_NAME\" --ip \"$MACVLAN_IP\" --cap-add=NET_ADMIN --cap-add=NET_RAW --device=/dev/net/tun:/dev/net/tun -v \"$CONFIG_DIR\":/etc/sing-box $DOWNLOAD_URL run -c /etc/sing-box/config.json"
 
     log "执行 Sing-box Docker 命令: ${YELLOW}${DOCKER_RUN_CMD}${NC}"
     if ! eval "$DOCKER_RUN_CMD"; then
