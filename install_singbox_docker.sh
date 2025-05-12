@@ -954,8 +954,8 @@ install_singbox() {
     ARCH=$(get_arch)
     log "检测到系统架构: ${ARCH}"
 
-    read -p "请输入 Sing-box 容器名称(默认: sing-box-container): " CONTAINER_NAME
-    CONTAINER_NAME=${CONTAINER_NAME:-sing-box-container}
+    read -p "请输入 Sing-box 容器名称(默认: docker-sing-box): " CONTAINER_NAME
+    CONTAINER_NAME=${CONTAINER_NAME:-docker-sing-box}
     log "Sing-box 容器名称: ${YELLOW}$CONTAINER_NAME${NC}"
 
     read -p "请输入 Sing-box 镜像版本(例如: 1.12.0 或 latest, 默认: latest): " VERSION
@@ -1122,8 +1122,8 @@ install_mihomo() {
     ARCH=$(get_arch)
     log "检测到系统架构: ${ARCH}"
 
-    read -p "请输入 Mihomo 容器名称(默认: mihomo10): " MIHOMO_CONTAINER_NAME
-    MIHOMO_CONTAINER_NAME=${MIHOMO_CONTAINER_NAME:-mihomo10}
+    read -p "请输入 Mihomo 容器名称(默认: docker-mihomo): " MIHOMO_CONTAINER_NAME
+    MIHOMO_CONTAINER_NAME=${MIHOMO_CONTAINER_NAME:-docker-mihomo}
     log "Mihomo 容器名称: ${YELLOW}$MIHOMO_CONTAINER_NAME${NC}"
 
     read -p "请输入 Mihomo 镜像版本(例如: 1.18.7 或 latest, 默认: latest): " MIHOMO_VERSION
@@ -1369,15 +1369,15 @@ main_menu() {
             1) install_singbox ;;
             2) install_mihomo ;;
             3)
-                read -p "请输入 Sing-box 容器名称(默认: sing-box-container): " CONTAINER_NAME
-                CONTAINER_NAME=${CONTAINER_NAME:-sing-box-container}
+                read -p "请输入 Sing-box 容器名称(默认: docker-sing-box): " CONTAINER_NAME
+                CONTAINER_NAME=${CONTAINER_NAME:-docker-sing-box}
                 read -p "请输入 Macvlan 网络名称(默认: macvlan-net): " MACVLAN_NET_NAME
                 MACVLAN_NET_NAME=${MACVLAN_NET_NAME:-macvlan-net}
                 uninstall_docker "sing-box"
                 ;;
             4)
-                read -p "请输入 Mihomo 容器名称(默认: mihomo10): " MIHOMO_CONTAINER_NAME
-                MIHOMO_CONTAINER_NAME=${MIHOMO_CONTAINER_NAME:-mihomo10}
+                read -p "请输入 Mihomo 容器名称(默认: docker-mihomo): " MIHOMO_CONTAINER_NAME
+                MIHOMO_CONTAINER_NAME=${MIHOMO_CONTAINER_NAME:-docker-mihomo}
                 read -p "请输入 Macvlan 网络名称(默认: macvlan-net): " MACVLAN_NET_NAME
                 MACVLAN_NET_NAME=${MACVLAN_NET_NAME:-macvlan-net}
                 uninstall_docker "mihomo"
