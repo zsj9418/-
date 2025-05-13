@@ -1,7 +1,7 @@
 #!/bin/bash
 # Docker管理脚本
 # 功能：支持 Watchtower 和 Sub-Store 的部署、通知、日志记录和数据备份/恢复
-# 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口。
+# 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口，优化 Watchtower 自动更新
 # 动态脚本加载：支持在根目录下自动创建一个目录并挂载读取各种规则文件以备后续的拓展性
 
 # 配置区（默认值）
@@ -43,9 +43,9 @@ log() {
   local message=$2
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   case $level in
-    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
-    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
-    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
+    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;;
+    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;;
+    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;;
   esac
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
@@ -87,7 +87,7 @@ prompt_for_port() {
 
   while true; do
     read -p "$prompt_message [$default_port]: " port
-    port=${port:-$default_port}  # 如果用户未输入，使用默认端口
+    port=${port:-$default_port}
     if [[ $port =~ ^[0-9]+$ ]] && [ $port -ge 1 ] && [ $port -le 65535 ]; then
       if check_port_available "$port"; then
         echo "$port"
@@ -111,7 +111,36 @@ prompt_for_path() {
   log "INFO" "设置前后端路径为: $SUB_STORE_FRONTEND_BACKEND_PATH"
 }
 
-# 安装依赖（根据系统和架构）
+# 检查网络连接
+check_network() {
+  log "INFO" "正在检查 Docker Hub 连接..."
+  if curl -s -I https://hub.docker.com >/dev/null; then
+    log "INFO" "Docker Hub 连接正常"
+  else
+    log "ERROR" "无法连接到 Docker Hub，请检查网络"
+    exit 1
+  fi
+}
+
+# 检查 Docker 权限
+check_docker_permissions() {
+  log "INFO" "正在检查 Docker 权限..."
+  if [[ -S /var/run/docker.sock && -r /var/run/docker.sock && -w /var/run/docker.sock ]]; then
+    log "INFO" "Docker 权限正常"
+  else
+    log "WARN" "Docker socket 权限不足，尝试修复..."
+    sudo chmod 660 /var/run/docker.sock
+    sudo chown root:docker /var/run/docker.sock
+    if [[ -S /var/run/docker.sock && -r /var/run/docker.sock && -w /var/run/docker.sock ]]; then
+      log "INFO" "Docker 权限修复成功"
+    else
+      log "ERROR" "无法修复 Docker 权限，请手动检查 /var/run/docker.sock"
+      exit 1
+    fi
+  fi
+}
+
+# 安装依赖
 install_dependencies() {
   log "INFO" "正在安装依赖..."
   if ! command -v docker &> /dev/null; then
@@ -143,7 +172,6 @@ install_dependencies() {
     log "INFO" "Docker 已存在，跳过安装"
   fi
 
-  # 检查并安装 jq
   if ! command -v jq &> /dev/null; then
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
       apt install -y jq || {
@@ -169,7 +197,6 @@ install_dependencies() {
 install_watchtower() {
   log "INFO" "正在查询所有正在运行的容器..."
   
-  # 获取所有运行中的容器名称
   local containers=($(docker ps --format "{{.Names}}"))
   
   if [ ${#containers[@]} -eq 0 ]; then
@@ -177,7 +204,7 @@ install_watchtower() {
     return
   fi
   
-  echo "请选择要监控的容器（多个用空格分隔）："
+  echo "请选择要监控的容器（多个用空格分隔，推荐选择 substore）："
   for i in "${!containers[@]}"; do
     echo "$((i + 1)). ${containers[$i]}"
   done
@@ -194,37 +221,73 @@ install_watchtower() {
     fi
   done
 
-  if [ ${#selected_containers[@]} -eq 0 ]; then
+  if [ ${#containers[@]} -eq 0 ]; then
     log "WARN" "没有有效的容器选择，取消更新"
     return
   fi
 
   log "INFO" "部署 Watchtower 监控容器: ${selected_containers[*]}"
 
-  # 先停止并删除旧的Watchtower容器（如果存在）
+  # 提示用户是否配置 Slack 通知
+  local slack_webhook=""
+  read -p "是否配置 Slack 通知？(y/n) [默认: n]: " enable_slack
+  enable_slack=${enable_slack:-n}
+  if [[ "$enable_slack" == "y" || "$enable_slack" == "Y" ]]; then
+    read -p "请输入 Slack Webhook URL: " slack_webhook
+    if [[ -z "$slack_webhook" ]]; then
+      log "WARN" "未提供 Slack Webhook URL，禁用通知"
+      slack_webhook=""
+    fi
+  fi
+
+  # 拉取最新 Watchtower 镜像
+  log "INFO" "正在拉取最新 Watchtower 镜像..."
+  docker pull containrrr/watchtower:latest || {
+    log "ERROR" "拉取 Watchtower 镜像失败"
+    exit 1
+  }
+
+  # 停止并删除旧的 Watchtower 容器
   docker rm -f $WATCHTOWER_CONTAINER_NAME >/dev/null 2>&1
 
-  # 启动Watchtower
-  docker run -d \
+  # 启动 Watchtower
+  local watchtower_cmd="docker run -d \
     --name $WATCHTOWER_CONTAINER_NAME \
     --restart=always \
     -v /var/run/docker.sock:/var/run/docker.sock \
     containrrr/watchtower \
     --cleanup \
-    --interval 3600 \
-    ${selected_containers[*]} || {
-      log "ERROR" "Watchtower 部署失败"
-      exit 1
-    }
+    --schedule \"0 */10 * * * *\" \
+    --include-stopped \
+    ${selected_containers[*]}"
 
-  log "INFO" "Watchtower部署成功，监控容器：${selected_containers[*]}"
+  if [[ -n "$slack_webhook" ]]; then
+    watchtower_cmd="$watchtower_cmd \
+      --notifications slack \
+      --notification-slack-identifier \"watchtower-server\" \
+      --notification-slack-webhook-url \"$slack_webhook\""
+  fi
+
+  eval "$watchtower_cmd" || {
+    log "ERROR" "Watchtower 部署失败"
+    exit 1
+  }
+
+  log "INFO" "Watchtower 部署成功，监控容器：${selected_containers[*]}，每10分钟检查一次"
+
+  # 立即运行一次检查以验证更新功能
+  log "INFO" "正在运行一次性检查以验证 Watchtower..."
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --run-once ${selected_containers[*]} || {
+    log "WARN" "Watchtower 一次性检查失败，请检查日志"
+  }
+  log "INFO" "请查看 Watchtower 日志以确认更新状态：docker logs $WATCHTOWER_CONTAINER_NAME"
 }
 
 # 获取 Sub-Store 版本列表
 get_substore_versions() {
   log "INFO" "正在获取 Sub-Store 版本列表..."
-  # 调用 Docker Hub API 获取版本信息，增加 page_size 参数以获取更多版本
-  curl -s "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r
+  local versions=($(curl -s "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r))
+  echo "latest" "${versions[@]}"  # 将 latest 添加到版本列表
 }
 
 # 提示用户选择版本
@@ -237,7 +300,7 @@ prompt_for_version() {
     exit 1
   fi
 
-  echo "请选择 Sub-Store 版本："
+  echo "请选择 Sub-Store 版本（推荐使用 latest 以确保自动更新）："
   for i in "${!versions[@]}"; do
     echo "$((i + 1)). ${versions[$i]}"
   done
@@ -267,7 +330,6 @@ async function operator(proxies, targetPlatform, context) {
     const cacheEnabled = $arguments.cache;
     const cache = scriptResourceCache;
 
-    // 配置参数
     const CONFIG = {
         TIMEOUT: parseInt($arguments.timeout) || 10000,
         RETRIES: parseInt($arguments.retries) || 3,
@@ -285,9 +347,8 @@ async function operator(proxies, targetPlatform, context) {
 
     let riskyIPs = new Set();
     const cacheKey = 'risky_ips_cache';
-    const cacheExpiry = 6 * 60 * 60 * 1000; // 缩短缓存时间到 6 小时
+    const cacheExpiry = 6 * 60 * 60 * 1000;
 
-    // 尝试使用缓存
     if (cacheEnabled) {
         const cachedData = cache.get(cacheKey);
         if (cachedData?.timestamp && (Date.now() - cachedData.timestamp < cacheExpiry)) {
@@ -297,9 +358,8 @@ async function operator(proxies, targetPlatform, context) {
         }
     }
 
-    let initialLoadSuccess = false; // 标记首次加载是否成功
+    let initialLoadSuccess = false;
 
-    // 获取风险 IP 列表
     async function fetchIPList(api) {
         const options = {
             url: api,
@@ -314,7 +374,6 @@ async function operator(proxies, targetPlatform, context) {
             try {
                 const response = await $.http.get(options);
                 if (response.body) {
-                    // 特殊处理 TOR 列表
                     if (api.includes('torproject.org/exit-addresses')) {
                         return response.body.split('\n')
                             .filter(line => line.startsWith('ExitAddress'))
@@ -343,7 +402,6 @@ async function operator(proxies, targetPlatform, context) {
         return;
     }
 
-    // 更新风险 IP 列表
     try {
         const results = await Promise.all(ipListAPIs.map(api => fetchIPList(api)));
         const fetchedIPs = results.flat();
@@ -372,7 +430,6 @@ async function operator(proxies, targetPlatform, context) {
 
     return await processProxies();
 
-    // 处理代理列表并筛除风险 IP
     async function processProxies() {
         const nonRiskyProxies = [];
         for (const proxy of proxies) {
@@ -411,7 +468,17 @@ async function operator(proxies, targetPlatform, context) {
     }
 
     function isIPInCIDR(ip, cidr) {
-        const [range, bits = 32] = cidr.split('/');
+        const [range, bits = 32] = cid-Latex 替换为：
+```latex
+\documentclass{article}
+\usepackage{CJKutf8}
+\begin{document}
+\begin{CJK}{UTF8}{gbsn}
+中文内容
+\end{CJK}
+\end{document}
+```
+cidr.split('/');
         const mask = ~((1 << (32 - bits)) - 1);
         const ipNum = ip.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
         const rangeNum = range.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
@@ -429,9 +496,11 @@ install_substore() {
   prompt_for_version
 
   log "INFO" "正在拉取镜像 xream/sub-store:$SUB_STORE_VERSION..."
-  docker pull "xream/sub-store:$SUB_STORE_VERSION"
+  docker pull "xream/sub-store:$SUB_STORE_VERSION" || {
+    log "ERROR" "拉取 Sub-Store 镜像失败"
+    exit 1
+  }
 
-  # 提示用户选择网络模式
   while true; do
     read -p "请选择网络模式 (bridge 或 host) [默认: bridge]: " network_mode
     network_mode=${network_mode:-bridge}
@@ -443,7 +512,6 @@ install_substore() {
     fi
   done
 
-  # 提示用户输入路径
   prompt_for_path
 
   log "INFO" "正在启动容器，网络模式: $NETWORK_MODE"
@@ -500,7 +568,6 @@ uninstall_container() {
     docker rm $container_name
     log "INFO" "容器 $container_name 已停止并移除"
 
-    # 询问是否删除镜像
     read -p "是否删除镜像 $image_name? (y/n) [默认: n]: " remove_image
     remove_image=${remove_image:-n}
     if [[ "$remove_image" == "y" || "$remove_image" == "Y" ]]; then
@@ -508,7 +575,6 @@ uninstall_container() {
       log "INFO" "镜像 $image_name 已删除"
     fi
 
-    # 询问是否清理卷
     read -p "是否清理相关数据卷 $DATA_DIR? (y/n) [默认: n]: " remove_volume
     remove_volume=${remove_volume:-n}
     if [[ "$remove_volume" == "y" || "$remove_volume" == "Y" ]] && [ "$container_name" == "$CONTAINER_NAME" ]; then
@@ -553,7 +619,7 @@ interactive_menu() {
   while true; do
     echo -e "\n选择操作："
     echo "1. 部署 Sub-Store"
-    echo "2. 部署 Watchtower"
+    echo "2. 部署 Watchtower（自动更新容器）"
     echo "3. 查看所有容器状态"
     echo "4. 卸载容器（Sub-Store 或 Watchtower）"
     echo "5. 数据备份"
@@ -597,6 +663,8 @@ interactive_menu() {
 main() {
   create_directories
   detect_system
+  check_network
+  check_docker_permissions
   install_dependencies
   interactive_menu
 }
