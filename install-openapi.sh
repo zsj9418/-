@@ -4,7 +4,7 @@
 # Docker 服务管理脚本
 #
 # 功能:
-# - 部署 One-API (SQLite/MySQL), Duck2API 等 Docker 服务
+# - 部署 One-API (SQLite/MySQL), Duck2API, Uni-API, New-API (calciumion) 等 Docker 服务
 # - 自动检测系统架构和操作系统 (包括 OpenWrt)
 # - 自动处理依赖安装 (apt, yum, dnf, pacman, opkg)
 # - 端口自动建议与验证
@@ -32,14 +32,19 @@ PORT=""                 # 选定的服务端口
 NETWORK_MODE=""         # 选定的网络模式
 LOG_FILE=""             # 日志文件路径
 DEFAULT_TZ="Asia/Shanghai" # 默认时区
+TEMP_DIR="/tmp/uni_api_deploy_$(date +%s)" # 用于克隆 uni-api 仓库
 
 # --- 服务配置常量 ---
 DEFAULT_PORT=1314
 # One-API 镜像
-ONE_API_IMAGE_SPECIFIC="justsong/one-api:v0.6.11-preview.1" 
+ONE_API_IMAGE_SPECIFIC="justsong/one-api:v0.6.11-preview.1"
 LATEST_ONE_API_IMAGE="ghcr.io/songquanpeng/one-api:latest"
 # Duck2API 镜像
 DUCK2API_IMAGE="ghcr.io/aurora-develop/duck2api:latest"
+# Uni-API 镜像（本地构建）
+UNI_API_IMAGE="uni-api:latest"
+# New-API (calciumion) 镜像
+NEW_API_CALCIUMION_IMAGE="calciumion/new-api:latest"
 
 # --- 日志设置 ---
 function setup_logging() {
@@ -95,7 +100,7 @@ function detect_architecture() {
   fi
 }
 
-# 检测操作系统和包管理器 (已修改)
+# 检测操作系统和包管理器
 function detect_os() {
   if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
@@ -120,8 +125,8 @@ function detect_os() {
         OS="arch" # 统一归类
         PACKAGE_MANAGER="pacman"
         ;;
-      openwrt | libwrt | nwrt | qwrt | hwrt | libwrt | LEDE | ImmortalWRT | X-WRT | iStoreOS) # <--- 修改点：添加 libwrt
-        OS="openwrt" # <--- 关键：统一识别为 openwrt
+      openwrt | libwrt | nwrt | qwrt | hwrt | libwrt | LEDE | ImmortalWRT | X-WRT | iStoreOS)
+        OS="openwrt" # 统一识别为 openwrt
         PACKAGE_MANAGER="opkg"
         ;;
       *)
@@ -148,7 +153,6 @@ function detect_os() {
   else
       red "错误：不支持的操作系统 ($(uname -s))" && exit 1
   fi
-  # 输出时，即使检测到 libwrt，也会显示 openwrt
   green "操作系统识别为：$OS (包管理器: $PACKAGE_MANAGER)"
 }
 
@@ -200,7 +204,6 @@ function install_dependency() {
       update_cmd=$(echo "$update_cmd" | sed 's/^/sudo /')
       install_cmd=$(echo "$install_cmd" | sed 's/^/sudo /')
   fi
-
 
   # 执行更新命令（如果需要）
   if [[ -n "$update_cmd" ]]; then
@@ -256,7 +259,6 @@ function check_base_dependencies() {
         green "端口检查工具 netstat 已安装。"
     fi
 }
-
 
 # 检查并安装 Docker 和 Docker Compose
 function check_docker_dependencies() {
@@ -343,7 +345,6 @@ function check_docker_dependencies() {
        red "错误：Docker 服务未能成功启动或无法连接。请手动检查 Docker 安装和状态。"
        exit 1
    fi
-
 
   # 检查 Docker Compose (作为插件或独立二进制文件)
   if docker compose version &>/dev/null; then
@@ -636,7 +637,6 @@ function deploy_service_sqlite() {
        green "数据目录 $data_dir 可写。"
   fi
 
-
   # 5. 构建并执行 docker run 命令
   green "正在部署 $name (SQLite 模式)..."
   local docker_run_cmd=()
@@ -655,6 +655,10 @@ function deploy_service_sqlite() {
   # 添加数据卷和时区
   docker_run_cmd+=(-v "$data_dir:/data")
   docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
+  # 某些服务可能需要额外的环境变量，这里可以预留位置或在特定部署函数中添加
+  # if [[ "$name" == "new-api-calciumion" ]]; then
+  #   docker_run_cmd+=(-e "SOME_ENV_VAR=value") # 示例
+  # fi
   docker_run_cmd+=("$image")
 
   # 执行命令
@@ -813,6 +817,151 @@ function deploy_one_api_mysql() {
   green "查看容器日志: docker logs $name"
 }
 
+# 新增：部署 Uni-API
+function deploy_uni_api() {
+  local name="uni-api"
+  local image="$UNI_API_IMAGE"
+  local internal_port="8000" # uni-api 默认端口
+  local data_dir_name="uni-api-data"
+  local data_dir="$HOME/$data_dir_name"
+  local env_file="$data_dir/.env"
+
+  yellow "--- 部署 Uni-API ---"
+
+  # 1. 检查容器名冲突
+  if ! check_existing_container "$name"; then return 1; fi
+
+  # 2. 端口和网络模式
+  validate_port "$internal_port" # 设置全局 PORT
+  choose_network_mode # 设置全局 NETWORK_MODE
+  validate_network_mode
+
+  # 3. 安装 git 并克隆仓库
+  yellow "检查 git 是否安装..."
+  install_dependency "git" "git"
+  yellow "克隆 uni-api 仓库到临时目录 $TEMP_DIR..."
+  rm -rf "$TEMP_DIR" && mkdir -p "$TEMP_DIR"
+  if ! git clone https://github.com/yym68686/uni-api.git "$TEMP_DIR"; then
+      red "错误：克隆 uni-api 仓库失败，请检查网络或仓库地址。"
+      rm -rf "$TEMP_DIR"
+      return 1
+  fi
+
+  # 4. 构建 Docker 镜像
+  yellow "构建 uni-api Docker 镜像 $image..."
+  cd "$TEMP_DIR"
+  local platform_arg=""
+  [[ -n "$PLATFORM" ]] && platform_arg="--platform $PLATFORM"
+  if ! docker build $platform_arg -t "$image" .; then
+      red "错误：构建 uni-api 镜像失败，请检查 Dockerfile 或构建日志。"
+      cd - >/dev/null
+      rm -rf "$TEMP_DIR"
+      return 1
+  fi
+  cd - >/dev/null
+  rm -rf "$TEMP_DIR"
+  green "uni-api 镜像 $image 构建成功。"
+
+  # 5. 创建数据目录
+  if [[ "$OS" == "openwrt" ]]; then
+      yellow "警告：OpenWrt/LibWRT 存储空间有限，数据将存放在 $data_dir。"
+      yellow "强烈建议将数据映射到外部存储！"
+      read -p "按 Enter 继续，或按 Ctrl+C 退出..." </dev/tty
+  fi
+  yellow "确保数据目录存在: $data_dir"
+  mkdir -p "$data_dir"
+  if ! touch "$data_dir/.writable_test" 2>/dev/null; then
+      red "错误：数据目录 $data_dir 不可写，请检查权限。"
+      if [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null; then
+          yellow "尝试修复目录权限..."
+          local chown_cmd="chown $(id -u):$(id -g) \"$data_dir\""
+          local chmod_cmd="chmod u+rwx \"$data_dir\""
+          if [[ "$EUID" -ne 0 ]]; then
+              chown_cmd="sudo $chown_cmd"
+              chmod_cmd="sudo $chmod_cmd"
+          fi
+          eval "$chown_cmd" || true
+          eval "$chmod_cmd" || true
+          if ! touch "$data_dir/.writable_test" 2>/dev/null; then
+              red "自动修复权限失败，请手动检查 $data_dir"
+              return 1
+          else
+              rm -f "$data_dir/.writable_test"
+              green "目录权限已尝试修复。"
+          fi
+      else
+          red "请手动检查 $data_dir 的权限。"
+          return 1
+      fi
+  else
+      rm -f "$data_dir/.writable_test"
+      green "数据目录 $data_dir 可写。"
+  fi
+
+  # 6. 配置 .env 文件
+  yellow "uni-api 需要 .env 文件配置 API 密钥（如 OPENAI_API_KEY）。"
+  read -p "是否生成示例 .env 文件？(y/n，默认 y): " env_choice </dev/tty
+  if [[ "${env_choice:-y}" =~ ^[Yy]$ ]]; then
+      cat > "$env_file" << EOF
+DATABASE_URL=sqlite:////app/data/uni_api.db
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+GROQ_API_KEY=your_groq_key
+# 添加其他 API 密钥或配置
+EOF
+      green "示例 .env 文件已生成：$env_file"
+      yellow "请编辑 $env_file 添加有效的 API 密钥，否则服务可能无法正常工作。"
+      read -p "按 Enter 继续，或按 Ctrl+C 退出以编辑 .env 文件..." </dev/tty
+  fi
+  if [[ ! -f "$env_file" ]]; then
+      yellow "警告：未找到 .env 文件，容器可能因缺少配置而失败。"
+  fi
+
+  # 7. 构建并执行 docker run 命令
+  green "正在部署 $name..."
+  local docker_run_cmd=()
+  docker_run_cmd+=(docker run -d --name "$name")
+  docker_run_cmd+=(--restart always)
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+      docker_run_cmd+=(--network host)
+      yellow "使用 host 网络模式，容器将监听端口 $internal_port。"
+  else
+      docker_run_cmd+=(--network bridge)
+      docker_run_cmd+=(-p "$PORT:$internal_port")
+  fi
+  docker_run_cmd+=(-v "$data_dir:/app/data")
+  [[ -f "$env_file" ]] && docker_run_cmd+=(-v "$env_file:/app/.env")
+  docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
+  docker_run_cmd+=("$image")
+
+  yellow "执行命令: ${docker_run_cmd[*]}"
+  if ! eval "${docker_run_cmd[*]}"; then
+      red "容器 $name 启动失败！"
+      yellow "请检查容器日志：docker logs $name"
+      docker rm "$name" &>/dev/null || true
+      return 1
+  fi
+
+  # 8. 部署成功提示
+  green "$name 部署成功！"
+  local access_ip="<您的服务器IP>"
+  access_ip=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+' || \
+              ip -4 addr show scope global | grep -oP 'inet \K[\d.]+' | head -n 1 || \
+              hostname -I | awk '{print $1}' || \
+              echo "$access_ip")
+  local access_port=$PORT
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+      access_port=$internal_port
+      green "访问地址 (host 模式): http://$access_ip:$access_port"
+  else
+      green "访问地址 (bridge 模式): http://$access_ip:$access_port"
+  fi
+  green "数据目录: $data_dir"
+  green ".env 文件: $env_file"
+  green "查看容器日志: docker logs $name"
+  yellow "请确保 $env_file 中的 API 密钥正确配置。"
+}
+
 # 卸载服务 (通用)
 # 参数: name, data_dir_name
 function uninstall_service() {
@@ -843,6 +992,8 @@ function uninstall_service() {
       one-api) image_pattern=$(echo "$ONE_API_IMAGE_SPECIFIC" | cut -d: -f1) ;; # justsong/one-api
       one-api-latest | one-api-mysql) image_pattern=$(echo "$LATEST_ONE_API_IMAGE" | cut -d: -f1) ;; # ghcr.io/songquanpeng/one-api
       duck2api) image_pattern=$(echo "$DUCK2API_IMAGE" | cut -d: -f1) ;; # ghcr.io/aurora-develop/duck2api
+      uni-api) image_pattern="$UNI_API_IMAGE" ;; # uni-api:latest
+      new-api-calciumion) image_pattern=$(echo "$NEW_API_CALCIUMION_IMAGE" | cut -d: -f1) ;; # calciumion/new-api
       *) yellow "警告：无法确定 '$name' 对应的镜像名称模式，跳过镜像移除。" ;;
   esac
 
@@ -868,7 +1019,6 @@ function uninstall_service() {
            yellow "未发现与 '$image_pattern' 相关的镜像。"
       fi
   fi
-
 
   # 处理数据目录
   if [[ -d "$data_dir" ]]; then
@@ -929,6 +1079,19 @@ function deploy_duck2api() {
   deploy_service_sqlite "duck2api" "$DUCK2API_IMAGE" 8080 "duck2api-data"
 }
 
+# 新增：部署 New-API (calciumion/new-api:latest)
+function deploy_new_api_calciumion() {
+  # For calciumion/new-api, it typically uses port 3000 internally and may require a SQL_DSN environment variable if not using embedded SQLite.
+  # It also often uses a /data volume for SQLite and /app/logs for logs if command specifies --log-dir /app/logs
+  # We will use the generic deploy_service_sqlite for simplicity, assuming SQLite usage by default.
+  # If it needs SQL_DSN, a more complex function similar to deploy_one_api_mysql would be needed.
+  # For now, we assume it uses /data for its data, similar to One-API.
+  # It might require specific environment variables. The current deploy_service_sqlite does not handle additional env vars easily.
+  # For simplicity, we use deploy_service_sqlite. If specific env vars or different volume mappings are strictly needed, this function needs to be more custom.
+  deploy_service_sqlite "new-api-calciumion" "$NEW_API_CALCIUMION_IMAGE" 3000 "new-api-calciumion-data"
+}
+
+
 # 卸载项目菜单
 function uninstall_project() {
   echo "请选择要卸载的项目："
@@ -936,13 +1099,17 @@ function uninstall_project() {
   echo "  2. One-API 最新版 (SQLite, 容器名: one-api-latest, 数据: $HOME/one-api-latest-data)"
   echo "  3. One-API 最新版 (MySQL, 容器名: one-api-mysql, 日志/数据: $HOME/one-api-mysql-logs)"
   echo "  4. Duck2API (容器名: duck2api, 数据: $HOME/duck2api-data)"
+  echo "  5. Uni-API (容器名: uni-api, 数据: $HOME/uni-api-data)"
+  echo "  6. New-API (calciumion) (容器名: new-api-calciumion, 数据: $HOME/new-api-calciumion-data)"
   echo "  0. 返回主菜单"
-  read -p "请输入选择（0-4）： " project_choice </dev/tty
+  read -p "请输入选择（0-6）： " project_choice </dev/tty
   case $project_choice in
     1) uninstall_service "one-api" "one-api-data" ;;
     2) uninstall_service "one-api-latest" "one-api-latest-data" ;;
-    3) uninstall_service "one-api-mysql" "one-api-mysql-logs" ;; # 注意数据目录名不同
+    3) uninstall_service "one-api-mysql" "one-api-mysql-logs" ;;
     4) uninstall_service "duck2api" "duck2api-data" ;;
+    5) uninstall_service "uni-api" "uni-api-data" ;;
+    6) uninstall_service "new-api-calciumion" "new-api-calciumion-data" ;;
     0) return ;;
     *) red "无效选项，请重新选择。" && uninstall_project ;;
   esac
@@ -984,7 +1151,6 @@ function main_menu() {
       sleep 1 # 短暂暂停让用户看到
   fi
 
-
   while true; do
     # 获取 Docker 和 Compose 版本信息（如果可用）
     local docker_version_info="未运行"
@@ -1005,14 +1171,16 @@ function main_menu() {
     echo "  2. 部署 One-API 最新版 (SQLite)"
     echo "  3. 部署 One-API 最新版 (使用 MySQL)"
     echo "  4. 部署 Duck2API"
+    echo "  5. 部署 Uni-API"
+    echo "  6. 部署 New-API (calciumion/new-api:latest)"
     echo "----------------------------------------"
-    echo "  5. 卸载服务"
-    echo "  6. 查看所有容器状态"
+    echo "  7. 卸载服务"
+    echo "  8. 查看所有容器状态"
     echo "----------------------------------------"
     echo "  0. 退出脚本"
     echo "========================================"
     # 从终端读取用户输入，即使 stdout 被重定向
-    read -p "请输入选项编号 (0-6): " choice </dev/tty
+    read -p "请输入选项编号 (0-8): " choice </dev/tty
 
     # 添加换行增加可读性
     echo ""
@@ -1022,10 +1190,12 @@ function main_menu() {
       2) deploy_latest_one_api_sqlite ;;
       3) deploy_one_api_mysql ;;
       4) deploy_duck2api ;;
-      5) uninstall_project ;;
-      6) view_container_status ;;
+      5) deploy_uni_api ;;
+      6) deploy_new_api_calciumion ;; # 新增的选项
+      7) uninstall_project ;;
+      8) view_container_status ;;
       0) green "感谢您的使用！脚本退出。" && exit 0 ;;
-      *) red "无效选项 '$choice'，请输入 0 到 6 之间的数字。" ;;
+      *) red "无效选项 '$choice'，请输入 0 到 8 之间的数字。" ;;
     esac
 
     # 在每次操作后暂停，让用户看到输出
