@@ -2,6 +2,7 @@
 # Docker管理脚本
 # 功能：支持 Watchtower 和 Sub-Store 的部署、通知、日志记录和数据备份/恢复
 # 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口，优化 Watchtower 自动更新
+# 新增功能：支持在 Watchtower 部署后动态添加自动更新容器
 # 动态脚本加载：支持在根目录下自动创建一个目录并挂载读取各种规则文件以备后续的拓展性
 
 # 配置区（默认值）
@@ -30,10 +31,7 @@ NC='\033[0m'
 
 # 创建必要的目录
 create_directories() {
-  mkdir -p "$DATA_DIR"
-  mkdir -p "$SCRIPTS_DIR"
-  mkdir -p "$BACKUP_DIR"
-  mkdir -p "$LOG_DIR"
+  mkdir -p "$DATA_DIR" "$SCRIPTS_DIR" "$BACKUP_DIR" "$LOG_DIR"
   log "INFO" "所有必要的目录已创建"
 }
 
@@ -41,8 +39,8 @@ create_directories() {
 log() {
   local level=$1
   local message=$2
-  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-  case $level in
+  local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+  case "$level" in
     "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;;
     "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;;
     "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;;
@@ -50,7 +48,7 @@ log() {
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
   # 限制日志大小为 1M，超过后清空
-  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
+  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
     > "$LOG_FILE"
     log "INFO" "日志文件大小超过 1M，已清空日志。"
   fi
@@ -60,7 +58,7 @@ log() {
 detect_system() {
   log "INFO" "正在检测设备架构和操作系统..."
   ARCH=$(uname -m)
-  if [ -f /etc/os-release ]; then
+  if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     OS=$ID
   else
@@ -72,11 +70,12 @@ detect_system() {
 # 检测端口是否可用
 check_port_available() {
   local port=$1
-  if lsof -i:"$port" >/dev/null 2>&1; then
-    return 1  # 端口被占用
+  if command -v ss >/dev/null 2>&1; then
+    ss -tuln | grep -q ":$port" && return 1
   else
-    return 0  # 端口可用
+    lsof -i:"$port" >/dev/null 2>&1 && return 1
   fi
+  return 0
 }
 
 # 提示用户输入端口
@@ -84,11 +83,10 @@ prompt_for_port() {
   local prompt_message=$1
   local default_port=$2
   local port=""
-
   while true; do
     read -p "$prompt_message [$default_port]: " port
     port=${port:-$default_port}
-    if [[ $port =~ ^[0-9]+$ ]] && [ $port -ge 1 ] && [ $port -le 65535 ]; then
+    if [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
       if check_port_available "$port"; then
         echo "$port"
         return
@@ -96,7 +94,7 @@ prompt_for_port() {
         log "WARN" "端口 $port 已被占用，请选择其他端口"
       fi
     else
-      log "WARN" "无效的端口号，请输入1到65535之间的数字"
+      log "WARN" "无效的端口号，请输入 1 到 65535 之间的数字"
     fi
   done
 }
@@ -107,14 +105,14 @@ prompt_for_path() {
   local user_input=""
   read -p "请输入 Sub-Store 前后端路径（只需输入路径名，不需加/） [$default_path]: " user_input
   user_input=${user_input:-$default_path}
-  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input}"
+  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input//[^a-zA-Z0-9_-]/}"
   log "INFO" "设置前后端路径为: $SUB_STORE_FRONTEND_BACKEND_PATH"
 }
 
 # 检查网络连接
 check_network() {
   log "INFO" "正在检查 Docker Hub 连接..."
-  if curl -s -I https://hub.docker.com >/dev/null; then
+  if curl -s -m 5 https://hub.docker.com >/dev/null; then
     log "INFO" "Docker Hub 连接正常"
   else
     log "ERROR" "无法连接到 Docker Hub，请检查网络"
@@ -129,9 +127,7 @@ check_docker_permissions() {
     log "INFO" "Docker 权限正常"
   else
     log "WARN" "Docker socket 权限不足，尝试修复..."
-    sudo chmod 660 /var/run/docker.sock
-    sudo chown root:docker /var/run/docker.sock
-    if [[ -S /var/run/docker.sock && -r /var/run/docker.sock && -w /var/run/docker.sock ]]; then
+    if sudo chmod 660 /var/run/docker.sock && sudo chown root:docker /var/run/docker.sock 2>/dev/null; then
       log "INFO" "Docker 权限修复成功"
     else
       log "ERROR" "无法修复 Docker 权限，请手动检查 /var/run/docker.sock"
@@ -143,42 +139,40 @@ check_docker_permissions() {
 # 安装依赖
 install_dependencies() {
   log "INFO" "正在安装依赖..."
-  if ! command -v docker &> /dev/null; then
+  if ! command -v docker >/dev/null 2>&1; then
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-      apt update && apt install -y curl lsof || {
+      apt-get update && apt-get install -y curl lsof ca-certificates || {
         log "ERROR" "依赖安装失败，请检查网络连接"
         exit 1
       }
       curl -fsSL https://get.docker.com | sh || {
-        log "ERROR" "Docker安装失败"
+        log "ERROR" "Docker 安装失败"
         exit 1
       }
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" ]]; then
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" ]]; then
       yum install -y curl lsof || {
         log "ERROR" "依赖安装失败，请检查网络连接"
         exit 1
       }
       curl -fsSL https://get.docker.com | sh || {
-        log "ERROR" "Docker安装失败"
+        log "ERROR" "Docker 安装失败"
         exit 1
       }
     else
       log "ERROR" "不支持的操作系统: $OS"
       exit 1
     fi
-    systemctl enable --now docker
+    systemctl enable --now docker >/dev/null 2>&1
     log "INFO" "Docker 已成功安装"
-  else
-    log "INFO" "Docker 已存在，跳过安装"
   fi
 
-  if ! command -v jq &> /dev/null; then
+  if ! command -v jq >/dev/null 2>&1; then
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-      apt install -y jq || {
+      apt-get install -y jq || {
         log "ERROR" "jq 安装失败"
         exit 1
       }
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" ]]; then
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" ]]; then
       yum install -y jq || {
         log "ERROR" "jq 安装失败"
         exit 1
@@ -188,16 +182,14 @@ install_dependencies() {
       exit 1
     fi
     log "INFO" "jq 已成功安装"
-  else
-    log "INFO" "jq 已存在，跳过安装"
   fi
 }
 
 # 部署 Watchtower
 install_watchtower() {
   log "INFO" "正在查询所有正在运行的容器..."
-  
-  local containers=($(docker ps --format "{{.Names}}"))
+  local containers
+  mapfile -t containers < <(docker ps --format "{{.Names}}")
   
   if [ ${#containers[@]} -eq 0 ]; then
     log "WARN" "没有找到运行中的容器，无法部署 Watchtower"
@@ -211,28 +203,26 @@ install_watchtower() {
   
   read -p "请输入容器编号（例如: 1 2 3）: " user_input
   local selected_indices=($user_input)
-  
   local selected_containers=()
   for index in "${selected_indices[@]}"; do
-    if [[ $index =~ ^[0-9]+$ ]] && [ $index -ge 1 ] && [ $index -le ${#containers[@]} ]; then
+    if [[ $index =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le ${#containers[@]} ]; then
       selected_containers+=("${containers[$((index - 1))]}")
     else
       log "WARN" "无效的选择: $index"
     fi
   done
 
-  if [ ${#containers[@]} -eq 0 ]; then
-    log "WARN" "没有有效的容器选择，取消更新"
+  if [ ${#selected_containers[@]} -eq 0 ]; then
+    log "WARN" "没有有效的容器选择，取消部署"
     return
   fi
 
   log "INFO" "部署 Watchtower 监控容器: ${selected_containers[*]}"
 
-  # 提示用户是否配置 Slack 通知
   local slack_webhook=""
   read -p "是否配置 Slack 通知？(y/n) [默认: n]: " enable_slack
   enable_slack=${enable_slack:-n}
-  if [[ "$enable_slack" == "y" || "$enable_slack" == "Y" ]]; then
+  if [[ "$enable_slack" =~ ^[yY]$ ]]; then
     read -p "请输入 Slack Webhook URL: " slack_webhook
     if [[ -z "$slack_webhook" ]]; then
       log "WARN" "未提供 Slack Webhook URL，禁用通知"
@@ -240,44 +230,138 @@ install_watchtower() {
     fi
   fi
 
-  # 拉取最新 Watchtower 镜像
   log "INFO" "正在拉取最新 Watchtower 镜像..."
-  docker pull containrrr/watchtower:latest || {
+  docker pull "$WATCHTOWER_IMAGE_NAME:latest" || {
     log "ERROR" "拉取 Watchtower 镜像失败"
     exit 1
   }
 
-  # 停止并删除旧的 Watchtower 容器
-  docker rm -f $WATCHTOWER_CONTAINER_NAME >/dev/null 2>&1
+  docker rm -f "$WATCHTOWER_CONTAINER_NAME" >/dev/null 2>&1
 
-  # 启动 Watchtower
-  local watchtower_cmd="docker run -d \
-    --name $WATCHTOWER_CONTAINER_NAME \
-    --restart=always \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    containrrr/watchtower \
-    --cleanup \
-    --schedule \"0 */10 * * * *\" \
-    --include-stopped \
-    ${selected_containers[*]}"
-
+  local watchtower_cmd=(
+    docker run -d
+    --name "$WATCHTOWER_CONTAINER_NAME"
+    --restart=always
+    -v /var/run/docker.sock:/var/run/docker.sock
+    "$WATCHTOWER_IMAGE_NAME"
+    --cleanup
+    --schedule "0 */10 * * * *"
+    --include-stopped
+  )
   if [[ -n "$slack_webhook" ]]; then
-    watchtower_cmd="$watchtower_cmd \
-      --notifications slack \
-      --notification-slack-identifier \"watchtower-server\" \
-      --notification-slack-webhook-url \"$slack_webhook\""
+    watchtower_cmd+=(
+      --notifications slack
+      --notification-slack-identifier "watchtower-server"
+      --notification-slack-webhook-url "$slack_webhook"
+    )
   fi
+  watchtower_cmd+=("${selected_containers[@]}")
 
-  eval "$watchtower_cmd" || {
+  "${watchtower_cmd[@]}" || {
     log "ERROR" "Watchtower 部署失败"
     exit 1
   }
 
   log "INFO" "Watchtower 部署成功，监控容器：${selected_containers[*]}，每10分钟检查一次"
 
-  # 立即运行一次检查以验证更新功能
   log "INFO" "正在运行一次性检查以验证 Watchtower..."
-  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --run-once ${selected_containers[*]} || {
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$WATCHTOWER_IMAGE_NAME" --run-once "${selected_containers[@]}" || {
+    log "WARN" "Watchtower 一次性检查失败，请检查日志"
+  }
+  log "INFO" "请查看 Watchtower 日志以确认更新状态：docker logs $WATCHTOWER_CONTAINER_NAME"
+}
+
+# 添加 Watchtower 监控容器
+add_watchtower_containers() {
+  log "INFO" "正在添加新的容器到 Watchtower 监控列表..."
+
+  if ! docker ps -a --format "{{.Names}}" | grep -q "^${WATCHTOWER_CONTAINER_NAME}$"; then
+    log "ERROR" "Watchtower 未部署，请先选择菜单选项 2 部署 Watchtower"
+    return
+  fi
+
+  local current_containers
+  mapfile -t current_containers < <(docker inspect "$WATCHTOWER_CONTAINER_NAME" | jq -r '.[0].Config.Entrypoint[] + " " + .[0].Config.Cmd[]' | grep -oE '[^ ]+$' | grep -vE '^--|^/')
+  log "INFO" "当前 Watchtower 监控的容器: ${current_containers[*]}"
+
+  local all_containers
+  mapfile -t all_containers < <(docker ps -a --format "{{.Names}}")
+  if [ ${#all_containers[@]} -eq 0 ]; then
+    log "WARN" "没有找到任何容器，无法添加"
+    return
+  fi
+
+  local available_containers=()
+  for container in "${all_containers[@]}"; do
+    if ! [[ " ${current_containers[*]} " =~ " $container " ]]; then
+      available_containers+=("$container")
+    fi
+  done
+
+  if [ ${#available_containers[@]} -eq 0 ]; then
+    log "WARN" "没有可添加的新容器（所有容器已在监控列表中）"
+    return
+  fi
+
+  echo "请选择要添加的容器（多个用空格分隔）："
+  for i in "${!available_containers[@]}"; do
+    echo "$((i + 1)). ${available_containers[$i]}"
+  done
+
+  read -p "请输入容器编号（例如: 1 2 3）: " user_input
+  local selected_indices=($user_input)
+  local selected_containers=()
+  for index in "${selected_indices[@]}"; do
+    if [[ $index =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le ${#available_containers[@]} ]; then
+      selected_containers+=("${available_containers[$((index - 1))]}")
+    else
+      log "WARN" "无效的选择: $index"
+    fi
+  done
+
+  if [ ${#selected_containers[@]} -eq 0 ]; then
+    log "WARN" "没有有效的容器选择，取消添加"
+    return
+  fi
+
+  local updated_containers=("${current_containers[@]}" "${selected_containers[@]}")
+  log "INFO" "更新后的 Watchtower 监控容器: ${updated_containers[*]}"
+
+  local slack_webhook=""
+  if docker inspect "$WATCHTOWER_CONTAINER_NAME" | grep -q "notification-slack-webhook-url"; then
+    slack_webhook=$(docker inspect "$WATCHTOWER_CONTAINER_NAME" | jq -r '.[0].Config.Cmd[] | select(contains("notification-slack-webhook-url"))' | grep -oE 'https://hooks.slack.com/services/[^ ]+')
+  fi
+
+  docker rm -f "$WATCHTOWER_CONTAINER_NAME" >/dev/null 2>&1
+
+  local watchtower_cmd=(
+    docker run -d
+    --name "$WATCHTOWER_CONTAINER_NAME"
+    --restart=always
+    -v /var/run/docker.sock:/var/run/docker.sock
+    "$WATCHTOWER_IMAGE_NAME"
+    --cleanup
+    --schedule "0 */10 * * * *"
+    --include-stopped
+  )
+  if [[ -n "$slack_webhook" ]]; then
+    watchtower_cmd+=(
+      --notifications slack
+      --notification-slack-identifier "watchtower-server"
+      --notification-slack-webhook-url "$slack_webhook"
+    )
+  fi
+  watchtower_cmd+=("${updated_containers[@]}")
+
+  "${watchtower_cmd[@]}" || {
+    log "ERROR" "Watchtower 更新失败"
+    exit 1
+  }
+
+  log "INFO" "Watchtower 已更新，新监控容器：${selected_containers[*]}，总监控容器：${updated_containers[*]}"
+
+  log "INFO" "正在运行一次性检查以验证 Watchtower..."
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$WATCHTOWER_IMAGE_NAME" --run-once "${updated_containers[@]}" || {
     log "WARN" "Watchtower 一次性检查失败，请检查日志"
   }
   log "INFO" "请查看 Watchtower 日志以确认更新状态：docker logs $WATCHTOWER_CONTAINER_NAME"
@@ -286,19 +370,19 @@ install_watchtower() {
 # 获取 Sub-Store 版本列表
 get_substore_versions() {
   log "INFO" "正在获取 Sub-Store 版本列表..."
-  local versions=($(curl -s "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r))
-  echo "latest" "${versions[@]}"  # 将 latest 添加到版本列表
+  local versions
+  versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r)
+  if [[ -z "$versions" ]]; then
+    log "ERROR" "无法获取 Sub-Store 版本列表"
+    exit 1
+  fi
+  echo "latest $versions"
 }
 
 # 提示用户选择版本
 prompt_for_version() {
   local versions=($(get_substore_versions))
   local num_versions=${#versions[@]}
-
-  if [ $num_versions -eq 0 ]; then
-    log "ERROR" "无法获取 Sub-Store 版本列表"
-    exit 1
-  fi
 
   echo "请选择 Sub-Store 版本（推荐使用 latest 以确保自动更新）："
   for i in "${!versions[@]}"; do
@@ -307,7 +391,7 @@ prompt_for_version() {
 
   while true; do
     read -p "请输入版本编号: " version_choice
-    if [[ $version_choice =~ ^[0-9]+$ ]] && [ $version_choice -ge 1 ] && [ $version_choice -le $num_versions ]; then
+    if [[ $version_choice =~ ^[0-9]+$ ]] && [ "$version_choice" -ge 1 ] && [ "$version_choice" -le "$num_versions" ]; then
       SUB_STORE_VERSION=${versions[$((version_choice - 1))]}
       break
     else
@@ -320,10 +404,9 @@ prompt_for_version() {
 
 # 初始化示例脚本
 initialize_example_scripts() {
-  echo "是否需要初始化示例脚本目录? (y/n) [默认: y]: "
-  read init_scripts
+  read -p "是否需要初始化示例脚本目录？(y/n) [默认: y]: " init_scripts
   init_scripts=${init_scripts:-y}
-  if [[ "$init_scripts" == "y" || "$init_scripts" == "Y" ]]; then
+  if [[ "$init_scripts" =~ ^[yY]$ ]]; then
     cat <<'EOF' > "$SCRIPTS_DIR/ip风险度.js"
 async function operator(proxies, targetPlatform, context) {
     const $ = $substore;
@@ -389,17 +472,17 @@ async function operator(proxies, targetPlatform, context) {
                         .map(line => line.trim())
                         .filter(line => line && !line.startsWith('#'));
                 }
-                return;
+                return [];
             } catch (error) {
                 retries++;
                 $.error(`获取 IP 列表失败 (尝试 ${retries}/${CONFIG.RETRIES}): ${api}, ${error}`);
                 if (retries === CONFIG.RETRIES) {
-                    return;
+                    return [];
                 }
                 await $.wait(CONFIG.RETRY_DELAY * retries);
             }
         }
-        return;
+        return [];
     }
 
     try {
@@ -468,17 +551,7 @@ async function operator(proxies, targetPlatform, context) {
     }
 
     function isIPInCIDR(ip, cidr) {
-        const [range, bits = 32] = cid-Latex 替换为：
-```latex
-\documentclass{article}
-\usepackage{CJKutf8}
-\begin{document}
-\begin{CJK}{UTF8}{gbsn}
-中文内容
-\end{CJK}
-\end{document}
-```
-cidr.split('/');
+        const [range, bits = 32] = cidr.split('/');
         const mask = ~((1 << (32 - bits)) - 1);
         const ipNum = ip.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
         const rangeNum = range.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0);
@@ -495,8 +568,8 @@ EOF
 install_substore() {
   prompt_for_version
 
-  log "INFO" "正在拉取镜像 xream/sub-store:$SUB_STORE_VERSION..."
-  docker pull "xream/sub-store:$SUB_STORE_VERSION" || {
+  log "INFO" "正在拉取镜像 $SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION..."
+  docker pull "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" || {
     log "ERROR" "拉取 Sub-Store 镜像失败"
     exit 1
   }
@@ -515,38 +588,29 @@ install_substore() {
   prompt_for_path
 
   log "INFO" "正在启动容器，网络模式: $NETWORK_MODE"
-  if [[ "$NETWORK_MODE" == "host" ]]; then
-    docker run -d \
-      --network host \
-      --name $CONTAINER_NAME \
-      --restart=always \
-      -v "${DATA_DIR}:/opt/app/data" \
-      -v "${SCRIPTS_DIR}:/opt/app/scripts" \
-      -e TZ=${TIMEZONE} \
-      -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
-      "xream/sub-store:$SUB_STORE_VERSION" || {
-        log "ERROR" "容器启动失败"
-        exit 1
-      }
-  else
-    log "INFO" "提示用户自定义端口..."
-    HOST_PORT_1=$(prompt_for_port "请输入前端端口 (Web UI)" $DEFAULT_FRONTEND_PORT)
-    HOST_PORT_2=$(prompt_for_port "请输入后端端口" $DEFAULT_BACKEND_PORT)
+  local docker_cmd=(
+    docker run -d
+    --name "$CONTAINER_NAME"
+    --restart=always
+    -v "${DATA_DIR}:/opt/app/data"
+    -v "${SCRIPTS_DIR}:/opt/app/scripts"
+    -e TZ="$TIMEZONE"
+    -e SUB_STORE_FRONTEND_BACKEND_PATH="$SUB_STORE_FRONTEND_BACKEND_PATH"
+    "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION"
+  )
 
-    docker run -d \
-      --name $CONTAINER_NAME \
-      --restart=always \
-      -p $HOST_PORT_1:3000 \
-      -p $HOST_PORT_2:3001 \
-      -v "${DATA_DIR}:/opt/app/data" \
-      -v "${SCRIPTS_DIR}:/opt/app/scripts" \
-      -e TZ=${TIMEZONE} \
-      -e SUB_STORE_FRONTEND_BACKEND_PATH=${SUB_STORE_FRONTEND_BACKEND_PATH} \
-      "xream/sub-store:$SUB_STORE_VERSION" || {
-        log "ERROR" "容器启动失败"
-        exit 1
-      }
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+    docker_cmd+=(--network host)
+  else
+    HOST_PORT_1=$(prompt_for_port "请输入前端端口 (Web UI)" "$DEFAULT_FRONTEND_PORT")
+    HOST_PORT_2=$(prompt_for_port "请输入后端端口" "$DEFAULT_BACKEND_PORT")
+    docker_cmd+=(-p "$HOST_PORT_1:3000" -p "$HOST_PORT_2:3001")
   fi
+
+  "${docker_cmd[@]}" || {
+    log "ERROR" "容器启动失败"
+    exit 1
+  }
 
   log "INFO" "Sub-Store 容器启动成功"
 }
@@ -564,22 +628,24 @@ uninstall_container() {
 
   if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
     log "INFO" "正在卸载容器 $container_name..."
-    docker stop $container_name
-    docker rm $container_name
+    docker stop "$container_name" >/dev/null
+    docker rm "$container_name" >/dev/null
     log "INFO" "容器 $container_name 已停止并移除"
 
     read -p "是否删除镜像 $image_name? (y/n) [默认: n]: " remove_image
     remove_image=${remove_image:-n}
-    if [[ "$remove_image" == "y" || "$remove_image" == "Y" ]]; then
-      docker rmi $image_name
+    if [[ "$remove_image" =~ ^[yY]$ ]]; then
+      docker rmi "$image_name" >/dev/null 2>&1
       log "INFO" "镜像 $image_name 已删除"
     fi
 
-    read -p "是否清理相关数据卷 $DATA_DIR? (y/n) [默认: n]: " remove_volume
-    remove_volume=${remove_volume:-n}
-    if [[ "$remove_volume" == "y" || "$remove_volume" == "Y" ]] && [ "$container_name" == "$CONTAINER_NAME" ]; then
-      rm -rf "$DATA_DIR"
-      log "INFO" "数据卷 $DATA_DIR 已清理"
+    if [[ "$container_name" == "$CONTAINER_NAME" ]]; then
+      read -p "是否清理相关数据卷 $DATA_DIR? (y/n) [默认: n]: " remove_volume
+      remove_volume=${remove_volume:-n}
+      if [[ "$remove_volume" =~ ^[yY]$ ]]; then
+        rm -rf "$DATA_DIR"
+        log "INFO" "数据卷 $DATA_DIR 已清理"
+      fi
     fi
   else
     log "WARN" "容器 $container_name 未运行，跳过卸载"
@@ -588,29 +654,36 @@ uninstall_container() {
 
 # 数据备份
 backup_data() {
-  if [ -d "$DATA_DIR" ]; then
+  if [[ -d "$DATA_DIR" && -n "$(ls -A "$DATA_DIR")" ]]; then
     log "INFO" "正在备份数据..."
-    TIMESTAMP=$(date +%Y%m%d%H%M%S)
-    BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
+    local timestamp=$(date +%Y%m%d%H%M%S)
+    local backup_file="$BACKUP_DIR/backup_$timestamp.tar.gz"
     mkdir -p "$BACKUP_DIR"
-    tar -czf "$BACKUP_FILE" -C "$DATA_DIR" .
-    log "INFO" "数据已备份到: $BACKUP_FILE"
+    tar -czf "$backup_file" -C "$DATA_DIR" . || {
+      log "ERROR" "备份失败"
+      exit 1
+    }
+    log "INFO" "数据已备份到: $backup_file"
   else
-    log "WARN" "未找到数据目录，跳过备份"
+    log "WARN" "数据目录为空或不存在，跳过备份"
   fi
 }
 
 # 数据恢复
 restore_data() {
-  local latest_backup=$(ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null | head -n 1)
-  if [ -z "$latest_backup" ]; then
+  local latest_backup
+  latest_backup=$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n 1)
+  if [[ -z "$latest_backup" ]]; then
     log "WARN" "未找到备份文件，跳过恢复"
     return
   fi
 
   log "INFO" "正在恢复数据..."
   mkdir -p "$DATA_DIR"
-  tar -xzf "$latest_backup" -C "$DATA_DIR"
+  tar -xzf "$latest_backup" -C "$DATA_DIR" || {
+    log "ERROR" "数据恢复失败"
+    exit 1
+  }
   log "INFO" "数据已从 $latest_backup 恢复"
 }
 
@@ -620,11 +693,12 @@ interactive_menu() {
     echo -e "\n选择操作："
     echo "1. 部署 Sub-Store"
     echo "2. 部署 Watchtower（自动更新容器）"
-    echo "3. 查看所有容器状态"
-    echo "4. 卸载容器（Sub-Store 或 Watchtower）"
-    echo "5. 数据备份"
-    echo "6. 数据恢复"
-    echo "7. 退出"
+    echo "3. 添加容器到 Watchtower 监控列表"
+    echo "4. 查看所有容器状态"
+    echo "5. 卸载容器（Sub-Store 或 Watchtower）"
+    echo "6. 数据备份"
+    echo "7. 数据恢复"
+    echo "8. 退出"
     read -p "请输入选项编号: " choice
 
     case $choice in
@@ -634,21 +708,22 @@ interactive_menu() {
         install_substore
         ;;
       2) install_watchtower ;;
-      3) check_all_containers_status ;;
-      4)
+      3) add_watchtower_containers ;;
+      4) check_all_containers_status ;;
+      5)
         echo -e "选择卸载的容器："
         echo "1. Sub-Store"
         echo "2. Watchtower"
         read -p "请输入选项编号: " uninstall_choice
         case $uninstall_choice in
-          1) uninstall_container $CONTAINER_NAME "xream/sub-store:$SUB_STORE_VERSION" ;;
-          2) uninstall_container $WATCHTOWER_CONTAINER_NAME $WATCHTOWER_IMAGE_NAME ;;
+          1) uninstall_container "$CONTAINER_NAME" "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" ;;
+          2) uninstall_container "$WATCHTOWER_CONTAINER_NAME" "$WATCHTOWER_IMAGE_NAME" ;;
           *) log "WARN" "无效输入，返回主菜单" ;;
         esac
         ;;
-      5) backup_data ;;
-      6) restore_data ;;
-      7)
+      6) backup_data ;;
+      7) restore_data ;;
+      8)
         log "INFO" "退出脚本"
         exit 0
         ;;
