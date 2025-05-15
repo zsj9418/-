@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# 预定义变量，确保不会未绑定
+: "${MIHOMO_CONFIG_DIR:=/etc/mihomo}"
+: "${MIHOMO_CONTAINER_NAME:=docker-mihomo}"
+: "${CONTAINER_NAME:=docker-mihomo}"
+: "${MACVLAN_NET_NAME:=macvlan-net}"
+: "${SHARED_MACVLAN_NET_NAME:=macvlan-net}"
+: "${SHARED_SUBNET:=}"
+: "${SHARED_GATEWAY:=}"
+: "${SHARED_PARENT_INTERFACE:=}"
+
 # 脚本版本和元数据
 SCRIPT_VERSION="1.2.0"
 SCRIPT_NAME="Sing-box 和 Mihomo Docker 安装器"
@@ -1025,7 +1035,7 @@ install_singbox() {
         if ! detect_lan_subnet_gateway; then
             echo -e "${RED}自动检测局域网信息失败，请手动配置网络参数${NC}"
             read -p "请输入局域网段(例如: 192.168.3.0/24): " SUBNET
-            read -p "请输入网关地址(例如: 192.168.3.18): " GATEWAY
+            read -p "请输入网关地址(例如: 192.168.3.1): " GATEWAY
             read -p "请输入父接口(例如: eth0): " PARENT_INTERFACE
         else
             SUBNET="$DETECTED_SUBNET"
@@ -1060,8 +1070,8 @@ install_singbox() {
         export SHARED_PARENT_INTERFACE="$PARENT_INTERFACE"
     fi
 
-    read -p "请输入 Sing-box 容器静态 IP 地址(例如: 192.168.3.181，确保在 ${SUBNET} 网段内且未被占用): " MACVLAN_IP
-    MACVLAN_IP=${MACVLAN_IP:-192.168.3.181}
+    read -p "请输入 Sing-box 容器静态 IP 地址(例如: 192.168.3.2，确保在 ${SUBNET} 网段内且未被占用): " MACVLAN_IP
+    MACVLAN_IP=${MACVLAN_IP:-192.168.3.2}
     if ! validate_ip_in_subnet "$MACVLAN_IP" "$SUBNET"; then
         exit 1
     fi
@@ -1116,6 +1126,10 @@ install_singbox() {
 install_mihomo() {
     check_root
     trap 'echo -e "${RED}安装中断，正在清理...${NC}"; cleanup; exit 1' INT
+    MIHOMO_CONFIG_DIR="${MIHOMO_CONFIG_DIR:-/etc/mihomo}"
+    CONTAINER_NAME="${CONTAINER_NAME:-docker-mihomo}"
+    MACVLAN_NET_NAME="${MACVLAN_NET_NAME:-macvlan-net}"
+    SHARED_MACVLAN_NET_NAME="${SHARED_MACVLAN_NET_NAME:-macvlan-net}"
     check_ipv6_support
     check_system_requirements
 
