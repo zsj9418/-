@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # 预定义变量，确保不会未绑定
+: "${CONFIG_DIR:=/etc/sing-box}"
+: "${SINGBOX_PORTS:=()}"
 : "${MIHOMO_CONFIG_DIR:=/etc/mihomo}"
 : "${MIHOMO_CONTAINER_NAME:=docker-mihomo}"
 : "${CONTAINER_NAME:=docker-mihomo}"
@@ -958,6 +960,8 @@ upload_config() {
 install_singbox() {
     check_root
     trap 'echo -e "${RED}安装中断，正在清理...${NC}"; cleanup; exit 1' INT
+    SINGBOX_CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
+    SINGBOX_PORTS=("${SINGBOX_PORTS[@]:-}")
     check_ipv6_support
     check_system_requirements
 
@@ -1319,6 +1323,7 @@ view_config() {
 update_config() {
     local project=$1
     if [[ "$project" == "sing-box" ]]; then
+        CONFIG_DIR="${CONFIG_DIR:-/etc/sing-box}"
         read -p "请输入新的 Sing-box 订阅 URL: " CONFIG_URL
         validate_url "$CONFIG_URL"
         validate_url_security "$CONFIG_URL" || exit 1
