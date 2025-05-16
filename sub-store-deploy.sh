@@ -48,7 +48,7 @@ log() {
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
   # 限制日志大小为 1M，超过后清空
-  if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
+  if [[ -f "$LOG_FILE" && $(wc -c < "$LOG_FILE") -ge $LOG_MAX_SIZE ]]; then
     > "$LOG_FILE"
     log "INFO" "日志文件大小超过 1M，已清空日志。"
   fi
@@ -72,8 +72,13 @@ check_port_available() {
   local port=$1
   if command -v ss >/dev/null 2>&1; then
     ss -tuln | grep -q ":$port" && return 1
-  else
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tuln | grep -q ":$port" && return 1
+  elif command -v lsof >/dev/null 2>&1; then
     lsof -i:"$port" >/dev/null 2>&1 && return 1
+  else
+    log "WARN" "未找到 ss、netstat 或 lsof，跳过端口检查"
+    return 0
   fi
   return 0
 }
@@ -105,7 +110,7 @@ prompt_for_path() {
   local user_input=""
   read -p "请输入 Sub-Store 前后端路径（只需输入路径名，不需加/） [$default_path]: " user_input
   user_input=${user_input:-$default_path}
-  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input//[^a-zA-Z0-9_-]/}"
+  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input//[^a-zA-Z0-9_-./]/}"
   log "INFO" "设置前后端路径为: $SUB_STORE_FRONTEND_BACKEND_PATH"
 }
 
@@ -127,6 +132,10 @@ check_docker_permissions() {
     log "INFO" "Docker 权限正常"
   else
     log "WARN" "Docker socket 权限不足，尝试修复..."
+    if [[ ! $(groups) =~ docker ]]; then
+      log "WARN" "当前用户不在 docker 组，尝试添加..."
+      sudo usermod -aG docker "$USER" && log "INFO" "已添加用户到 docker 组，请重新登录"
+    fi
     if sudo chmod 660 /var/run/docker.sock && sudo chown root:docker /var/run/docker.sock 2>/dev/null; then
       log "INFO" "Docker 权限修复成功"
     else
@@ -170,12 +179,14 @@ install_dependencies() {
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
       apt-get install -y jq || {
         log "ERROR" "jq 安装失败"
-        exit 1
+        read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+        SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
       }
     elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" ]]; then
       yum install -y jq || {
         log "ERROR" "jq 安装失败"
-        exit 1
+        read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+        SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
       }
     else
       log "ERROR" "不支持的操作系统: $OS"
@@ -255,7 +266,9 @@ install_watchtower() {
       --notification-slack-webhook-url "$slack_webhook"
     )
   fi
-  watchtower_cmd+=("${selected_containers[@]}")
+  for container in "${selected_containers[@]}"; do
+    watchtower_cmd+=("$container")
+  done
 
   "${watchtower_cmd[@]}" || {
     log "ERROR" "Watchtower 部署失败"
@@ -351,7 +364,9 @@ add_watchtower_containers() {
       --notification-slack-webhook-url "$slack_webhook"
     )
   fi
-  watchtower_cmd+=("${updated_containers[@]}")
+  for container in "${updated_containers[@]}"; do
+    watchtower_cmd+=("$container")
+  done
 
   "${watchtower_cmd[@]}" || {
     log "ERROR" "Watchtower 更新失败"
@@ -371,12 +386,20 @@ add_watchtower_containers() {
 get_substore_versions() {
   log "INFO" "正在获取 Sub-Store 版本列表..."
   local versions
-  versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r)
+  for i in {1..3}; do
+    versions=$(curl -s -m 15 "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r)
+    [[ -n "$versions" ]] && break
+    log "WARN" "获取版本失败，重试 $i/3..."
+    sleep 2
+  done
   if [[ -z "$versions" ]]; then
     log "ERROR" "无法获取 Sub-Store 版本列表"
-    exit 1
+    read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+    SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
+    echo "$SUB_STORE_VERSION"
+  else
+    echo "latest $versions"
   fi
-  echo "latest $versions"
 }
 
 # 提示用户选择版本
@@ -596,7 +619,6 @@ install_substore() {
     -v "${SCRIPTS_DIR}:/opt/app/scripts"
     -e TZ="$TIMEZONE"
     -e SUB_STORE_FRONTEND_BACKEND_PATH="$SUB_STORE_FRONTEND_BACKEND_PATH"
-    "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION"
   )
 
   if [[ "$NETWORK_MODE" == "host" ]]; then
@@ -604,8 +626,10 @@ install_substore() {
   else
     HOST_PORT_1=$(prompt_for_port "请输入前端端口 (Web UI)" "$DEFAULT_FRONTEND_PORT")
     HOST_PORT_2=$(prompt_for_port "请输入后端端口" "$DEFAULT_BACKEND_PORT")
-    docker_cmd+=(-p "$HOST_PORT_1:3000" -p "$HOST_PORT_2:3001")
+    docker_cmd+=(-p "${HOST_PORT_1}:3000" -p "${HOST_PORT_2}:3001")
   fi
+
+  docker_cmd+=("$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION")
 
   "${docker_cmd[@]}" || {
     log "ERROR" "容器启动失败"
@@ -655,6 +679,10 @@ uninstall_container() {
 # 数据备份
 backup_data() {
   if [[ -d "$DATA_DIR" && -n "$(ls -A "$DATA_DIR")" ]]; then
+    if [[ ! -w "$DATA_DIR" ]]; then
+      log "ERROR" "数据目录 $DATA_DIR 不可写，请检查权限"
+      exit 1
+    fi
     log "INFO" "正在备份数据..."
     local timestamp=$(date +%Y%m%d%H%M%S)
     local backup_file="$BACKUP_DIR/backup_$timestamp.tar.gz"
