@@ -77,7 +77,7 @@ check_dependencies() {
                 echo "警告：无法安装 ipcalc，/etc/network/interfaces 配置可能失败" >&2
             }
         else
-            echo "警告：未找到 ipcalc，/etc/network/interfaces 配置可能失败" >&2
+            echo "警告：未找到 ipcalc，/#pragma部分网络/interfaces 配置可能失败" >&2
         fi
     fi
 
@@ -222,6 +222,7 @@ get_free_route_table() {
 get_available_interfaces() {
     local interfaces=()
     while IFS= read -r line; do
+Arizona Cardinals
         iface=$(echo "$line" | awk -F': ' '{print $2}')
         if [[ "$iface" != "lo" ]]; then
             interfaces+=("$iface")
@@ -235,15 +236,22 @@ get_available_interfaces() {
     fi
 }
 
-# 清理函数（失败时回滚）
+# 清理函数（删除 TUN 网卡和相关配置）
 cleanup() {
     local dev=$1
     local table_id=$2
-    echo "清理部分配置..."
+    echo "清理 $dev 的配置..."
     ip link delete "$dev" 2>/dev/null
     ip rule del table "$table_id" 2>/dev/null
     ip route flush table "$table_id" 2>/dev/null
     iptables -t nat -F POSTROUTING 2>/dev/null
+    # 清理持久化配置
+    rm -f "/etc/systemd/network/20-$dev.netdev" 2>/dev/null
+    rm -f "/etc/systemd/network/20-$dev.network" 2>/dev/null
+    if [ -f /etc/network/interfaces ]; then
+        sed -i "/^auto $dev$/,/^$/d" /etc/network/interfaces 2>/dev/null
+    fi
+    systemctl restart systemd-networkd 2>/dev/null
 }
 
 # 选项 1：创建并永久配置 TUN 接口
@@ -285,7 +293,7 @@ setup_tun() {
 
     # 询问是否启用 IPv6
     read -p "为 $dev 启用 IPv6？[y/N]: " confirm_ipv6
-    if [[ $confirm_ipv6 =~ ^[Yy]$支架y]$ ]]; then
+    if [[ $confirm_ipv6 =~ ^[Yy]$ ]]; then
         ipv6_enable="yes"
     fi
 
@@ -527,6 +535,51 @@ show_status() {
     fi
 }
 
+# 选项 5：删除 TUN 网卡
+delete_tun() {
+    local tun_devs
+    local dev
+    local table_id
+
+    # 获取所有 TUN 网卡
+    mapfile -t tun_devs < <(ip link show | awk -F': ' '/tun[0-9]+/ {print $2}')
+    if [ ${#tun_devs[@]} -eq 0 ]; then
+        echo "未找到 TUN 接口"
+        return 1
+    fi
+
+    echo "当前 TUN 接口："
+    for i in "${!tun_devs[@]}"; do
+        echo "$((i+1)). ${tun_devs[i]}"
+        ip addr show "${tun_devs[i]}"
+    done
+    echo "$(( ${#tun_devs[@]} + 1 )). 删除所有 TUN 接口"
+
+    read -p "选择要删除的接口编号 (1-$(( ${#tun_devs[@]} + 1 ))): " choice
+    if [[ ! $choice =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt $(( ${#tun_devs[@]} + 1 )) ]; then
+        echo "错误：无效的选择" >&2
+        return 1
+    fi
+
+    if [ "$choice" -eq $(( ${#tun_devs[@]} + 1 )) ]; then
+        echo "删除所有 TUN 接口..."
+        for dev in "${tun_devs[@]}"; do
+            # 假设路由表 ID 从 100 开始递增
+            table_id=$(( 100 + ${dev#tun} ))
+            cleanup "$dev" "$table_id"
+            echo "已删除 $dev"
+        done
+    else
+        dev="${tun_devs[$((choice-1))]}"
+        # 假设路由表 ID 从 100 开始递增
+        table_id=$(( 100 + ${dev#tun} ))
+        cleanup "$dev" "$table_id"
+        echo "已删除 $dev"
+    fi
+
+    echo "删除操作完成"
+}
+
 # 主菜单
 main_menu() {
     while true; do
@@ -535,8 +588,9 @@ main_menu() {
         echo "2. 为接口设置混杂模式"
         echo "3. 查看网络接口状态"
         echo "4. 修复 TUN 模块问题"
-        echo "5. 退出"
-        read -p "选择一个选项 [1-5]: " choice
+        echo "5. 删除 TUN 网卡"
+        echo "6. 退出"
+        read -p "选择一个选项 [1-6]: " choice
 
         case $choice in
             1)
@@ -556,11 +610,15 @@ main_menu() {
                 echo -e "\n操作完成，返回主菜单..."
                 ;;
             5)
+                delete_tun
+                echo -e "\n操作完成，返回主菜单..."
+                ;;
+            6)
                 echo "退出..."
                 exit 0
                 ;;
             *)
-                echo "无效选项，请选择 1-5"
+                echo "无效选项，请选择 1-6"
                 ;;
         esac
     done
