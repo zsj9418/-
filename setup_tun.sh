@@ -1,212 +1,268 @@
 #!/bin/bash
 
-# 脚本名称
-SCRIPT_NAME="setup_tun.sh"
+# 默认 TUN 设备名称
+DEFAULT_TUN_DEV="tun0"
 
-# 默认配置
-DEFAULT_TUN_INTERFACE="tun0"
-DEFAULT_TUN_IP="10.0.0.1/24"
-LOG_FILE="/var/log/setup_tun.log"
-
-# 检测所需的命令
-REQUIRED_COMMANDS=("ip" "modprobe" "systemctl")
-
-# 检查并安装缺失的依赖
-install_dependencies() {
-    echo -e "\033[33m正在检查并安装缺失的依赖...\033[0m"
-    
-    # 检测操作系统
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME=$NAME
-        OS_VERSION=$VERSION_ID
-    else
-        echo -e "\033[31m错误: 无法检测操作系统。\033[0m"
-        exit 1
-    fi
-
-    # 根据不同的操作系统安装依赖
-    for cmd in "${REQUIRED_COMMANDS[@]}"; do
-        if ! command -v $cmd &> /dev/null; then
-            case $OS_NAME in
-                *Ubuntu*|*Debian*)
-                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
-                    sudo apt update && sudo apt install -y iproute2
-                    ;;
-                *CentOS*|*RHEL*)
-                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
-                    sudo yum install -y iproute
-                    ;;
-                *macOS*)
-                    echo -e "\033[33m未找到命令 $cmd，正在安装...\033[0m"
-                    brew install iproute2mac
-                    ;;
-                *)
-                    echo -e "\033[31m错误: 不支持的操作系统 $OS_NAME。\033[0m"
-                    exit 1
-                    ;;
-            esac
-        fi
-    done
-}
-
-# 检查 TUN/TAP 支持
-check_tun_support() {
-    if [ ! -c /dev/net/tun ]; then
-        echo -e "\033[31m错误: 设备不支持 TUN/TAP 功能，/dev/net/tun 不存在。\033[0m"
+# 检查是否以 root 权限运行
+check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        echo "Error: This script must be run as root" >&2
         exit 1
     fi
 }
 
-# 函数：记录日志
-log_message() {
-    # 限制日志文件大小为 1MB
-    if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -ge 1048576 ]; then
-        echo "" > $LOG_FILE  # 清空日志文件
-    fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
-}
-
-# 检查现有的 TUN 接口
-check_existing_tun_interfaces() {
-    echo -e "\033[33m当前设备上已开启的 TUN 接口:\033[0m"
-    existing_interfaces=$(ip a | grep "tun" | awk '{print $2}' | sed 's/://')
-    
-    if [ -z "$existing_interfaces" ]; then
-        echo -e "\033[32m没有发现已开启的 TUN 接口。\033[0m"
-    else
-        echo -e "\033[31m已开启的 TUN 接口: $existing_interfaces\033[0m"
-        echo -e "\033[31m请注意，这些接口可能会与您即将创建的接口冲突。\033[0m"
-    fi
-}
-
-# 配置防火墙规则
-configure_firewall() {
-    echo -e "\033[33m正在配置防火墙以允许 TUN 接口流量...\033[0m"
-    
-    # 检测操作系统
-    if [[ "$OS_NAME" == *"Ubuntu"* || "$OS_NAME" == *"Debian"* ]]; then
-        # 使用 UFW
-        sudo ufw allow in on $TUN_INTERFACE
-        sudo ufw allow out on $TUN_INTERFACE
-    elif [[ "$OS_NAME" == *"CentOS"* || "$OS_NAME" == *"RHEL"* ]]; then
-        # 使用 firewalld
-        sudo firewall-cmd --zone=public --add-interface=$TUN_INTERFACE --permanent
-        sudo firewall-cmd --reload
-    else
-        echo -e "\033[31m警告: 防火墙配置未处理，手动配置可能是必要的。\033[0m"
-    fi
-}
-
-# 主程序
-main() {
-    install_dependencies    # 检查并安装缺失的依赖
-    check_tun_support       # 检查 TUN/TAP 支持
-    check_existing_tun_interfaces
-
-    # 提示用户决定是否继续
-    read -p "您希望继续创建 TUN 接口 $DEFAULT_TUN_INTERFACE 吗？(y/n): " user_choice
-    if [[ "$user_choice" != "y" && "$user_choice" != "Y" ]]; then
-        echo -e "\033[33m操作已取消。\033[0m"
-        exit 0
-    fi
-
-    # 用户输入配置
-    read -p "请输入 TUN 接口名称 (默认: $DEFAULT_TUN_INTERFACE): " USER_TUN_INTERFACE
-    read -p "请输入 TUN IP 地址 (默认: $DEFAULT_TUN_IP): " USER_TUN_IP
-
-    # 设置变量
-    TUN_INTERFACE=${USER_TUN_INTERFACE:-$DEFAULT_TUN_INTERFACE}
-    TUN_IP=${USER_TUN_IP:-$DEFAULT_TUN_IP}
-
-    load_tun_module
-    check_and_remove_tun_interface
-    create_service
-    enable_service
-    configure_firewall  # 配置防火墙规则
-
-    # 检查TUN接口状态
-    if ip a show $TUN_INTERFACE &> /dev/null; then
-        log_message "TUN接口 $TUN_INTERFACE 已成功创建并启动。"
-    else
-        log_message "错误: TUN接口 $TUN_INTERFACE 创建失败。"
-        exit 1
-    fi
-}
-
-# 加载TUN模块
-load_tun_module() {
-    if ! lsmod | grep -q tun; then
-        if sudo modprobe tun; then
-            log_message "成功: 加载 TUN 模块。"
+# 检查依赖并自动修复
+check_dependencies() {
+    # 检查 iproute2
+    if ! command -v ip >/dev/null 2>&1; then
+        echo "ip command not found. Attempting to install iproute2..."
+        if command -v apt >/dev/null 2>&1; then
+            apt update && apt install -y iproute2 || {
+                echo "Error: Failed to install iproute2" >&2
+                exit 1
+            }
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y iproute2 || {
+                echo "Error: Failed to install iproute2" >&2
+                exit 1
+            }
+        elif command -v apk >/dev/null 2>&1; then
+            apk add iproute2 || {
+                echo "Error: Failed to install iproute2" >&2
+                exit 1
+            }
         else
-            log_message "错误: 加载 TUN 模块失败。"
+            echo "Error: iproute2 not found and no known package manager detected" >&2
             exit 1
         fi
+    fi
+
+    # 检查 tun 模块
+    if ! lsmod | grep -q tun; then
+        echo "Loading tun module..."
+        modprobe tun || {
+            echo "Error: Failed to load tun module. Ensure kernel supports TUN/TAP" >&2
+            exit 1
+        }
+    fi
+
+    # 检查 /dev/net/tun
+    if [ ! -c /dev/net/tun ]; then
+        echo "Creating /dev/net/tun device..."
+        mkdir -p /dev/net
+        mknod /dev/net/tun c 10 200 || {
+            echo "Error: Failed to create /dev/net/tun" >&2
+            exit 1
+        }
+        chmod 666 /dev/net/tun
+    fi
+
+    # 检查容器环境
+    if [ -f /proc/1/cgroup ] && grep -q 'docker\|lxc\|podman' /proc/1/cgroup; then
+        echo "Warning: Running in a container. Ensure --cap-add=NET_ADMIN and --device=/dev/net/tun are set."
+        read -p "Continue? [y/N]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && exit 1
+    fi
+}
+
+# 验证 IP 地址格式
+validate_ip() {
+    local ip=$1
+    if [[ ! $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        echo "Error: Invalid IP address format. Example: 192.168.1.1/24" >&2
+        return 1
+    fi
+    return 0
+}
+
+# 获取可用网卡列表
+get_available_interfaces() {
+    ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | grep -v '^lo$'
+}
+
+# 选项 1：创建并永久配置 TUN 接口
+setup_tun() {
+    local dev="$DEFAULT_TUN_DEV"
+    local ip_addr
+
+    echo "Setting up TUN interface ($dev)..."
+    # 检查是否已存在
+    if ip link show "$dev" >/dev/null 2>&1; then
+        echo "Warning: $dev already exists."
+        read -p "Delete and recreate $dev? [y/N]: " confirm
+        if [[ $confirm =~ ^[Yy]$ ]]; then
+            ip link delete "$dev" || {
+                echo "Error: Failed to delete $dev" >&2
+                return 1
+            }
+        else
+            echo "Operation aborted."
+            return 1
+        fi
+    fi
+
+    # 创建 TUN 接口
+    ip tuntap add mode tun dev "$dev" || {
+        echo "Error: Failed to create $dev interface" >&2
+        return 1
+    }
+    ip link set "$dev" up || {
+        echo "Error: Failed to activate $dev interface" >&2
+        return 1
+    }
+
+    # 获取 IP 地址
+    read -p "Enter IP address for $dev (e.g., 192.168.1.1/24): " ip_addr
+    if ! validate_ip "$ip_addr"; then
+        return 1
+    fi
+    ip addr add "$ip_addr" dev "$dev" || {
+        echo "Error: Failed to set IP address $ip_addr on $dev" >&2
+        return 1
+    }
+
+    # 自动检测持久化方式
+    echo "Configuring persistent TUN interface..."
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-networkd >/dev/null 2>&1; then
+        echo "Using systemd-networkd for persistence..."
+        cat > /etc/systemd/network/20-tun0.netdev <<EOF
+[NetDev]
+Name=$dev
+Kind=tun
+EOF
+        cat > /etc/systemd/network/20-tun0.network <<EOF
+[Match]
+Name=$dev
+
+[Network]
+Address=$ip_addr
+EOF
+        systemctl restart systemd-networkd || {
+            echo "Warning: Failed to restart systemd-networkd" >&2
+        }
+    elif [ -f /etc/network/interfaces ]; then
+        echo "Using /etc/network/interfaces for persistence..."
+        echo -e "\nauto $dev\niface $dev inet static\n    address ${ip_addr%%/*}\n    netmask $(ipcalc -m "$ip_addr" | cut -d= -f2)" >> /etc/network/interfaces
     else
-        log_message "警告: TUN 模块已加载。"
+        echo "Warning: No supported method for persistent configuration found."
+        read -p "Continue without persistent configuration? [y/N]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return 1
     fi
+
+    echo "TUN interface $dev created and configured successfully with IP $ip_addr"
+    ip addr show "$dev"
 }
 
-# 检查并删除现有的TUN接口
-check_and_remove_tun_interface() {
-    if ip a show $TUN_INTERFACE &> /dev/null; then
-        log_message "警告: TUN接口 $TUN_INTERFACE 已存在，正在删除..."
+# 选项 2：设置网卡混杂模式并永久生效
+setup_promisc() {
+    local dev
+    local interfaces
 
-        # 先将接口设置为关闭状态
-        sudo ip link set dev $TUN_INTERFACE down 2>/dev/null
-
-        # 尝试删除接口，支持重试机制
-        for attempt in {1..3}; do
-            if sudo ip tuntap del dev $TUN_INTERFACE; then
-                log_message "成功: 删除现有的 TUN 接口 $TUN_INTERFACE。"
-                return
-            else
-                log_message "错误: 删除 TUN 接口 $TUN_INTERFACE 失败，尝试 $attempt/3。"
-                sleep 1
-            fi
-        done
-        log_message "错误: 无法删除 TUN 接口 $TUN_INTERFACE，请手动检查。"
-        exit 1
+    # 获取可用网卡
+    mapfile -t interfaces < <(get_available_interfaces)
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        echo "Error: No network interfaces found" >&2
+        return 1
     fi
-}
 
-# 创建或更新TUN接口的服务文件
-create_service() {
-    SERVICE_FILE="/etc/systemd/system/tun.service"
+    # 显示网卡列表供用户选择
+    echo "Available network interfaces:"
+    for i in "${!interfaces[@]}"; do
+        echo "$((i+1)). ${interfaces[i]}"
+    done
+    read -p "Select interface number (1-${#interfaces[@]}): " choice
+    if [[ ! $choice =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#interfaces[@]} ]; then
+        echo "Error: Invalid selection" >&2
+        return 1
+    fi
+    dev="${interfaces[$((choice-1))]}"
 
-    echo -e "[Unit]
-Description=Setup TUN interface
+    echo "Setting $dev to promiscuous mode..."
+    ip link set "$dev" promisc on || {
+        echo "Error: Failed to set $dev to promiscuous mode" >&2
+        return 1
+    }
+
+    # 自动检测持久化方式
+    echo "Configuring persistent promiscuous mode..."
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "Using systemd service for persistence..."
+        cat > /etc/systemd/system/promisc-$dev.service <<EOF
+[Unit]
+Description=Set $dev to promiscuous mode
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/sbin/ip tuntap del dev $TUN_INTERFACE
-ExecStart=/sbin/ip tuntap add dev $TUN_INTERFACE mode tun
-ExecStart=/sbin/ip addr add $TUN_IP dev $TUN_INTERFACE
-ExecStart=/sbin/ip link set dev $TUN_INTERFACE up
+ExecStart=/sbin/ip link set $dev promisc on
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target" | sudo tee $SERVICE_FILE > /dev/null
-
-    log_message "成功: 创建或更新服务文件 $SERVICE_FILE。"
-}
-
-# 启用并启动服务
-enable_service() {
-    sudo systemctl daemon-reload
-    sudo systemctl enable tun.service
-    sudo systemctl start tun.service
-
-    if systemctl is-active --quiet tun.service; then
-        log_message "成功: TUN 服务已启用并启动。"
+WantedBy=multi-user.target
+EOF
+        systemctl enable promisc-$dev.service
+        systemctl start promisc-$dev.service || {
+            echo "Warning: Failed to start promisc-$dev.service" >&2
+        }
+    elif [ -f /etc/rc.local ]; then
+        echo "Using /etc/rc.local for persistence..."
+        sed -i '/exit 0/d' /etc/rc.local
+        echo "ip link set $dev promisc on" >> /etc/rc.local
+        echo "exit 0" >> /etc/rc.local
+        chmod +x /etc/rc.local
     else
-        log_message "错误: TUN 服务启动失败，请检查状态。"
-        systemctl status tun.service | tee -a $LOG_FILE
-        exit 1
+        echo "Warning: No supported method for persistent configuration found."
+        read -p "Continue without persistent configuration? [y/N]: " confirm
+        [[ ! $confirm =~ ^[Yy]$ ]] && return 1
     fi
+
+    echo "Interface $dev set to promiscuous mode successfully"
+    ip link show "$dev"
 }
 
-# 执行主程序
-main
+# 选项 3：查看接口状态
+show_status() {
+    echo "Listing all network interfaces:"
+    ip link show
+    echo -e "\nDetailed status for $DEFAULT_TUN_DEV (if exists):"
+    ip addr show "$DEFAULT_TUN_DEV" 2>/dev/null || echo "$DEFAULT_TUN_DEV does not exist"
+}
+
+# 主菜单
+main_menu() {
+    while true; do
+        echo -e "\n=== TUN Interface Configuration Menu ==="
+        echo "1. Setup persistent TUN interface"
+        echo "2. Set promiscuous mode for an interface"
+        echo "3. Show network interface status"
+        echo "4. Exit"
+        read -p "Select an option [1-4]: " choice
+
+        case $choice in
+            1)
+                setup_tun
+                echo -e "\nOperation completed. Returning to main menu..."
+                ;;
+            2)
+                setup_promisc
+                echo -e "\nOperation completed. Returning to main menu..."
+                ;;
+            3)
+                show_status
+                echo -e "\nOperation completed. Returning to main menu..."
+                ;;
+            4)
+                echo "Exiting..."
+                exit 0
+                ;;
+            *)
+                echo "Invalid option. Please select 1-4."
+                ;;
+        esac
+    done
+}
+
+# 主程序
+check_root
+check_dependencies
+main_menu
