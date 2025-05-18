@@ -77,7 +77,7 @@ check_dependencies() {
                 echo "警告：无法安装 ipcalc，/etc/network/interfaces 配置可能失败" >&2
             }
         else
-            echo "警告：未找到 ipcalc，/#pragma部分网络/interfaces 配置可能失败" >&2
+            echo "警告：未找到 ipcalc，/etc/network/interfaces 配置可能失败" >&2
         fi
     fi
 
@@ -222,7 +222,6 @@ get_free_route_table() {
 get_available_interfaces() {
     local interfaces=()
     while IFS= read -r line; do
-Arizona Cardinals
         iface=$(echo "$line" | awk -F': ' '{print $2}')
         if [[ "$iface" != "lo" ]]; then
             interfaces+=("$iface")
@@ -485,35 +484,62 @@ setup_promisc() {
     echo "配置持久化混杂模式..."
     if command -v systemctl >/dev/null 2>&1; then
         echo "使用 systemd 服务进行持久化..."
-        cat > "/etc/systemd/system/promisc-$dev.service" <<EOF
+        # 创建模板化的 systemd 服务
+        cat > "/etc/systemd/system/promisc@.service" <<EOF
 [Unit]
-Description=Set $dev to promiscuous mode
-After=network.target
+Description=Set %i to promiscuous mode
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/ip link set $dev promisc on
+ExecStart=/sbin/ip link set %i promisc on
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl enable "promisc-$dev.service"
-        systemctl start "promisc-$dev.service" || {
-            echo "警告：无法启动 promisc-$dev.service" >&2
+        systemctl daemon-reload
+        systemctl enable "promisc@$dev.service" || {
+            echo "错误：无法启用 promisc@$dev.service" >&2
+            return 1
         }
+        systemctl start "promisc@$dev.service" || {
+            echo "警告：无法启动 promisc@$dev.service" >&2
+        }
+    elif command -v nmcli >/dev/null 2>&1; then
+        echo "检测到 NetworkManager，尝试使用 nmcli 配置混杂模式..."
+        local conn_name
+        conn_name=$(nmcli -t -f NAME,DEVICE connection show | grep ":$dev$" | cut -d: -f1)
+        if [ -n "$conn_name" ]; then
+            nmcli connection modify "$conn_name" 802-3-ethernet.promiscuous true || {
+                echo "警告：无法通过 nmcli 设置混杂模式" >&2
+            }
+            systemctl restart NetworkManager || {
+                echo "警告：无法重启 NetworkManager" >&2
+            }
+        else
+            echo "警告：未找到 $dev 的 NetworkManager 连接" >&2
+        fi
     elif [ -f /etc/rc.local ]; then
         echo "使用 /etc/rc.local 进行持久化..."
         sed -i '/exit 0/d' /etc/rc.local
         echo "ip link set $dev promisc on" >> /etc/rc.local
         echo "exit 0" >> /etc/rc.local
         chmod +x /etc/rc.local
+        systemctl enable rc-local 2>/dev/null || {
+            echo "警告：无法启用 rc-local 服务，请确保系统支持 rc.local" >&2
+        }
     else
-        echo "警告：未找到支持的持久化方法"
-        read -p "是否继续而不进行持久化配置？[y/N]: " confirm
-        if [[ ! $confirm =~ ^[Yy]$ ]]; then
-            return 1
-        fi
+        echo "警告：未找到支持的持久化方法（systemd 或 rc.local）"
+        echo "尝试使用 crontab 进行持久化..."
+        echo "@reboot /sbin/ip link set $dev promisc on" | crontab - || {
+            echo "错误：无法配置 crontab 持久化" >&2
+            read -p "是否继续而不进行持久化配置？[y/N]: " confirm
+            if [[ ! $confirm =~ ^[Yy]$ ]]; then
+                return 1
+            fi
+        }
     fi
 
     echo "接口 $dev 已成功设置为混杂模式"
