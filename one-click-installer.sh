@@ -64,6 +64,7 @@ DEFAULT_OPTIONS=(
     "29. 硬盘测速"
     "30. 哪吒探针部署"
     "31. 在docker部署sing-box和mihomo"
+    "32. 安装裸核sing-box和mihomo"
     "98. 快捷键管理"
 )
 
@@ -100,6 +101,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["29"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/disk_speed_test.sh"
     ["30"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-nezha.sh"
     ["31"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_singbox_docker.sh"
+    ["32"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-sing-box%2Bmihomo.sh"
 )
 
 # 声明全局变量
