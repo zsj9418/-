@@ -63,7 +63,7 @@ DEFAULT_OPTIONS=(
     "28. casaos部署"
     "29. 硬盘测速"
     "30. 哪吒探针部署"
-    "31. 在docker部署sing-box"
+    "31. 在docker部署sing-box和mihomo"
     "98. 快捷键管理"
 )
 
