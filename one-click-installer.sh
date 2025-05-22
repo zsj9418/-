@@ -65,7 +65,7 @@ DEFAULT_OPTIONS=(
     "30. 哪吒探针部署"
     "31. 在docker部署sing-box和mihomo"
     "32. 安装裸核sing-box和mihomo"
-    "33. 安装docker版nnds-go"
+    "33. 安装docker版ddns-go"
     "98. 快捷键管理"
 )
 
