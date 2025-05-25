@@ -68,6 +68,7 @@ DEFAULT_OPTIONS=(
     "33. 安装docker版ddns-go"
     "34. 海纳思内置卸载"
     "35. 安装docker版lucky"
+    "36. dae(大鹅代理)配置"
     "98. 快捷键管理"
 )
 
@@ -108,6 +109,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["33"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker_ddns_go.sh"
     ["34"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/uninstall_histb.sh"
     ["35"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker_lucky.sh"
+    ["36"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup-dae.sh"
 )
 
 # 声明全局变量
