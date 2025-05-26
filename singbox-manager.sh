@@ -84,7 +84,7 @@ install_deps() {
     pkg_manager=""
     install_cmd=""
     update_cmd=""
-    pkgs="curl tar jq psmisc kmod-ipt-tproxy"
+    pkgs=""
     cron_pkg="cron"
     installed_pkgs=""
     failed_pkgs=""
@@ -93,23 +93,24 @@ install_deps() {
         pkg_manager="opkg"
         update_cmd="opkg update"
         install_cmd="opkg install"
+        pkgs="curl tar jq psmisc kmod-ipt-tproxy"
     elif command -v apt >/dev/null 2>&1; then
         pkg_manager="apt"
         update_cmd="apt update"
         install_cmd="apt install -y"
-        pkgs="curl tar iptables ipset jq psmisc cron fzf"
+        pkgs="curl tar iptables ipset jq psmisc cron"
     elif command -v yum >/dev/null 2>&1; then
         pkg_manager="yum"
         update_cmd=""
         install_cmd="yum install -y"
         cron_pkg="cronie"
-        pkgs="curl tar iptables ipset jq psmisc cronie fzf"
+        pkgs="curl tar iptables ipset jq psmisc cronie"
     elif command -v apk >/dev/null 2>&1; then
         pkg_manager="apk"
         update_cmd="apk update"
         install_cmd="apk add"
         cron_pkg="cronie"
-        pkgs="curl tar iptables ipset jq psmisc cronie fzf"
+        pkgs="curl tar iptables ipset jq psmisc cronie"
     else
         red "不支持的包管理器，请手动安装依赖"
         return 1
@@ -146,13 +147,6 @@ install_deps() {
             fi
         fi
     done
-    # 检查 fzf
-    if ! command -v fzf >/dev/null 2>&1; then
-        red "未检测到 fzf，请手动安装"
-        failed_pkgs="$failed_pkgs fzf"
-    else
-        installed_pkgs="$installed_pkgs fzf"
-    fi
     # 清理包列表
     installed_pkgs=$(echo "$installed_pkgs" | sed 's/^ //')
     failed_pkgs=$(echo "$failed_pkgs" | sed 's/^ //')
@@ -161,7 +155,11 @@ install_deps() {
         red "依赖安装失败：部分包未找到或无法安装"
         yellow "已安装的包：${installed_pkgs:-无}"
         yellow "未安装的包：${failed_pkgs:-无}"
-        yellow "请尝试运行 'opkg update' 或手动安装缺失包"
+        if [ "$pkg_manager" = "opkg" ]; then
+            yellow "请尝试运行 'opkg update' 或手动安装缺失包"
+        else
+            yellow "请尝试运行 '${update_cmd}' 或手动安装缺失包"
+        fi
         printf "是否继续安装 sing-box？(y/n): "
         read continue_install
         if [ "$continue_install" = "y" ] || [ "$continue_install" = "Y" ]; then
@@ -546,46 +544,45 @@ install_singbox() {
         releases_json_file="$TEMP_DIR/releases.json"
         echo "$releases_json" > "$releases_json_file"
         cleaned_json=$(tr -d '\000-\037' < "$releases_json_file")
-        stable_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' | sort -r -k3 | head -n 5 | awk '{print $1 " - " $2}')
-        prerelease_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' | sort -r -k3 | head -n 5 | awk '{print $1 " - " $2}')
-        version_list=$(printf "%s\n%s" "$stable_versions" "$prerelease_versions")
-        if [ -z "$version_list" ]; then
+        # 生成版本列表，存储纯版本号和显示用描述
+        version_list_file="$TEMP_DIR/version_list.txt"
+        stable_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' | sort -r -k3 | head -n 5)
+        prerelease_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' | sort -r -k3 | head -n 5)
+        printf "%s\n%s" "$stable_versions" "$prerelease_versions" | while IFS=$'\t' read -r tag_name type published_at; do
+            echo "$tag_name" >> "$version_list_file"
+        done
+        if [ ! -s "$version_list_file" ]; then
             red "无法解析版本列表"
             return 1
         fi
-        default_version=$(echo "$stable_versions" | head -n 1 | awk '{print $1}')
+        default_version=$(head -n 1 "$version_list_file")
         yellow "推荐安装最新稳定版: $default_version"
-        if command -v fzf >/dev/null 2>&1; then
-            version=$(echo "$version_list" | fzf --prompt="请选择 sing-box 版本 [默认: $default_version] > " --height=20 --reverse --select-1 --query="$default_version" || echo "$default_version")
-        else
-            yellow "未检测到 fzf，使用序号选择版本"
-            version_list_file="$TEMP_DIR/version_list.txt"
-            echo "$version_list" > "$version_list_file"
-            printf "\n可用版本列表：\n"
-            i=1
-            while IFS= read -r ver; do
-                printf "%2d. %s\n" "$i" "$ver"
-                i=$(expr $i + 1)
-            done < "$version_list_file"
-            max_index=$(expr $i - 1)
-            while true; do
-                printf "\n请输入版本序号 [1-%d，默认: 1] 或 'q' 使用默认版本: " "$max_index"
-                read version_index
-                if [ -z "$version_index" ] || [ "$version_index" = "q" ] || [ "$version_index" = "Q" ]; then
-                    version="$default_version"
-                    log "用户选择默认版本: $version"
-                    break
-                fi
-                if echo "$version_index" | grep -qE '^[0-9]+$' && [ "$version_index" -ge 1 ] && [ "$version_index" -le "$max_index" ]; then
-                    version=$(sed -n "${version_index}p" "$version_list_file" | awk '{print $1}')
-                    log "用户选择版本: $version"
-                    break
-                else
-                    red "无效输入，请输入 1-$max_index 或 'q'"
-                fi
-            done
-        fi
-        validate_version "$version" || { red "版本号无效"; return 1; }
+        # 显示版本列表
+        printf "\n可用版本列表：\n"
+        i=1
+        while IFS= read -r ver; do
+            type=$(echo "$stable_versions\n$prerelease_versions" | grep "^$ver" | awk -F'\t' '{print $2}')
+            printf "%2d. %s - %s\n" "$i" "$ver" "$type"
+            i=$(expr $i + 1)
+        done < "$version_list_file"
+        max_index=$(expr $i - 1)
+        while true; do
+            printf "\n请输入版本序号 [1-%d，默认: 1] 或 'q' 使用默认版本: " "$max_index"
+            read version_index
+            if [ -z "$version_index" ] || [ "$version_index" = "q" ] || [ "$version_index" = "Q" ]; then
+                version="$default_version"
+                log "用户选择默认版本: $version"
+                break
+            fi
+            if echo "$version_index" | grep -qE '^[0-9]+$' && [ "$version_index" -ge 1 ] && [ "$version_index" -le "$max_index" ]; then
+                version=$(sed -n "${version_index}p" "$version_list_file")
+                log "用户选择版本: $version"
+                break
+            else
+                red "无效输入，请输入 1-$max_index 或 'q'"
+            fi
+        done
+        validate_version "$version" || { red "版本号无效: $version"; return 1; }
     fi
     version=${version#v}
     log "将安装版本: $version"
