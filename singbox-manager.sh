@@ -147,7 +147,7 @@ install_deps() {
         cron_pkg="cronie"
         pkgs="curl tar iptables ipset jq psmisc cronie"
     else
-        red "不支持的包管理器，请手动安装依赖"
+        red "不支持的包管理器，请手动安装依赖：curl tar jq psmisc"
         return 1
     fi
     # 替换 cron 包名
@@ -155,13 +155,24 @@ install_deps() {
     log "使用包管理器: $pkg_manager"
     # 更新软件源
     if [ -n "$update_cmd" ]; then
-        $update_cmd || { red "包列表更新失败"; return 1; }
+        for attempt in 1 2 3; do
+            if $update_cmd >/dev/null 2>>"$LOG_FILE"; then
+                log "包列表更新成功 (尝试 $attempt)"
+                break
+            fi
+            log "包列表更新失败 (尝试 $attempt)"
+            if [ "$attempt" -eq 3 ]; then
+                red "无法更新软件源，请检查网络或软件源配置"
+                return 1
+            fi
+            sleep 2
+        done
     fi
     # 安装每个包
     for pkg in $pkgs; do
         if [ "$pkg_manager" = "opkg" ]; then
             if opkg list | grep -q "^$pkg -"; then
-                if $install_cmd $pkg 2>>"$LOG_FILE"; then
+                if $install_cmd $pkg >/dev/null 2>>"$LOG_FILE"; then
                     installed_pkgs="$installed_pkgs $pkg"
                     log "已安装或更新包: $pkg"
                 else
@@ -173,7 +184,7 @@ install_deps() {
                 log "包不可用: $pkg"
             fi
         else
-            if $install_cmd $pkg 2>>"$LOG_FILE"; then
+            if $install_cmd $pkg >/dev/null 2>>"$LOG_FILE"; then
                 installed_pkgs="$installed_pkgs $pkg"
                 log "已安装或更新包: $pkg"
             else
@@ -187,13 +198,16 @@ install_deps() {
     failed_pkgs=$(echo "$failed_pkgs" | sed 's/^ //')
     # 处理依赖安装失败
     if [ -n "$failed_pkgs" ]; then
-        red "依赖安装失败：部分包未找到或无法安装"
+        red "以下依赖安装失败：$failed_pkgs"
         yellow "已安装的包：${installed_pkgs:-无}"
-        yellow "未安装的包：${failed_pkgs:-无}"
         if [ "$pkg_manager" = "opkg" ]; then
             yellow "请尝试运行 'opkg update' 或手动安装缺失包"
         else
             yellow "请尝试运行 '${update_cmd}' 或手动安装缺失包"
+        fi
+        if echo "$failed_pkgs" | grep -q "jq"; then
+            yellow "jq 未安装，将使用回退方法解析版本列表"
+            return 0
         fi
         printf "是否继续安装 sing-box？(y/n): "
         read continue_install
@@ -311,13 +325,46 @@ else
     version_list_file="$TEMP_DIR/version_list.txt"
     # 清空版本列表文件
     > "$version_list_file"
-    # 获取 5 个稳定版
-    stable_versions=$(jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
-    # 获取 5 个预发布版
-    prerelease_versions=$(jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
-    # 合并版本列表
-    echo "$stable_versions" > "$TEMP_DIR/versions.txt"
-    echo "$prerelease_versions" >> "$TEMP_DIR/versions.txt"
+    SYSTEM=$(detect_system)
+    if [ "$SYSTEM" = "openwrt" ] && ! command -v jq >/dev/null 2>&1; then
+        log "OpenWrt 系统未安装 jq，使用回退方法解析版本..."
+        # 回退方法：使用 grep 和 sed 解析 JSON
+        stable_versions=""
+        prerelease_versions=""
+        # 提取 tag_name、prerelease 和 published_at 字段到临时文件
+        grep '"tag_name":' "$releases_json_file" | sed 's/.*"tag_name": "\([^"]*\)".*/\1/' > "$TEMP_DIR/tags.txt"
+        grep '"prerelease":' "$releases_json_file" | sed 's/.*"prerelease": \([^,]*\),.*/\1/' > "$TEMP_DIR/prereleases.txt"
+        grep '"published_at":' "$releases_json_file" | sed 's/.*"published_at": "\([^"]*\)".*/\1/' > "$TEMP_DIR/published_ats.txt"
+        # 确保文件行数一致
+        min_lines=$(wc -l "$TEMP_DIR/tags.txt" "$TEMP_DIR/prereleases.txt" "$TEMP_DIR/published_ats.txt" | awk 'NR==1||NR==2||NR==3{print $1}' | sort -n | head -n 1)
+        head -n "$min_lines" "$TEMP_DIR/tags.txt" > "$TEMP_DIR/tags_tmp.txt"
+        head -n "$min_lines" "$TEMP_DIR/prereleases.txt" > "$TEMP_DIR/prereleases_tmp.txt"
+        head -n "$min_lines" "$TEMP_DIR/published_ats.txt" > "$TEMP_DIR/published_ats_tmp.txt"
+        # 合并为版本列表
+        paste -d'\t' "$TEMP_DIR/tags_tmp.txt" "$TEMP_DIR/prereleases_tmp.txt" "$TEMP_DIR/published_ats_tmp.txt" | while read -r tag is_prerelease published_at; do
+            if [ "$is_prerelease" = "false" ] && [ $(echo "$stable_versions" | grep -c .) -lt 5 ]; then
+                stable_versions="$stable_versions$tag\t稳定版\t$published_at\n"
+            elif [ "$is_prerelease" = "true" ] && [ $(echo "$prerelease_versions" | grep -c .) -lt 5 ]; then
+                prerelease_versions="$prerelease_versions$tag\t预发布版\t$published_at\n"
+            fi
+        done
+        stable_versions=$(echo -n "$stable_versions" | head -n 5)
+        prerelease_versions=$(echo -n "$prerelease_versions" | head -n 5)
+        # 合并版本列表
+        echo -n "$stable_versions" > "$TEMP_DIR/versions.txt"
+        echo -n "$prerelease_versions" >> "$TEMP_DIR/versions.txt"
+    else
+        if ! command -v jq >/dev/null 2>&1; then
+            red "jq 未安装，请先安装 jq（例如：apt install jq 或 yum install jq）"
+            return 1
+        fi
+        # 使用 jq 解析
+        stable_versions=$(jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
+        prerelease_versions=$(jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
+        # 合并版本列表
+        echo "$stable_versions" > "$TEMP_DIR/versions.txt"
+        echo "$prerelease_versions" >> "$TEMP_DIR/versions.txt"
+    fi
     if [ ! -s "$TEMP_DIR/versions.txt" ]; then
         red "无法解析版本列表"
         return 1
