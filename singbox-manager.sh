@@ -30,7 +30,7 @@ DEVICE_NAME=$(get_device_name)
 
 # 日志记录函数
 log() {
-    timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     printf "%b[%s] %s%b\n" "$YELLOW" "$timestamp" "$1" "$NC"
     echo "[$timestamp] $1" >> "$LOG_FILE"
 }
@@ -84,46 +84,97 @@ install_deps() {
     pkg_manager=""
     install_cmd=""
     update_cmd=""
-    pkgs="curl tar iptables ipset jq psmisc cron fzf"
+    pkgs="curl tar jq psmisc kmod-ipt-tproxy"
     cron_pkg="cron"
-    if command -v apt >/dev/null 2>&1; then
+    installed_pkgs=""
+    failed_pkgs=""
+    # 检测包管理器
+    if command -v opkg >/dev/null 2>&1; then
+        pkg_manager="opkg"
+        update_cmd="opkg update"
+        install_cmd="opkg install"
+    elif command -v apt >/dev/null 2>&1; then
         pkg_manager="apt"
         update_cmd="apt update"
         install_cmd="apt install -y"
+        pkgs="curl tar iptables ipset jq psmisc cron fzf"
     elif command -v yum >/dev/null 2>&1; then
         pkg_manager="yum"
         update_cmd=""
         install_cmd="yum install -y"
         cron_pkg="cronie"
+        pkgs="curl tar iptables ipset jq psmisc cronie fzf"
     elif command -v apk >/dev/null 2>&1; then
         pkg_manager="apk"
         update_cmd="apk update"
         install_cmd="apk add"
         cron_pkg="cronie"
-    elif command -v opkg >/dev/null 2>&1; then
-        pkg_manager="opkg"
-        update_cmd="opkg update"
-        install_cmd="opkg install"
-        pkgs="curl tar jq coreutils-killall iptables-mod-tproxy"
-        cron_pkg="cron"
+        pkgs="curl tar iptables ipset jq psmisc cronie fzf"
     else
         red "不支持的包管理器，请手动安装依赖"
         return 1
     fi
+    # 替换 cron 包名
     pkgs=$(echo "$pkgs" | sed "s/cron/$cron_pkg/")
     log "使用包管理器: $pkg_manager"
+    # 更新软件源
     if [ -n "$update_cmd" ]; then
         $update_cmd || { red "包列表更新失败"; return 1; }
     fi
-    if ! $install_cmd $pkgs; then
-        red "依赖安装失败: $pkgs"
-        return 1
-    fi
+    # 安装每个包
+    for pkg in $pkgs; do
+        if [ "$pkg_manager" = "opkg" ]; then
+            if opkg list | grep -q "^$pkg -"; then
+                if $install_cmd $pkg 2>>"$LOG_FILE"; then
+                    installed_pkgs="$installed_pkgs $pkg"
+                    log "已安装或更新包: $pkg"
+                else
+                    failed_pkgs="$failed_pkgs $pkg"
+                    log "安装包失败: $pkg"
+                fi
+            else
+                failed_pkgs="$failed_pkgs $pkg"
+                log "包不可用: $pkg"
+            fi
+        else
+            if $install_cmd $pkg 2>>"$LOG_FILE"; then
+                installed_pkgs="$installed_pkgs $pkg"
+                log "已安装或更新包: $pkg"
+            else
+                failed_pkgs="$failed_pkgs $pkg"
+                log "安装包失败: $pkg"
+            fi
+        fi
+    done
+    # 检查 fzf
     if ! command -v fzf >/dev/null 2>&1; then
         red "未检测到 fzf，请手动安装"
-        return 1
+        failed_pkgs="$failed_pkgs fzf"
+    else
+        installed_pkgs="$installed_pkgs fzf"
     fi
-    green "依赖安装完成"
+    # 清理包列表
+    installed_pkgs=$(echo "$installed_pkgs" | sed 's/^ //')
+    failed_pkgs=$(echo "$failed_pkgs" | sed 's/^ //')
+    # 处理依赖安装失败
+    if [ -n "$failed_pkgs" ]; then
+        red "依赖安装失败：部分包未找到或无法安装"
+        yellow "已安装的包：${installed_pkgs:-无}"
+        yellow "未安装的包：${failed_pkgs:-无}"
+        yellow "请尝试运行 'opkg update' 或手动安装缺失包"
+        printf "是否继续安装 sing-box？(y/n): "
+        read continue_install
+        if [ "$continue_install" = "y" ] || [ "$continue_install" = "Y" ]; then
+            yellow "用户选择继续安装"
+            return 0
+        else
+            red "用户取消安装"
+            return 1
+        fi
+    else
+        green "依赖安装完成"
+        return 0
+    fi
 }
 
 # 获取网关 IP
@@ -168,7 +219,7 @@ cleanup() {
         rm -rf "$TEMP_DIR"
     fi
 }
-trap 'echo "脚本意外中断，执行清理..."; cleanup' INT TERM EXIT
+trap 'echo "脚本意外中断，执行清理..."; cleanup; exit 1' INT TERM EXIT
 
 # 检查网络
 check_network() {
@@ -190,18 +241,23 @@ check_network() {
 
 # 配置网络
 configure_network() {
-    log "配置 IPv4 转发和 NAT..."
-    if sysctl net.ipv4.ip_forward | grep -q "net.ipv4.ip_forward = 1"; then
-        green "IPv4 转发已启用"
-    else
-        yellow "启用 IPv4 转发..."
-        sysctl -w net.ipv4.ip_forward=1
-        if grep -q "^net.ipv4.ip_forward=" /etc/sysctl.conf; then
-            sed -i 's/^net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+    log "配置网络..."
+    SYSTEM=$(detect_system)
+    if [ "$SYSTEM" != "openwrt" ]; then
+        if sysctl net.ipv4.ip_forward | grep -q "net.ipv4.ip_forward = 1"; then
+            green "IPv4 转发已启用"
         else
-            echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+            yellow "启用 IPv4 转发..."
+            sysctl -w net.ipv4.ip_forward=1
+            if grep -q "^net.ipv4.ip_forward=" /etc/sysctl.conf; then
+                sed -i 's/^net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+            else
+                echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+            fi
+            green "IPv4 转发已启用并持久化"
         fi
-        green "IPv4 转发已启用并持久化"
+    else
+        yellow "OpenWrt 系统，跳过 IP 转发设置，请通过 LuCI 或 uci 配置"
     fi
     nat_rule_exists=$(iptables -t nat -C POSTROUTING -s 192.168.0.0/16 -j MASQUERADE 2>/dev/null; echo $?)
     if [ "$nat_rule_exists" -eq 0 ]; then
@@ -212,11 +268,7 @@ configure_network() {
             green "NAT 规则添加成功"
             if command -v iptables-save >/dev/null 2>&1; then
                 mkdir -p /etc/iptables
-                if iptables-save > /etc/iptables/rules.v4; then
-                    green "iptables 规则已保存"
-                else
-                    red "iptables-save 保存失败"
-                fi
+                iptables-save > /etc/iptables/rules.v4 || red "保存 iptables 规则失败"
             else
                 yellow "未找到 iptables-save，NAT 规则可能不持久"
             fi
@@ -291,8 +343,8 @@ setup_env() {
 
 # 企业微信通知
 send_wx_notification() {
-    local webhook_url="$1"
-    local message_content="$2"
+    webhook_url="$1"
+    message_content="$2"
     if [ -z "$webhook_url" ]; then
         yellow "未配置企业微信 Webhook，跳过通知"
         return
@@ -427,7 +479,7 @@ EOF
         fi
         if [ "$autostart_set" = false ] && [ -f /etc/rc.local ] && [ -x /etc/rc.local ]; then
             log "添加到 /etc/rc.local..."
-            if ! grep -Fq "$start_cmd_raw" /etc/rc.local; then
+            if ! grep -q "$start_cmd_raw" /etc/rc.local; then
                 if sed -i "/^exit 0/i $start_cmd" /etc/rc.local; then
                     green "已添加到 rc.local"
                     autostart_set=true
@@ -493,7 +545,7 @@ install_singbox() {
     else
         releases_json_file="$TEMP_DIR/releases.json"
         echo "$releases_json" > "$releases_json_file"
-        cleaned_json=$(cat "$releases_json_file" | tr -d '\000-\037')
+        cleaned_json=$(tr -d '\000-\037' < "$releases_json_file")
         stable_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' | sort -r -k3 | head -n 5 | awk '{print $1 " - " $2}')
         prerelease_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' | sort -r -k3 | head -n 5 | awk '{print $1 " - " $2}')
         version_list=$(printf "%s\n%s" "$stable_versions" "$prerelease_versions")
@@ -503,7 +555,36 @@ install_singbox() {
         fi
         default_version=$(echo "$stable_versions" | head -n 1 | awk '{print $1}')
         yellow "推荐安装最新稳定版: $default_version"
-        version=$(echo "$version_list" | fzf --prompt="请选择 sing-box 版本 [默认: $default_version] > " --height=20 --reverse --select-1 --query="$default_version" || echo "$default_version")
+        if command -v fzf >/dev/null 2>&1; then
+            version=$(echo "$version_list" | fzf --prompt="请选择 sing-box 版本 [默认: $default_version] > " --height=20 --reverse --select-1 --query="$default_version" || echo "$default_version")
+        else
+            yellow "未检测到 fzf，使用序号选择版本"
+            version_list_file="$TEMP_DIR/version_list.txt"
+            echo "$version_list" > "$version_list_file"
+            printf "\n可用版本列表：\n"
+            i=1
+            while IFS= read -r ver; do
+                printf "%2d. %s\n" "$i" "$ver"
+                i=$(expr $i + 1)
+            done < "$version_list_file"
+            max_index=$(expr $i - 1)
+            while true; do
+                printf "\n请输入版本序号 [1-%d，默认: 1] 或 'q' 使用默认版本: " "$max_index"
+                read version_index
+                if [ -z "$version_index" ] || [ "$version_index" = "q" ] || [ "$version_index" = "Q" ]; then
+                    version="$default_version"
+                    log "用户选择默认版本: $version"
+                    break
+                fi
+                if echo "$version_index" | grep -qE '^[0-9]+$' && [ "$version_index" -ge 1 ] && [ "$version_index" -le "$max_index" ]; then
+                    version=$(sed -n "${version_index}p" "$version_list_file" | awk '{print $1}')
+                    log "用户选择版本: $version"
+                    break
+                else
+                    red "无效输入，请输入 1-$max_index 或 'q'"
+                fi
+            done
+        fi
         validate_version "$version" || { red "版本号无效"; return 1; }
     fi
     version=${version#v}
@@ -588,7 +669,7 @@ EOF
     else
         yellow "OpenWrt 系统，跳过 TUN 设备检查"
         if ! lsmod | grep -q "tun"; then
-            yellow "未检测到 TUN 模块，请确保已加载（运行 'modprobe tun'）"
+            yellow "未检测到 TUN 模块，请运行 'modprobe tun'"
         fi
     fi
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -600,9 +681,9 @@ EOF
     fi
     configure_network
     setup_autostart
-    gateway_ip=$(get_gateway_ip) || gateway_ip="无法获取"
+    gateway_ip=$(get_gateway_ip) || gateway_ip=""
     green "sing-box v$version 安装完成"
-    if [ "$gateway_ip" != "无法获取" ]; then
+    if [ -n "$gateway_ip" ]; then
         yellow "网关和 DNS 可设置为: $gateway_ip"
     fi
     green "请运行选项 2 配置订阅链接"
@@ -618,16 +699,16 @@ update_config_and_run() {
         return 1
     fi
     log "生成更新脚本: $UPDATE_SCRIPT..."
-    cat <<EOF > "$UPDATE_SCRIPT"
+    cat >"$UPDATE_SCRIPT" <<EOF
 #!/bin/sh
 set -eu
 ENV_FILE="$ENV_FILE"
 CONFIG_PATH=""
-UPDATE_LOG_FILE=""
+UPDATE_LOG_FILE="/var/log/sing-box-update.log"
 WX_WEBHOOK=""
 SINGBOX_BIN_PATH=""
 SUBSCRIBE_URLS=""
-TIMESTAMP=\$(date +'%Y-%m-%d %H:%M:%S')
+TIMESTAMP=\$(date '+%Y-%m-%d %H:%M:%S')
 DEVICE_NAME="\$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo 'unknown-device')"
 SYSTEM="\$( [ -f /etc/openwrt_release ] && echo 'openwrt' || echo 'other' )"
 RED='\033[0;31m'
@@ -655,17 +736,18 @@ load_env_vars() {
     _log "环境变量加载成功"
 }
 limit_log_lines() {
-    max_lines=1000
+    max_size=1048576
     if [ -f "\$UPDATE_LOG_FILE" ]; then
-        current_lines=\$(wc -l < "\$UPDATE_LOG_FILE")
-        if [ "\$current_lines" -gt "\$max_lines" ]; then
-            _log "裁剪日志文件..."
-            tail -n "\$max_lines" "\$UPDATE_LOG_FILE" > "\$UPDATE_LOG_FILE.tmp" && mv "\$UPDATE_LOG_FILE.tmp" "\$UPDATE_LOG_FILE"
+        current_size=\$(wc -c < "\$UPDATE_LOG_FILE")
+        if [ "\$current_size" -gt "\$max_size" ]; then
+            _log "更新日志超过 1MB，清空..."
+            > "\$UPDATE_LOG_FILE"
+            _log "更新日志已清空"
         fi
     fi
 }
 send_msg() {
-    local message_content="\$1"
+    message_content="\$1"
     if [ -z "\$WX_WEBHOOK" ]; then
         return
     fi
@@ -696,7 +778,7 @@ install_jq_if_needed() {
     fi
 }
 validate_config() {
-    local file_to_check="\$1"
+    file_to_check="\$1"
     if [ ! -s "\$file_to_check" ]; then
         red_log "配置文件 \$file_to_check 不存在或为空"
         return 1
@@ -790,7 +872,7 @@ start_service() {
 }
 run_update() {
     _log "=== 开始执行 sing-box 配置更新 ==="
-    final_message="📡 sing-box 更新报告 (\$(date +'%H:%M:%S'))"
+    final_message="📡 sing-box 更新报告 (\$(date '+%H:%M:%S'))"
     overall_success=false
     TEMP_CONFIG_PATH="\${CONFIG_PATH}.tmp.\$\$"
     for sub_url in \$SUBSCRIBE_URLS; do
@@ -1055,13 +1137,13 @@ uninstall_singbox() {
 
 # 限制主脚本日志大小
 limit_main_log_lines() {
-    max_lines=1000
+    max_size=1048576
     if [ -f "$LOG_FILE" ]; then
-        current_lines=$(wc -l < "$LOG_FILE")
-        if [ "$current_lines" -gt "$max_lines" ]; then
-            log "主脚本日志超过 $max_lines 行，裁剪..."
-            tail -n "$max_lines" "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
-            log "主脚本日志已裁剪"
+        current_size=$(wc -c < "$LOG_FILE")
+        if [ "$current_size" -gt "$max_size" ]; then
+            log "主脚本日志超过 1MB，清空..."
+            > "$LOG_FILE"
+            log "主脚本日志已清空"
         fi
     fi
 }
@@ -1080,13 +1162,14 @@ main_menu() {
         printf "请输入选项 [1-6]: "
         read choice
         exit_code=0
+        limit_main_log_lines
         case "$choice" in
             1) install_singbox || exit_code=$? ;;
             2) update_config_and_run || exit_code=$? ;;
             3) setup_scheduled_update || exit_code=$? ;;
             4) manage_service || exit_code=$? ;;
             5) uninstall_singbox || exit_code=$? ;;
-            6) green "退出脚本..."; exit 0 ;;
+            6) green "退出脚本..."; trap - INT TERM EXIT; exit 0 ;;
             *) red "无效选项 '$choice'"; exit_code=1 ;;
         esac
         if [ "$exit_code" -ne 0 ] && [ "$choice" -ne 6 ]; then
@@ -1094,7 +1177,7 @@ main_menu() {
         fi
         if [ "$choice" -ne 6 ]; then
             printf "\n按 [Enter] 返回主菜单..."
-            read -r dummy_input
+            read dummy_input
         fi
     done
 }
@@ -1109,4 +1192,5 @@ limit_main_log_lines
 log "=== 主脚本启动 ==="
 main_menu
 log "=== 主脚本正常退出 ==="
+trap - INT TERM EXIT
 exit 0
