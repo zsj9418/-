@@ -78,6 +78,41 @@ detect_system() {
     fi
 }
 
+# 清理临时文件
+cleanup() {
+    if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
+        log "清理临时文件: $TEMP_DIR"
+        rm -rf "$TEMP_DIR"
+    fi
+}
+trap 'echo "脚本意外中断，执行清理..."; cleanup; exit 1' INT TERM EXIT
+
+# 检查网络
+check_network() {
+    log "检查网络通畅性..."
+    if ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
+        green "网络连接正常 (ping 8.8.8.8)"
+        return 0
+    else
+        log "ping 8.8.8.8 失败，尝试 curl..."
+        if curl -s --head --connect-timeout 10 --max-time 15 https://www.google.com >/dev/null 2>&1; then
+            green "网络连接正常 (curl google.com)"
+            return 0
+        else
+            red "无法连接到外网，请检查网络配置"
+            return 1
+        fi
+    fi
+}
+
+# 验证版本号
+validate_version() {
+    version="$1"
+    if ! echo "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)*$'; then
+        red "无效的版本号格式: $version"
+        return 1
+    fi
+}
 # 安装依赖
 install_deps() {
     log "正在检查并安装依赖..."
@@ -201,42 +236,6 @@ get_gateway_ip() {
     echo "$gw_ip"
 }
 
-# 验证版本号
-validate_version() {
-    version="$1"
-    if ! echo "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)*$'; then
-        red "无效的版本号格式: $version"
-        return 1
-    fi
-}
-
-# 清理临时文件
-cleanup() {
-    if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
-        log "清理临时文件: $TEMP_DIR"
-        rm -rf "$TEMP_DIR"
-    fi
-}
-trap 'echo "脚本意外中断，执行清理..."; cleanup; exit 1' INT TERM EXIT
-
-# 检查网络
-check_network() {
-    log "检查网络通畅性..."
-    if ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
-        green "网络连接正常 (ping 8.8.8.8)"
-        return 0
-    else
-        log "ping 8.8.8.8 失败，尝试 curl..."
-        if curl -s --head --connect-timeout 10 --max-time 15 https://www.google.com >/dev/null 2>&1; then
-            green "网络连接正常 (curl google.com)"
-            return 0
-        else
-            red "无法连接到外网，请检查网络配置"
-            return 1
-        fi
-    fi
-}
-
 # 配置网络
 configure_network() {
     log "配置网络..."
@@ -254,28 +253,377 @@ configure_network() {
             fi
             green "IPv4 转发已启用并持久化"
         fi
+        nat_rule_exists=$(iptables -t nat -C POSTROUTING -s 192.168.0.0/16 -j MASQUERADE 2>/dev/null; echo $?)
+        if [ "$nat_rule_exists" -eq 0 ]; then
+            green "NAT 规则已存在"
+        else
+            yellow "添加 NAT 规则..."
+            if iptables -t nat -A POSTROUTING -s 192.168.0.0/16 -j MASQUERADE; then
+                green "NAT 规则添加成功"
+                if command -v iptables-save >/dev/null 2>&1; then
+                    mkdir -p /etc/iptables
+                    iptables-save > /etc/iptables/rules.v4 || red "保存 iptables 规则失败"
+                else
+                    yellow "未找到 iptables-save，NAT 规则可能不持久"
+                fi
+            else
+                red "添加 NAT 规则失败"
+            fi
+        fi
     else
         yellow "OpenWrt 系统，跳过 IP 转发设置，请通过 LuCI 或 uci 配置"
     fi
-    nat_rule_exists=$(iptables -t nat -C POSTROUTING -s 192.168.0.0/16 -j MASQUERADE 2>/dev/null; echo $?)
-    if [ "$nat_rule_exists" -eq 0 ]; then
-        green "NAT 规则已存在"
-    else
-        yellow "添加 NAT 规则..."
-        if iptables -t nat -A POSTROUTING -s 192.168.0.0/16 -j MASQUERADE; then
-            green "NAT 规则添加成功"
-            if command -v iptables-save >/dev/null 2>&1; then
-                mkdir -p /etc/iptables
-                iptables-save > /etc/iptables/rules.v4 || red "保存 iptables 规则失败"
-            else
-                yellow "未找到 iptables-save，NAT 规则可能不持久"
-            fi
-        else
-            red "添加 NAT 规则失败"
-        fi
+}
+# 安装 sing-box
+install_singbox() {
+    check_root
+    TEMP_DIR=$(mktemp -d) || { red "创建临时目录失败"; return 1; }
+    trap 'echo "安装中断，清理..."; cleanup; trap - INT TERM EXIT; return 1' INT TERM
+    trap 'cleanup; trap - INT TERM EXIT' EXIT
+    ARCH=$(get_arch)
+    log "检测到架构: $ARCH"
+    SYSTEM=$(detect_system)
+    log "获取 GitHub 版本信息..."
+api_url="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30"
+releases_json=""
+for attempt in 1 2 3; do
+    releases_json=$(curl -sSL --connect-timeout 10 --max-time 20 "$api_url")
+    if [ -n "$releases_json" ] && echo "$releases_json" | grep -q '"tag_name"'; then
+        log "获取 GitHub API 数据成功 (尝试 $attempt)"
+        break
     fi
+    log "获取 GitHub API 数据失败 (尝试 $attempt)"
+    sleep 2
+done
+if [ -z "$releases_json" ] || echo "$releases_json" | grep -q '"message": "Not Found"'; then
+    red "无法获取版本信息"
+    while [ -z "$version" ]; do
+        printf "请输入版本号 (如 1.9.0): "
+        read manual_version
+        validate_version "$manual_version" || continue
+        version="$manual_version"
+    done
+else
+    releases_json_file="$TEMP_DIR/releases.json"
+    echo "$releases_json" > "$releases_json_file"
+    # 清理 JSON 数据中的非法字符
+    cat "$releases_json_file" | tr -d '\000-\037' > "$releases_json_file.tmp" && mv "$releases_json_file.tmp" "$releases_json_file"
+    version_list_file="$TEMP_DIR/version_list.txt"
+    # 清空版本列表文件
+    > "$version_list_file"
+    # 获取 5 个稳定版
+    stable_versions=$(jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
+    # 获取 5 个预发布版
+    prerelease_versions=$(jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' "$releases_json_file" | sort -r -k3 | head -n 5)
+    # 合并版本列表
+    echo "$stable_versions" > "$TEMP_DIR/versions.txt"
+    echo "$prerelease_versions" >> "$TEMP_DIR/versions.txt"
+    if [ ! -s "$TEMP_DIR/versions.txt" ]; then
+        red "无法解析版本列表"
+        return 1
+    fi
+    # 将版本号写入 version_list_file
+    cat "$TEMP_DIR/versions.txt" | while read -r line; do
+        tag_name=$(echo "$line" | cut -f1)
+        echo "$tag_name" >> "$version_list_file"
+    done
+    default_version=$(echo "$stable_versions" | head -n 1 | cut -f1)
+    if [ -z "$default_version" ]; then
+        default_version=$(head -n 1 "$version_list_file")
+    fi
+    yellow "推荐安装最新稳定版: $default_version"
+    printf "\n可用版本列表：\n"
+    i=1
+    while read -r line; do
+        tag_name=$(echo "$line" | cut -f1)
+        type=$(echo "$line" | cut -f2)
+        printf "%2d. %-10s - %s\n" "$i" "$tag_name" "$type"
+        i=$((i + 1))
+    done < "$TEMP_DIR/versions.txt"
+    max_index=$((i - 1))
+    while true; do
+        printf "\n请输入版本序号 [1-%d，默认: 1] 或 'q' 使用默认版本: " "$max_index"
+        read version_index
+        if [ -z "$version_index" ] || [ "$version_index" = "q" ] || [ "$version_index" = "Q" ]; then
+            version="$default_version"
+            log "用户选择默认版本: $version"
+            break
+        fi
+        if echo "$version_index" | grep -qE '^[0-9]+$' && [ "$version_index" -ge 1 ] && [ "$version_index" -le "$max_index" ]; then
+            version=$(sed -n "${version_index}p" "$version_list_file")
+            log "用户选择版本: $version"
+            break
+        else
+            red "无效输入，请输入 1-$max_index 或 'q'"
+        fi
+    done
+    validate_version "$version" || { red "版本号无效: $version"; return 1; }
+fi
+    version=${version#v}
+    log "将安装版本: $version"
+    download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${ARCH}.tar.gz"
+    for attempt in 1 2 3; do
+        if curl -L --connect-timeout 15 --max-time 120 "$download_url" -o "$TEMP_DIR/sing-box.tar.gz"; then
+            green "下载完成"
+            break
+        fi
+        red "下载失败 (尝试 $attempt)"
+        sleep 2
+        if [ "$attempt" -eq 3 ]; then
+            red "下载失败"
+            printf "是否重新选择版本？(y/n): "
+            read retry_version
+            if [ "$retry_version" = "y" ] || [ "$retry_version" = "Y" ]; then
+                return 2
+            else
+                return 1
+            fi
+        fi
+    done
+    if ! tar xzf "$TEMP_DIR/sing-box.tar.gz" -C "$TEMP_DIR"; then
+        red "解压失败"
+        return 1
+    fi
+    extracted_dir=$(find "$TEMP_DIR" -maxdepth 1 -type d -name "sing-box-*-linux-$ARCH")
+    if [ -z "$extracted_dir" ] || [ ! -f "$extracted_dir/sing-box" ]; then
+        if [ -f "$TEMP_DIR/sing-box" ]; then
+            extracted_singbox="$TEMP_DIR/sing-box"
+        else
+            red "未找到 sing-box 可执行文件"
+            return 1
+        fi
+    else
+        extracted_singbox="$extracted_dir/sing-box"
+    fi
+    mkdir -p "$BIN_DIR" "$BASE_DIR"
+    log "安装 sing-box 到 $BIN_DIR/sing-box..."
+    if ! cp "$extracted_singbox" "$BIN_DIR/sing-box"; then
+        red "复制文件失败"
+        return 1
+    fi
+    chmod +x "$BIN_DIR/sing-box"
+    green "sing-box 可执行文件已安装"
+    if [ "$SYSTEM" = "openwrt" ]; then
+        log "创建 OpenWrt 服务脚本..."
+        cat > /etc/init.d/sing-box << EOF
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+START=99
+USE_PROCD=1
+
+#####  ONLY CHANGE THIS BLOCK  ######
+PROG=/usr/bin/sing-box
+RES_DIR=/etc/sing-box/
+CONF=./config.json
+#####  ONLY CHANGE THIS BLOCK  ######
+
+start_service() {
+  sleep 10
+  procd_open_instance
+  procd_set_param command \$PROG run -D \$RES_DIR -c \$CONF
+  procd_set_param user root
+  procd_set_param limits core="unlimited"
+  procd_set_param limits nofile="1000000 1000000"
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_set_param respawn \${respawn_threshold:-3600} \${respawn_timeout:-5} \${respawn_retry:-5}
+  procd_close_instance
+  iptables -I FORWARD -o tun+ -j ACCEPT
+  echo "sing-box is started!"
 }
 
+stop_service() {
+  service_stop \$PROG
+  iptables -D FORWARD -o tun+ -j ACCEPT
+  echo "sing-box is stopped!"
+}
+
+reload_service() {
+  stop
+  sleep 5s
+  echo "sing-box is restarted!"
+  start
+}
+EOF
+        chmod +x /etc/init.d/sing-box
+        green "已创建 OpenWrt 服务脚本"
+        log "配置 OpenWrt 防火墙..."
+        if [ -f /etc/config/firewall ]; then
+            if ! uci show firewall | grep -q "firewall.@nat.*name='MASQUERADE'"; then
+                uci add firewall nat
+                uci set firewall.@nat[-1].name='MASQUERADE'
+                uci set firewall.@nat[-1].src='lan'
+                uci set firewall.@nat[-1].target='MASQUERADE'
+                uci set firewall.@nat[-1].proto='all'
+                log "已添加 NAT 规则"
+            else
+                yellow "NAT 规则已存在，跳过"
+            fi
+            if ! uci show firewall | grep -q "firewall.@zone.*name='proxy'"; then
+                uci add firewall zone
+                uci set firewall.@zone[-1].name='proxy'
+                uci set firewall.@zone[-1].forward='REJECT'
+                uci set firewall.@zone[-1].output='ACCEPT'
+                uci set firewall.@zone[-1].input='ACCEPT'
+                uci set firewall.@zone[-1].mtu_fix='1'
+                uci set firewall.@zone[-1].device='tun0'
+                uci add_list firewall.@zone[-1].network='proxy'
+                log "已添加 proxy 区域"
+            else
+                yellow "proxy 区域已存在，跳过"
+            fi
+            if ! uci show firewall | grep -q "firewall.@forwarding.*name='lan-proxy'"; then
+                uci add firewall forwarding
+                uci set firewall.@forwarding[-1].name='lan-proxy'
+                uci set firewall.@forwarding[-1].dest='proxy'
+                uci set firewall.@forwarding[-1].src='lan'
+                log "已添加 lan-proxy 转发规则"
+            else
+                yellow "lan-proxy 转发规则已存在，跳过"
+            fi
+            uci commit firewall
+            log "防火墙配置已保存"
+        else
+            red "未找到 /etc/config/firewall，无法配置防火墙"
+        fi
+        log "配置 OpenWrt 网络..."
+        if [ -f /etc/config/network ]; then
+            if ! uci show network | grep -q "network.proxy"; then
+                uci set network.proxy=interface
+                uci set network.proxy.proto='none'
+                uci set network.proxy.device='tun0'
+                uci commit network
+                log "已添加 proxy 网络接口"
+            else
+                yellow "proxy 网络接口已存在，跳过"
+            fi
+        else
+            red "未找到 /etc/config/network，无法配置网络"
+        fi
+        log "重启网络和防火墙服务..."
+        if /etc/init.d/network restart && /etc/init.d/firewall restart; then
+            green "网络和防火墙服务重启成功"
+        else
+            red "网络或防火墙服务重启失败"
+        fi
+        log "检查 TUN 模块..."
+        if ! lsmod | grep -q "tun"; then
+            log "加载 TUN 模块..."
+            if modprobe tun; then
+                green "TUN 模块加载成功"
+            else
+                red "加载 TUN 模块失败"
+                return 1
+            fi
+        else
+            green "TUN 模块已加载"
+        fi
+    else
+        log "检查 TUN 设备..."
+        if ls /dev/net/tun >/dev/null 2>&1; then
+            green "TUN 设备已存在"
+        else
+            yellow "TUN 设备不存在，尝试创建..."
+            modprobe tun || yellow "加载 TUN 模块失败"
+            mkdir -p /dev/net
+            if mknod /dev/net/tun c 10 200; then
+                chmod 0666 /dev/net/tun
+                green "TUN 设备创建成功"
+            else
+                red "创建 TUN 设备失败"
+            fi
+        fi
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log "创建默认 sing-box 配置文件..."
+        cat > "$CONFIG_FILE" << EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google",
+        "address": "8.8.8.8",
+        "strategy": "ipv4_only"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "inet4_address": "172.19.0.1/30",
+      "mtu": 1500,
+      "auto_route": true,
+      "strict_route": true,
+      "endpoint_independent_nat": false,
+      "stack": "system",
+      "platform": {
+        "http_proxy": {
+          "enabled": true,
+          "server": "127.0.0.1",
+          "server_port": 8080
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "tun-in",
+        "outbound": "direct"
+      }
+    ]
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "store_selected": true
+    }
+  }
+}
+EOF
+        chmod 600 "$CONFIG_FILE"
+        green "默认配置文件已创建"
+    else
+        yellow "配置文件已存在"
+    fi
+    configure_network
+    setup_autostart
+    gateway_ip=$(get_gateway_ip) || gateway_ip=""
+    green "sing-box v$version 安装完成"
+    if [ -n "$gateway_ip" ]; then
+        yellow "网关和 DNS 可设置为: $gateway_ip"
+    fi
+    green "请运行选项 2 配置订阅链接"
+    return 0
+}
 # 加载环境变量
 load_env() {
     if [ -f "$ENV_FILE" ]; then
@@ -354,337 +702,6 @@ send_wx_notification() {
     else
         red "通知发送失败"
     fi
-}
-
-# 启动 sing-box
-start_singbox() {
-    SYSTEM=$(detect_system)
-    if [ "$SYSTEM" = "openwrt" ]; then
-        log "在 OpenWrt 上启动 sing-box..."
-        if [ -x /etc/init.d/sing-box ]; then
-            if /etc/init.d/sing-box start; then
-                green "sing-box 服务启动成功"
-                return 0
-            else
-                red "sing-box 服务启动失败"
-                return 1
-            fi
-        else
-            red "未找到 /etc/init.d/sing-box"
-            return 1
-        fi
-    else
-        if [ ! -r "$CONFIG_FILE" ] || [ ! -x "$BIN_DIR/sing-box" ]; then
-            red "配置文件或可执行文件不可用"
-            return 1
-        fi
-        log "使用 nohup 启动 sing-box..."
-        nohup "$BIN_DIR/sing-box" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
-        sleep 3
-        if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-            pid=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE")
-            green "sing-box 启动成功 (PID: $pid)"
-            return 0
-        else
-            red "sing-box 启动失败"
-            return 1
-        fi
-    fi
-}
-
-# 停止 sing-box
-stop_singbox() {
-    SYSTEM=$(detect_system)
-    if [ "$SYSTEM" = "openwrt" ]; then
-        log "在 OpenWrt 上停止 sing-box..."
-        if [ -x /etc/init.d/sing-box ]; then
-            if /etc/init.d/sing-box stop; then
-                green "sing-box 服务停止成功"
-                return 0
-            else
-                red "sing-box 服务停止失败"
-                return 1
-            fi
-        else
-            red "未找到 /etc/init.d/sing-box"
-            return 1
-        fi
-    else
-        log "停止 sing-box 进程..."
-        if pkill -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true; then
-            sleep 2
-            if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-                yellow "进程仍在运行，强制停止..."
-                pkill -9 -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true
-                sleep 1
-                if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
-                    red "强制停止失败"
-                    return 1
-                fi
-            fi
-            green "sing-box 进程已停止"
-        else
-            yellow "sing-box 未运行"
-        fi
-        return 0
-    fi
-}
-
-# 设置开机自启动
-setup_autostart() {
-    SYSTEM=$(detect_system)
-    log "设置开机自启动..."
-    if [ "$SYSTEM" = "openwrt" ]; then
-        if [ -x /etc/init.d/sing-box ]; then
-            if /etc/init.d/sing-box enable; then
-                green "sing-box 服务自启动已启用"
-                return 0
-            else
-                red "设置服务自启动失败"
-                return 1
-            fi
-        else
-            red "未找到 /etc/init.d/sing-box"
-            return 1
-        fi
-    else
-        start_cmd_raw="$BIN_DIR/sing-box run -c $CONFIG_FILE"
-        start_cmd="nohup $start_cmd_raw >/dev/null 2>&1 &"
-        autostart_set=false
-        if command -v systemctl >/dev/null 2>&1; then
-            log "创建 systemd 服务..."
-            service_file="/etc/systemd/system/sing-box.service"
-            cat > "$service_file" << EOF
-[Unit]
-Description=Sing-Box Service
-After=network.target
-[Service]
-WorkingDirectory=$BASE_DIR
-ExecStart=$start_cmd_raw
-Restart=on-failure
-RestartSec=5s
-[Install]
-WantedBy=multi-user.target
-EOF
-            chmod 644 "$service_file"
-            if systemctl daemon-reload && systemctl enable sing-box; then
-                green "systemd 服务已启用"
-                autostart_set=true
-            else
-                red "systemd 服务创建失败"
-                rm -f "$service_file"
-            fi
-        fi
-        if [ "$autostart_set" = false ] && [ -f /etc/rc.local ] && [ -x /etc/rc.local ]; then
-            log "添加到 /etc/rc.local..."
-            if ! grep -q "$start_cmd_raw" /etc/rc.local; then
-                if sed -i "/^exit 0/i $start_cmd" /etc/rc.local; then
-                    green "已添加到 rc.local"
-                    autostart_set=true
-                else
-                    red "添加到 rc.local 失败"
-                fi
-            else
-                yellow "rc.local 已包含启动命令"
-                autostart_set=true
-            fi
-        fi
-        if [ "$autostart_set" = false ] && command -v crontab >/dev/null 2>&1; then
-            log "使用 cron @reboot..."
-            current_crontab=$(crontab -l 2>/dev/null | grep -v "$start_cmd_raw")
-            new_crontab=$(printf "%s\n%s\n" "$current_crontab" "@reboot $start_cmd")
-            echo "$new_crontab" | crontab -
-            if crontab -l 2>/dev/null | grep -q "@reboot.*$start_cmd_raw"; then
-                green "cron @reboot 自启动已设置"
-                autostart_set=true
-            else
-                red "cron @reboot 设置失败"
-            fi
-        fi
-        if [ "$autostart_set" = false ]; then
-            red "无法设置自启动，请手动配置"
-            return 1
-        fi
-        return 0
-    fi
-}
-
-# 安装 sing-box
-install_singbox() {
-    check_root
-    TEMP_DIR=$(mktemp -d) || { red "创建临时目录失败"; return 1; }
-    trap 'echo "安装中断，清理..."; cleanup; trap - INT TERM EXIT; return 1' INT TERM
-    trap 'cleanup; trap - INT TERM EXIT' EXIT
-    ARCH=$(get_arch)
-    log "检测到架构: $ARCH"
-    SYSTEM=$(detect_system)
-    log "检测到系统: $SYSTEM"
-    install_deps || { red "依赖安装失败"; return 1; }
-    log "获取 GitHub 版本信息..."
-    api_url="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30"
-    releases_json=""
-    for attempt in 1 2 3; do
-        releases_json=$(curl -sSL --connect-timeout 10 --max-time 20 "$api_url")
-        if [ -n "$releases_json" ] && echo "$releases_json" | grep -q '"tag_name"'; then
-            log "获取 GitHub API 数据成功 (尝试 $attempt)"
-            break
-        fi
-        log "获取 GitHub API 数据失败 (尝试 $attempt)"
-        sleep 2
-    done
-    if [ -z "$releases_json" ] || echo "$releases_json" | grep -q '"message": "Not Found"'; then
-        red "无法获取版本信息"
-        while [ -z "$version" ]; do
-            printf "请输入版本号 (如 1.9.0): "
-            read manual_version
-            validate_version "$manual_version" || continue
-            version="$manual_version"
-        done
-    else
-        releases_json_file="$TEMP_DIR/releases.json"
-        echo "$releases_json" > "$releases_json_file"
-        cleaned_json=$(tr -d '\000-\037' < "$releases_json_file")
-        # 生成版本列表，存储纯版本号和显示用描述
-        version_list_file="$TEMP_DIR/version_list.txt"
-        stable_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == false) | [.tag_name, "稳定版", .published_at] | join("\t")' | sort -r -k3 | head -n 5)
-        prerelease_versions=$(echo "$cleaned_json" | jq -r '.[] | select(.prerelease == true) | [.tag_name, "预发布版", .published_at] | join("\t")' | sort -r -k3 | head -n 5)
-        printf "%s\n%s" "$stable_versions" "$prerelease_versions" | while IFS=$'\t' read -r tag_name type published_at; do
-            echo "$tag_name" >> "$version_list_file"
-        done
-        if [ ! -s "$version_list_file" ]; then
-            red "无法解析版本列表"
-            return 1
-        fi
-        default_version=$(head -n 1 "$version_list_file")
-        yellow "推荐安装最新稳定版: $default_version"
-        # 显示版本列表
-        printf "\n可用版本列表：\n"
-        i=1
-        while IFS= read -r ver; do
-            type=$(echo "$stable_versions\n$prerelease_versions" | grep "^$ver" | awk -F'\t' '{print $2}')
-            printf "%2d. %s - %s\n" "$i" "$ver" "$type"
-            i=$(expr $i + 1)
-        done < "$version_list_file"
-        max_index=$(expr $i - 1)
-        while true; do
-            printf "\n请输入版本序号 [1-%d，默认: 1] 或 'q' 使用默认版本: " "$max_index"
-            read version_index
-            if [ -z "$version_index" ] || [ "$version_index" = "q" ] || [ "$version_index" = "Q" ]; then
-                version="$default_version"
-                log "用户选择默认版本: $version"
-                break
-            fi
-            if echo "$version_index" | grep -qE '^[0-9]+$' && [ "$version_index" -ge 1 ] && [ "$version_index" -le "$max_index" ]; then
-                version=$(sed -n "${version_index}p" "$version_list_file")
-                log "用户选择版本: $version"
-                break
-            else
-                red "无效输入，请输入 1-$max_index 或 'q'"
-            fi
-        done
-        validate_version "$version" || { red "版本号无效: $version"; return 1; }
-    fi
-    version=${version#v}
-    log "将安装版本: $version"
-    download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${ARCH}.tar.gz"
-    for attempt in 1 2 3; do
-        if curl -L --connect-timeout 15 --max-time 120 "$download_url" -o "$TEMP_DIR/sing-box.tar.gz"; then
-            green "下载完成"
-            break
-        fi
-        red "下载失败 (尝试 $attempt)"
-        sleep 2
-        if [ "$attempt" -eq 3 ]; then
-            red "下载失败"
-            printf "是否重新选择版本？(y/n): "
-            read retry_version
-            if [ "$retry_version" = "y" ] || [ "$retry_version" = "Y" ]; then
-                return 2
-            else
-                return 1
-            fi
-        fi
-    done
-    if ! tar xzf "$TEMP_DIR/sing-box.tar.gz" -C "$TEMP_DIR"; then
-        red "解压失败"
-        return 1
-    fi
-    extracted_dir=$(find "$TEMP_DIR" -maxdepth 1 -type d -name "sing-box-*-linux-$ARCH")
-    if [ -z "$extracted_dir" ] || [ ! -f "$extracted_dir/sing-box" ]; then
-        if [ -f "$TEMP_DIR/sing-box" ]; then
-            extracted_singbox="$TEMP_DIR/sing-box"
-        else
-            red "未找到 sing-box 可执行文件"
-            return 1
-        fi
-    else
-        extracted_singbox="$extracted_dir/sing-box"
-    fi
-    mkdir -p "$BIN_DIR" "$BASE_DIR"
-    log "安装 sing-box 到 $BIN_DIR/sing-box..."
-    if ! cp "$extracted_singbox" "$BIN_DIR/sing-box"; then
-        red "复制文件失败"
-        return 1
-    fi
-    chmod +x "$BIN_DIR/sing-box"
-    green "sing-box 可执行文件已安装"
-    if [ "$SYSTEM" = "openwrt" ]; then
-        log "创建 OpenWrt 服务脚本..."
-        cat > /etc/init.d/sing-box << EOF
-#!/bin/sh /etc/rc.common
-START=90
-STOP=10
-USE_PROCD=1
-start_service() {
-    procd_open_instance
-    procd_set_param command $BIN_DIR/sing-box run -c $CONFIG_FILE
-    procd_set_param respawn
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_set_param file $CONFIG_FILE
-    procd_close_instance
-}
-EOF
-        chmod +x /etc/init.d/sing-box
-        green "已创建 OpenWrt 服务脚本"
-    fi
-    if [ "$SYSTEM" != "openwrt" ]; then
-        log "检查 TUN 设备..."
-        if ls /dev/net/tun >/dev/null 2>&1; then
-            green "TUN 设备已存在"
-        else
-            yellow "TUN 设备不存在，尝试创建..."
-            modprobe tun || yellow "加载 TUN 模块失败"
-            mkdir -p /dev/net
-            if mknod /dev/net/tun c 10 200; then
-                chmod 0666 /dev/net/tun
-                green "TUN 设备创建成功"
-            else
-                red "创建 TUN 设备失败"
-            fi
-        fi
-    else
-        yellow "OpenWrt 系统，跳过 TUN 设备检查"
-        if ! lsmod | grep -q "tun"; then
-            yellow "未检测到 TUN 模块，请运行 'modprobe tun'"
-        fi
-    fi
-    if [ ! -f "$CONFIG_FILE" ]; then
-        log "创建空配置文件..."
-        echo "{}" > "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
-    else
-        yellow "配置文件已存在"
-    fi
-    configure_network
-    setup_autostart
-    gateway_ip=$(get_gateway_ip) || gateway_ip=""
-    green "sing-box v$version 安装完成"
-    if [ -n "$gateway_ip" ]; then
-        yellow "网关和 DNS 可设置为: $gateway_ip"
-    fi
-    green "请运行选项 2 配置订阅链接"
-    return 0
 }
 
 # 更新配置并运行
@@ -912,7 +929,7 @@ run_update() {
         green_log "更新成功完成"
     else
         red_log "更新失败"
-        if [ "\$SYSTEM" = "openwrt" ] && [ -x /etc/init.d/sing-box ]; then
+        if [ "\$SYSTEM" = "openwrt" ]; then
             /etc/init.d/sing-box status | grep -q "running" && yellow_log "sing-box 仍在运行旧配置" || yellow_log "sing-box 未运行"
         else
             pgrep -f "\$SINGBOX_BIN_PATH run -c \$CONFIG_PATH" >/dev/null 2>&1 && yellow_log "sing-box 仍在运行旧配置" || yellow_log "sing-box 未运行"
@@ -1008,6 +1025,158 @@ setup_scheduled_update() {
             ;;
     esac
 }
+# 启动 sing-box
+start_singbox() {
+    SYSTEM=$(detect_system)
+    if [ "$SYSTEM" = "openwrt" ]; then
+        log "在 OpenWrt 上启动 sing-box..."
+        if [ -x /etc/init.d/sing-box ]; then
+            if /etc/init.d/sing-box start; then
+                green "sing-box 服务启动成功"
+                return 0
+            else
+                red "sing-box 服务启动失败"
+                return 1
+            fi
+        else
+            red "未找到 /etc/init.d/sing-box"
+            return 1
+        fi
+    else
+        if [ ! -r "$CONFIG_FILE" ] || [ ! -x "$BIN_DIR/sing-box" ]; then
+            red "配置文件或可执行文件不可用"
+            return 1
+        fi
+        log "使用 nohup 启动 sing-box..."
+        nohup "$BIN_DIR/sing-box" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
+        sleep 3
+        if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
+            pid=$(pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE")
+            green "sing-box 启动成功 (PID: $pid)"
+            return 0
+        else
+            red "sing-box 启动失败"
+            return 1
+        fi
+    fi
+}
+
+# 停止 sing-box
+stop_singbox() {
+    SYSTEM=$(detect_system)
+    if [ "$SYSTEM" = "openwrt" ]; then
+        log "在 OpenWrt 上停止 sing-box..."
+        if [ -x /etc/init.d/sing-box ]; then
+            if /etc/init.d/sing-box stop; then
+                green "sing-box 服务停止成功"
+                return 0
+            else
+                red "sing-box 服务停止失败"
+                return 1
+            fi
+        else
+            red "未找到 /etc/init.d/sing-box"
+            return 1
+        fi
+    else
+        log "停止 sing-box 进程..."
+        if pkill -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true; then
+            sleep 2
+            if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
+                yellow "进程仍在运行，强制停止..."
+                pkill -9 -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" || true
+                sleep 1
+                if pgrep -f "$BIN_DIR/sing-box run -c $CONFIG_FILE" >/dev/null 2>&1; then
+                    red "强制停止失败"
+                    return 1
+                fi
+            fi
+            green "sing-box 进程已停止"
+        else
+            yellow "sing-box 未运行"
+        fi
+        return 0
+    fi
+}
+
+# 设置开机自启动
+setup_autostart() {
+    SYSTEM=$(detect_system)
+    log "设置开机自启动..."
+    if [ "$SYSTEM" = "openwrt" ]; then
+        if [ -x /etc/init.d/sing-box ]; then
+            if /etc/init.d/sing-box enable; then
+                green "sing-box 服务自启动已启用"
+                return 0
+            else
+                red "设置服务自启动失败"
+                return 1
+            fi
+        else
+            red "未找到 /etc/init.d/sing-box"
+            return 1
+        fi
+    else
+        start_cmd_raw="$BIN_DIR/sing-box run -c $CONFIG_FILE"
+        start_cmd="nohup $start_cmd_raw >/dev/null 2>&1 &"
+        autostart_set=false
+        if command -v systemctl >/dev/null 2>&1; then
+            log "创建 systemd 服务..."
+            service_file="/etc/systemd/system/sing-box.service"
+            cat > "$service_file" << EOF
+[Unit]
+Description=Sing-Box Service
+After=network.target
+[Service]
+WorkingDirectory=$BASE_DIR
+ExecStart=$start_cmd_raw
+Restart=on-failure
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+            chmod 644 "$service_file"
+            if systemctl daemon-reload && systemctl enable sing-box; then
+                green "systemd 服务已启用"
+                autostart_set=true
+            else
+                red "systemd 服务创建失败"
+                rm -f "$service_file"
+            fi
+        fi
+        if [ "$autostart_set" = false ] && [ -f /etc/rc.local ] && [ -x /etc/rc.local ]; then
+            log "添加到 /etc/rc.local..."
+            if ! grep -q "$start_cmd_raw" /etc/rc.local; then
+                if sed -i "/^exit 0/i $start_cmd" /etc/rc.local; then
+                    green "已添加到 rc.local"
+                    autostart_set=true
+                else
+                    red "添加到 rc.local 失败"
+                fi
+            else
+                yellow "rc.local 已包含启动命令"
+                autostart_set=true
+            fi
+        fi
+        if [ "$autostart_set" = false ] && command -v crontab >/dev/null 2>&1; then
+            log "使用 cron @reboot..."
+            current_crontab=$(crontab -l 2>/dev/null | grep -v "$start_cmd_raw")
+            new_crontab=$(printf "%s\n%s\n" "$current_crontab" "@reboot $start_cmd")
+            echo "$new_crontab" | crontab -
+            if crontab -l 2>/dev/null | grep -q "@reboot.*$start_cmd_raw"; then
+                green "cron @reboot 自启动已设置"
+                autostart_set=true
+            else
+                red "cron @reboot 设置失败"
+            fi
+        fi
+        if [ "$autostart_set" = false ]; then
+            red "无法设置自启动，请手动配置"
+            return 1
+        fi
+        return 0
+    fi
+}
 
 # 查看状态/控制服务
 manage_service() {
@@ -1094,6 +1263,33 @@ uninstall_singbox() {
             rm -f /etc/init.d/sing-box
             green "OpenWrt 服务脚本已移除"
         fi
+        log "移除 OpenWrt 防火墙配置..."
+        if [ -f /etc/config/firewall ]; then
+            if uci show firewall | grep -q "firewall.@nat.*name='MASQUERADE'"; then
+                uci delete firewall.@nat[$(uci show firewall | grep "name='MASQUERADE'" | cut -d'[' -f2 | cut -d']' -f1)]
+                log "已移除 NAT 规则"
+            fi
+            if uci show firewall | grep -q "firewall.@zone.*name='proxy'"; then
+                uci delete firewall.@zone[$(uci show firewall | grep "name='proxy'" | cut -d'[' -f2 | cut -d']' -f1)]
+                log "已移除 proxy 区域"
+            fi
+            if uci show firewall | grep -q "firewall.@forwarding.*name='lan-proxy'"; then
+                uci delete firewall.@forwarding[$(uci show firewall | grep "name='lan-proxy'" | cut -d'[' -f2 | cut -d']' -f1)]
+                log "已移除 lan-proxy 转发规则"
+            fi
+            uci commit firewall
+            log "防火墙配置已清理"
+            /etc/init.d/firewall restart && green "防火墙服务已重启" || red "防火墙服务重启失败"
+        fi
+        log "移除 OpenWrt 网络配置..."
+        if [ -f /etc/config/network ]; then
+            if uci show network | grep -q "network.proxy"; then
+                uci delete network.proxy
+                uci commit network
+                log "已移除 proxy 网络接口"
+            fi
+            /etc/init.d/network restart && green "网络服务已重启" || red "网络服务重启失败"
+        fi
     else
         if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/sing-box.service ]; then
             systemctl stop sing-box.service 2>/dev/null || true
@@ -1131,7 +1327,6 @@ uninstall_singbox() {
     green "sing-box 卸载完成"
     yellow "IP 转发设置未禁用，请手动修改 /etc/sysctl.conf"
 }
-
 # 限制主脚本日志大小
 limit_main_log_lines() {
     max_size=1048576
@@ -1149,7 +1344,7 @@ limit_main_log_lines() {
 main_menu() {
     while true; do
         printf "\n%b=== sing-box 管理脚本 (OpenWrt 优化版) ===%b\n" "$GREEN" "$NC"
-        echo " 1. 安装 sing-box"
+        echo " 1. 安装 sing-box (OpenWrt: 包含防火墙和网络配置)"
         echo " 2. 配置订阅链接并更新"
         echo " 3. 设置定时更新任务"
         echo " 4. 查看状态 / 启动 | 停止 | 重启"
