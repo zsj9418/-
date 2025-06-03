@@ -41,12 +41,12 @@ check_port_available() {
 # 安装/配置DDNS-GO（修复端口映射）
 install_ddns_go() {
     echo -e "\n${GREEN}=== 安装/配置 DDNS-GO ===${NC}"
-    
+
     if ! check_docker; then
         echo -e "${RED}请先安装Docker后再运行此脚本${NC}"
         return 1
     fi
-    
+
     # 获取用户指定的主机端口
     local host_port=$DEFAULT_HOST_PORT
     while true; do
@@ -67,37 +67,58 @@ install_ddns_go() {
 
     echo -e "\n${BLUE}端口映射配置:${NC}"
     echo -e "主机端口: ${YELLOW}${host_port}${NC} → 容器端口: ${YELLOW}${CONTAINER_PORT}${NC}"
-    
+
     # 检查并删除现有容器
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo -e "${YELLOW}发现已存在的容器，将先删除旧容器...${NC}"
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
-    
+
     # 创建配置目录
     mkdir -p "$CONFIG_DIR"
-    
-    # 部署容器（固定容器内9876端口）
+
+    # 生成或更新配置文件
+    local config_file="$CONFIG_DIR/config.json"
+    if [[ ! -f "$config_file" ]]; then
+        cat > "$config_file" << EOF
+{
+  "addr": "[::]:$host_port",
+  "ipv6": true
+}
+EOF
+    else
+        echo -e "${YELLOW}检测到已有配置文件，将保留原配置。请确保 'addr' 字段为 '[::]:$host_port'${NC}"
+    fi
+
+    # 部署容器（使用 host 网络模式）
     echo -e "\n${GREEN}正在部署 DDNS-GO...${NC}"
     docker run -d \
         --name $CONTAINER_NAME \
         --restart=always \
-        -p "${host_port}:${CONTAINER_PORT}" \
+        --network host \
         -v "$CONFIG_DIR:/root" \
         $IMAGE_NAME
 
     # 等待容器启动
     sleep 3
-    
+
     # 验证部署
     echo -e "\n${GREEN}验证部署状态...${NC}"
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo -e "容器状态: ${GREEN}运行中${NC}"
-        echo -e "访问地址: ${YELLOW}http://<你的IP>:${host_port}${NC}"
-        
-        # 显示实际端口映射
-        echo -e "\n${BLUE}实际端口映射:${NC}"
-        docker port $CONTAINER_NAME
+
+        # 显示 IPv4 和 IPv6 访问地址
+        local ipv4=$(hostname -I | awk '{print $1}')
+        local ipv6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d'/' -f1 | head -n1)
+
+        echo -e "\n${BLUE}访问地址:${NC}"
+        if [[ -n "$ipv4" ]]; then
+            echo -e "IPv4: http://$ipv4:$host_port"
+        fi
+        if [[ -n "$ipv6" ]]; then
+            echo -e "IPv6: http://[$ipv6]:$host_port"
+        fi
+
     else
         echo -e "${RED}容器启动失败！${NC}"
         echo -e "请检查日志: ${YELLOW}docker logs ${CONTAINER_NAME}${NC}"
