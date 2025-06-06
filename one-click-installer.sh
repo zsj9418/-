@@ -50,7 +50,7 @@ DEFAULT_OPTIONS=(
     "15. 部署 Sub-Store"
     "16. 安装 思源笔记"
     "17. 安装 Sun-Panel"
-    "18. 安装 OpenWrt Docker"
+    "18. 安装 docker版OpenWrt"
     "19. 配置定时任务"
     "20. 设置 WiFi 热点"
     "21. 4G-UFI 切卡管理"
