@@ -12,38 +12,80 @@ detect_system() {
     fi
 }
 
-# 2. 自动安装caddy（支持多架构）
-install_caddy() {
-    echo "开始自动下载Caddy二进制文件..."
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64|amd64)
-            BINARY_URL="https://github.com/caddyserver/dist/releases/latest/download/caddy_linux_amd64.tar.gz"
-            ;;
-        armv7l|armv7*)
-            BINARY_URL="https://github.com/caddyserver/dist/releases/latest/download/caddy_linux_armv7.tar.gz"
-            ;;
-        aarch64|arm64)
-            BINARY_URL="https://github.com/caddyserver/dist/releases/latest/download/caddy_linux_arm64.tar.gz"
-            ;;
-        *)
-            echo "不支持的架构：$ARCH，无法自动下载caddy。请手动安装。"
-            return 1
-            ;;
-    esac
-    TMP_DIR="/tmp/caddy_install"
-    mkdir -p "$TMP_DIR"
-    cd "$TMP_DIR" || return 1
-    wget -O caddy.tar.gz "$BINARY_URL" || { echo "下载失败"; return 1; }
-    tar -xzf caddy.tar.gz || { echo "解压失败"; return 1; }
-    cp caddy /usr/bin/ || { echo "复制到 /usr/bin/ 失败"; return 1; }
-    chmod +x /usr/bin/caddy
-    rm -rf "$TMP_DIR"
-    echo "Caddy已安装到 /usr/bin/caddy"
-    return 0
+# 2. 获取所有Caddy版本（标签）
+get_caddy_versions() {
+  curl -s https://api.github.com/repos/caddyserver/caddy/releases | \
+  grep -E '"tag_name":' | \
+  sed -E 's/.*"tag_name": ?"([^"]+)".*/\1/' | \
+  awk '{print NR, $0}'
 }
 
-# 3. 检查依赖
+# 3. 用户选择版本
+select_caddy_version() {
+  echo "可用Caddy版本："
+  get_caddy_versions
+  echo "请输入要安装的版本编号（如 1）："
+  read -r version_index
+  version_line=$(get_caddy_versions | sed -n "${version_index}p")
+  version_tag=$(echo "$version_line" | awk '{print $2}')
+  echo "你选择的版本：$version_tag"
+  echo "$version_tag"
+}
+
+# 4. 根据架构拼接下载链接
+get_caddy_download_url() {
+  local version_tag=$1
+  local arch=$(uname -m)
+  local base_url="https://github.com/caddyserver/caddy/releases/download/$version_tag"
+
+  case "$arch" in
+    aarch64|arm64)
+      echo "$base_url/caddy_${version_tag}_linux_arm64.tar.gz"
+      ;;
+    x86_64|amd64)
+      echo "$base_url/caddy_${version_tag}_linux_amd64.tar.gz"
+      ;;
+    armv7l|armv7*)
+      echo "$base_url/caddy_${version_tag}_linux_armv7.tar.gz"
+      ;;
+    *)
+      echo "未支持的架构：$arch" >&2
+      return 1
+      ;;
+  esac
+}
+
+# 5. 安装Caddy（支持版本选择）
+install_caddy() {
+  echo "检测可用Caddy版本..."
+  version=$(select_caddy_version)
+  if [ -z "$version" ]; then
+    echo "未能获取版本信息"
+    return 1
+  fi
+  echo "你选择的版本：$version"
+  download_url=$(get_caddy_download_url "$version")
+  if [ -z "$download_url" ]; then
+    echo "未找到适合架构的版本下载地址" >&2
+    return 1
+  fi
+  echo "下载地址：$download_url"
+
+  # 下载压缩包
+  TMP_DIR="/tmp/caddy_install"
+  mkdir -p "$TMP_DIR"
+  wget -O "$TMP_DIR/caddy.tar.gz" "$download_url" || { echo "下载失败"; return 1; }
+  # 解压
+  tar -xzf "$TMP_DIR/caddy.tar.gz" -C "$TMP_DIR"
+  # 复制二进制
+  cp "$TMP_DIR/caddy" /usr/bin/ || { echo "复制失败"; return 1; }
+  chmod +x /usr/bin/caddy
+  # 清理
+  rm -rf "$TMP_DIR"
+  echo "Caddy已安装到 /usr/bin/caddy"
+}
+
+# 6. 检查依赖
 check_and_install() {
     local cmd=$1
     local pkg=$2
@@ -70,7 +112,7 @@ check_and_install() {
     fi
 }
 
-# 4. 载入状态
+# 7. 载入状态
 load_state() {
     if [ -f "$STATE_FILE" ]; then
         source "$STATE_FILE"
@@ -80,13 +122,13 @@ load_state() {
     fi
 }
 
-# 5. 保存状态
+# 8. 保存状态
 save_state() {
     echo "SERVICE_STATUS='$SERVICE_STATUS'" > "$STATE_FILE"
     echo "CADDY_RUNNING=$CADDY_RUNNING" >> "$STATE_FILE"
 }
 
-# 6. 确保配置文件存在
+# 9. 确保配置文件存在
 prepare_caddy_config() {
     if [ ! -f "$CADDY_CONF" ] || [ ! -s "$CADDY_CONF" ]; then
         echo "配置文件不存在或为空，创建基础配置..."
@@ -95,14 +137,14 @@ prepare_caddy_config() {
     fi
 }
 
-# 7. 格式化配置文件
+# 10. 格式化配置
 format_caddy_config() {
     if command -v caddy >/dev/null 2>&1; then
         caddy fmt --overwrite "$CADDY_CONF"
     fi
 }
 
-# 8. 验证配置文件
+# 11. 验证配置
 validate_caddy_config() {
     if command -v caddy >/dev/null 2>&1; then
         caddy validate --config "$CADDY_CONF"
@@ -112,7 +154,7 @@ validate_caddy_config() {
     fi
 }
 
-# 9. 启动caddy
+# 12. 启动caddy
 start_caddy() {
     prepare_caddy_config
     if ! pgrep -x "caddy" > /dev/null; then
@@ -131,7 +173,7 @@ start_caddy() {
     save_state
 }
 
-# 10. 配置caddy
+# 13. 配置反向代理
 configure_caddy() {
     prepare_caddy_config
     echo "配置caddy反向代理..."
@@ -159,7 +201,7 @@ configure_caddy() {
     echo "配置完成"
 }
 
-# 11. 添加新反向代理
+# 14. 添加新反向代理
 add_new_proxy() {
     prepare_caddy_config
     echo "添加新反向代理："
@@ -178,7 +220,7 @@ add_new_proxy() {
     echo "已添加"
 }
 
-# 12. 查看状态
+# 15. 查看状态
 view_status() {
     echo "系统类型：$SYSTEM_TYPE"
     echo "服务状态：$SERVICE_STATUS"
@@ -187,7 +229,7 @@ view_status() {
     netstat -tulnp | grep -E ':(80|443|8080)'
 }
 
-# 13. 停止端口（80/443/两者）并阻止自动重启
+# 16. 停止端口（80/443/两者）
 stop_ports() {
     echo "选择停止端口："
     echo "1. 停止80端口"
@@ -214,7 +256,7 @@ stop_ports() {
             return
             ;;
     esac
-    # 杀掉残留进程（以防万一）
+    # 杀残留进程
     local PIDS
     PIDS=$(netstat -tulnp | grep -E ':(80|443) ' | awk '{print $7}' | cut -d'/' -f1)
     for pid in $PIDS; do
@@ -225,7 +267,7 @@ stop_ports() {
     save_state
 }
 
-# 14. 启动80端口（启用对应服务）
+# 17. 启动80端口
 start_port_80() {
     /etc/init.d/uhttpd enable
     /etc/init.d/uhttpd start
@@ -235,20 +277,20 @@ start_port_80() {
     save_state
 }
 
-# 15. 启动443端口（启用对应服务）
+# 18. 启动443端口
 start_port_443() {
     /etc/init.d/caddy enable
     /etc/init.d/caddy start
     echo "443端口已启动"
 }
 
-# 16. 一次启动80和443
+# 19. 重新启动全部（80+443）
 start_both_ports() {
     start_port_80
     start_port_443
 }
 
-# 17. 启动caddy
+# 20. 启动caddy
 start_caddy() {
     if check_and_install "caddy" "caddy"; then
         /etc/init.d/caddy enable
@@ -265,14 +307,14 @@ start_caddy() {
     fi
 }
 
-# 18. 卸载caddy
+# 21. 卸载caddy
 uninstall_caddy() {
     /etc/init.d/caddy stop
     /etc/init.d/caddy disable
     echo "已卸载caddy"
 }
 
-# 19. 恢复之前状态
+# 22. 恢复之前状态
 restore_previous() {
     if [ "$SERVICE_STATUS" = "uhttpd" ]; then
         /etc/init.d/uhttpd start
@@ -282,7 +324,7 @@ restore_previous() {
     fi
 }
 
-# 20. 停止服务（uhttpd或caddy）
+# 23. 停止服务（uhttpd或caddy）
 stop_service() {
     echo "请选择要停止的服务："
     echo "1. uhttpd"
@@ -311,7 +353,7 @@ stop_service() {
     fi
 }
 
-# 21. 获取服务状态（运行和启用）
+# 24. 获取服务状态（运行和启用）
 get_service_status() {
     local svc_name=$1
     local running="否"
@@ -321,7 +363,7 @@ get_service_status() {
     echo "$running|$enabled"
 }
 
-# 22. 主菜单（排序优化）
+# 25. 主菜单（排序优化）
 main_menu() {
     detect_system
     load_state
@@ -364,23 +406,23 @@ main_menu() {
                 esac
                 ;;
             4)
-                # 显示uhttpd和caddy状态
+                # 显示状态
                 echo "当前服务状态："
                 uhttpd_status=$(get_service_status uhttpd)
                 caddy_status=$(get_service_status caddy)
                 echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
                 echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
-                # 停止服务
+                # 停止
                 stop_service
                 ;;
             5)
-                # 显示uhttpd和caddy状态
+                # 显示状态
                 echo "当前服务状态："
                 uhttpd_status=$(get_service_status uhttpd)
                 caddy_status=$(get_service_status caddy)
                 echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
                 echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
-                # 启动服务
+                # 启动
                 echo "选择启动哪个服务："
                 echo "1. 启动uhttpd"
                 echo "2. 启动caddy"
