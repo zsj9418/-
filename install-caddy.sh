@@ -112,31 +112,29 @@ validate_caddy_config() {
     fi
 }
 
-# 9. 启动caddy（后台，确保API监听）
+# 9. 启动caddy
 start_caddy() {
     prepare_caddy_config
-    # 如果未在运行，启动
     if ! pgrep -x "caddy" > /dev/null; then
         echo "启动caddy..."
-        caddy run --config "$CADDY_CONF" &>/dev/null &   # 后台启动
+        caddy run --config "$CADDY_CONF" &>/dev/null &
         sleep 3
     fi
-    # 验证配置
     if validate_caddy_config; then
-        echo "配置验证通过，重载caddy..."
-        caddy reload --config "$CADDY_CONF"
-        echo "配置已加载"
+        echo "配置验证通过，caddy已启动"
         CADDY_RUNNING=1
     else
-        echo "配置有误，未重载"
+        echo "配置有误，caddy未启动"
         CADDY_RUNNING=0
     fi
+    SERVICE_STATUS="caddy"
+    save_state
 }
 
-# 10. 配置caddy（用户输入）
+# 10. 配置caddy
 configure_caddy() {
     prepare_caddy_config
-    echo "配置caddy反向代理（支持多个域名和目标）"
+    echo "配置caddy反向代理..."
     echo "每行输入：域名 目标地址（格式：domain.com 192.168.1.2:端口），空行结束"
     echo "示例："
     echo "example.com 192.168.1.10:8080"
@@ -189,7 +187,7 @@ view_status() {
     netstat -tulnp | grep -E ':(80|443|8080)'
 }
 
-# 13. 停止端口（80/443/两者）
+# 13. 停止端口（80/443/两者）并阻止自动重启
 stop_ports() {
     echo "选择停止端口："
     echo "1. 停止80端口"
@@ -198,21 +196,27 @@ stop_ports() {
     read -rp "选择 (1/2/3): " port_choice
     case "$port_choice" in
         1)
-            PIDS=$(netstat -tulnp | grep -E ':(80) ' | awk '{print $7}' | cut -d'/' -f1)
+            /etc/init.d/uhttpd stop
+            /etc/init.d/uhttpd disable
             ;;
         2)
-            PIDS=$(netstat -tulnp | grep -E ':(443) ' | awk '{print $7}' | cut -d'/' -f1)
+            /etc/init.d/caddy stop
+            /etc/init.d/caddy disable
             ;;
         3)
-            PIDS=$(netstat -tulnp | grep -E ':(80|443) ' | awk '{print $7}' | cut -d'/' -f1)
+            /etc/init.d/uhttpd stop
+            /etc/init.d/uhttpd disable
+            /etc/init.d/caddy stop
+            /etc/init.d/caddy disable
             ;;
         *)
             echo "无效选择"
             return
             ;;
     esac
-    # 去重
-    PIDS=$(echo "$PIDS" | sort -u)
+    # 杀掉残留进程（以防万一）
+    local PIDS
+    PIDS=$(netstat -tulnp | grep -E ':(80|443) ' | awk '{print $7}' | cut -d'/' -f1)
     for pid in $PIDS; do
         echo "杀掉进程ID：$pid"
         kill "$pid" 2>/dev/null || kill -9 "$pid"
@@ -221,67 +225,54 @@ stop_ports() {
     save_state
 }
 
-# 14. 启动80端口
+# 14. 启动80端口（启用对应服务）
 start_port_80() {
-    echo "尝试启动80端口（假设已有服务配置监听80）..."
-    # 这里示例：启动uhttpd（或其他web服务）
-    /etc/init.d/uhttpd start
     /etc/init.d/uhttpd enable
+    /etc/init.d/uhttpd start
     echo "80端口已启动"
-    # 更新状态
     SERVICE_STATUS="uhttpd"
+    CADDY_RUNNING=0
     save_state
 }
 
-# 15. 启动443端口
+# 15. 启动443端口（启用对应服务）
 start_port_443() {
-    echo "启动443端口（假设caddy配置支持监听443）..."
-    start_caddy
-    # start_caddy已处理
+    /etc/init.d/caddy enable
+    /etc/init.d/caddy start
+    echo "443端口已启动"
 }
 
-# 16. 启动80和443端口
+# 16. 一次启动80和443
 start_both_ports() {
     start_port_80
     start_port_443
 }
 
-# 17. 启动caddy（确保后台运行）
+# 17. 启动caddy
 start_caddy() {
     if check_and_install "caddy" "caddy"; then
-        if command -v caddy >/dev/null 2>&1; then
-            if ! pgrep -x "caddy" > /dev/null; then
-                echo "启动caddy..."
-                caddy run --config "$CADDY_CONF" &>/dev/null & 
-                sleep 3
-            fi
-            if validate_caddy_config; then
-                echo "配置验证通过，重载caddy..."
-                caddy reload --config "$CADDY_CONF"
-                echo "配置已加载"
-                CADDY_RUNNING=1
-            else
-                echo "配置有误，未重载"
-                CADDY_RUNNING=0
-            fi
+        /etc/init.d/caddy enable
+        /etc/init.d/caddy start
+        if validate_caddy_config; then
+            echo "配置验证通过，caddy已启动"
+            CADDY_RUNNING=1
+        else
+            echo "配置有误，caddy未启动"
+            CADDY_RUNNING=0
         fi
+        SERVICE_STATUS="caddy"
+        save_state
     fi
 }
 
-# 18. 其他功能（卸载、恢复）
+# 18. 卸载caddy
 uninstall_caddy() {
-    echo "卸载caddy..."
-    if command -v caddy >/dev/null 2>&1; then
-        caddy stop
-        if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-            opkg remove caddy
-        fi
-        echo "已卸载caddy"
-    else
-        echo "未检测到caddy"
-    fi
+    /etc/init.d/caddy stop
+    /etc/init.d/caddy disable
+    echo "已卸载caddy"
 }
 
+# 19. 恢复之前状态
 restore_previous() {
     if [ "$SERVICE_STATUS" = "uhttpd" ]; then
         /etc/init.d/uhttpd start
@@ -291,7 +282,46 @@ restore_previous() {
     fi
 }
 
-# 19. 主菜单
+# 20. 停止服务（uhttpd或caddy）
+stop_service() {
+    echo "请选择要停止的服务："
+    echo "1. uhttpd"
+    echo "2. caddy"
+    read -rp "输入 (1/2): " svc_choice
+    if [ "$svc_choice" = "1" ]; then
+        /etc/init.d/uhttpd stop
+        /etc/init.d/uhttpd disable
+        echo "uhttpd已停止并禁用"
+        if [ $? -eq 0 ]; then
+            echo "操作成功"
+        else
+            echo "操作失败"
+        fi
+    elif [ "$svc_choice" = "2" ]; then
+        /etc/init.d/caddy stop
+        /etc/init.d/caddy disable
+        echo "caddy已停止并禁用"
+        if [ $? -eq 0 ]; then
+            echo "操作成功"
+        else
+            echo "操作失败"
+        fi
+    else
+        echo "无效选择"
+    fi
+}
+
+# 21. 获取服务状态（运行和启用）
+get_service_status() {
+    local svc_name=$1
+    local running="否"
+    local enabled="否"
+    /etc/init.d/$svc_name status >/dev/null 2>&1 && running="是"
+    /etc/init.d/$svc_name enabled >/dev/null 2>&1 && enabled="是"
+    echo "$running|$enabled"
+}
+
+# 22. 主菜单（排序优化）
 main_menu() {
     detect_system
     load_state
@@ -304,44 +334,76 @@ main_menu() {
         echo "=============================="
         echo "1. 查看当前系统和端口状态"
         echo "2. 停止端口（80/443/两者）"
-        echo "3. 启动服务（uhttpd或caddy）"
-        echo "4. 配置caddy反向代理"
-        echo "5. 添加新反向代理"
-        echo "6. 恢复到之前的运行状态"
-        echo "7. 卸载caddy（可选）"
-        echo "8. 退出"
-        read -rp "请选择操作(1-8): " opt
+        echo "3. 启动端口（80/443/两者）"
+        echo "4. 停止服务（uhttpd或caddy）"
+        echo "5. 启动服务（uhttpd或caddy）"
+        echo "6. 配置caddy反向代理"
+        echo "7. 添加新反向代理"
+        echo "8. 恢复到之前的运行状态"
+        echo "9. 卸载caddy"
+        echo "10. 退出"
+        read -rp "请选择操作(1-10): " opt
+
         case "$opt" in
             1) view_status ;;
             2) stop_ports ;;
             3)
-                echo "启动子菜单："
-                echo "1. 启动uhttpd"
-                echo "2. 启动caddy"
-                echo "3. 启动80端口"
-                echo "4. 启动443端口"
-                echo "5. 启动80和443端口"
-                read -rp "选择 (1/2/3/4/5): " sub_choice
-                case "$sub_choice" in
-                    1) start_uhttpd ;;
-                    2) start_caddy ;;
-                    3) start_port_80 ;;
-                    4) start_port_443 ;;
-                    5) start_both_ports ;;
+                echo "启动端口："
+                echo "1. 启动80端口"
+                echo "2. 启动443端口"
+                echo "3. 启动80和443端口"
+                read -rp "选择 (1/2/3): " port_choice
+                case "$port_choice" in
+                    1) start_port_80 ;;
+                    2) start_port_443 ;;
+                    3)
+                        start_port_80
+                        start_port_443
+                        ;;
                     *) echo "无效选择" ;;
                 esac
                 ;;
-            4) 
+            4)
+                # 显示uhttpd和caddy状态
+                echo "当前服务状态："
+                uhttpd_status=$(get_service_status uhttpd)
+                caddy_status=$(get_service_status caddy)
+                echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
+                echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
+                # 停止服务
+                stop_service
+                ;;
+            5)
+                # 显示uhttpd和caddy状态
+                echo "当前服务状态："
+                uhttpd_status=$(get_service_status uhttpd)
+                caddy_status=$(get_service_status caddy)
+                echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
+                echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
+                # 启动服务
+                echo "选择启动哪个服务："
+                echo "1. 启动uhttpd"
+                echo "2. 启动caddy"
+                read -rp "输入 (1/2): " svc_choice
+                if [ "$svc_choice" = "1" ]; then
+                    start_port_80
+                elif [ "$svc_choice" = "2" ]; then
+                    start_caddy
+                else
+                    echo "无效选择"
+                fi
+                ;;
+            6) 
                 if command -v caddy >/dev/null 2>&1; then
                     configure_caddy
                 else
                     echo "请先安装caddy"
                 fi
                 ;;
-            5) add_new_proxy ;;
-            6) restore_previous ;;
-            7) uninstall_caddy ;;
-            8) echo "退出"; exit 0 ;;
+            7) add_new_proxy ;;
+            8) restore_previous ;;
+            9) uninstall_caddy ;;
+            10) echo "退出"; exit 0 ;;
             *) echo "无效选择" ;;
         esac
         echo
