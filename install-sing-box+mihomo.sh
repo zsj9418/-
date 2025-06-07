@@ -233,53 +233,139 @@ check_network() {
     fi
 }
 
-# 配置网络（启用转发和 iptables NAT）
+# 配置网络（启用 IPv4 和 IPv6 转发以及 NAT）
 configure_network_forwarding_nat() {
-    log "配置 IPv4 转发和 NAT..."
- 
+    log "配置 IPv4 和 IPv6 转发以及 NAT..."
+
+    # 启用 IPv4 转发
     if sysctl net.ipv4.ip_forward | grep -q "net.ipv4.ip_forward = 1"; then
         green "IPv4 转发已启用"
     else
         yellow "启用 IPv4 转发..."
-        sysctl -w net.ipv4.ip_forward=1
+        if sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+            green "IPv4 转发已通过 sysctl -w 启用"
+        else
+            red "启用 IPv4 转发失败"
+            return 1
+        fi
         if grep -q "^net.ipv4.ip_forward=" /etc/sysctl.conf; then
             sed -i 's/^net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
         else
-            echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         fi
-        green "IPv4 转发已启用并持久化"
+        green "IPv4 转发已写入 /etc/sysctl.conf"
     fi
 
+    # 启用 IPv6 转发
+    if sysctl net.ipv6.conf.all.forwarding | grep -q "net.ipv6.conf.all.forwarding = 1"; then
+        green "IPv6 转发已启用"
+    else
+        yellow "启用 IPv6 转发..."
+        if sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1; then
+            green "IPv6 转发已通过 sysctl -w 启用"
+        else
+            red "启用 IPv6 转发失败，可能是系统不支持 IPv6"
+            return 1
+        fi
+        if grep -q "^net.ipv6.conf.all.forwarding=" /etc/sysctl.conf; then
+            sed -i 's/^net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
+        else
+            echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+        fi
+        green "IPv6 转发已写入 /etc/sysctl.conf"
+    fi
+
+    # 清理可能的禁用 IPv6 配置
+    if grep -q "^net.ipv6.conf.all.disable_ipv6=" /etc/sysctl.conf; then
+        sed -i '/^net.ipv6.conf.all.disable_ipv6=/d' /etc/sysctl.conf
+        yellow "已移除 /etc/sysctl.conf 中的禁用 IPv6 配置"
+    fi
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+
+    # 应用 sysctl 配置
+    if sysctl -p >/dev/null 2>&1; then
+        green "sysctl 配置已成功应用"
+        yellow "请运行以下命令验证配置是否生效："
+        yellow "  sysctl net.ipv4.ip_forward"
+        yellow "  sysctl net.ipv6.conf.all.forwarding"
+        yellow "预期输出："
+        yellow "  net.ipv4.ip_forward = 1"
+        yellow "  net.ipv6.conf.all.forwarding = 1"
+    else
+        red "应用 sysctl 配置失败，请检查 /etc/sysctl.conf 权限或内容"
+        yellow "您可以手动运行 'sysctl -p' 查看错误信息"
+        return 1
+    fi
+
+    # 配置 IPv4 NAT 规则
     local NAT_SOURCE_CIDR="192.168.0.0/16"
     if ! iptables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null; then
-        yellow "添加 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR)..."
+        yellow "添加 IPv4 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR)..."
         if iptables -t nat -A POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE; then
-             green "NAT 规则添加成功"
-             if [ "$SYSTEM_TYPE" = "openwrt" ]; then
-                 yellow "OpenWrt 系统：请手动将 NAT 规则添加到 UCI 防火墙配置以实现持久化。"
-                 yellow "示例命令："
-                 yellow "  uci add firewall rule"
-                 yellow "  uci set firewall.@rule[-1].name='Masquerade_Proxy'"
-                 yellow "  uci set firewall.@rule[-1].src='lan'"
-                 yellow "  uci set firewall.@rule[-1].target='MASQUERADE'"
-                 yellow "  uci commit firewall && /etc/init.d/firewall restart"
-             elif command -v iptables-save >/dev/null 2>&1; then
-                 mkdir -p /etc/iptables
-                 if iptables-save > /etc/iptables/rules.v4; then
-                     green "iptables 规则已保存到 /etc/iptables/rules.v4"
-                 else
-                     red "iptables-save 保存规则失败"
-                 fi
-             else
-                 yellow "未找到 iptables-save 命令，NAT 规则可能不会持久化。"
-             fi
+            green "IPv4 NAT 规则添加成功"
+            if [ "$SYSTEM_TYPE" = "openwrt" ]; then
+                yellow "OpenWrt 系统：请手动将 IPv4 NAT 规则添加到 UCI 防火墙配置以实现持久化。"
+                yellow "示例命令："
+                yellow "  uci add firewall rule"
+                yellow "  uci set firewall.@rule[-1].name='Masquerade_Proxy_IPv4'"
+                yellow "  uci set firewall.@rule[-1].src='lan'"
+                yellow "  uci set firewall.@rule[-1].target='MASQUERADE'"
+                yellow "  uci commit firewall && /etc/init.d/firewall restart"
+            elif command -v iptables-save >/dev/null 2>&1; then
+                mkdir -p /etc/iptables
+                if iptables-save > /etc/iptables/rules.v4; then
+                    green "IPv4 iptables 规则已保存到 /etc/iptables/rules.v4"
+                else
+                    red "IPv4 iptables-save 保存规则失败"
+                fi
+            else
+                yellow "未找到 iptables-save 命令，IPv4 NAT 规则可能不会持久化。"
+            fi
         else
-            red "添加 NAT 规则失败"
+            red "添加 IPv4 NAT 规则失败"
             return 1
         fi
     else
-        green "NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR) 已存在"
+        green "IPv4 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR) 已存在"
     fi
+
+    # 配置 IPv6 NAT 规则
+    local NAT_SOURCE_CIDR_V6="fc00::/7"
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6tables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null; then
+            yellow "添加 IPv6 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR_V6)..."
+            if ip6tables -t nat -A POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE; then
+                green "IPv6 NAT 规则添加成功"
+                if [ "$SYSTEM_TYPE" = "openwrt" ]; then
+                    yellow "OpenWrt 系统：请手动将 IPv6 NAT 规则添加到 UCI 防火墙配置以实现持久化。"
+                    yellow "示例命令："
+                    yellow "  uci add firewall rule"
+                    yellow "  uci set firewall.@rule[-1].name='Masquerade_Proxy_IPv6'"
+                    yellow "  uci set firewall.@rule[-1].src='lan'"
+                    yellow "  uci set firewall.@rule[-1].family='ipv6'"
+                    yellow "  uci set firewall.@rule[-1].target='MASQUERADE'"
+                    yellow "  uci commit firewall && /etc/init.d/firewall restart"
+                elif command -v ip6tables-save >/dev/null 2>&1; then
+                    mkdir -p /etc/iptables
+                    if ip6tables-save > /etc/iptables/rules.v6; then
+                        green "IPv6 ip6tables 规则已保存到 /etc/iptables/rules.v6"
+                    else
+                        red "IPv6 ip6tables-save 保存规则失败"
+                    fi
+                else
+                    yellow "未找到 ip6tables-save 命令，IPv6 NAT 规则可能不会持久化。"
+                fi
+            else
+                red "添加 IPv6 NAT 规则失败"
+                return 1
+            fi
+        else
+            green "IPv6 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR_V6) 已存在"
+        fi
+    else
+        yellow "未找到 ip6tables 命令，跳过 IPv6 NAT 配置。请确保已安装 ip6tables。"
+    fi
+
     return 0
 }
 
