@@ -862,15 +862,39 @@ setup_scheduled_update_internal() {
     . "$env_file"
     local CRON_INTERVAL_LOCAL="${CRON_INTERVAL:-0}"
 
+    log "配置 ${service_name} 自动更新..."
+    printf "%b当前自动更新间隔：%s 分钟（0 表示已禁用）%b\n" "$YELLOW" "$CRON_INTERVAL_LOCAL" "$NC"
+    printf "%b请输入新的更新间隔时间（分钟，0 表示禁用自动更新，推荐 1440 为每天一次）：%b\n" "$GREEN" "$NC"
+    read -r CRON_INTERVAL_INPUT
+    if ! echo "$CRON_INTERVAL_INPUT" | grep -Eq '^[0-9]+$'; then
+        red "无效的间隔时间，将保留原有设置（${CRON_INTERVAL_LOCAL} 分钟）。"
+        return 1
+    fi
+    CRON_INTERVAL="$CRON_INTERVAL_INPUT"
+
+    # 更新环境变量文件
+    if [ -f "$env_file" ]; then
+        sed -i "s/^CRON_INTERVAL=.*/CRON_INTERVAL=$CRON_INTERVAL/" "$env_file"
+        if [ $? -ne 0 ]; then
+            red "更新 ${env_file} 失败"
+            return 1
+        fi
+    else
+        red "${env_file} 不存在，请先配置订阅和模式"
+        return 1
+    fi
+
+    # 清除现有 crontab 任务
     (crontab -l 2>/dev/null | grep -v "$cron_target_script") | crontab -
     rm -f "$cron_target_script"
 
-    if [ "$CRON_INTERVAL_LOCAL" -eq 0 ]; then
+    if [ "$CRON_INTERVAL" -eq 0 ]; then
         green "${service_name} 自动更新已禁用。"
         return 0
     fi
 
-    log "正在配置 ${service_name} 自动更新..."
+    # 创建更新脚本
+    log "生成 ${service_name} 自动更新脚本：$cron_target_script"
     mkdir -p "$(dirname "$cron_target_script")"
     cat << EOF > "$cron_target_script"
 #!/bin/sh
@@ -879,11 +903,11 @@ update_config_and_run_internal "$service_type" >> "$LOG_FILE" 2>&1
 EOF
     chmod +x "$cron_target_script"
 
-    local CRON_SCHEDULE="*/$CRON_INTERVAL_LOCAL * * * *"
+    # 设置 crontab 任务
+    local CRON_SCHEDULE="*/$CRON_INTERVAL * * * *"
     (crontab -l 2>/dev/null; echo "$CRON_SCHEDULE $cron_target_script") | crontab -
-
     if [ $? -eq 0 ]; then
-        green "${service_name} 自动更新已设置为每 ${CRON_INTERVAL_LOCAL} 分钟执行一次。"
+        green "${service_name} 自动更新已设置为每 ${CRON_INTERVAL} 分钟执行一次。"
     else
         red "${service_name} 自动更新设置失败！"
         return 1
