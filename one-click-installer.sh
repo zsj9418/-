@@ -71,6 +71,7 @@ DEFAULT_OPTIONS=(
     "36. dae(大鹅代理)配置"
     "37. 开启caddy反代功能"
     "38. docker部署rustdesk远程控制"
+    "39. openwrt固定MAC"
     "98. 快捷键管理"
 )
 
@@ -114,6 +115,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["36"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup-dae.sh"
     ["37"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-caddy.sh"
     ["38"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-rustdesk.sh"
+    ["39"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openwrt_mac.sh"
 )
 
 # 声明全局变量
