@@ -643,6 +643,64 @@ install_mihomo() {
     return 0
 }
 
+# 获取 Mihomo Alpha (Smart Group) 版本列表
+get_mihomo_alpha_versions() {
+    local arch="$1" # 例如 amd64, arm64
+    local releases_info
+    releases_info=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases") || {
+        red "无法获取 Mihomo Alpha 版本信息，请检查网络或 GitHub API 限制。"
+        return 1
+    }
+
+    # 解析 releases，提取 Prerelease-Alpha 版本的资产
+    local versions=()
+    local i=0
+    while IFS= read -r asset_info; do
+        local asset_name
+        local download_url
+        local commit_id
+        local published_at
+        asset_name=$(echo "$asset_info" | jq -r '.name')
+        # 匹配 mihomo-linux-<arch>-alpha-smart-<commit>.gz
+        if [[ "$asset_name" =~ mihomo-linux-${arch}(-compatible)?-alpha-smart-([0-9a-f]+)\.gz ]]; then
+            commit_id="${BASH_REMATCH[2]}"
+            download_url=$(echo "$asset_info" | jq -r '.browser_download_url')
+            published_at=$(echo "$asset_info" | jq -r '.published_at' | cut -d'T' -f1)
+            versions[$i]="${commit_id}|${published_at}|${download_url}|${asset_name}"
+            ((i++))
+        fi
+    done < <(echo "$releases_info" | jq -c '.[] | .assets[]')
+
+    if [ ${#versions[@]} -eq 0 ]; then
+        red "未找到适用于架构 $arch 的 Mihomo Alpha (Smart Group) 版本。"
+        return 1
+    fi
+
+    echo "${versions[@]}"
+    return 0
+}
+
+# 获取 Mihomo Model.bin 的最新下载链接
+get_mihomo_model_bin_url() {
+    local releases_info
+    releases_info=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases") || {
+        red "无法获取 Mihomo 发布信息以查找 Model.bin，请检查网络或 GitHub API 限制。"
+        return 1
+    }
+
+    # 查找 LightGBM-Model 标签下的 Model.bin 文件
+    local model_bin_url
+    model_bin_url=$(echo "$releases_info" | jq -r '.[] | select(.tag_name == "LightGBM-Model") | .assets[] | select(.name == "Model.bin") | .browser_download_url')
+
+    if [ -z "$model_bin_url" ]; then
+        red "未找到 LightGBM-Model 标签下的 Model.bin 文件。"
+        return 1
+    fi
+
+    echo "$model_bin_url"
+    return 0
+}
+
 # 安装 Mihomo Alpha with Smart Group 版本
 install_mihomo_alpha_smart() {
     log "开始安装 Mihomo Alpha with Smart Group 版本..."
@@ -650,25 +708,52 @@ install_mihomo_alpha_smart() {
     configure_network_forwarding_nat || return 1
 
     local local_arch=$(get_arch) || return 1
-    local FILENAME=""
-    local ALPHA_VERSION_TAG="Prerelease-Alpha" # 固定为Alpha版本标签
-    local BUILD_IDENTIFIER="4abb70e" # 根据您的要求固定此构建标识
+    local supported_arches=("amd64" "arm64") # 当前已知的 alpha-smart 支持架构
+    local arch_supported=0
+    for supported_arch in "${supported_arches[@]}"; do
+        if [ "$local_arch" = "$supported_arch" ]; then
+            arch_supported=1
+            break
+        fi
+    done
+    if [ "$arch_supported" -eq 0 ]; then
+        red "暂无 $local_arch 架构的 Mihomo Alpha with Smart Group 版本支持，目前仅支持 amd64 和 arm64。"
+        return 1
+    fi
 
-    case "$local_arch" in
-        amd64) FILENAME="mihomo-linux-amd64-compatible-alpha-smart-${BUILD_IDENTIFIER}.gz" ;;
-        arm64) FILENAME="mihomo-linux-arm64-alpha-smart-${BUILD_IDENTIFIER}.gz" ;;
-        # 注意：这里需要根据实际的vernesong/mihomo Alpha版本发布文件名来填充armv7和riscv64的命名规则
-        # 如果没有对应的alpha-smart版本，可能需要调整逻辑
-        armv7) red "暂无 armv7 的 Mihomo Alpha with Smart Group 特定版本，请手动确认下载链接。"; return 1 ;;
-        riscv64) red "暂无 riscv64 的 Mihomo Alpha with Smart Group 特定版本，请手动确认下载链接。"; return 1 ;;
-        *) red "不支持的架构: $local_arch"; return 1 ;;
-    esac
+    log "正在获取 Mihomo Alpha with Smart Group 可用版本..."
+    local versions
+    versions=$(get_mihomo_alpha_versions "$local_arch") || return 1
 
-    local DOWNLOAD_URL="https://github.com/vernesong/mihomo/releases/download/${ALPHA_VERSION_TAG}/${FILENAME}"
+    # 解析版本并显示选择菜单
+    local version_array=($versions)
+    clear
+    printf "\\n%b=== 选择 Mihomo Alpha (Smart Group) 版本 ===%b\\n" "$GREEN" "$NC"
+    local i=1
+    declare -A version_map
+    for version_info in "${version_array[@]}"; do
+        IFS='|' read -r commit_id published_at download_url asset_name <<< "$version_info"
+        printf "  %d) Commit: %s (发布日期: %s, 文件: %s)\\n" "$i" "$commit_id" "$published_at" "$asset_name"
+        version_map[$i]="$download_url|$asset_name"
+        ((i++))
+    done
+    printf "%b=====================================%b\\n" "$GREEN" "$NC"
+    printf "请输入选项 (1-%d): " "${#version_array[@]}"
+    read -r choice
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#version_array[@]}" ]; then
+        red "无效选项 '$choice'，安装取消。"
+        return 1
+    fi
+
+    local selected_version=${version_map[$choice]}
+    local DOWNLOAD_URL=$(echo "$selected_version" | cut -d'|' -f1)
+    local FILENAME=$(echo "$selected_version" | cut -d'|' -f2)
+
     TEMP_DIR=$(mktemp -d)
     local GZ_PATH="$TEMP_DIR/$FILENAME"
 
-    log "下载 Mihomo Alpha with Smart Group (${local_arch})..."
+    log "下载 Mihomo Alpha with Smart Group ($local_arch, 文件: $FILENAME)..."
     if ! curl -L -o "$GZ_PATH" "$DOWNLOAD_URL"; then
         red "下载 Mihomo Alpha with Smart Group 失败！URL: ${DOWNLOAD_URL}"
         cleanup
@@ -696,27 +781,32 @@ install_mihomo_alpha_smart() {
     chmod +x "$MH_BIN_PATH"
 
     # 下载 Model.bin 文件到 Mihomo 配置目录
-    local MODEL_BIN_URL="https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin"
     local MODEL_BIN_PATH="$MH_BASE_DIR/Model.bin"
-    log "下载 Model.bin 到 $MODEL_BIN_PATH..."
-    mkdir -p "$MH_BASE_DIR" # 确保配置目录存在
-    if ! curl -L -o "$MODEL_BIN_PATH" "$MODEL_BIN_URL"; then
-        red "下载 Model.bin 失败！URL: ${MODEL_BIN_URL}"
-        # 即使Model.bin下载失败也继续，因为Mihomo核心可能仍然可用
-        yellow "Model.bin 下载失败，Mihomo Smart Group 功能可能受限。"
-    else
-        green "Model.bin 下载成功。"
+    log "正在获取最新 Model.bin 下载链接..."
+    local MODEL_BIN_URL
+    MODEL_BIN_URL=$(get_mihomo_model_bin_url) || {
+        yellow "无法获取 Model.bin 下载链接，将跳过 Model.bin 下载，Mihomo Smart Group 功能可能受限。"
+    }
+
+    if [ -n "$MODEL_BIN_URL" ]; then
+        log "下载 Model.bin 到 $MODEL_BIN_PATH..."
+        mkdir -p "$MH_BASE_DIR" # 确保配置目录存在
+        if ! curl -L -o "$MODEL_BIN_PATH" "$MODEL_BIN_URL"; then
+            red "下载 Model.bin 失败！URL: ${MODEL_BIN_URL}"
+            yellow "Model.bin 下载失败，Mihomo Smart Group 功能可能受限。"
+        else
+            green "Model.bin 下载成功，保存为 $MODEL_BIN_PATH。"
+        fi
     fi
 
     cleanup
     green "Mihomo Alpha with Smart Group 安装成功！"
 
-    generate_initial_mihomo_config # 仍然使用原有的Mihomo配置生成函数
-    setup_service "mihomo" # 仍然使用原有的Mihomo服务设置函数
+    generate_initial_mihomo_config
+    setup_service "mihomo"
     green "Mihomo Alpha with Smart Group 部署完成。"
     return 0
 }
-
 
 # 生成初始 Mihomo 配置
 generate_initial_mihomo_config() {
