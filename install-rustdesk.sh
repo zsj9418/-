@@ -244,8 +244,15 @@ get_server_id() {
 
 # 获取中继服务器地址
 get_relay_address() {
-  SERVER_IP=$(get_server_ip)
-  echo "${SERVER_IP}:${HBBR_PORTS[2]}"  # 使用 hbbr 的中继端口
+  local net_mode=$1
+  local server_ip
+  if [ "$net_mode" == "host" ]; then
+    server_ip="127.0.0.1"
+    echo "${server_ip}:${HBBS_PORTS[2]}"  # 21117
+  else
+    server_ip=$(get_server_ip)
+    echo "${server_ip}:${HBBR_PORTS[2]}"  # 31117
+  fi
 }
 
 # 部署 hbbs 和 hbbr
@@ -255,20 +262,26 @@ deploy_hbbs_hbbr() {
   docker rm -f "$CONTAINER_NAME_HBBS" "$CONTAINER_NAME_HBBR" >/dev/null 2>&1 || true
 
   echo "请选择网络模式："
-  echo "1) host 模式（容器直接使用宿主机网络）"
-  echo "2) 桥接（bridge）模式（需配置宿主机端口）"
+  echo "1) Host 模式（容器共享宿主机网络，使用 127.0.0.1 通信，适合简单部署）"
+  echo "2) 桥接（Bridge）模式（容器隔离，使用容器名称通信，适合安全隔离）"
   read -p "输入（1 或 2，回车默认 1）： " net_mode
   net_mode=${net_mode:-1}
 
   if [ "$net_mode" == "1" ]; then
-    echo -e "${GREEN}你选择了 host 模式，端口由宿主机管理。${NC}"
-    port_args_hbbs="--net=host"
-    port_args_hbbr="--net=host"
+    echo -e "${GREEN}你选择了 Host 模式，容器共享宿主机网络命名空间。${NC}"
     port_config="Host 模式"
     HBBS_PORTS=("21115" "21116" "21117" "21118" "21119")
     HBBR_PORTS=("21115" "21116" "21117" "21118" "21119")
+    NET_MODE="host"
+
+    # 验证端口
+    if ! validate_ports "${HBBS_PORTS[@]}"; then
+      echo -e "${RED}错误：端口 ${HBBS_PORTS[*]} 中有端口被占用！请释放端口或选择其他端口。${NC}"
+      sleep 2
+      main_menu
+    fi
   elif [ "$net_mode" == "2" ]; then
-    echo -e "${YELLOW}你选择了桥接模式，请配置宿主机端口。${NC}"
+    echo -e "${YELLOW}你选择了桥接模式，容器将加入 rustdesk-net 网络。${NC}"
     echo "注意：hbbs 和 hbbr 需使用不同的宿主机端口！"
     echo "hbbs 端口用途：21115 (TCP), 21116 (TCP/UDP, ID 服务器), 21117 (TCP), 21118 (TCP), 21119 (TCP)"
     echo "hbbr 端口用途：21115 (TCP), 21116 (TCP/UDP), 21117 (TCP, 中继服务器), 21118 (TCP), 21119 (TCP)"
@@ -328,6 +341,7 @@ deploy_hbbs_hbbr() {
     done
     HBBR_PORTS=("${hbbr_ports_array[@]}")
     port_config="hbbs 宿主机端口：$hbbs_host_ports\nhbbr 宿主机端口：$hbbr_host_ports"
+    NET_MODE="bridge"
   else
     echo -e "${RED}无效选择，返回主菜单。${NC}"
     sleep 2
@@ -335,23 +349,46 @@ deploy_hbbs_hbbr() {
   fi
 
   echo -e "${YELLOW}正在拉取镜像 $IMAGE_NAME_HBBS_HBBR...${NC}"
-  docker pull "$IMAGE_NAME_HBBS_HBBR" || { echo -e "${RED}镜像拉取失败，请检查网络连接或镜像地址。${NC}"; exit 1; }
+  if ! docker pull "$IMAGE_NAME_HBBS_HBBR" 2>&1 | tee -a "$LOG_FILE"; then
+    echo -e "${RED}镜像拉取失败，请检查网络连接或镜像地址。尝试使用备用镜像版本（1.1.10-1）。${NC}"
+    IMAGE_NAME_HBBS_HBBR="rustdesk/rustdesk-server:1.1.10-1"
+    if ! docker pull "$IMAGE_NAME_HBBS_HBBR" 2>&1 | tee -a "$LOG_FILE"; then
+      echo -e "${RED}备用镜像拉取失败，请检查网络或手动指定镜像版本。${NC}"
+      exit 1
+    fi
+  fi
 
-  # 创建自定义网络
-  docker network create rustdesk-net >/dev/null 2>&1 || true
+  # 创建自定义网络（桥接模式需要）
+  if [ "$NET_MODE" == "bridge" ]; then
+    docker network create rustdesk-net >/dev/null 2>&1 || true
+  fi
 
+  # 启动 hbbs 容器
   echo -e "${YELLOW}开始部署 hbbs 容器...${NC}"
-  if ! docker run -d --name "$CONTAINER_NAME_HBBS" --restart=unless-stopped $port_args_hbbs --network rustdesk-net -v "$DATA_DIR:/root" --platform "$PLATFORM" "$IMAGE_NAME_HBBS_HBBR" hbbs; then
-    echo -e "${RED}错误：hbbs 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_HBBS）。${NC}"
-    docker rm -f "$CONTAINER_NAME_HBBS" >/dev/null 2>&1 || true
+  local network_arg=""
+  if [ "$NET_MODE" == "bridge" ]; then
+    network_arg="--network rustdesk-net $port_args_hbbs"
+  else
+    network_arg="--net=host"
+  fi
+  if ! docker run -d --name "$CONTAINER_NAME_HBBS" --restart=unless-stopped $network_arg \
+    -v "$DATA_DIR:/root" --platform "$PLATFORM" "$IMAGE_NAME_HBBS_HBBR" hbbs 2>&1 | tee -a "$LOG_FILE"; then
+    echo -e "${RED}错误：hbbs 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_HBBS 或 $LOG_FILE）。${NC}"
     sleep 2
     main_menu
   fi
 
+  # 启动 hbbr 容器
   echo -e "${YELLOW}开始部署 hbbr 容器...${NC}"
-  if ! docker run -d --name "$CONTAINER_NAME_HBBR" --restart=unless-stopped $port_args_hbbr --network rustdesk-net -v "$DATA_DIR:/root" --platform "$PLATFORM" "$IMAGE_NAME_HBBS_HBBR" hbbr; then
-    echo -e "${RED}错误：hbbr 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_HBBR）。${NC}"
-    docker rm -f "$CONTAINER_NAME_HBBS" "$CONTAINER_NAME_HBBR" >/dev/null 2>&1 || true
+  if [ "$NET_MODE" == "bridge" ]; then
+    network_arg="--network rustdesk-net $port_args_hbbr"
+  else
+    network_arg="--net=host"
+  fi
+  if ! docker run -d --name "$CONTAINER_NAME_HBBR" --restart=unless-stopped $network_arg \
+    -v "$DATA_DIR:/root" --platform "$PLATFORM" "$IMAGE_NAME_HBBS_HBBR" hbbr 2>&1 | tee -a "$LOG_FILE"; then
+    echo -e "${RED}错误：hbbr 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_HBBR 或 $LOG_FILE）。${NC}"
+    docker rm -f "$CONTAINER_NAME_HBBS" >/dev/null 2>&1 || true
     sleep 2
     main_menu
   fi
@@ -361,8 +398,8 @@ deploy_hbbs_hbbr() {
 
   # 提取 Key
   KEY=$(extract_key "$CONTAINER_NAME_HBBS")
-  SERVER_IP=$(get_server_ip)
-  SERVER_PORT=${HBBR_PORTS[2]}  # 使用 hbbr 的中继端口
+  SERVER_IP=$([ "$NET_MODE" == "host" ] && echo "127.0.0.1" || get_server_ip)
+  SERVER_PORT=$([ "$NET_MODE" == "host" ] && echo "${HBBS_PORTS[2]}" || echo "${HBBR_PORTS[2]}")
 
   echo -e "\n${GREEN}== 服务器密钥信息 ==${NC}"
   echo "IP: $SERVER_IP"
@@ -384,74 +421,52 @@ deploy_api() {
   echo -e "${YELLOW}开始部署 RustDesk API 容器...${NC}"
 
   # 检查 hbbs 是否运行
-  if ! docker ps --format '{{.Names}}' | grep -q "^$CONTAINER_NAME_HBBS$"; then
+  if ! docker ps -a --format '{{.Names}}' | grep -q "^$CONTAINER_NAME_HBBS$"; then
     echo -e "${RED}错误：hbbs 容器未运行！请先部署 hbbs 和 hbbr。${NC}"
     sleep 2
     main_menu
   fi
 
-  # 自动检测 IP
-  DEFAULT_IP=$(get_server_ip)
-  echo -e "${YELLOW}检测到的本机 IP 地址：$DEFAULT_IP${NC}"
-  read -p "请输入服务器 IP 地址（回车使用默认值 $DEFAULT_IP）： " SERVER_IP
-  SERVER_IP=${SERVER_IP:-$DEFAULT_IP}
-  until validate_ip "$SERVER_IP"; do
-    echo -e "${RED}错误：无效的 IP 地址格式！${NC}"
-    read -p "请输入有效的服务器 IP 地址： " SERVER_IP
-  done
+  # 检查网络模式（从 hbbs 容器获取）
+  NET_MODE=$(docker inspect "$CONTAINER_NAME_HBBS" | grep '"NetworkMode":' | grep -q '"host"' && echo "host" || echo "bridge")
+  echo -e "${GREEN}检测到 $CONTAINER_NAME_HBBS 使用 $NET_MODE 模式，API 将使用相同模式。${NC}"
 
-  # 网络模式选择
-  echo "请选择网络模式："
-  echo "1) host 模式（容器直接使用宿主机网络）"
-  echo "2) 桥接（bridge）模式（需配置宿主机端口）"
-  read -p "输入（1 或 2，回车默认 1）： " net_mode
-  net_mode=${net_mode:-1}
-
-  if [ "$net_mode" == "1" ]; then
-    echo -e "${GREEN}你选择了 host 模式，端口由宿主机管理。${NC}"
+  if [ "$NET_MODE" == "host" ]; then
+    echo -e "${GREEN}使用 Host 模式，容器共享宿主机网络，使用 127.0.0.1 通信。${NC}"
     port_args="--net=host"
     API_PORT=21114
-    port_config="Host 模式"
     ID_PORT=21116
     RELAY_PORT=21117
-  elif [ "$net_mode" == "2" ]; then
-    echo -e "${YELLOW}你选择了桥接模式，请配置宿主机端口。${NC}"
+    SERVER_IP="127.0.0.1"
+    ID_SERVER="127.0.0.1"
+    RELAY_SERVER="127.0.0.1"
+    port_config="Host 模式"
+
+    # 验证 API 端口
+    if ! validate_port "$API_PORT"; then
+      echo -e "${RED}错误：API 端口 $API_PORT 被占用！请释放端口或选择其他端口。${NC}"
+      sleep 2
+      main_menu
+    fi
+  else
+    echo -e "${YELLOW}使用桥接模式，容器加入 rustdesk-net 网络，使用容器名称通信。${NC}"
     echo "默认宿主机端口：21114"
     echo "容器端口固定为：21114（无需输入）"
     read -p "请输入宿主机端口（回车使用默认 21114）： " host_port
     host_port=${host_port:-21114}
     if ! validate_port "$host_port"; then
-      echo -e "${RED}错误：宿主机端口 $host_port 无效或已被占用！请重新运行脚本。${NC}"
+      echo -e "${RED}错误：宿主机端口 $host_port 无效或已被占用！${NC}"
       sleep 2
       main_menu
     fi
-    port_args="-p $host_port:21114"
+    port_args="-p $host_port:21114 --network rustdesk-net"
     API_PORT=$host_port
+    ID_PORT=21116
+    RELAY_PORT=21117
+    SERVER_IP=$(get_server_ip)
+    ID_SERVER="$CONTAINER_NAME_HBBS"
+    RELAY_SERVER="$CONTAINER_NAME_HBBR"
     port_config="宿主机端口：$host_port"
-
-    # 配置 ID 服务器端口（匹配 hbbs 的宿主机端口）
-    echo -e "${YELLOW}注意：ID 服务器端口必须匹配 hbbs 的宿主机端口（默认 ${HBBS_PORTS[1]}）${NC}"
-    read -p "请输入 ID 服务器端口（回车使用默认 ${HBBS_PORTS[1]}）： " ID_PORT
-    ID_PORT=${ID_PORT:-${HBBS_PORTS[1]}}
-    if [ "$ID_PORT" != "${HBBS_PORTS[1]}" ]; then
-      echo -e "${RED}错误：ID 服务器端口必须为 ${HBBS_PORTS[1]}！${NC}"
-      sleep 2
-      main_menu
-    fi
-
-    # 配置中继服务器端口（匹配 hbbr 的宿主机端口）
-    echo -e "${YELLOW}注意：中继服务器端口必须匹配 hbbr 的宿主机端口（默认 ${HBBR_PORTS[2]}）${NC}"
-    read -p "请输入中继服务器端口（回车使用默认 ${HBBR_PORTS[2]}）： " RELAY_PORT
-    RELAY_PORT=${RELAY_PORT:-${HBBR_PORTS[2]}}
-    if [ "$RELAY_PORT" != "${HBBR_PORTS[2]}" ]; then
-      echo -e "${RED}错误：中继服务器端口必须为 ${HBBR_PORTS[2]}！${NC}"
-      sleep 2
-      main_menu
-    fi
-  else
-    echo -e "${RED}无效选择，返回主菜单。${NC}"
-    sleep 2
-    main_menu
   fi
 
   # 密钥配置
@@ -489,31 +504,36 @@ deploy_api() {
   fi
 
   echo -e "${YELLOW}正在拉取镜像 $IMAGE_NAME_API...${NC}"
-  docker pull "$IMAGE_NAME_API" || { echo -e "${RED}镜像拉取失败，请检查网络连接或镜像地址。${NC}"; exit 1; }
+  if ! docker pull "$IMAGE_NAME_API" 2>&1 | tee -a "$LOG_FILE"; then
+    echo -e "${RED}镜像拉取失败，请检查网络连接或镜像地址。${NC}"
+    exit 1
+  fi
 
   # 启动 API 容器
   echo -e "${YELLOW}正在启动 RustDesk API 容器...${NC}"
-  docker run -d --name "$CONTAINER_NAME_API" \
+  if ! docker run -d --name "$CONTAINER_NAME_API" \
     $port_args \
-    --network rustdesk-net \
     -v "$API_DATA_DIR:/app/data" \
     $KEY_VOLUME \
     -e TZ="$TZ" \
     -e RUSTDESK_API_LANG="$LANG" \
-    -e RUSTDESK_API_RUSTDESK_ID_SERVER="$SERVER_IP:$ID_PORT" \
-    -e RUSTDESK_API_RUSTDESK_RELAY_SERVER="$SERVER_IP:$RELAY_PORT" \
+    -e RUSTDESK_API_RUSTDESK_ID_SERVER="$ID_SERVER:$ID_PORT" \
+    -e RUSTDESK_API_RUSTDESK_RELAY_SERVER="$RELAY_SERVER:$RELAY_PORT" \
     -e RUSTDESK_API_RUSTDESK_API_SERVER="http://$SERVER_IP:$API_PORT" \
     $KEY_ENV \
     --restart=unless-stopped \
     --platform "$PLATFORM" \
-    "$IMAGE_NAME_API"
+    "$IMAGE_NAME_API" 2>&1 | tee -a "$LOG_FILE"; then
+    echo -e "${RED}错误：API 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_API 或 $LOG_FILE）。${NC}"
+    sleep 2
+    main_menu
+  fi
 
-  if [ $? -eq 0 ]; then
-    echo -e "${GREEN}RustDesk API 容器启动成功！${NC}"
-    echo -e "${GREEN}访问地址：http://$SERVER_IP:$API_PORT/_admin/${NC}"
-    echo -e "${GREEN}默认用户名：admin，密码请查看容器日志（docker logs $CONTAINER_NAME_API）${NC}"
-  else
-    echo -e "${RED}错误：API 容器启动失败！请检查日志（docker logs $CONTAINER_NAME_API）。${NC}"
+  echo -e "${GREEN}RustDesk API 容器启动成功！${NC}"
+  echo -e "${GREEN}访问地址：http://$SERVER_IP:$API_PORT/_admin/${NC}"
+  echo -e "${GREEN}默认用户名：admin，密码请查看容器日志（docker logs $CONTAINER_NAME_API）${NC}"
+  if [ "$NET_MODE" == "bridge" ]; then
+    echo -e "${YELLOW}注意：桥接模式下，check_cmd 可能需要使用 lejianwen/rustdesk-api:full-s6 镜像或配置代理以支持非回环地址请求。${NC}"
   fi
   read -p "按回车返回主菜单..." temp
   main_menu
@@ -618,8 +638,9 @@ view_latest_key() {
 # 查看服务器信息
 view_server_info() {
   SERVER_ID=$(get_server_id "$CONTAINER_NAME_HBBS")
-  SERVER_IP=$(get_server_ip)
-  RELAY_ADDR=$(get_relay_address)
+  NET_MODE=$(docker inspect "$CONTAINER_NAME_HBBS" | grep '"NetworkMode":' | grep -q '"host"' && echo "host" || echo "bridge")
+  SERVER_IP=$([ "$NET_MODE" == "host" ] && echo "127.0.0.1" || get_server_ip)
+  RELAY_ADDR=$(get_relay_address "$NET_MODE")
   API_ADDR="http://$SERVER_IP:21114/_admin/"
 
   echo -e "${GREEN}服务器信息：${NC}"
