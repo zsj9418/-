@@ -241,20 +241,53 @@ install_watchtower() {
     fi
   fi
 
-  log "INFO" "正在拉取最新 Watchtower 镜像..."
-  docker pull "$WATCHTOWER_IMAGE_NAME:latest" || {
-    log "ERROR" "拉取 Watchtower 镜像失败"
-    exit 1
-  }
+  # 检查并清理所有可能的 Watchtower 容器
+  log "INFO" "检查并清理所有可能的 Watchtower 容器..."
+  local existing_containers
+  mapfile -t existing_containers < <(docker ps -a --filter "name=watchtower" --format "{{.ID}}")
+  if [ ${#existing_containers[@]} -gt 0 ]; then
+    log "INFO" "发现 ${#existing_containers[@]} 个现有 Watchtower 容器，正在停止并移除..."
+    for container_id in "${existing_containers[@]}"; do
+      log "INFO" "停止容器 ID: $container_id"
+      if ! docker stop "$container_id" >/dev/null 2>&1; then
+        log "WARN" "无法停止容器 $container_id，可能已被停止"
+      fi
+      log "INFO" "移除容器 ID: $container_id"
+      if ! docker rm "$container_id" >/dev/null 2>&1; then
+        log "ERROR" "无法移除容器 $container_id，请检查 Docker 权限或状态"
+        exit 1
+      fi
+    done
+    log "INFO" "所有 Watchtower 容器已成功移除"
+  else
+    log "INFO" "未找到现有的 Watchtower 容器，继续部署"
+  fi
 
-  docker rm -f "$WATCHTOWER_CONTAINER_NAME" >/dev/null 2>&1
+  # 拉取 Watchtower 镜像（带重试机制）
+  log "INFO" "正在拉取最新 Watchtower 镜像..."
+  local retries=3
+  local retry_delay=5
+  local pull_success=false
+  for ((i=1; i<=retries; i++)); do
+    if docker pull "$WATCHTOWER_IMAGE_NAME:latest"; then
+      pull_success=true
+      break
+    else
+      log "WARN" "拉取 Watchtower 镜像失败，重试 $i/$retries..."
+      sleep $retry_delay
+    fi
+  done
+  if ! $pull_success; then
+    log "ERROR" "拉取 Watchtower 镜像失败，请检查网络或 Docker Hub 连接"
+    exit 1
+  fi
 
   local watchtower_cmd=(
     docker run -d
     --name "$WATCHTOWER_CONTAINER_NAME"
     --restart=always
     -v /var/run/docker.sock:/var/run/docker.sock
-    "$WATCHTOWER_IMAGE_NAME"
+    "$WATCHTOWER_IMAGE_NAME:latest"
     --cleanup
     --schedule "0 */10 * * * *"
     --include-stopped
@@ -270,17 +303,38 @@ install_watchtower() {
     watchtower_cmd+=("$container")
   done
 
-  "${watchtower_cmd[@]}" || {
-    log "ERROR" "Watchtower 部署失败"
+  log "INFO" "正在启动 Watchtower 容器..."
+  if ! "${watchtower_cmd[@]}"; then
+    log "ERROR" "Watchtower 容器启动失败，请检查 Docker 日志：docker logs $WATCHTOWER_CONTAINER_NAME"
     exit 1
-  }
+  fi
+
+  # 等待容器启动并检查状态
+  sleep 3
+  if ! docker ps --filter "name=$WATCHTOWER_CONTAINER_NAME" --format "{{.Status}}" | grep -q "Up"; then
+    log "ERROR" "Watchtower 容器未能保持运行状态，请检查日志：docker logs $WATCHTOWER_CONTAINER_NAME"
+    exit 1
+  fi
 
   log "INFO" "Watchtower 部署成功，监控容器：${selected_containers[*]}，每10分钟检查一次"
 
+  # 运行一次性检查（带重试机制）
   log "INFO" "正在运行一次性检查以验证 Watchtower..."
-  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$WATCHTOWER_IMAGE_NAME" --run-once "${selected_containers[@]}" || {
-    log "WARN" "Watchtower 一次性检查失败，请检查日志"
-  }
+  local check_success=false
+  for ((i=1; i<=retries; i++)); do
+    if docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$WATCHTOWER_IMAGE_NAME:latest" --run-once "${selected_containers[@]}"; then
+      check_success=true
+      break
+    else
+      log "WARN" "Watchtower 一次性检查失败，重试 $i/$retries..."
+      sleep $retry_delay
+    fi
+  done
+  if ! $check_success; then
+    log "WARN" "Watchtower 一次性检查失败，请检查日志：docker logs $WATCHTOWER_CONTAINER_NAME"
+  else
+    log "INFO" "Watchtower 一次性检查完成"
+  fi
   log "INFO" "请查看 Watchtower 日志以确认更新状态：docker logs $WATCHTOWER_CONTAINER_NAME"
 }
 
