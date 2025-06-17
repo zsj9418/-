@@ -701,7 +701,6 @@ get_mihomo_model_bin_url() {
     return 0
 }
 
-# 安装 Mihomo Alpha with Smart Group 版本
 install_mihomo_alpha_smart() {
     log "开始安装 Mihomo Alpha with Smart Group 版本..."
     check_network || return 1
@@ -774,35 +773,103 @@ install_mihomo_alpha_smart() {
         return 1
     fi
 
+    # 停止 Mihomo 服务以避免 'Text file busy' 错误
+    log "停止 Mihomo 服务以确保文件可被覆盖..."
+    manage_service_internal "mihomo" "stop" || yellow "停止 Mihomo 服务失败，可能影响文件复制。"
+
+    # 检查目标文件是否被占用
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof "$MH_BIN_PATH" >/dev/null 2>&1; then
+            yellow "文件 $MH_BIN_PATH 被占用，尝试终止相关进程..."
+            lsof -t "$MH_BIN_PATH" | xargs -r kill -9
+            sleep 1 # 等待进程终止
+        fi
+    else
+        yellow "未找到 lsof 命令，无法检查 $MH_BIN_PATH 是否被占用。请确保没有进程使用该文件。"
+    fi
+
     mkdir -p "$(dirname "$MH_BIN_PATH")" || { red "创建安装目录 $(dirname "$MH_BIN_PATH") 失败"; cleanup; return 1; }
 
     log "安装 Mihomo Alpha with Smart Group 到 $MH_BIN_PATH..."
-    cp "$MIHOMO_BIN_UNPACKED" "$MH_BIN_PATH"
+    if ! cp "$MIHOMO_BIN_UNPACKED" "$MH_BIN_PATH"; then
+        red "复制 Mihomo 可执行文件失败，可能文件仍被占用。"
+        cleanup
+        return 1
+    fi
     chmod +x "$MH_BIN_PATH"
 
-    # 下载 Model.bin 文件到 Mihomo 配置目录
+    # 获取 LightGBM Model 版本列表
     local MODEL_BIN_PATH="$MH_BASE_DIR/Model.bin"
-    log "正在获取最新 Model.bin 下载链接..."
-    local MODEL_BIN_URL
-    MODEL_BIN_URL=$(get_mihomo_model_bin_url) || {
-        yellow "无法获取 Model.bin 下载链接，将跳过 Model.bin 下载，Mihomo Smart Group 功能可能受限。"
+    log "正在获取 LightGBM Model 版本列表..."
+    local model_releases
+    model_releases=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases/tags/LightGBM-Model" | jq -r '.assets[] | select(.name | test(".*\\.bin")) | "\(.name)|\(.browser_download_url)|\(.updated_at)"') || {
+        red "无法获取 LightGBM Model 版本信息，请检查网络或 GitHub API 限制。"
+        yellow "将跳过 Model.bin 下载，Mihomo Smart Group 功能可能受限。"
+        model_releases=""
     }
 
-    if [ -n "$MODEL_BIN_URL" ]; then
-        log "下载 Model.bin 到 $MODEL_BIN_PATH..."
-        mkdir -p "$MH_BASE_DIR" # 确保配置目录存在
-        if ! curl -L -o "$MODEL_BIN_PATH" "$MODEL_BIN_URL"; then
-            red "下载 Model.bin 失败！URL: ${MODEL_BIN_URL}"
-            yellow "Model.bin 下载失败，Mihomo Smart Group 功能可能受限。"
+    if [ -z "$model_releases" ]; then
+        yellow "未找到 LightGBM Model 的模型文件，跳过下载。"
+    else
+        # 解析版本并显示选择菜单
+        local model_array=($model_releases)
+        clear
+        printf "\\n%b=== 选择 LightGBM Model 版本 ===%b\\n" "$GREEN" "$NC"
+        local j=1
+        declare -A model_map
+        for model_info in "${model_array[@]}"; do
+            IFS='|' read -r model_name download_url updated_at <<< "$model_info"
+            printf "  %d) 文件: %s (更新日期: %s)\\n" "$j" "$model_name" "$updated_at"
+            model_map[$j]="$download_url|$model_name"
+            ((j++))
+        done
+        printf "%b=====================================%b\\n" "$GREEN" "$NC"
+        if [ "${#model_array[@]}" -eq 1 ]; then
+            printf "仅找到一个版本，自动选择：%s\\n" "${model_array[0]%%|*}"
+            model_choice=1
         else
-            green "Model.bin 下载成功，保存为 $MODEL_BIN_PATH。"
+            printf "请输入选项 (1-%d): " "${#model_array[@]}"
+            read -r model_choice
+        fi
+
+        if ! [[ "$model_choice" =~ ^[0-9]+$ ]] || [ "$model_choice" -lt 1 ] || [ "$model_choice" -gt "${#model_array[@]}" ]; then
+            red "无效选项 '$model_choice'，将跳过 Model.bin 下载。"
+            yellow "Mihomo Smart Group 功能可能受限。"
+        else
+            local selected_model=${model_map[$model_choice]}
+            local MODEL_BIN_URL=$(echo "$selected_model" | cut -d'|' -f1)
+            local MODEL_BIN_NAME=$(echo "$selected_model" | cut -d'|' -f2)
+
+            log "下载 LightGBM Model ($MODEL_BIN_NAME) 到 $MODEL_BIN_PATH..."
+            mkdir -p "$MH_BASE_DIR" # 确保配置目录存在
+            if ! curl -L -o "$MODEL_BIN_PATH" "$MODEL_BIN_URL"; then
+                red "下载 Model.bin 失败！URL: ${MODEL_BIN_URL}"
+                yellow "Model.bin 下载失败，Mihomo Smart Group 功能可能受限。"
+            else
+                green "Model.bin 下载成功，保存为 $MODEL_BIN_PATH。"
+            fi
+        fi
+    fi
+
+    # 检查是否存在 YAML 配置文件
+    if [ -f "$MH_CONFIG_FILE" ]; then
+        yellow "检测到现有 Mihomo 配置文件 $MH_CONFIG_FILE，跳过生成默认配置以保留现有配置。"
+    else
+        log "未找到 Mihomo 配置文件 $MH_CONFIG_FILE，将生成默认配置文件..."
+        generate_initial_mihomo_config
+        if [ $? -eq 0 ]; then
+            green "Mihomo 默认配置文件已生成：$MH_CONFIG_FILE"
+            yellow "提示：请编辑 $MH_CONFIG_FILE 配置您的代理！"
+        else
+            red "Mihomo 默认配置文件生成失败！"
+            cleanup
+            return 1
         fi
     fi
 
     cleanup
     green "Mihomo Alpha with Smart Group 安装成功！"
 
-    generate_initial_mihomo_config
     setup_service "mihomo"
     green "Mihomo Alpha with Smart Group 部署完成。"
     return 0
