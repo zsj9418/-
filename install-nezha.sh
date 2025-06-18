@@ -19,7 +19,7 @@ MAX_LOG_SIZE="1m"
 RETRY_COUNT=3
 DEPENDENCY_CHECK_FILE="/tmp/nezha_dependency_check"
 MIN_DISK_SPACE=1 # 最小磁盘空间（GB）
-MIN_MEMORY=256 # 最小内存（MB）
+MIN_MEMORY=150 # 最小内存（MB）
 
 # -------------------------------
 # 核心功能函数
