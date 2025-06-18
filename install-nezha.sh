@@ -8,8 +8,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # 无颜色
 
 # 默认参数
-IMAGE_NAME="nezhahq/dashboard"
-DEFAULT_TAG="latest"
+IMAGE_NAME="ghcr.io/nezhahq/nezha"  # 使用 GitHub Container Registry 镜像
+DEFAULT_TAG="latest"                # 默认版本标签
 DEFAULT_WEB_PORT="8008"
 DEFAULT_AGENT_PORT="5555"
 DEFAULT_DATA_DIR="/opt/nezha/dashboard"
@@ -20,6 +20,10 @@ RETRY_COUNT=3
 DEPENDENCY_CHECK_FILE="/tmp/nezha_dependency_check"
 MIN_DISK_SPACE=1 # 最小磁盘空间（GB）
 MIN_MEMORY=256 # 最小内存（MB）
+
+# -------------------------------
+# 核心功能函数
+# -------------------------------
 
 # 检查是否以root权限运行
 check_root() {
@@ -72,10 +76,8 @@ check_disk_space() {
 
 # 检查内存
 check_memory() {
-    # 首先尝试 free 命令
     local available_memory=$(free -m | grep -i mem | awk '{print $7}')
     if [ -z "$available_memory" ]; then
-        # 备用方法：从 /proc/meminfo 获取 Available
         available_memory=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
     fi
     if [ -z "$available_memory" ] || [ "$available_memory" -lt "$MIN_MEMORY" ]; then
@@ -129,71 +131,16 @@ check_dependencies() {
         deps_installed=1
     fi
 
-    if ! command -v unzip &> /dev/null; then
-        echo -e "${YELLOW}unzip 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian) $PKG_MANAGER install -y unzip;;
-            redhat) $PKG_MANAGER install -y unzip;;
-            macos) brew install unzip;;
-        esac
-        deps_installed=1
-    fi
-
-    if ! command -v jq &> /dev/null; then
-        echo -e "${YELLOW}jq 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian) $PKG_MANAGER install -y jq;;
-            redhat) $PKG_MANAGER install -y jq;;
-            macos) brew install jq;;
-        esac
-        deps_installed=1
-    fi
-
-    if ! command -v ss &> /dev/null; then
-        echo -e "${YELLOW}ss 未安装，正在安装...${NC}"
-        case $OS_TYPE in
-            debian) $PKG_MANAGER install -y iproute2;;
-            redhat) $PKG_MANAGER install -y iproute;;
-            macos) echo -e "${YELLOW}macOS 不支持 ss，使用 netstat 替代${NC}";;
-        esac
-        deps_installed=1
-    fi
-
     if [ $deps_installed -eq 0 ]; then
         echo -e "${GREEN}所有依赖已满足${NC}"
     fi
     touch "$DEPENDENCY_CHECK_FILE"
 }
 
-# 获取可用镜像版本
+# 获取可用镜像版本（直接使用默认版本）
 get_available_tags() {
-    echo -e "${BLUE}正在从 Docker Hub 获取可用版本...${NC}"
-    TAGS=$(curl -s "https://hub.docker.com/v2/repositories/nezhahq/dashboard/tags?page_size=100" | \
-           grep -o '"name":"[^"]*"' | sed 's/"name":"\(.*\)"/\1/' | grep -v "latest" | sort -r)
-    TAGS="latest $TAGS"
-    if [ -z "$TAGS" ]; then
-        echo -e "${RED}无法获取版本列表，使用默认版本 $DEFAULT_TAG${NC}"
-        SELECTED_TAG="$DEFAULT_TAG"
-    else
-        echo -e "${BLUE}可用版本如下:${NC}"
-        i=1
-        for tag in $TAGS; do
-            echo "$i) $tag"
-            ((i++))
-        done
-        read -p "请选择版本号（直接回车使用默认值 $DEFAULT_TAG）: " TAG_CHOICE
-        if [ -z "$TAG_CHOICE" ]; then
-            SELECTED_TAG="$DEFAULT_TAG"
-        else
-            SELECTED_TAG=$(echo "$TAGS" | sed -n "${TAG_CHOICE}p")
-            if [ -z "$SELECTED_TAG" ]; then
-                echo -e "${YELLOW}无效选择，使用默认版本 $DEFAULT_TAG${NC}"
-                SELECTED_TAG="$DEFAULT_TAG"
-            fi
-        fi
-    fi
-    echo -e "${GREEN}已选择版本: $SELECTED_TAG${NC}"
-    IMAGE_NAME="$IMAGE_NAME:$SELECTED_TAG"
+    echo -e "${BLUE}使用 GitHub Container Registry 镜像: ${IMAGE_NAME}:${DEFAULT_TAG}${NC}"
+    IMAGE_NAME="${IMAGE_NAME}:${DEFAULT_TAG}"  # 确保包含标签
 }
 
 # 检查并设置数据目录
@@ -212,7 +159,7 @@ get_user_input() {
     read -p "请输入 Web 端口（直接回车使用默认值 $DEFAULT_WEB_PORT）: " WEB_PORT
     WEB_PORT=${WEB_PORT:-$DEFAULT_WEB_PORT}
     read -p "请输入 Agent 端口（直接回车使用默认值 $DEFAULT_AGENT_PORT）: " AGENT_PORT
-    AGENT_PORT=${WEB_PORT:-$DEFAULT_AGENT_PORT}
+    AGENT_PORT=${AGENT_PORT:-$DEFAULT_AGENT_PORT}
     read -p "请输入时区（直接回车使用默认值 $DEFAULT_TIMEZONE）: " TIMEZONE
     TIMEZONE=${TIMEZONE:-$DEFAULT_TIMEZONE}
 }
@@ -250,81 +197,61 @@ select_network_mode() {
     echo -e "${GREEN}网络模式: $NETWORK_MODE${NC}"
 }
 
-# 检查 Docker 配置
-check_docker_config() {
-    if [ -f "/etc/docker/daemon.json" ]; then
-        echo -e "${YELLOW}检测到 Docker 配置文件 /etc/docker/daemon.json${NC}"
-        echo -e "${BLUE}内容如下:${NC}"
-        cat /etc/docker/daemon.json
-        echo -e "${YELLOW}如果配置了私有注册表，可能导致拉取失败${NC}"
-        read -p "是否临时禁用 daemon.json？(y/n): " DISABLE_DAEMON
-        if [ "$DISABLE_DAEMON" == "y" ]; then
-            mv /etc/docker/daemon.json /etc/docker/daemon.json.bak
-            systemctl restart docker
-            echo -e "${GREEN}Docker 服务已重启${NC}"
-        fi
-    fi
+# 查看容器状态
+view_containers() {
+    echo -e "${BLUE}当前所有容器状态:${NC}"
+    docker ps -a
 }
 
-# 拉取镜像并重试
+# 拉取镜像并重试（完全指向 GHCR）
 pull_image() {
-    echo -e "${BLUE}正在拉取镜像 $IMAGE_NAME...${NC}"
+    echo -e "${BLUE}正在从 GitHub Container Registry 拉取镜像 ${IMAGE_NAME}...${NC}"
+    
     for ((i=1; i<=RETRY_COUNT; i++)); do
-        if docker pull "$IMAGE_NAME"; then
+        if docker pull "${IMAGE_NAME}"; then
             echo -e "${GREEN}镜像拉取成功${NC}"
             return 0
         fi
-        echo -e "${YELLOW}第 $i 次拉取失败，重试中...${NC}"
+        
+        echo -e "${YELLOW}第 $i 次拉取失败，重试中...（等待 2 秒）${NC}"
         sleep 2
+        
+        # 最后一次重试前检查镜像是否存在
+        if [ $i -eq $RETRY_COUNT ]; then
+            echo -e "${YELLOW}正在验证镜像是否存在..."
+            if ! curl -sI "https://ghcr.io/v2/nezhahq/nezha/manifests/${DEFAULT_TAG}" | grep -q "200 OK"; then
+                echo -e "${RED}致命错误：镜像 ${IMAGE_NAME} 在仓库中不存在${NC}"
+                echo -e "请检查以下信息："
+                echo -e "1. 项目仓库: https://github.com/nezhahq/nezha/pkgs/container/nezha"
+                echo -e "2. 可用标签: latest 或具体版本号（如 v0.15.0）"
+                exit 1
+            fi
+        fi
     done
+
+    # 最终错误处理
     echo -e "${RED}镜像拉取失败，请检查以下问题：${NC}"
-    echo -e "1. 网络连接：运行 'ping registry-1.docker.io' 和 'curl -I https://registry-1.docker.io'。"
-    echo -e "2. DNS 配置：确保 /etc/resolv.conf 包含有效 DNS（如 8.8.8.8）。"
-    echo -e "3. Docker 配置：检查 /etc/docker/daemon.json 是否指定私有注册表。"
-    echo -e "4. 镜像名称：确保 nezhahq/dashboard 存在（可访问 https://hub.docker.com/r/nezhahq/dashboard）。"
-    echo -e "5. 尝试手动拉取：'docker pull registry-1.docker.io/nezhahq/dashboard:latest'。"
+    echo -e "1. 网络连接：运行 'ping ghcr.io' 和 'curl -I https://ghcr.io'"
+    echo -e "2. Docker 配置：检查 /etc/docker/daemon.json 是否包含镜像加速配置"
+    echo -e "3. 权限问题：尝试 'docker login ghcr.io'（如需认证）"
+    echo -e "4. 手动拉取测试：执行 'docker pull ${IMAGE_NAME}'"
     exit 1
 }
 
-# 检查时区文件
-check_timezone_files() {
-    if [ ! -f "/etc/localtime" ]; then
-        echo -e "${YELLOW}警告：宿主机 /etc/localtime 不存在，跳过挂载，将依赖 TZ 环境变量设置时区${NC}"
-        LOCALTIME_MOUNT=""
-    else
-        LOCALTIME_MOUNT="-v /etc/localtime:/etc/localtime:ro"
-    fi
-}
-
-# 启动容器
+# 启动容器（确保使用正确的镜像名称）
 start_container() {
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${YELLOW}检测到同名容器 $CONTAINER_NAME 已存在${NC}"
-        read -p "是否删除并重新创建？(y/n): " REMOVE
-        if [ "$REMOVE" == "y" ]; then
-            docker rm -f "$CONTAINER_NAME"
-        else
-            echo -e "${RED}请手动删除容器或更改容器名称${NC}"
-            exit 1
-        fi
-    fi
-
-    # 检查时区文件
-    check_timezone_files
-
-    # 启动容器，捕获详细错误日志
-    local error_log=$(docker run -d \
+    docker run -d \
         --name "$CONTAINER_NAME" \
         $NETWORK_MODE \
         -v "$DATA_DIR:/dashboard/data" \
-        $LOCALTIME_MOUNT \
+        -v /etc/localtime:/etc/localtime:ro \
         -p "$WEB_PORT:8008" \
         -p "$AGENT_PORT:5555" \
         -e PORT="$WEB_PORT" \
         -e TZ="$TIMEZONE" \
         --restart unless-stopped \
         --log-opt max-size="$MAX_LOG_SIZE" \
-        "$IMAGE_NAME" 2>&1)
+        "${IMAGE_NAME}"  # 确保引用完整镜像名称
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}容器 $CONTAINER_NAME 启动成功！${NC}"
@@ -333,79 +260,39 @@ start_container() {
         echo -e "数据目录: $DATA_DIR"
         echo -e "时区: $TIMEZONE"
         echo -e "${YELLOW}请在浏览器中访问 http://localhost:$WEB_PORT 进行初始配置（设置管理员账户等）${NC}"
-        echo -e "${YELLOW}参考文档: https://github.com/nezhahq/nezha${NC}"
     else
         echo -e "${RED}容器启动失败，请检查以下错误信息：${NC}"
-        echo "$error_log"
-        echo -e "${YELLOW}建议：${NC}"
-        echo -e "1. 检查 Docker 服务是否正常运行（systemctl status docker）。"
-        echo -e "2. 确保数据目录 $DATA_DIR 可写（chmod -R 777 $DATA_DIR）。"
-        echo -e "3. 验证端口 $WEB_PORT 和 $AGENT_PORT 未被占用。"
-        echo -e "4. 查看容器日志（docker logs $CONTAINER_NAME）以获取更多信息。"
-        echo -e "5. 尝试使用其他版本（例如 v0.15.0），运行：docker run -e ... nezhahq/dashboard:v0.15.0"
+        docker logs "$CONTAINER_NAME"
         exit 1
     fi
 }
 
-# 查看容器状态
-view_containers() {
-    echo -e "${BLUE}当前所有容器状态:${NC}"
-    docker ps -a
-}
-
-# 强化卸载功能
+# 卸载功能
 uninstall() {
     echo -e "${YELLOW}正在卸载 $CONTAINER_NAME...${NC}"
 
     # 停止并删除容器
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${BLUE}检测到容器 $CONTAINER_NAME${NC}"
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null
+        docker rm -f "$CONTAINER_NAME"
         echo -e "${GREEN}容器 $CONTAINER_NAME 已删除${NC}"
     else
         echo -e "${YELLOW}未找到容器 $CONTAINER_NAME，跳过删除${NC}"
     fi
 
     # 删除镜像
-    if docker images -q "$IMAGE_NAME" | grep -q .; then
-        read -p "是否删除镜像 $IMAGE_NAME？(y/n): " DELETE_IMAGE
-        if [ "$DELETE_IMAGE" == "y" ]; then
-            docker rmi "$IMAGE_NAME" 2>/dev/null
-            echo -e "${GREEN}镜像 $IMAGE_NAME 已删除${NC}"
-        else
-            echo -e "${YELLOW}保留镜像 $IMAGE_NAME${NC}"
-        fi
+    if docker images -q "${IMAGE_NAME}" | grep -q .; then
+        docker rmi -f "${IMAGE_NAME}"
+        echo -e "${GREEN}镜像 ${IMAGE_NAME} 已删除${NC}"
     else
-        echo -e "${YELLOW}未找到镜像 $IMAGE_NAME，跳过删除${NC}"
+        echo -e "${YELLOW}未找到镜像 ${IMAGE_NAME}，跳过删除${NC}"
     fi
 
     # 删除数据目录
     if [ -d "$DATA_DIR" ]; then
-        read -p "是否删除数据目录 $DATA_DIR？(y/n): " DELETE_DATA
-        if [ "$DELETE_DATA" == "y" ]; then
-            rm -rf "$DATA_DIR"
-            echo -e "${GREEN}数据目录 $DATA_DIR 已删除${NC}"
-        else
-            echo -e "${YELLOW}保留数据目录 $DATA_DIR${NC}"
-        fi
+        rm -rf "$DATA_DIR"
+        echo -e "${GREEN}数据目录 $DATA_DIR 已删除${NC}"
     else
         echo -e "${YELLOW}未找到数据目录 $DATA_DIR，跳过删除${NC}"
-    fi
-
-    # 清理无用 Docker 资源
-    read -p "是否清理无用的 Docker 网络和卷？(y/n): " CLEAN_DOCKER
-    if [ "$CLEAN_DOCKER" == "y" ]; then
-        docker network prune -f 2>/dev/null
-        docker volume prune -f 2>/dev/null
-        echo -e "${GREEN}无用的 Docker 网络和卷已清理${NC}"
-    else
-        echo -e "${YELLOW}跳过清理 Docker 网络和卷${NC}"
-    fi
-
-    # 删除依赖检查标记文件
-    if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
-        rm -f "$DEPENDENCY_CHECK_FILE"
-        echo -e "${GREEN}依赖检查标记文件已删除${NC}"
     fi
 
     echo -e "${GREEN}卸载完成${NC}"
@@ -413,10 +300,6 @@ uninstall() {
 
 # 主菜单
 main_menu() {
-    detect_os
-    detect_arch
-    check_disk_space $MIN_DISK_SPACE
-    check_memory
     while true; do
         echo -e "${BLUE}=== 哪吒探针部署脚本 ===${NC}"
         echo "1) 安装并启动哪吒探针"
@@ -427,8 +310,11 @@ main_menu() {
         case $CHOICE in
             1)
                 check_root
+                detect_os
+                detect_arch
+                check_disk_space $MIN_DISK_SPACE
+                check_memory
                 check_dependencies
-                check_docker_config
                 get_available_tags
                 get_user_input
                 setup_data_dir
