@@ -1,14 +1,49 @@
 #!/bin/bash
 
-CADDY_CONF="/etc/caddy/Caddyfile"
-STATE_FILE="/tmp/deploy_state"
+# 可配置变量
+: ${CADDY_BIN_PATH:="/usr/local/bin/caddy"}
+: ${CADDY_CONF_DIR:="/etc/caddy"}
+: ${CADDY_CONF_FILE:="$CADDY_CONF_DIR/Caddyfile"}
+: ${CADDY_LOG_DIR:="/var/log/caddy"}
+: ${CADDY_USER:="www-data"}
+: ${STATE_FILE:="${XDG_RUNTIME_DIR:-/tmp}/deploy_state"}
 
-# 1. 识别系统类型
+# 架构映射
+declare -A ARCH_MAP=(
+    ["x86_64"]="amd64"
+    ["aarch64"]="arm64"
+    ["armv7l"]="armv7"
+    ["armv6l"]="armv6"
+    ["i686"]="386"
+    ["ppc64le"]="ppc64le"
+    ["riscv64"]="riscv64"
+)
+
+# 1. 增强系统检测
 detect_system() {
-    if grep -q "OpenWrt" /etc/os-release 2>/dev/null; then
-        SYSTEM_TYPE="OpenWrt"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case $ID in
+            openwrt) SYSTEM_TYPE="OpenWrt" ;;
+            debian|ubuntu) SYSTEM_TYPE="Debian" ;;
+            centos|fedora|rhel) SYSTEM_TYPE="RHEL" ;;
+            alpine) SYSTEM_TYPE="Alpine" ;;
+            *) SYSTEM_TYPE="Other" ;;
+        esac
+        
+        # 检测init系统
+        if [ -d /run/systemd/system ]; then
+            INIT_SYSTEM="systemd"
+        elif [ -x /sbin/openrc ]; then
+            INIT_SYSTEM="openrc"
+        elif [ -f /etc/init.d/cron ]; then
+            INIT_SYSTEM="sysvinit"
+        else
+            INIT_SYSTEM="unknown"
+        fi
     else
-        SYSTEM_TYPE="Other"
+        SYSTEM_TYPE="Unknown"
+        INIT_SYSTEM="unknown"
     fi
 }
 
@@ -36,23 +71,8 @@ select_caddy_version() {
 get_caddy_download_url() {
   local version_tag=$1
   local arch=$(uname -m)
-  local base_url="https://github.com/caddyserver/caddy/releases/download/$version_tag"
-
-  case "$arch" in
-    aarch64|arm64)
-      echo "$base_url/caddy_${version_tag}_linux_arm64.tar.gz"
-      ;;
-    x86_64|amd64)
-      echo "$base_url/caddy_${version_tag}_linux_amd64.tar.gz"
-      ;;
-    armv7l|armv7*)
-      echo "$base_url/caddy_${version_tag}_linux_armv7.tar.gz"
-      ;;
-    *)
-      echo "未支持的架构：$arch" >&2
-      return 1
-      ;;
-  esac
+  local mapped_arch=${ARCH_MAP[$arch]:-$arch}
+  echo "https://github.com/caddyserver/caddy/releases/download/$version_tag/caddy_${version_tag}_linux_${mapped_arch}.tar.gz"
 }
 
 # 5. 安装Caddy（支持版本选择）
@@ -63,6 +83,7 @@ install_caddy() {
     echo "未能获取版本信息"
     return 1
   fi
+  
   echo "你选择的版本：$version"
   download_url=$(get_caddy_download_url "$version")
   if [ -z "$download_url" ]; then
@@ -71,44 +92,46 @@ install_caddy() {
   fi
   echo "下载地址：$download_url"
 
+  # 创建必要目录
+  mkdir -p "$(dirname "$CADDY_BIN_PATH")"
+  mkdir -p "$CADDY_CONF_DIR"
+  mkdir -p "$CADDY_LOG_DIR"
+  
+  # 设置用户权限
+  if id "$CADDY_USER" &>/dev/null; then
+    chown -R "$CADDY_USER":"$CADDY_USER" "$CADDY_CONF_DIR" "$CADDY_LOG_DIR"
+  fi
+
   # 下载压缩包
   TMP_DIR="/tmp/caddy_install"
   mkdir -p "$TMP_DIR"
   wget -O "$TMP_DIR/caddy.tar.gz" "$download_url" || { echo "下载失败"; return 1; }
+  
   # 解压
   tar -xzf "$TMP_DIR/caddy.tar.gz" -C "$TMP_DIR"
+  
   # 复制二进制
-  cp "$TMP_DIR/caddy" /usr/bin/ || { echo "复制失败"; return 1; }
-  chmod +x /usr/bin/caddy
+  cp "$TMP_DIR/caddy" "$CADDY_BIN_PATH" || { echo "复制失败"; return 1; }
+  chmod +x "$CADDY_BIN_PATH"
+  
   # 清理
   rm -rf "$TMP_DIR"
-  echo "Caddy已安装到 /usr/bin/caddy"
+  echo "Caddy已安装到 $CADDY_BIN_PATH"
 }
 
 # 6. 检查依赖
 check_and_install() {
     local cmd=$1
-    local pkg=$2
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "缺少依赖：$cmd，尝试自动安装..."
-        if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-            if [ "$pkg" = "caddy" ]; then
-                install_caddy
-                if [ $? -ne 0 ]; then
-                    echo "自动安装caddy失败，请手动安装。"
-                    return 1
-                fi
-            else
-                opkg update && opkg install "$pkg"
-                if [ $? -ne 0 ]; then
-                    echo "安装$pkg失败"
-                    return 1
-                fi
-            fi
-        else
-            echo "请手动安装 $pkg"
-            return 1
-        fi
+    if ! command -v "$cmd" >/dev/null; then
+        case $cmd in
+            caddy) install_caddy ;;
+            netstat)
+                install_dependencies net-tools
+                ;;
+            ps)
+                install_dependencies procps
+                ;;
+        esac
     fi
 }
 
@@ -130,24 +153,24 @@ save_state() {
 
 # 9. 确保配置文件存在
 prepare_caddy_config() {
-    if [ ! -f "$CADDY_CONF" ] || [ ! -s "$CADDY_CONF" ]; then
+    if [ ! -f "$CADDY_CONF_FILE" ] || [ ! -s "$CADDY_CONF_FILE" ]; then
         echo "配置文件不存在或为空，创建基础配置..."
-        mkdir -p "$(dirname "$CADDY_CONF")"
-        echo "# 自动生成的空配置" > "$CADDY_CONF"
+        mkdir -p "$(dirname "$CADDY_CONF_FILE")"
+        echo "# 自动生成的空配置" > "$CADDY_CONF_FILE"
     fi
 }
 
 # 10. 格式化配置
 format_caddy_config() {
     if command -v caddy >/dev/null 2>&1; then
-        caddy fmt --overwrite "$CADDY_CONF"
+        caddy fmt --overwrite "$CADDY_CONF_FILE"
     fi
 }
 
 # 11. 验证配置
 validate_caddy_config() {
     if command -v caddy >/dev/null 2>&1; then
-        caddy validate --config "$CADDY_CONF"
+        caddy validate --config "$CADDY_CONF_FILE"
         return $?
     else
         return 1
@@ -159,7 +182,7 @@ start_caddy() {
     prepare_caddy_config
     if ! pgrep -x "caddy" > /dev/null; then
         echo "启动caddy..."
-        caddy run --config "$CADDY_CONF" &>/dev/null &
+        caddy run --config "$CADDY_CONF_FILE" &>/dev/null &
         sleep 3
     fi
     if validate_caddy_config; then
@@ -181,7 +204,7 @@ configure_caddy() {
     echo "示例："
     echo "example.com 192.168.1.10:8080"
     echo "请输入配置："
-    > "$CADDY_CONF"
+    > "$CADDY_CONF_FILE"
     while true; do
         read -rp "输入： " line
         [ -z "$line" ] && break
@@ -195,7 +218,7 @@ configure_caddy() {
   encode gzip
   reverse_proxy $target
 }
-" >> "$CADDY_CONF"
+" >> "$CADDY_CONF_FILE"
     done
     start_caddy
     echo "配置完成"
@@ -215,7 +238,7 @@ add_new_proxy() {
   encode gzip
   reverse_proxy $target
 }
-" >> "$CADDY_CONF"
+" >> "$CADDY_CONF_FILE"
     start_caddy
     echo "已添加"
 }
@@ -238,18 +261,14 @@ stop_ports() {
     read -rp "选择 (1/2/3): " port_choice
     case "$port_choice" in
         1)
-            /etc/init.d/uhttpd stop
-            /etc/init.d/uhttpd disable
+            stop_service uhttpd
             ;;
         2)
-            /etc/init.d/caddy stop
-            /etc/init.d/caddy disable
+            stop_service caddy
             ;;
         3)
-            /etc/init.d/uhttpd stop
-            /etc/init.d/uhttpd disable
-            /etc/init.d/caddy stop
-            /etc/init.d/caddy disable
+            stop_service uhttpd
+            stop_service caddy
             ;;
         *)
             echo "无效选择"
@@ -269,8 +288,7 @@ stop_ports() {
 
 # 17. 启动80端口
 start_port_80() {
-    /etc/init.d/uhttpd enable
-    /etc/init.d/uhttpd start
+    start_service uhttpd
     echo "80端口已启动"
     SERVICE_STATUS="uhttpd"
     CADDY_RUNNING=0
@@ -279,8 +297,7 @@ start_port_80() {
 
 # 18. 启动443端口
 start_port_443() {
-    /etc/init.d/caddy enable
-    /etc/init.d/caddy start
+    start_service caddy
     echo "443端口已启动"
 }
 
@@ -293,8 +310,7 @@ start_both_ports() {
 # 20. 启动caddy
 start_caddy() {
     if check_and_install "caddy" "caddy"; then
-        /etc/init.d/caddy enable
-        /etc/init.d/caddy start
+        start_service caddy
         if validate_caddy_config; then
             echo "配置验证通过，caddy已启动"
             CADDY_RUNNING=1
@@ -309,48 +325,42 @@ start_caddy() {
 
 # 21. 卸载caddy
 uninstall_caddy() {
-    /etc/init.d/caddy stop
-    /etc/init.d/caddy disable
+    stop_service caddy
+    rm -f "$CADDY_BIN_PATH"
     echo "已卸载caddy"
 }
 
 # 22. 恢复之前状态
 restore_previous() {
     if [ "$SERVICE_STATUS" = "uhttpd" ]; then
-        /etc/init.d/uhttpd start
-        /etc/init.d/uhttpd enable
+        start_port_80
     elif [ "$SERVICE_STATUS" = "caddy" ]; then
         start_caddy
     fi
 }
 
-# 23. 停止服务（uhttpd或caddy）
+# 23. 停止服务
 stop_service() {
-    echo "请选择要停止的服务："
-    echo "1. uhttpd"
-    echo "2. caddy"
-    read -rp "输入 (1/2): " svc_choice
-    if [ "$svc_choice" = "1" ]; then
-        /etc/init.d/uhttpd stop
-        /etc/init.d/uhttpd disable
-        echo "uhttpd已停止并禁用"
-        if [ $? -eq 0 ]; then
-            echo "操作成功"
-        else
-            echo "操作失败"
-        fi
-    elif [ "$svc_choice" = "2" ]; then
-        /etc/init.d/caddy stop
-        /etc/init.d/caddy disable
-        echo "caddy已停止并禁用"
-        if [ $? -eq 0 ]; then
-            echo "操作成功"
-        else
-            echo "操作失败"
-        fi
-    else
-        echo "无效选择"
-    fi
+    local svc=$1
+    case $INIT_SYSTEM in
+        systemd)
+            systemctl stop $svc
+            systemctl disable $svc
+            ;;
+        openrc)
+            rc-service $svc stop
+            rc-update del $svc
+            ;;
+        sysvinit)
+            service $svc stop
+            update-rc.d $svc remove
+            ;;
+        *)
+            /etc/init.d/$svc stop
+            /etc/init.d/$svc disable
+            ;;
+    esac
+    echo "$svc已停止并禁用"
 }
 
 # 24. 获取服务状态（运行和启用）
@@ -358,12 +368,28 @@ get_service_status() {
     local svc_name=$1
     local running="否"
     local enabled="否"
-    /etc/init.d/$svc_name status >/dev/null 2>&1 && running="是"
-    /etc/init.d/$svc_name enabled >/dev/null 2>&1 && enabled="是"
+    case $INIT_SYSTEM in
+        systemd)
+            systemctl is-active --quiet $svc_name && running="是"
+            systemctl is-enabled --quiet $svc_name && enabled="是"
+            ;;
+        openrc)
+            rc-service $svc_name status &>/dev/null && running="是"
+            rc-update show | grep -q $svc_name && enabled="是"
+            ;;
+        sysvinit)
+            service $svc_name status &>/dev/null && running="是"
+            [ -x /etc/init.d/$svc_name ] && enabled="是"
+            ;;
+        *)
+            /etc/init.d/$svc_name status &>/dev/null && running="是"
+            /etc/init.d/$svc_name enabled &>/dev/null && enabled="是"
+            ;;
+    esac
     echo "$running|$enabled"
 }
 
-# 25. 主菜单（排序优化）
+# 25. 主菜单
 main_menu() {
     detect_system
     load_state
