@@ -78,7 +78,7 @@ function v0_input_env() {
     done
 
     read -rp "NO_AUTO_RENEW (如不使用脚本同步功能填1，默认留空): " NO_AUTO_RENEW
-    read -rp "$DASHBOARD_VERSION(填0.17.9): " DASHBOARD_VERSION
+    read -rp "DASHBOARD_VERSION(填0.17.9): " DASHBOARD_VERSION
     
 }
 
