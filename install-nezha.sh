@@ -37,6 +37,7 @@ REVERSE_PROXY_MODE="$REVERSE_PROXY_MODE"
 ARGO_AUTH="$ARGO_AUTH"
 ARGO_DOMAIN="$ARGO_DOMAIN"
 NO_AUTO_RENEW="$NO_AUTO_RENEW"
+DASHBOARD_VERSION="$DASHBOARD_VERSION"
 EOF
     echo -e "${GREEN}配置已保存到 $V0_CONFIG_FILE${NC}"
 }
@@ -77,6 +78,8 @@ function v0_input_env() {
     done
 
     read -rp "NO_AUTO_RENEW (如不使用脚本同步功能填1，默认留空): " NO_AUTO_RENEW
+    read -rp "$DASHBOARD_VERSION(填0.17.9): " DASHBOARD_VERSION
+    
 }
 
 # V0 - 部署 Argo Nezha
@@ -158,6 +161,7 @@ function v0_deploy() {
         -e ARGO_AUTH="$ARGO_AUTH" \
         -e ARGO_DOMAIN="$ARGO_DOMAIN" \
         -e NO_AUTO_RENEW="$NO_AUTO_RENEW" \
+        -e DASHBOARD_VERSION="$DASHBOARD_VERSION" \
         --restart always \
         "$V0_IMAGE"
 
