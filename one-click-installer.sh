@@ -72,6 +72,7 @@ DEFAULT_OPTIONS=(
     "37. 开启caddy反代功能"
     "38. docker部署rustdesk远程控制"
     "39. openwrt固定MAC"
+    "40. 安装docker版青龙面板"
     "98. 快捷键管理"
 )
 
@@ -116,6 +117,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["37"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-caddy.sh"
     ["38"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-rustdesk.sh"
     ["39"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openwrt_mac.sh"
+    ["40"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/ql.sh"
 )
 
 # 声明全局变量
