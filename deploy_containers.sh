@@ -299,18 +299,35 @@ function websshv2_check_dependencies() {
     touch "$WEBSSH_DEPENDENCY_CHECK_FILE_V2"
 }
 function websshv2_get_available_tags() {
-    TAGS=$(curl -s "https://hub.docker.com/v2/repositories/${WEBSSH_IMAGE_V2}/tags?page_size=50" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -E "^[0-9\.]+$" | sort -Vr)
-    TAGS="latest $TAGS"
-    if [ -z "$TAGS" ]; then
-        WEBSSH_SELECTED_TAG_V2="$WEBSSH_DEFAULT_TAG_V2"
+    local repo="${WEBSSH_IMAGE_V2}"
+    local api_url="https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50"
+    TAGS_RAW=$(curl -fsSL "$api_url" 2>/dev/null || echo "")
+    # 解析tag名
+    TAGS=$(echo "$TAGS_RAW" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+    # 只保留数字版本tag
+    NUMERIC_TAGS=$(echo "$TAGS" | grep -E '^[0-9\.]+$' || true)
+    # 总是将 latest 置于最前
+    FINAL_TAGS="latest"
+    if [[ -n "$NUMERIC_TAGS" ]]; then
+        FINAL_TAGS="latest $NUMERIC_TAGS"
+    fi
+
+    # 如果最终没有其他tag，只给latest时，也仍然展示，可被选择
+    i=1
+    for tag in $FINAL_TAGS; do
+        echo "$i) $tag"
+        ((i++))
+    done
+    read -p "请选择 WebSSH V2 镜像版本（回车=latest）: " t
+    if [ -z "$t" ]; then
+        WEBSSH_SELECTED_TAG_V2="latest"
     else
-        i=1; for tag in $TAGS; do echo "$i) $tag"; ((i++)); done
-        read -p "请选择 WebSSH V2 镜像版本（回车=latest）: " t
-        if [ -z "$t" ]; then
-            WEBSSH_SELECTED_TAG_V2="$WEBSSH_DEFAULT_TAG_V2"
+        cnt=$(echo "$FINAL_TAGS" | wc -w)
+        if [[ "$t" =~ ^[0-9]+$ ]] && (( t >= 1 && t <= cnt )); then
+            WEBSSH_SELECTED_TAG_V2=$(echo "$FINAL_TAGS" | awk "{if(NR==$t)print}")
         else
-            WEBSSH_SELECTED_TAG_V2=$(echo "$TAGS" | awk "{if(NR==$t)print}")
-            [ -z "$WEBSSH_SELECTED_TAG_V2" ] && WEBSSH_SELECTED_TAG_V2="$WEBSSH_DEFAULT_TAG_V2"
+            yellow "输入无效，已自动选择 [latest] 作为版本。"
+            WEBSSH_SELECTED_TAG_V2="latest"
         fi
     fi
     WEBSSH_IMAGE_TAGGED_V2="$WEBSSH_IMAGE_V2:$WEBSSH_SELECTED_TAG_V2"
