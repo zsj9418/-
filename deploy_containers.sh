@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
-trap 'echo "脚本被中断"; exit 1' INT
+
+trap 'echo -e "\e[31m脚本被中断（$?）: 行号 ${LINENO}, 命令 `${BASH_COMMAND}`\e[0m"; exit 1' INT ERR
+
+# -------- 全局变量预初始化（防 set -u 杀脚本） --------
+IS_OPENWRT=false
+OS=""
+PACKAGE_MANAGER=""
+PLATFORM=""
+NETWORK_MODE=""
+PORT=""
 
 LOG_FILE="/var/log/deploy_script.log"
 LOG_MAX_SIZE=1048576
@@ -10,7 +19,6 @@ fi
 touch "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# 常量
 LOBE_CHAT_IMAGE="lobehub/lobe-chat:latest"
 WEBSSH_IMAGE_V1="jrohy/webssh"
 WEBSSH_IMAGE_V2="cmliu/webssh"
@@ -39,7 +47,7 @@ function detect_architecture() {
     armv7l | armhf) PLATFORM="linux/arm/v7" ;;
     aarch64 | arm64) PLATFORM="linux/arm64" ;;
     mips | mipsel) PLATFORM="linux/mips" ;;
-    *) red "不支持的架构 ($ARCH)" && exit 1 ;;
+    *) red "不支持的架构 ($ARCH)" ; exit 1 ;;
   esac
   green "设备架构：$ARCH，适配平台：$PLATFORM"
 }
@@ -58,7 +66,7 @@ function detect_os() {
     PACKAGE_MANAGER="yum"
     IS_OPENWRT=false
   else
-    red "不支持的操作系统" && exit 1
+    red "不支持的操作系统" ; exit 1
   fi
   green "操作系统：$OS"
 }
@@ -80,7 +88,7 @@ function install_dependency() {
 
 function check_dependencies() {
   if [[ ! -f "/var/log/deploy_dependencies_checked" ]]; then
-    if $IS_OPENWRT; then
+    if [[ "$IS_OPENWRT" == "true" ]]; then
       install_dependency "docker" "opkg install docker"
       install_dependency "lsof" "opkg install lsof"
       /etc/init.d/dockerd enable
@@ -94,7 +102,7 @@ function check_dependencies() {
 }
 
 function check_user_permission() {
-  if $IS_OPENWRT; then
+  if [[ "$IS_OPENWRT" == "true" ]]; then
     if [[ $(id -u) -ne 0 ]]; then
       red "OpenWrt 建议用 root 用户运行脚本"
       exit 1
@@ -109,11 +117,10 @@ function check_user_permission() {
   fi
 }
 
-# --------- 公共端口选择 ----------
 function find_available_port() {
   local start_port=${1:-2001}
   while :; do
-    if $IS_OPENWRT; then
+    if [[ "$IS_OPENWRT" == "true" ]]; then
       if ! netstat -tuln | grep -q ":$start_port "; then break; fi
     else
       if ! lsof -i:$start_port &>/dev/null; then break; fi
@@ -131,6 +138,164 @@ function validate_port() {
   if ! [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1 && "$PORT" -le 65535 ]]; then
     red "端口号无效，请输入 1-65535。" ; exit 1
   fi
+}
+
+# ----------- WebSSH V2 TAG拉取健壮处理 --------------
+function websshv2_get_available_tags() {
+    local repo="${WEBSSH_IMAGE_V2}"
+    local api_url="https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50"
+    TAGS_RAW=$(curl -fsSL "$api_url" 2>/dev/null || true)
+    TAGS=$(echo "$TAGS_RAW" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+    NUMERIC_TAGS=$(echo "$TAGS" | grep -E '^[0-9\.]+$' || true)
+    FINAL_TAGS="latest"
+    if [[ -n "$NUMERIC_TAGS" ]]; then
+        FINAL_TAGS="latest $NUMERIC_TAGS"
+    fi
+
+    if [[ -z "$NUMERIC_TAGS" ]]; then
+        yellow "没有发现除 latest 以外的历史版本，仅可部署 latest。"
+    fi
+
+    i=1
+    for tag in $FINAL_TAGS; do
+        echo "$i) $tag"
+        ((i++))
+    done
+    read -p "请选择 WebSSH V2 镜像版本（回车=latest）: " t
+    if [ -z "$t" ]; then
+        WEBSSH_SELECTED_TAG_V2="latest"
+    else
+        cnt=$(echo "$FINAL_TAGS" | wc -w)
+        if [[ "$t" =~ ^[0-9]+$ ]] && (( t >= 1 && t <= cnt )); then
+            WEBSSH_SELECTED_TAG_V2=$(echo "$FINAL_TAGS" | awk "{if(NR==$t)print}")
+        else
+            yellow "输入无效，已自动选择 [latest] 作为版本。"
+            WEBSSH_SELECTED_TAG_V2="latest"
+        fi
+    fi
+    WEBSSH_IMAGE_TAGGED_V2="$WEBSSH_IMAGE_V2:$WEBSSH_SELECTED_TAG_V2"
+}
+
+function websshv2_setup_data_dir() {
+    read -p "请输入 WebSSH V2 持久化数据目录（留空为$WEBSSH_DEFAULT_DATA_V2）: " data
+    WEBSSH_DATA_DIR_V2=${data:-$WEBSSH_DEFAULT_DATA_V2}
+    mkdir -p "$WEBSSH_DATA_DIR_V2"
+    chown -R 0:0 "$WEBSSH_DATA_DIR_V2" 2>/dev/null
+    chmod 755 "$WEBSSH_DATA_DIR_V2"
+}
+
+function websshv2_get_port() {
+    read -p "请输入映射端口（主机端口, 默认$WEBSSH_DEFAULT_PORT_V2）: " p
+    WEBSSH_HOST_PORT_V2=${p:-$WEBSSH_DEFAULT_PORT_V2}
+    if ! [[ "$WEBSSH_HOST_PORT_V2" =~ ^[0-9]+$ && "$WEBSSH_HOST_PORT_V2" -gt 0 && "$WEBSSH_HOST_PORT_V2" -le 65535 ]]; then
+        yellow "无效端口，已选用默认 $WEBSSH_DEFAULT_PORT_V2"
+        WEBSSH_HOST_PORT_V2=$WEBSSH_DEFAULT_PORT_V2
+    fi
+
+    if [[ "$IS_OPENWRT" == "true" ]]; then
+        while netstat -tuln | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
+            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
+            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
+        done
+    elif [[ "$OS" == "macOS" ]]; then
+        while netstat -an | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
+            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
+            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
+        done
+    else
+        while ss -tuln | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
+            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
+            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
+        done
+    fi
+}
+
+function websshv2_select_network_mode() {
+    echo -e "请选择网络模式："
+    echo "1) bridge（推荐/OpenWrt推荐）"
+    echo "2) host"
+    echo "3) macvlan（进阶）"
+    read -p "请输入选项(1-3,默认1): " wnet
+    case $wnet in
+        2) WEBSSH_NETWORK_MODE_V2="--network host" ;;
+        3) WEBSSH_NETWORK_MODE_V2="--network macvlan" ;;
+        *)  WEBSSH_NETWORK_MODE_V2="--network bridge" ;;
+    esac
+}
+
+function websshv2_check_dependencies() {
+    if [ -f "$WEBSSH_DEPENDENCY_CHECK_FILE_V2" ]; then
+        return 0
+    fi
+    if [[ "$IS_OPENWRT" == "true" ]]; then
+        install_dependency "curl" "opkg install curl"
+    else
+        install_dependency "curl" "sudo $PACKAGE_MANAGER install -y curl"
+    fi
+    touch "$WEBSSH_DEPENDENCY_CHECK_FILE_V2"
+}
+
+function websshv2_pull_image() {
+    for ((i=1;i<=WEBSSH_RETRY_COUNT;i++)); do
+        if docker pull "$WEBSSH_IMAGE_TAGGED_V2"; then
+            green "WebSSH V2 镜像拉取成功。"
+            return 0
+        else
+            red "第 $i 次尝试拉取 [$WEBSSH_IMAGE_TAGGED_V2] 失败。"
+            sleep 2
+        fi
+    done
+    red "WebSSH V2 镜像拉取失败，请检查你的网络、镜像仓库地址或者是否被墙。"
+    exit 1
+}
+
+# ----------- WebSSH V1&面板服务镜像拉取和部署健壮性处理 --------
+function deploy_panel_service() {
+  local cname=$1; local image=$2; local intport=$3; local hostport=$4
+  if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+    yellow "容器 $cname 已存在。"
+    echo "请先卸载或手动删除。"
+    return
+  fi
+  choose_network_mode
+  if docker pull $image; then
+      green "镜像 [$image] 拉取成功。"
+  else
+      red "镜像 [$image] 拉取失败，请检查网络或镜像源。"
+      exit 1
+  fi
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+    docker run -d --name $cname --network host --restart always $image
+  else
+    docker run -d --name $cname --network bridge -p $hostport:$intport --restart always $image
+  fi
+  green "服务 $cname 部署成功, 访问：http://<你的IP>:$hostport"
+}
+function uninstall_panel_service() {
+  local cname=$1
+  if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+    docker stop $cname && docker rm $cname
+    green "容器 $cname 已卸载"
+  else
+    yellow "未发现 $cname 容器"
+  fi
+  docker network prune -f || true
+  docker volume prune -f || true
+}
+function check_panel_status() {
+  local cname=$1
+  docker ps -a --filter "name=$cname"
+  docker logs --tail 20 $cname 2>/dev/null || true
+}
+function choose_network_mode() {
+  echo "请选择网络模式："
+  echo "1. bridge（推荐）"
+  echo "2. host（使用主机网络）"
+  read -p "请输入选项（1 或 2，默认1）： " mode
+  case $mode in
+    2) NETWORK_MODE="host" ;;
+    *) NETWORK_MODE="bridge" ;;
+  esac
 }
 
 # -------- Lobe Chat ---------
@@ -190,13 +355,17 @@ function webssh_v1_menu() {
     case $op in
       1)
         validate_port $WEBSSH_DEFAULT_PORT_V1
-        # 部署
         if docker ps -a --format '{{.Names}}' | grep -q "^$WEBSSH_CONTAINER_NAME_V1$"; then
           yellow "容器 $WEBSSH_CONTAINER_NAME_V1 已存在。"
           echo "请先卸载或手动删除。"
         else
           choose_network_mode
-          docker pull $WEBSSH_IMAGE_V1
+          if docker pull $WEBSSH_IMAGE_V1; then
+              green "镜像 [$WEBSSH_IMAGE_V1] 拉取成功。"
+          else
+              red "镜像 [$WEBSSH_IMAGE_V1] 拉取失败，请检查网络或镜像源。"
+              exit 1
+          fi
           if [[ "$NETWORK_MODE" == "host" ]]; then
             docker run -d --name $WEBSSH_CONTAINER_NAME_V1 \
               --network host \
@@ -211,7 +380,6 @@ function webssh_v1_menu() {
         fi
         ;;
       2)
-        # 卸载
         if docker ps -a --format '{{.Names}}' | grep -q "^$WEBSSH_CONTAINER_NAME_V1$"; then
           docker stop $WEBSSH_CONTAINER_NAME_V1 && docker rm $WEBSSH_CONTAINER_NAME_V1
           green "WebSSH V1 已卸载"
@@ -286,98 +454,6 @@ function webssh_v2_menu() {
     echo -e "\n$LOG_DIVIDER\n已返回 WebSSH V2 子菜单。"
   done
 }
-# v2专用子功能
-function websshv2_check_dependencies() {
-    if [ -f "$WEBSSH_DEPENDENCY_CHECK_FILE_V2" ]; then
-        return 0
-    fi
-    if $IS_OPENWRT; then
-        install_dependency "curl" "opkg install curl"
-    else
-        install_dependency "curl" "sudo $PACKAGE_MANAGER install -y curl"
-    fi
-    touch "$WEBSSH_DEPENDENCY_CHECK_FILE_V2"
-}
-function websshv2_get_available_tags() {
-    local repo="${WEBSSH_IMAGE_V2}"
-    local api_url="https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50"
-    TAGS_RAW=$(curl -fsSL "$api_url" 2>/dev/null || echo "")
-    # 解析tag名
-    TAGS=$(echo "$TAGS_RAW" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-    # 只保留数字版本tag
-    NUMERIC_TAGS=$(echo "$TAGS" | grep -E '^[0-9\.]+$' || true)
-    # 总是将 latest 置于最前
-    FINAL_TAGS="latest"
-    if [[ -n "$NUMERIC_TAGS" ]]; then
-        FINAL_TAGS="latest $NUMERIC_TAGS"
-    fi
-
-    # 如果最终没有其他tag，只给latest时，也仍然展示，可被选择
-    i=1
-    for tag in $FINAL_TAGS; do
-        echo "$i) $tag"
-        ((i++))
-    done
-    read -p "请选择 WebSSH V2 镜像版本（回车=latest）: " t
-    if [ -z "$t" ]; then
-        WEBSSH_SELECTED_TAG_V2="latest"
-    else
-        cnt=$(echo "$FINAL_TAGS" | wc -w)
-        if [[ "$t" =~ ^[0-9]+$ ]] && (( t >= 1 && t <= cnt )); then
-            WEBSSH_SELECTED_TAG_V2=$(echo "$FINAL_TAGS" | awk "{if(NR==$t)print}")
-        else
-            yellow "输入无效，已自动选择 [latest] 作为版本。"
-            WEBSSH_SELECTED_TAG_V2="latest"
-        fi
-    fi
-    WEBSSH_IMAGE_TAGGED_V2="$WEBSSH_IMAGE_V2:$WEBSSH_SELECTED_TAG_V2"
-}
-function websshv2_setup_data_dir() {
-    read -p "请输入 WebSSH V2 持久化数据目录（留空为$WEBSSH_DEFAULT_DATA_V2）: " data
-    WEBSSH_DATA_DIR_V2=${data:-$WEBSSH_DEFAULT_DATA_V2}
-    mkdir -p "$WEBSSH_DATA_DIR_V2"
-    chown -R 0:0 "$WEBSSH_DATA_DIR_V2" 2>/dev/null
-    chmod 755 "$WEBSSH_DATA_DIR_V2"
-}
-function websshv2_get_port() {
-    read -p "请输入映射端口（主机端口, 默认$WEBSSH_DEFAULT_PORT_V2）: " p
-    WEBSSH_HOST_PORT_V2=${p:-$WEBSSH_DEFAULT_PORT_V2}
-    if $IS_OPENWRT; then
-        while netstat -tuln | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
-            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
-            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
-        done
-    elif [[ "$OS" == "macOS" ]]; then
-        while netstat -an | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
-            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
-            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
-        done
-    else
-        while ss -tuln | grep -q ":$WEBSSH_HOST_PORT_V2 "; do
-            yellow "端口 $WEBSSH_HOST_PORT_V2 已被占用"
-            read -p "请输入新的端口: " WEBSSH_HOST_PORT_V2
-        done
-    fi
-}
-function websshv2_select_network_mode() {
-    echo -e "请选择网络模式："
-    echo "1) bridge（推荐/OpenWrt推荐）"
-    echo "2) host"
-    echo "3) macvlan（进阶）"
-    read -p "请输入选项(1-3,默认1): " wnet
-    case $wnet in
-        2) WEBSSH_NETWORK_MODE_V2="--network host" ;;
-        3) WEBSSH_NETWORK_MODE_V2="--network macvlan" ;;
-        *)  WEBSSH_NETWORK_MODE_V2="--network bridge" ;;
-    esac
-}
-function websshv2_pull_image() {
-    for ((i=1;i<=WEBSSH_RETRY_COUNT;i++)); do
-        if docker pull "$WEBSSH_IMAGE_TAGGED_V2"; then return 0; fi
-        sleep 2
-    done
-    red "WebSSH V2 镜像拉取失败" && exit 1
-}
 
 # ---------- Looking Glass ----------
 function looking_glass_menu() {
@@ -407,6 +483,7 @@ function looking_glass_menu() {
     echo -e "\n$LOG_DIVIDER\n已返回 Looking Glass 子菜单。"
   done
 }
+
 # ------- Speedtest -------------
 function speedtest_menu() {
   while true; do
@@ -436,49 +513,6 @@ function speedtest_menu() {
   done
 }
 
-# -------- 通用 服务管理 ---------
-function deploy_panel_service() {
-  local cname=$1; local image=$2; local intport=$3; local hostport=$4
-  if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
-    yellow "容器 $cname 已存在。"
-    echo "请先卸载或手动删除。"
-    return
-  fi
-  choose_network_mode
-  docker pull $image
-  if [[ "$NETWORK_MODE" == "host" ]]; then
-    docker run -d --name $cname --network host --restart always $image
-  else
-    docker run -d --name $cname --network bridge -p $hostport:$intport --restart always $image
-  fi
-  green "服务 $cname 部署成功, 访问：http://<你的IP>:$hostport"
-}
-function uninstall_panel_service() {
-  local cname=$1
-  if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
-    docker stop $cname && docker rm $cname
-    green "容器 $cname 已卸载"
-  else
-    yellow "未发现 $cname 容器"
-  fi
-  docker network prune -f || true
-  docker volume prune -f || true
-}
-function check_panel_status() {
-  local cname=$1
-  docker ps -a --filter "name=$cname"
-  docker logs --tail 20 $cname 2>/dev/null || true
-}
-function choose_network_mode() {
-  echo "请选择网络模式："
-  echo "1. bridge（推荐）"
-  echo "2. host（使用主机网络）"
-  read -p "请输入选项（1 或 2，默认1）： " mode
-  case $mode in
-    2) NETWORK_MODE="host" ;;
-    *) NETWORK_MODE="bridge" ;;
-  esac
-}
 # --------------------- 主菜单 ---------------------
 function main_menu() {
   detect_architecture
@@ -500,7 +534,7 @@ function main_menu() {
       3) looking_glass_menu ;;
       4) speedtest_menu ;;
       5) docker ps -a ;;
-      6) green "感谢您的使用，脚本退出。" && exit 0 ;;
+      6) green "感谢您的使用，脚本退出。" ; exit 0 ;;
       *) red "无效选项。" ;;
     esac
     echo -e "\n$LOG_DIVIDER\n已返回主菜单。"
