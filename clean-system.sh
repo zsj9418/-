@@ -106,14 +106,43 @@ clean_system() {
 }
 
 # 设置定时任务
+# 设置定时任务，只写入 root 的 crontab
 setup_cron() {
     install_dependencies
     yellow "设置每两天自动运行一次..."
-    local cron_job="0 0 */2 * * /bin/bash $(realpath "$0") --cron"
-    (crontab -l 2>/dev/null | grep -v "$(realpath "$0")"; echo "$cron_job") | crontab -
-    green "定时任务已设置！"
-    yellow "当前的定时任务如下："
-    crontab -l
+
+    local script_path
+    script_path="$(realpath "$0")"
+    local cron_job="0 0 */2 * * /bin/bash $script_path --cron >>/tmp/clean-cron.log 2>&1"
+
+    # 检查自己是不是root用户。如果不是root，直接用sudo写入root crontab。
+    if [[ $EUID -ne 0 ]]; then
+        yellow "检测到非root用户，定时任务将写入root账户crontab。"
+        # 获取root用户crontab内容，排除之前设置过的本脚本，追加新内容，再写回。
+        tmpfile=$(mktemp)
+        sudo crontab -l 2>/dev/null | grep -v "$script_path" > "$tmpfile" || true
+        echo "$cron_job" >> "$tmpfile"
+        sudo crontab "$tmpfile"
+        rm -f "$tmpfile"
+        green "定时任务已添加到 root 用户的 crontab："
+        sudo crontab -l
+    else
+        # 已经是root，操作自己的crontab即可
+        tmpfile=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "$script_path" > "$tmpfile" || true
+        echo "$cron_job" >> "$tmpfile"
+        crontab "$tmpfile"
+        rm -f "$tmpfile"
+        green "定时任务已添加到 root 用户的 crontab："
+        crontab -l
+    fi
+
+    yellow "当前的 root 用户定时任务如下（请确保脚本路径与日志可访问/有权限）："
+    if [[ $EUID -ne 0 ]]; then
+        sudo crontab -l
+    else
+        crontab -l
+    fi
 }
 
 # 创建快捷方式
