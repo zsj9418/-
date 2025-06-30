@@ -193,7 +193,7 @@ function download_script() {
             if [[ "$url" == https://raw.githubusercontent.com/* ]]; then
                 for proxy in "${PROXY_PREFIXES[@]}"; do
                     # 使用代理格式
-                    proxy_url="${proxy}${url#https://}"
+                    proxy_url="${proxy}${url}"
                     echo "切换到代理 URL: $proxy_url" >&2
                     if curl -fsSL "$proxy_url" -o "$script_path"; then
                         if [[ -s "$script_path" ]]; then
