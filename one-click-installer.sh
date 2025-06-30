@@ -1,6 +1,94 @@
 #!/bin/bash
 set -euo pipefail  # 严格错误处理
 
+# ------- 依赖检测与自动安装 -------
+NEEDED_CMDS=(wget curl tar zip sudo nano vim)
+MISSING_CMDS=()
+OS=""
+PKG_MANAGER=""
+
+detect_os_pkg() {
+    # 检测系统类型和包管理器
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt-get"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+    else
+        PKG_MANAGER=""
+    fi
+}
+
+for cmd in "${NEEDED_CMDS[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
+done
+
+if [ ${#MISSING_CMDS[@]} -gt 0 ]; then
+    detect_os_pkg
+    echo "缺少以下依赖：${MISSING_CMDS[*]}"
+    if [ -n "$PKG_MANAGER" ]; then
+        echo "正在安装依赖，请稍候……"
+        case "$PKG_MANAGER" in
+            apt-get) sudo apt-get update && sudo apt-get install -y "${MISSING_CMDS[@]}";;
+            yum) sudo yum install -y "${MISSING_CMDS[@]}";;
+            dnf) sudo dnf install -y "${MISSING_CMDS[@]}";;
+            opkg) sudo opkg update && sudo opkg install "${MISSING_CMDS[@]}";;
+            *)
+                echo "未知包管理器，无法自动安装，请手动安装：${MISSING_CMDS[*]}"
+                exit 1
+                ;;
+        esac
+    else
+        echo "无法自动检测包管理器，请手动安装缺失依赖：${MISSING_CMDS[*]}"
+        exit 1
+    fi
+fi
+
+# ------- 首次启动快捷键提示 -------
+function add_script_shortcut() {
+    local SYMLINK_NAME="a"
+    local CUR_PATH
+    CUR_PATH="$(realpath "$0")"
+    local SYMLINK_DIRS=("/usr/local/bin" "/usr/bin" "/bin" "$HOME/.local/bin")
+    [ -d /etc/openwrt_release ] && SYMLINK_DIRS=("/usr/bin" "/bin" "$HOME/.local/bin")
+    local DIR=""
+    for d in "${SYMLINK_DIRS[@]}"; do
+        mkdir -p "$d" 2>/dev/null
+        [ -w "$d" ] && DIR="$d" && break
+    done
+    if [ -z "$DIR" ]; then
+        echo "没有可写入的系统目录，无法自动添加快捷键a"
+        return
+    fi
+    local LINK="${DIR}/${SYMLINK_NAME}"
+    if [ -L "$LINK" ] && [ "$(readlink -f "$LINK")" = "$CUR_PATH" ]; then
+        echo "快捷键 a 已存在于 $DIR，可以直接在终端输入 a 启动本脚本"
+        return
+    fi
+    echo
+    read -r -p "是否创建快捷键 (a) 到 $DIR，（回车=是，n=跳过）：" ANS
+    if [[ -z "$ANS" || "$ANS" =~ ^[Yy] ]]; then
+        ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
+        if [ $? -eq 0 ]; then
+            echo "已创建快捷键 a，后续只需输入 a 即可启动本脚本"
+        else
+            echo "快捷键创建失败，可能权限不足: $LINK"
+        fi
+    else
+        echo "已跳过快捷键设置"
+    fi
+}
+
+add_script_shortcut
+
+
 # ------------------------- 配置区域 -------------------------
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
