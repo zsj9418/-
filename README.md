@@ -6,7 +6,7 @@ bash one-click-installer.sh
 
 ```
 ```
-wget -O one-click-installer.sh https://ghfast.top/https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
+wget -O one-click-installer.sh https://un.ax18.ggff.net/https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/one-click-installer.sh && \
 chmod +x one-click-installer.sh && \
 bash one-click-installer.sh
 ```
