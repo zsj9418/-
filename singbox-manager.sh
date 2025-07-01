@@ -948,7 +948,7 @@ run_update() {
                     if start_service; then
                         node_count=\$(get_node_count)
                         green_log "服务启动成功，节点数: \$node_count"
-                        final_message="\$final_message\n✅ 成功更新并启动"
+                        final_message="\$final_message\n✅ 成功更新并启动，节点数: \$node_count"
                         overall_success=true
                         break
                     else
