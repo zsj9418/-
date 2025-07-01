@@ -1,7 +1,4 @@
 #!/bin/bash
-# Docker管理脚本
-# 功能：支持 Sun-Panel 的部署、通知、日志记录和数据备份/恢复
-# 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口，并支持选择版本。
 
 # 配置区（默认值）
 DATA_DIR="/opt/sun-panel/data"
@@ -17,6 +14,7 @@ DEFAULT_SUN_PANEL_PORT=3002
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 初始化日志
@@ -25,9 +23,9 @@ log() {
   local message=$2
   local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
   case $level in
-    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
-    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
-    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;; # Redirect to stderr
+    "INFO") echo -e "${GREEN}[INFO] $timestamp - $message${NC}" >&2 ;;
+    "WARN") echo -e "${YELLOW}[WARN] $timestamp - $message${NC}" >&2 ;;
+    "ERROR") echo -e "${RED}[ERROR] $timestamp - $message${NC}" >&2 ;;
   esac
   echo "[$level] $timestamp - $message" >> "$LOG_FILE"
 
@@ -172,12 +170,35 @@ prompt_for_version() {
   log "INFO" "选择的 Sun-Panel 版本: $SUN_PANEL_VERSION"
 }
 
+# 重置管理员密码
+reset_admin_password() {
+  log "INFO" "正在尝试重置管理员密码..."
+  if docker ps --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    echo -e "${YELLOW}正在执行密码重置操作...${NC}"
+    docker exec -it $CONTAINER_NAME ./sun-panel -password-reset
+    log "INFO" "密码已重置为默认值"
+    echo -e "\n${GREEN}密码重置成功！${NC}"
+    echo -e "${CYAN}=================================${NC}"
+    echo -e "${YELLOW}新的管理员凭据：${NC}"
+    echo "账号：admin@sun.cc"
+    echo "密码：12345678"
+    echo -e "${CYAN}=================================${NC}"
+    echo -e "${YELLOW}请及时登录并修改密码${NC}"
+  else
+    log "ERROR" "容器 $CONTAINER_NAME 未运行，无法重置密码"
+    echo -e "${RED}错误：Sun-Panel 容器未运行${NC}"
+  fi
+}
+
 # 部署 Sun-Panel
 install_sunpanel() {
   prompt_for_version
 
   log "INFO" "正在拉取镜像 $SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION..."
-  docker pull "$SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION"
+  docker pull "$SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION" || {
+    log "ERROR" "镜像拉取失败"
+    exit 1
+  }
 
   # 提示用户选择网络模式
   while true; do
@@ -223,18 +244,23 @@ install_sunpanel() {
 
   log "INFO" "Sun-Panel 部署成功"
 
-  # 提示用户如何使用
-  echo -e "\n${GREEN}部署完成！以下是使用信息：${NC}"
-  echo "默认账号密码："
+  # 增强版部署完成提示
+  echo -e "\n${GREEN}部署完成！以下是重要信息：${NC}"
+  echo -e "${CYAN}=================================${NC}"
+  echo -e "${YELLOW}默认管理员凭据（首次登录后请修改）${NC}"
   echo "账号：admin@sun.cc"
   echo "密码：12345678"
-  echo "访问地址："
+  echo -e "${CYAN}=================================${NC}"
+  echo -e "访问地址："
   if [[ "$NETWORK_MODE" == "host" ]]; then
     echo "http://<你的服务器IP>:3002"
   else
     echo "http://<你的服务器IP>:$HOST_PORT"
   fi
-  echo -e "请确保防火墙允许 $HOST_PORT 端口的访问。\n"
+  echo -e "\n${YELLOW}安全提示：${NC}"
+  echo "1. 请确保防火墙允许 $HOST_PORT 端口的访问"
+  echo "2. 首次登录后请立即修改默认密码"
+  echo "3. 如需重置密码，请使用本脚本的'重置管理员密码'功能"
 }
 
 # 查看所有容器状态
@@ -282,8 +308,11 @@ backup_data() {
     mkdir -p "$BACKUP_DIR"
     tar -czf "$BACKUP_FILE" -C "$DATA_DIR" .
     log "INFO" "数据已备份到: $BACKUP_FILE"
+    echo -e "${GREEN}备份成功！${NC}"
+    echo "备份文件位置: $BACKUP_FILE"
   else
     log "WARN" "未找到数据目录，跳过备份"
+    echo -e "${YELLOW}警告：未找到数据目录${NC}"
   fi
 }
 
@@ -292,6 +321,7 @@ restore_data() {
   local latest_backup=$(ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null | head -n 1)
   if [ -z "$latest_backup" ]; then
     log "WARN" "未找到备份文件，跳过恢复"
+    echo -e "${YELLOW}未找到备份文件${NC}"
     return
   fi
 
@@ -299,18 +329,23 @@ restore_data() {
   mkdir -p "$DATA_DIR"
   tar -xzf "$latest_backup" -C "$DATA_DIR"
   log "INFO" "数据已从 $latest_backup 恢复"
+  echo -e "${GREEN}数据恢复成功！${NC}"
+  echo "恢复来源: $latest_backup"
 }
 
 # 交互式菜单
 interactive_menu() {
   while true; do
-    echo -e "\n选择操作："
+    echo -e "\n${CYAN}Sun-Panel 管理脚本${NC}"
+    echo -e "${YELLOW}===================${NC}"
     echo "1. 部署 Sun-Panel"
     echo "2. 查看所有容器状态"
-    echo "3. 卸载容器（Sun-Panel）"
+    echo "3. 卸载 Sun-Panel"
     echo "4. 数据备份"
     echo "5. 数据恢复"
-    echo "6. 退出"
+    echo "6. 重置管理员密码"
+    echo "7. 退出"
+    echo -e "${YELLOW}===================${NC}"
     read -p "请输入选项编号: " choice
 
     case $choice in
@@ -319,12 +354,15 @@ interactive_menu() {
       3) uninstall_container $CONTAINER_NAME ;;
       4) backup_data ;;
       5) restore_data ;;
-      6)
+      6) reset_admin_password ;;
+      7)
         log "INFO" "退出脚本"
+        echo -e "${GREEN}感谢使用 Sun-Panel 管理脚本${NC}"
         exit 0
         ;;
       *)
         log "WARN" "无效输入，请重新选择"
+        echo -e "${RED}错误：无效选项${NC}"
         ;;
     esac
   done
@@ -332,6 +370,14 @@ interactive_menu() {
 
 # 主流程
 main() {
+  # 显示欢迎信息
+  echo -e "${CYAN}"
+  echo "======================================"
+  echo " Sun-Panel Docker 管理脚本 v2.0"
+  echo " 支持部署、管理和维护 Sun-Panel"
+  echo "======================================"
+  echo -e "${NC}"
+  
   detect_system
   install_dependencies
   interactive_menu
