@@ -35,20 +35,20 @@ log "Grep 版本：$(grep --version | head -n1)"
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64)
-        DOCKER_IMAGE="sulinggg/openwrt:latest"
-        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:latest"
+        DOCKER_IMAGE="sulinggg/openwrt:x86_64"
+        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:x86_64"
         FALLBACK_IMAGE="sulinggg/openwrt:openwrt-18.06-k5.4"
         ARCH_DESC="Intel/AMD 64位设备"
         ;;
     aarch64 | arm64)
-        DOCKER_IMAGE="sulinggg/openwrt:latest" # 优先 latest，更通用
-        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:latest"
+        DOCKER_IMAGE="sulinggg/openwrt:armv8"
+        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:armv8"
         FALLBACK_IMAGE="sulinggg/openwrt:rpi4"
         ARCH_DESC="ARM64 设备（树莓派4B/N1等）"
         ;;
     armv7l)
-        DOCKER_IMAGE="dickhub/openwrt:armv7"
-        ALIYUN_IMAGE=""
+        DOCKER_IMAGE="sulinggg/openwrt:armv7"
+        ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:armv7"
         FALLBACK_IMAGE=""
         ARCH_DESC="ARMv7 设备（NanoPi R2S/R4S等）"
         ;;
