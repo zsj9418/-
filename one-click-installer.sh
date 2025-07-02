@@ -93,7 +93,7 @@ add_script_shortcut
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
 LOG_MAX_SIZE=1048576  # 日志文件最大大小，1MB = 1048576 字节
-PROXY_PREFIXES=("https://un.ax18.ggff.net/")  # 可用的代理地址
+PROXY_PREFIXES=("https://un.ax18.ggff.net/ https://cdn.yyds9527.nyc.mn/")  # 可用的代理地址
 RETRY_COUNT=3  # 下载重试次数
 CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"  # 自定义菜单配置文件
 
