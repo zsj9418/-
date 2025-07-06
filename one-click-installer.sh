@@ -1,8 +1,8 @@
 #!/bin/bash
-set -euo pipefail  # 严格错误处理
+set -euo pipefail # 严格错误处理
 
 # ------- 依赖检测与自动安装 -------
-NEEDED_CMDS=(wget curl tar zip sudo nano vim)
+NEEDED_CMDS=(wget curl tar)
 MISSING_CMDS=()
 OS=""
 PKG_MANAGER=""
@@ -13,33 +13,53 @@ detect_os_pkg() {
         . /etc/os-release
         OS=$ID
     fi
-    if command -v apt-get >/dev/null 2>&1; then
+
+    # Prioritize opkg for OpenWrt
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+    elif command -v apt-get >/dev/null 2>&1; then
         PKG_MANAGER="apt-get"
     elif command -v yum >/dev/null 2>&1; then
         PKG_MANAGER="yum"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf"
-    elif command -v opkg >/dev/null 2>&1; then
-        PKG_MANAGER="opkg"
     else
         PKG_MANAGER=""
     fi
+}
+
+# Function to check if running as root
+is_root() {
+    [ "$(id -u)" -eq 0 ]
 }
 
 for cmd in "${NEEDED_CMDS[@]}"; do
     command -v "$cmd" >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
 done
 
+# Add common OpenWrt editors if not present and the system is OpenWrt
+if [ -f /etc/openwrt_release ]; then
+    command -v nano >/dev/null 2>&1 || MISSING_CMDS+=(nano)
+    command -v vim >/dev/null 2>&1 || MISSING_CMDS+=(vim)
+fi
+
 if [ ${#MISSING_CMDS[@]} -gt 0 ]; then
     detect_os_pkg
     echo "缺少以下依赖：${MISSING_CMDS[*]}"
     if [ -n "$PKG_MANAGER" ]; then
         echo "正在安装依赖，请稍候……"
+        # Check for root before attempting installation
+        if ! is_root && [ "$PKG_MANAGER" != "opkg" ]; then # opkg typically doesn't need sudo
+            echo "非root用户，请手动安装以下依赖或使用sudo运行此脚本：${MISSING_CMDS[*]}"
+            exit 1
+        fi
+
+        # Use appropriate command for installation
         case "$PKG_MANAGER" in
             apt-get) sudo apt-get update && sudo apt-get install -y "${MISSING_CMDS[@]}";;
             yum) sudo yum install -y "${MISSING_CMDS[@]}";;
             dnf) sudo dnf install -y "${MISSING_CMDS[@]}";;
-            opkg) sudo opkg update && sudo opkg install "${MISSING_CMDS[@]}";;
+            opkg) opkg update && opkg install "${MISSING_CMDS[@]}";; # opkg usually runs as root
             *)
                 echo "未知包管理器，无法自动安装，请手动安装：${MISSING_CMDS[*]}"
                 exit 1
@@ -52,50 +72,97 @@ if [ ${#MISSING_CMDS[@]} -gt 0 ]; then
 fi
 
 # ------- 首次启动快捷键提示 -------
+# Helper function for realpath fallback
+get_real_path() {
+    local path="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path" 2>/dev/null
+    elif command -v readlink >/dev/null 2>&1 && [ "$(uname)" != "Darwin" ]; then # readlink -f is not standard on macOS
+        readlink -f "$path" 2>/dev/null
+    else
+        echo "$path" # Fallback to original path if no suitable command found
+    fi
+}
+
 function add_script_shortcut() {
     local SYMLINK_NAME="a"
     local CUR_PATH
-    CUR_PATH="$(realpath "$0")"
+    CUR_PATH="$(get_real_path "$0")" # Use the new helper function
     local SYMLINK_DIRS=("/usr/local/bin" "/usr/bin" "/bin" "$HOME/.local/bin")
-    [ -d /etc/openwrt_release ] && SYMLINK_DIRS=("/usr/bin" "/bin" "$HOME/.local/bin")
+    [ -f /etc/openwrt_release ] && SYMLINK_DIRS=("/usr/bin" "/bin" "$HOME/.local/bin") # OpenWrt specific directories
     local DIR=""
     for d in "${SYMLINK_DIRS[@]}"; do
         mkdir -p "$d" 2>/dev/null
-        [ -w "$d" ] && DIR="$d" && break
+        # Check if the directory is writable by the current user or if running as root
+        if [[ -w "$d" || -z "$DIR" && "$(id -u)" -eq 0 ]]; then
+            DIR="$d"
+            break
+        fi
     done
+
     if [ -z "$DIR" ]; then
-        echo "没有可写入的系统目录，无法自动添加快捷键a"
+        echo "没有可写入的系统目录，无法自动添加快捷键a。请手动创建快捷方式或检查权限。"
         return
     fi
+
     local LINK="${DIR}/${SYMLINK_NAME}"
-    if [ -L "$LINK" ] && [ "$(readlink -f "$LINK")" = "$CUR_PATH" ]; then
-        echo "快捷键 a 已存在于 $DIR，可以直接在终端输入 a 启动本脚本"
+
+    if [ -L "$LINK" ] && [ "$(readlink -f "$LINK" 2>/dev/null)" = "$CUR_PATH" ]; then
+        echo "快捷键 '$SYMLINK_NAME' 已存在于 $DIR，可以直接在终端输入 '$SYMLINK_NAME' 启动本脚本。"
         return
     fi
-    echo
-    read -r -p "是否创建快捷键 (a) 到 $DIR，（回车=是，n=跳过）：" ANS
-    if [[ -z "$ANS" || "$ANS" =~ ^[Yy] ]]; then
-        ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
-        if [ $? -eq 0 ]; then
-            echo "已创建快捷键 a，后续只需输入 a 即可启动本脚本"
+
+    # If the shortcut exists but points to a different script, or is not a symlink
+    if [ -e "$LINK" ]; then
+        echo "快捷键 '$SYMLINK_NAME' 已存在但指向其他文件或不是软链接：$LINK -> $(readlink -f "$LINK" 2>/dev/null)"
+        read -r -p "是否覆盖创建快捷键 '$SYMLINK_NAME' 到 $DIR，（回车=是，n=跳过）：" ANS
+        if [[ -z "$ANS" || "$ANS" =~ ^[Yy] ]]; then
+            # Attempt to create the symlink, possibly with sudo if needed
+            if [[ -w "$DIR" ]]; then
+                ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
+            elif is_root; then # Running as root, try without sudo
+                ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
+            else # Not writable and not root, try with sudo
+                sudo ln -sf "$CUR_PATH" "$LINK" && sudo chmod +x "$CUR_PATH"
+            fi
+
+            if [ $? -eq 0 ]; then
+                echo "已成功创建快捷键 '$SYMLINK_NAME'，后续只需输入 '$SYMLINK_NAME' 即可启动本脚本。"
+            else
+                echo "快捷键创建失败，可能权限不足或目标目录不可写: $LINK"
+            fi
         else
-            echo "快捷键创建失败，可能权限不足: $LINK"
+            echo "已跳过快捷键设置。"
         fi
     else
-        echo "已跳过快捷键设置"
+        # Directly attempt to create the shortcut without asking, if possible
+        echo "正在尝试创建快捷键 '$SYMLINK_NAME' 到 $DIR..."
+        if [[ -w "$DIR" ]]; then
+            ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
+        elif is_root; then # Running as root, try without sudo
+            ln -sf "$CUR_PATH" "$LINK" && chmod +x "$CUR_PATH"
+        else # Not writable and not root, try with sudo
+            sudo ln -sf "$CUR_PATH" "$LINK" && sudo chmod +x "$CUR_PATH"
+        fi
+
+        if [ $? -eq 0 ]; then
+            echo "已成功创建快捷键 '$SYMLINK_NAME'，后续只需输入 '$SYMLINK_NAME' 即可启动本脚本。"
+        else
+            echo "快捷键创建失败，可能权限不足或目标目录不可写: $LINK"
+            echo "如果需要，您可以尝试手动运行此命令创建快捷键：ln -s '$CUR_PATH' '$LINK'"
+        fi
     fi
 }
 
 add_script_shortcut
 
-
 # ------------------------- 配置区域 -------------------------
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
-LOG_MAX_SIZE=1048576  # 日志文件最大大小，1MB = 1048576 字节
-PROXY_PREFIXES=("https://un.ax18.ggff.net/" "https://cdn.yyds9527.nyc.mn/")  # 可用的代理地址
-RETRY_COUNT=3  # 下载重试次数
-CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"  # 自定义菜单配置文件
+LOG_MAX_SIZE=1048576 # 日志文件最大大小，1MB = 1048576 字节
+PROXY_PREFIXES=("https://un.ax18.ggff.net/" "https://cdn.yyds9527.nyc.mn/") # 可用的代理地址
+RETRY_COUNT=3 # 下载重试次数
+CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf" # 自定义菜单配置文件
 
 # ------------------------- 初始化 -------------------------
 mkdir -p "$SCRIPT_DIR" || { echo "无法创建脚本存放目录：$SCRIPT_DIR"; exit 1; }
@@ -111,25 +178,20 @@ function is_openwrt() {
 
 # 获取当前脚本的真实路径
 function get_current_script_path() {
-    # 尝试多种方法获取真实路径
-    local path
-    path="$(realpath "$0" 2>/dev/null)" || \
-    path="$(readlink -f "$0" 2>/dev/null)" || \
-    path="$0"
-    echo "$path"
+    get_real_path "$0"
 }
 
-# ------------------------- 默认脚本列表  -------------------------
+# ------------------------- 默认脚本列表 -------------------------
 DEFAULT_OPTIONS=(
-    "1.  安装 Docker"
-    "2.  SSH 工具 & 测速容器"
-    "3.  安装常用工具"
-    "4.  清理系统垃圾"
-    "5.  获取设备信息"
-    "6.  安装 AdGuard Home"
-    "7.  安装 Alist"
-    "8.  安装 NexTerm"
-    "9.  安装 OpenAPI"
+    "1. 安装 Docker"
+    "2. SSH 工具 & 测速容器"
+    "3. 安装常用工具"
+    "4. 清理系统垃圾"
+    "5. 获取设备信息"
+    "6. 安装 AdGuard Home"
+    "7. 安装 Alist"
+    "8. 安装 NexTerm"
+    "9. 安装 OpenAPI"
     "10. 安装 Sing-box"
     "11. 安装 Subconverter"
     "12. 设置 DNS"
@@ -219,7 +281,13 @@ declare -A CUSTOM_SCRIPT_NAMES=()
 function manage_logs() {
     if [[ -f "$LOG_FILE" ]]; then
         # 获取文件大小（字节）
-        local log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || ls -l "$LOG_FILE" | awk '{print $5}')
+        local log_size
+        if command -v stat >/dev/null 2>&1; then
+            log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null)
+        else # Fallback for systems without stat (like some busybox variants)
+            log_size=$(ls -l "$LOG_FILE" | awk '{print $5}')
+        fi
+
         if [[ $log_size -ge $LOG_MAX_SIZE ]]; then
             echo "[$(date +'%Y-%m-%d %H:%M:%S')] 日志文件超过 1MB（当前大小: $log_size 字节），正在清理..." | tee -a "$LOG_FILE"
             # 计算需要保留的字节数（大约最后 50% 的内容，防止截断过少）
@@ -248,6 +316,12 @@ function download_script() {
     local url="${DEFAULT_SCRIPTS[$choice]}"
     local script_name=""
     local script_path=""
+
+    # If the URL is empty, it means this option doesn't have a corresponding script URL (e.g., control options)
+    if [ -z "$url" ]; then
+        echo "此选项没有对应的脚本可供下载。" >&2
+        return 1
+    fi
 
     # 从 URL 中提取脚本文件名
     script_name=$(basename "$url")
@@ -292,7 +366,7 @@ function download_script() {
                             echo "$script_path"
                             return 0
                         else
-                            echo "下载 $script_name 后文件为空，下载失败。" >&2
+                            echo "下载 $script_name 后文件为空，代理下载失败。" >&2
                             rm -f "$script_path"
                             return 1
                         fi
@@ -315,6 +389,8 @@ function run_script() {
     local script_path="$1"
     if [[ -f "$script_path" ]]; then
         echo "正在运行脚本 $script_path..." | tee -a "$LOG_FILE"
+        # Ensure the script is executable, which should have been done during download
+        chmod +x "$script_path"
         bash "$script_path" 2>&1 | tee -a "$LOG_FILE"
         if [[ $? -eq 0 ]]; then
             echo "脚本 $script_path 运行成功。" | tee -a "$LOG_FILE"
@@ -328,11 +404,11 @@ function run_script() {
 
 # 快捷键管理（合并了脚本绑定功能）
 function manage_symlink() {
-    local current_script=$(realpath "$0")
+    local current_script=$(get_current_script_path)
     while true; do
         clear
         echo "========================================"
-        echo "          快捷键管理"
+        echo "           快捷键管理"
         echo "========================================"
         echo "请选择操作："
         echo "1. 管理当前脚本快捷键"
@@ -380,7 +456,7 @@ function manage_current_script_symlink() {
         mkdir -p "$dir" 2>/dev/null || continue
         
         # 检查是否可写
-        if [[ -w "$dir" ]]; then
+        if [[ -w "$dir" || "$(id -u)" -eq 0 ]]; then # Allow if writable or running as root
             symlink_dir="$dir"
             break
         fi
@@ -449,7 +525,15 @@ function manage_current_script_symlink() {
                 fi
 
                 # 创建链接 (使用绝对路径)
-                if ln -s "$current_script" "$link" 2>/dev/null; then
+                if [[ -w "$symlink_dir" ]]; then
+                    ln -s "$current_script" "$link" 2>/dev/null
+                elif is_root; then
+                    ln -s "$current_script" "$link" 2>/dev/null
+                else
+                    sudo ln -s "$current_script" "$link" 2>/dev/null
+                fi
+
+                if [ $? -eq 0 ]; then
                     echo "快捷键 '$shortcut' 已成功创建到:"
                     echo "$link -> $current_script"
                     echo "现在您可以直接在终端输入 '$shortcut' 来运行脚本"
@@ -472,7 +556,15 @@ function manage_current_script_symlink() {
                     local target
                     target="$(readlink -f "$link" 2>/dev/null)" || target=""
                     if [[ "$target" == "$current_script" || "$target" == "$SCRIPT_DIR"/* ]]; then
-                        if rm -f "$link"; then
+                        if [[ -w "$symlink_dir" ]]; then
+                            rm -f "$link"
+                        elif is_root; then
+                            rm -f "$link"
+                        else
+                            sudo rm -f "$link"
+                        fi
+
+                        if [ $? -eq 0 ]; then
                             echo "快捷键 '$shortcut' 已删除"
                         else
                             echo "删除失败，请尝试手动删除: rm -f '$link'"
@@ -511,7 +603,7 @@ function bind_script_to_shortcut() {
         read -r script_path
 
         # 获取绝对路径
-        script_path="$(realpath "$script_path" 2>/dev/null || echo "$script_path")"
+        script_path="$(get_real_path "$script_path")"
         
         # 路径验证
         if [[ ! -f "$script_path" ]]; then
@@ -541,7 +633,7 @@ function bind_script_to_shortcut() {
         local symlink_dir=""
         for dir in "${symlink_dirs[@]}"; do
             mkdir -p "$dir" 2>/dev/null || continue
-            if [[ -w "$dir" ]]; then
+            if [[ -w "$dir" || "$(id -u)" -eq 0 ]]; then # Allow if writable or running as root
                 symlink_dir="$dir"
                 break
             fi
@@ -561,9 +653,18 @@ function bind_script_to_shortcut() {
         fi
 
         # 创建链接
-        if ln -s "$script_path" "$link"; then
+        if [[ -w "$symlink_dir" ]]; then
+            ln -s "$script_path" "$link"
+        elif is_root; then
+            ln -s "$script_path" "$link"
+        else
+            sudo ln -s "$script_path" "$link"
+        fi
+
+        if [ $? -eq 0 ]; then
             echo "成功创建快捷键:"
             echo "$link -> $script_path"
+            echo "请确保脚本 '$script_path' 具有执行权限 (chmod +x '$script_path')"
         else
             echo "创建失败，可能原因:"
             echo "1. 权限不足 (尝试: chmod +x '$script_path')"
@@ -593,7 +694,18 @@ function manage_custom_menu() {
         echo "          自定义菜单管理"
         echo "========================================"
         echo "当前自定义菜单选项："
-        cat "$CUSTOM_MENU_FILE"
+        local custom_menu_count=0
+        while IFS= read -r line; do
+            if [[ -n "$line" && "$line" != \#* ]]; then
+                echo "  $line"
+                custom_menu_count=$((custom_menu_count + 1))
+            fi
+        done < "$CUSTOM_MENU_FILE"
+
+        if [[ "$custom_menu_count" -eq 0 ]]; then
+            echo "  (暂无自定义菜单项)"
+        fi
+
         echo "----------------------------------------"
         echo "1. 添加菜单选项"
         echo "2. 删除菜单选项"
@@ -602,21 +714,46 @@ function manage_custom_menu() {
         read -rp "请输入选项编号: " choice
         case "$choice" in
             1)
-                next_id=$(get_next_custom_menu_id)
+                local next_id=$(get_next_custom_menu_id)
                 echo "请输入新菜单项显示名称："
                 read -r name
+                # Simple validation for name
+                if [[ -z "$name" ]]; then
+                    echo "菜单名称不能为空！"
+                    read -rp "按回车键继续..."
+                    continue
+                fi
+
                 echo "请输入脚本 URL 或本地路径："
                 read -r url
-                # 生成脚本文件名
-                local script_name=$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]').sh
+                # Simple validation for URL/path
+                if [[ -z "$url" ]]; then
+                    echo "脚本URL或本地路径不能为空！"
+                    read -rp "按回车键继续..."
+                    continue
+                fi
+
+                # Generate a simple script name from the provided name, ensuring it's alphanumeric
+                local script_name=$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+                if [ -z "$script_name" ]; then
+                    script_name="custom_script_${next_id}.sh"
+                else
+                    script_name="${script_name}.sh"
+                fi
+                
                 echo "$next_id|$name|$url|$script_name" >> "$CUSTOM_MENU_FILE"
                 echo "菜单项已添加，编号为 $next_id，脚本文件将保存为 $script_name。"
                 ;;
             2)
                 echo "请输入要删除的菜单项编号："
                 read -r id
-                sed -i "/^$id|/d" "$CUSTOM_MENU_FILE"
-                echo "菜单项已删除。"
+                # Validate if the ID exists in the custom menu file before attempting to delete
+                if grep -q "^$id|" "$CUSTOM_MENU_FILE"; then
+                    sed -i "/^$id|/d" "$CUSTOM_MENU_FILE"
+                    echo "菜单项已删除。"
+                else
+                    echo "错误：未找到编号为 '$id' 的自定义菜单项。"
+                fi
                 ;;
             0)
                 break
@@ -673,34 +810,55 @@ function load_menu() {
             fi
         else # 非数字编号的选项 (例如 "98. 快捷键管理")
             OPTIONS+=("$option_text") # 添加非数字编号的选项
+            # Special handling for internal menu items that don't have a URL
             if [[ "$option_text" == "98. 快捷键管理" ]]; then
-                SCRIPTS["98"]="" # 快捷键管理等功能项不需要关联脚本URL
-            elif [[ "$option_text" == "99. 管理自定义菜单" ]]; then
-                SCRIPTS["99"]="" # 自定义菜单管理功能项不需要关联脚本URL
-            elif [[ "$option_text" == "0. 退出" ]]; then
-                SCRIPTS["0"]="" # 退出选项不需要关联脚本URL
+                SCRIPTS["98"]="" 
             fi
         fi
     done
 
-    # 加载自定义菜单项 (保持不变)
-    local custom_options=()
+    # 加载自定义菜单项
+    local custom_options_array=()
     while IFS= read -r line; do
         if [[ -n "$line" && "$line" != \#* ]]; then
             IFS='|' read -r id name url script_name <<< "$line"
-            OPTIONS+=("$id. $name")
+            custom_options_array+=("$id. $name")
             SCRIPTS["$id"]="$url"
             CUSTOM_SCRIPT_NAMES["$id"]="$script_name"
         fi
     done < "$CUSTOM_MENU_FILE"
-    # 按编号排序 (确保包括自定义菜单项)
-    IFS=$'\n' sorted_custom_options=($(sort -n <<< "${OPTIONS[*]}"))
-    OPTIONS=("${sorted_custom_options[@]}")
+
+    # Add custom options to main OPTIONS array
+    OPTIONS+=("${custom_options_array[@]}")
+
+    # Sort all options by number
+    IFS=$'\n' sorted_options=($(sort -n <<< "${OPTIONS[*]}"))
+    OPTIONS=("${sorted_options[@]}")
     unset IFS
 
-    # 确保“管理自定义菜单”和“退出”选项在最后 (固定编号 - 再次添加以确保在最后)
-    OPTIONS+=("99. 管理自定义菜单" "0. 退出")
+    # Add "Manage Custom Menu" and "Exit" to the end (ensure they are always last)
+    # Filter out existing entries to prevent duplicates if already present from default_options or sorting
+    local final_options=()
+    local seen_options="" # Use a string for quick lookup (less efficient for huge lists, but fine here)
+    for opt in "${OPTIONS[@]}"; do
+        if ! [[ "$seen_options" =~ "$opt" ]]; then
+            final_options+=("$opt")
+            seen_options+="$opt"
+        fi
+    done
+
+    # Ensure 99 and 0 are only added once at the very end
+    if ! [[ "$seen_options" =~ "99. 管理自定义菜单" ]]; then
+        final_options+=("99. 管理自定义菜单")
+        SCRIPTS["99"]=""
+    fi
+    if ! [[ "$seen_options" =~ "0. 退出" ]]; then
+        final_options+=("0. 退出")
+        SCRIPTS["0"]=""
+    fi
+    OPTIONS=("${final_options[@]}")
 }
+
 
 # 打印菜单
 function print_menu() {
@@ -733,8 +891,18 @@ function main() {
             99)  # 自定义菜单管理
                 manage_custom_menu
                 ;;
-            [1-9]|[1-9][0-9])  # 数字选项 (1-99)
-                if [[ "$choice" -le 99 ]]; then # 限制选项为 1-99 (包括自定义菜单)
+            # Handle both default and custom script ranges more robustly
+            [0-9]* ) # Accepts any number
+                # Check if the choice exists as a key in SCRIPTS array
+                if [[ -v SCRIPTS["$choice"] ]]; then
+                    # Handle internal menu options that don't have a URL
+                    if [ -z "${SCRIPTS["$choice"]}" ]; then
+                        # This case is handled by 98 and 99 directly, no external script
+                        echo "这是内部管理选项，请选择其他选项或输入 0 退出。"
+                        read -rp "按回车键返回主菜单..."
+                        continue
+                    fi
+
                     manage_logs
                     script_path=$(download_script "$choice")
                     if [[ $? -eq 0 ]]; then # 检查 download_script 是否成功
