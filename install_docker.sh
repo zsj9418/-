@@ -5,6 +5,9 @@ DEPS=("curl" "wget" "jq" "fzf")
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
+# 新增代理前缀列表
+PROXY_PREFIXES=("https://un.ax18.ggff.net/" "https://cdn.yyds9527.nyc.mn/")
+
 # 全局变量
 INSTALL_STATUS=$(mktemp)  # 记录依赖安装状态
 DOCKER_URL=""
@@ -273,12 +276,28 @@ install_docker() {
     DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
 
     echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz" || {
-        echo -e "${RED}下载失败，请检查版本号或网络状态。${NC}"
-        echo -e "${YELLOW}尝试的URL: $DOCKER_URL${NC}"
-        rm -rf "$DOCKER_INSTALL_DIR"
-        exit 1
-    }
+    if ! curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
+        echo -e "${RED}直连下载失败，尝试使用代理下载...${NC}"
+        local DOWNLOAD_SUCCESS=false
+        for PROXY_PREFIX in "${PROXY_PREFIXES[@]}"; do
+            local PROXY_DOCKER_URL="${PROXY_PREFIXES}${DOCKER_URL}"
+            echo "尝试通过代理下载：$PROXY_DOCKER_URL"
+            if curl -fSL --retry 3 "$PROXY_DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
+                echo -e "${GREEN}通过代理下载成功！${NC}"
+                DOWNLOAD_SUCCESS=true
+                break
+            else
+                echo -e "${YELLOW}代理下载失败：${PROXY_DOCKER_URL}${NC}"
+            fi
+        done
+
+        if ! $DOWNLOAD_SUCCESS; then
+            echo -e "${RED}所有下载尝试均失败，请检查网络连接、代理设置或版本号。${NC}"
+            echo -e "${YELLOW}尝试的原始URL: $DOCKER_URL${NC}"
+            rm -rf "$DOCKER_INSTALL_DIR"
+            exit 1
+        fi
+    fi
 
     echo "正在解压 Docker 包到临时文件夹..."
     if ! tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR"; then
