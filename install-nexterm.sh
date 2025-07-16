@@ -166,27 +166,35 @@ select_docker_image_tag() {
 generate_or_set_encryption_key() {
     echo -e "\n${BLUE}=== 设置 ENCRYPTION_KEY ===${NC}"
     echo -e "Nexterm 需要一个加密密钥来保护其数据。强烈建议设置一个随机、复杂的密钥。"
+    echo -e "${YELLOW}密钥必须是 64 个字符的十六进制字符串。${NC}"
     
     local default_key=$(openssl rand -hex 32 2>/dev/null || head /dev/urandom | tr -dc A-F0-9 | head -c 64) # 优先使用 openssl
-    read -rp "请输入 ENCRYPTION_KEY（留空则生成一个随机密钥）：" user_input_key
-
-    if [[ -z "$user_input_key" ]]; then
-        if [[ -z "$default_key" ]]; then
-            echo -e "${RED}无法自动生成密钥，请手动输入一个随机十六进制字符串！${NC}"
-            read -rp "请输入 ENCRYPTION_KEY: " ENCRYPTION_KEY_VALUE
-            if [[ -z "$ENCRYPTION_KEY_VALUE" ]]; then
-                echo -e "${RED}密钥不能为空，部署中止！${NC}"
-                exit 1
+    
+    while true; do
+        read -rp "请输入 ENCRYPTION_KEY（留空则生成一个随机密钥）：" user_input_key
+        
+        local final_key=""
+        if [[ -z "$user_input_key" ]]; then
+            if [[ -z "$default_key" ]]; then
+                echo -e "${RED}警告：无法自动生成密钥。请手动输入一个 64 位十六进制字符串！${NC}"
+                read -rp "请输入 ENCRYPTION_KEY: " final_key
+            else
+                final_key="$default_key"
             fi
         else
-            ENCRYPTION_KEY_VALUE="$default_key"
-            echo -e "${GREEN}已为您生成随机密钥：${ENCRYPTION_KEY_VALUE}${NC}"
+            final_key="$user_input_key"
         fi
-    else
-        ENCRYPTION_KEY_VALUE="$user_input_key"
-        echo -e "${GREEN}已使用您输入的密钥。${NC}"
-    fi
-    echo -e "${YELLOW}请务必牢记此密钥！如果丢失，您将无法访问之前加密的数据。${NC}"
+
+        # 校验最终密钥的格式和长度
+        if [[ "$final_key" =~ ^[0-9a-fA-F]{64}$ ]]; then # 校验是否是64位十六进制
+            ENCRYPTION_KEY_VALUE="$final_key"
+            echo -e "${GREEN}已设置密钥：${ENCRYPTION_KEY_VALUE}${NC}"
+            echo -e "${YELLOW}请务必牢记此密钥！如果丢失，您将无法访问之前加密的数据。${NC}"
+            break # 校验通过，退出循环
+        else
+            echo -e "${RED}无效密钥！ENCRYPTION_KEY 必须是 64 个字符的十六进制字符串。请重新输入或留空以生成。${NC}"
+        fi
+    done
 }
 
 # 清理旧版本
@@ -252,24 +260,25 @@ pull_image() {
     return 0
 }
 
-# 容器启动 (修改此处，添加 -e ENCRYPTION_KEY)
+# 容器启动
 start_container() {
     echo -e "\n${YELLOW}启动容器 ${docker_name}...${NC}"
-    local docker_run_cmd=""
+    local docker_run_options="" # 用于存储网络和端口选项
     
-    # 构建基础的 docker run 命令
-    local base_cmd="docker run -d \
+    if [[ "$NETWORK_MODE" == "host" ]]; then
+        docker_run_options="--network host"
+    else
+        docker_run_options="--network bridge -p $PORT:$internal_port"
+    fi
+
+    # 构建完整的 docker run 命令，确保所有Docker选项都在镜像名称之前
+    local docker_run_cmd="docker run -d \
             --name $docker_name \
             -v $CONFIG_DIR:/app/data \
             --restart unless-stopped \
             -e ENCRYPTION_KEY=\"$ENCRYPTION_KEY_VALUE\" \
-            $docker_img"
-
-    if [[ "$NETWORK_MODE" == "host" ]]; then
-        docker_run_cmd="$base_cmd --network host"
-    else
-        docker_run_cmd="$base_cmd --network bridge -p $PORT:$internal_port"
-    fi
+            $docker_run_options \
+            $docker_img" # 镜像名称在所有Docker选项之后
 
     echo -e "${BLUE}执行命令：${docker_run_cmd}${NC}"
     eval "$docker_run_cmd" || { echo -e "${RED}容器启动失败，请检查日志。${NC}"; return 1; }
