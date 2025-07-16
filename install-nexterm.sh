@@ -17,6 +17,9 @@ CONFIG_DIR="/home/docker/nexterm"
 LOG_FILE="/var/log/nexterm-deploy.log"
 LOG_MAX_SIZE=1048576 # 1M
 
+# 新增全局变量用于存储 ENCRYPTION_KEY
+ENCRYPTION_KEY_VALUE=""
+
 # 模拟 Docker Hub 上的可用标签（实际应通过API获取）
 # 实际场景中，你需要通过 curl -s "https://registry.hub.docker.com/v2/germannewsmaker/nexterm/tags/list/" | jq -r '.tags[]' 获取
 declare -a available_tags=("latest" "v1.0.0" "v1.0.1" "dev") # 假设的可用标签
@@ -159,10 +162,36 @@ select_docker_image_tag() {
     echo -e "${GREEN}已选择镜像：${docker_img}${NC}"
 }
 
+# 新增函数：生成或设置 ENCRYPTION_KEY
+generate_or_set_encryption_key() {
+    echo -e "\n${BLUE}=== 设置 ENCRYPTION_KEY ===${NC}"
+    echo -e "Nexterm 需要一个加密密钥来保护其数据。强烈建议设置一个随机、复杂的密钥。"
+    
+    local default_key=$(openssl rand -hex 32 2>/dev/null || head /dev/urandom | tr -dc A-F0-9 | head -c 64) # 优先使用 openssl
+    read -rp "请输入 ENCRYPTION_KEY（留空则生成一个随机密钥）：" user_input_key
+
+    if [[ -z "$user_input_key" ]]; then
+        if [[ -z "$default_key" ]]; then
+            echo -e "${RED}无法自动生成密钥，请手动输入一个随机十六进制字符串！${NC}"
+            read -rp "请输入 ENCRYPTION_KEY: " ENCRYPTION_KEY_VALUE
+            if [[ -z "$ENCRYPTION_KEY_VALUE" ]]; then
+                echo -e "${RED}密钥不能为空，部署中止！${NC}"
+                exit 1
+            fi
+        else
+            ENCRYPTION_KEY_VALUE="$default_key"
+            echo -e "${GREEN}已为您生成随机密钥：${ENCRYPTION_KEY_VALUE}${NC}"
+        fi
+    else
+        ENCRYPTION_KEY_VALUE="$user_input_key"
+        echo -e "${GREEN}已使用您输入的密钥。${NC}"
+    fi
+    echo -e "${YELLOW}请务必牢记此密钥！如果丢失，您将无法访问之前加密的数据。${NC}"
+}
 
 # 清理旧版本
 clean_legacy() {
-    echo -e "\n${GREEN}=== 清理旧版本 DDNS-GO ===${NC}"
+    echo -e "\n${GREEN}=== 清理旧版本 Nexterm ===${NC}"
     if docker inspect "$docker_name" &>/dev/null; then
         echo -e "${YELLOW}发现已存在容器 $docker_name${NC}"
         if confirm_operation "是否卸载当前版本（这将停止并删除容器和镜像）？"; then
@@ -171,14 +200,20 @@ clean_legacy() {
             docker rm -f "$docker_name" >/dev/null 2>&1 || true
             echo -e "${GREEN}容器已删除。${NC}"
 
-            # 检查是否有相关镜像，并提示删除
-            local current_img=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "$IMAGE_NAME" | head -n 1) # 获取当前安装的镜像
-            if [[ -n "$current_img" ]]; then
-                if confirm_operation "是否删除镜像 ${current_img}？"; then
-                    docker rmi "$current_img" >/dev/null 2>&1 || true
-                    echo -e "${GREEN}镜像已删除。${NC}"
+            # 检查是否有相关镜像，并提示删除 (注意这里的 IMAGE_NAME 应该指代通用镜像名，而非具体标签)
+            # 改进：如果 docker_img 变量被设置，使用它来检查
+            local current_img_base="germannewsmaker/nexterm"
+            local existing_images=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "$current_img_base")
+            
+            if [[ -n "$existing_images" ]]; then
+                echo -e "${YELLOW}发现以下相关镜像：${NC}"
+                echo -e "${existing_images}"
+                if confirm_operation "是否删除所有相关镜像？"; then
+                    # 批量删除找到的所有相关镜像
+                    echo "$existing_images" | xargs -r docker rmi >/dev/null 2>&1 || true
+                    echo -e "${GREEN}相关镜像已删除。${NC}"
                 else
-                    echo -e "${YELLOW}镜像保留。${NC}"
+                    echo -e "${YELLOW}相关镜像保留。${NC}"
                 fi
             fi
 
@@ -217,25 +252,23 @@ pull_image() {
     return 0
 }
 
-# 容器启动
+# 容器启动 (修改此处，添加 -e ENCRYPTION_KEY)
 start_container() {
     echo -e "\n${YELLOW}启动容器 ${docker_name}...${NC}"
     local docker_run_cmd=""
+    
+    # 构建基础的 docker run 命令
+    local base_cmd="docker run -d \
+            --name $docker_name \
+            -v $CONFIG_DIR:/app/data \
+            --restart unless-stopped \
+            -e ENCRYPTION_KEY=\"$ENCRYPTION_KEY_VALUE\" \
+            $docker_img"
+
     if [[ "$NETWORK_MODE" == "host" ]]; then
-        docker_run_cmd="docker run -d \
-            --name $docker_name \
-            --network host \
-            -v $CONFIG_DIR:/app/data \
-            --restart unless-stopped \
-            $docker_img"
+        docker_run_cmd="$base_cmd --network host"
     else
-        docker_run_cmd="docker run -d \
-            --name $docker_name \
-            --network bridge \
-            -v $CONFIG_DIR:/app/data \
-            -p $PORT:$internal_port \
-            --restart unless-stopped \
-            $docker_img"
+        docker_run_cmd="$base_cmd --network bridge -p $PORT:$internal_port"
     fi
 
     echo -e "${BLUE}执行命令：${docker_run_cmd}${NC}"
@@ -247,6 +280,8 @@ start_container() {
 # 部署验证
 verify_deployment() {
     echo -e "\n${GREEN}验证部署状态...${NC}"
+    # 等待容器完全启动，避免立即检查导致误判
+    sleep 5 
     if docker ps --format '{{.Names}}' | grep -q "^${docker_name}$"; then
         echo -e "容器状态: ${GREEN}运行中${NC}"
 
@@ -273,7 +308,7 @@ verify_deployment() {
     return 0
 }
 
-# 部署 Nexterm 主流程
+# 部署 Nexterm 主流程 (修改此处，添加密钥设置步骤)
 deploy_nexterm() {
     echo -e "\n${GREEN}=== 部署 Nexterm ===${NC}"
     if ! check_docker; then
@@ -284,6 +319,7 @@ deploy_nexterm() {
     validate_and_set_port
     choose_network_mode
     select_docker_image_tag # 选择镜像版本
+    generate_or_set_encryption_key # 新增：设置加密密钥
 
     # 在部署前询问是否清理旧版本
     if docker inspect "$docker_name" &>/dev/null; then
@@ -302,7 +338,7 @@ deploy_nexterm() {
 }
 
 
-# 显示管理菜单
+# 显示管理菜单 (新增查看 KEY 选项)
 show_menu() {
     echo -e "\n${GREEN}=== Nexterm 管理菜单 ===${NC}"
     echo "1) 部署/重新配置 Nexterm"
@@ -312,6 +348,7 @@ show_menu() {
     echo "5) 停止容器"
     echo "6) 启动容器"
     echo "7) 卸载容器"
+    echo "8) 查看容器加密密钥 (ENCRYPTION_KEY)" # 新增选项
     echo "0) 退出"
 }
 
@@ -321,8 +358,8 @@ main() {
     # detect_system_and_architecture # 原始脚本有此功能，但与Docker部署非强相关，可按需保留或移除
     while true; do
         show_menu
-        read -rp "请输入选项 [0-7]: " choice
-        
+        read -rp "请输入选项 [0-8]: " choice # 选项范围更新
+
         case $choice in
             1) deploy_nexterm ;;
             2) 
@@ -368,6 +405,20 @@ main() {
                     echo -e "${GREEN}Nexterm 容器及相关数据已卸载清理完成。${NC}"
                 else
                     echo -e "${YELLOW}取消卸载操作。${NC}"
+                fi
+                ;;
+            8) # 新增：查看容器加密密钥
+                echo -e "\n${BLUE}=== 查看容器加密密钥 (ENCRYPTION_KEY) ===${NC}"
+                if docker inspect "$docker_name" &>/dev/null; then
+                    local key=$(docker inspect --format='{{range .Config.Env}}{{if hasPrefix . "ENCRYPTION_KEY="}}{{.}}{{end}}{{end}}' "$docker_name" | cut -d'=' -f2-)
+                    if [[ -n "$key" ]]; then
+                        echo -e "${GREEN}Nexterm 加密密钥：${key}${NC}"
+                        echo -e "${YELLOW}警告：此密钥是敏感信息，请妥善保管！${NC}"
+                    else
+                        echo -e "${YELLOW}当前运行的 Nexterm 容器未设置 ENCRYPTION_KEY 环境变量，或无法获取。${NC}"
+                    fi
+                else
+                    echo -e "${RED}Nexterm 容器未运行或不存在。${NC}"
                 fi
                 ;;
             0)
