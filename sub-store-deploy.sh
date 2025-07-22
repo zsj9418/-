@@ -1,9 +1,7 @@
 #!/bin/bash
 # Docker管理脚本
 # 功能：支持 Watchtower 和 Sub-Store 的部署、通知、日志记录和数据备份/恢复
-# 增强功能：用户可以选择网络模式（bridge 或 host），支持自定义端口，优化 Watchtower 自动更新
-# 新增功能：支持在 Watchtower 部署后动态添加自动更新容器
-# 动态脚本加载：支持在根目录下自动创建一个目录并挂载读取各种规则文件以备后续的拓展性
+# 支持多架构、多系统，包括 OpenWRT 变种
 
 # 配置区（默认值）
 DATA_DIR="$HOME/substore/data"
@@ -29,10 +27,34 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# 创建必要的目录
-create_directories() {
-  mkdir -p "$DATA_DIR" "$SCRIPTS_DIR" "$BACKUP_DIR" "$LOG_DIR"
-  log "INFO" "所有必要的目录已创建"
+# 检测系统架构和操作系统
+detect_system() {
+  log "INFO" "正在检测设备架构和操作系统..."
+  ARCH=$(uname -m)
+  OS="unknown"
+
+  # 检测 OpenWRT 系统
+  if [ -f /etc/openwrt_release ]; then
+    OS="openwrt"
+    log "INFO" "检测到 OpenWRT 系统"
+  elif [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+  else
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  fi
+
+  # 处理不同架构
+  case "$ARCH" in
+    "x86_64"|"amd64") ARCH="amd64" ;;
+    "aarch64"|"arm64") ARCH="arm64" ;;
+    "armv7l"|"armv6l") ARCH="arm" ;;
+    "i386"|"i686") ARCH="386" ;;
+    *) log "WARN" "未知架构: $ARCH" ;;
+  esac
+
+  log "INFO" "设备架构: $ARCH, 操作系统: $OS"
+  export ARCH OS
 }
 
 # 初始化日志
@@ -54,20 +76,13 @@ log() {
   fi
 }
 
-# 检测设备架构和操作系统
-detect_system() {
-  log "INFO" "正在检测设备架构和操作系统..."
-  ARCH=$(uname -m)
-  if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    OS=$ID
-  else
-    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-  fi
-  log "INFO" "设备架构: $ARCH, 操作系统: $OS"
+# 创建必要的目录
+create_directories() {
+  mkdir -p "$DATA_DIR" "$SCRIPTS_DIR" "$BACKUP_DIR" "$LOG_DIR"
+  log "INFO" "所有必要的目录已创建"
 }
 
-# 检测端口是否可用
+# 检查端口是否可用
 check_port_available() {
   local port=$1
   if command -v ss >/dev/null 2>&1; then
@@ -76,8 +91,10 @@ check_port_available() {
     netstat -tuln | grep -q ":$port" && return 1
   elif command -v lsof >/dev/null 2>&1; then
     lsof -i:"$port" >/dev/null 2>&1 && return 1
+  elif command -v ip >/dev/null 2>&1; then
+    ip addr | grep -q ":$port" && return 1
   else
-    log "WARN" "未找到 ss、netstat 或 lsof，跳过端口检查"
+    log "WARN" "未找到 ss、netstat、lsof 或 ip，跳过端口检查"
     return 0
   fi
   return 0
@@ -116,11 +133,11 @@ prompt_for_path() {
 
 # 检查网络连接
 check_network() {
-  log "INFO" "正在检查 Docker Hub 连接..."
+  log "INFO" "正在检查网络连接..."
   if curl -s -m 5 https://hub.docker.com >/dev/null; then
-    log "INFO" "Docker Hub 连接正常"
+    log "INFO" "网络连接正常"
   else
-    log "ERROR" "无法连接到 Docker Hub，请检查网络"
+    log "ERROR" "无法连接到网络，请检查网络"
     exit 1
   fi
 }
@@ -132,10 +149,19 @@ check_docker_permissions() {
     log "INFO" "Docker 权限正常"
   else
     log "WARN" "Docker socket 权限不足，尝试修复..."
-    if [[ ! $(groups) =~ docker ]]; then
+
+    # 检查当前用户是否在 docker 组
+    if ! groups "$USER" | grep -q docker; then
       log "WARN" "当前用户不在 docker 组，尝试添加..."
-      sudo usermod -aG docker "$USER" && log "INFO" "已添加用户到 docker 组，请重新登录"
+      if command -v usermod >/dev/null 2>&1; then
+        sudo usermod -aG docker "$USER" && log "INFO" "已添加用户到 docker 组，请重新登录"
+      else
+        log "ERROR" "无法找到 usermod 命令，请手动添加用户到 docker 组"
+        exit 1
+      fi
     fi
+
+    # 修复 Docker socket 权限
     if sudo chmod 660 /var/run/docker.sock && sudo chown root:docker /var/run/docker.sock 2>/dev/null; then
       log "INFO" "Docker 权限修复成功"
     else
@@ -148,51 +174,131 @@ check_docker_permissions() {
 # 安装依赖
 install_dependencies() {
   log "INFO" "正在安装依赖..."
+
+  # 检查是否安装了 Docker
   if ! command -v docker >/dev/null 2>&1; then
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-      apt-get update && apt-get install -y curl lsof ca-certificates || {
-        log "ERROR" "依赖安装失败，请检查网络连接"
+    log "INFO" "正在安装 Docker..."
+
+    # 根据不同系统安装 Docker
+    case "$OS" in
+      "ubuntu"|"debian")
+        if ! command -v apt-get >/dev/null 2>&1; then
+          log "ERROR" "未找到 apt-get 命令，请确保系统支持"
+          exit 1
+        fi
+        apt-get update && apt-get install -y curl lsof ca-certificates || {
+          log "ERROR" "依赖安装失败，请检查网络连接"
+          exit 1
+        }
+        curl -fsSL https://get.docker.com | sh || {
+          log "ERROR" "Docker 安装失败"
+          exit 1
+        }
+        ;;
+      "centos"|"rhel"|"rocky"|"almalinux")
+        if ! command -v yum >/dev/null 2>&1; then
+          log "ERROR" "未找到 yum 命令，请确保系统支持"
+          exit 1
+        fi
+        yum install -y curl lsof || {
+          log "ERROR" "依赖安装失败，请检查网络连接"
+          exit 1
+        }
+        curl -fsSL https://get.docker.com | sh || {
+          log "ERROR" "Docker 安装失败"
+          exit 1
+        }
+        ;;
+      "openwrt")
+        if ! command -v opkg >/dev/null 2>&1; then
+          log "ERROR" "未找到 opkg 命令，请确保系统支持"
+          exit 1
+        fi
+        opkg update
+        opkg install curl lsof || {
+          log "ERROR" "依赖安装失败，请检查网络连接"
+          exit 1
+        }
+        # OpenWRT 可能需要手动安装 Docker
+        log "INFO" "OpenWRT 系统需要手动安装 Docker，请参考文档"
         exit 1
-      }
-      curl -fsSL https://get.docker.com | sh || {
-        log "ERROR" "Docker 安装失败"
+        ;;
+      *)
+        log "ERROR" "不支持的操作系统: $OS"
         exit 1
-      }
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" ]]; then
-      yum install -y curl lsof || {
-        log "ERROR" "依赖安装失败，请检查网络连接"
-        exit 1
-      }
-      curl -fsSL https://get.docker.com | sh || {
-        log "ERROR" "Docker 安装失败"
-        exit 1
-      }
+        ;;
+    esac
+
+    # 启动 Docker 服务
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl enable --now docker >/dev/null 2>&1
+    elif command -v service >/dev/null 2>&1; then
+      service docker enable && service docker start
     else
-      log "ERROR" "不支持的操作系统: $OS"
-      exit 1
+      log "WARN" "无法启动 Docker 服务，请手动启动"
     fi
-    systemctl enable --now docker >/dev/null 2>&1
+
     log "INFO" "Docker 已成功安装"
   fi
 
+  # 检查是否安装了 jq
   if ! command -v jq >/dev/null 2>&1; then
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-      apt-get install -y jq || {
-        log "ERROR" "jq 安装失败"
-        read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
-        SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
-      }
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" ]]; then
-      yum install -y jq || {
-        log "ERROR" "jq 安装失败"
-        read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
-        SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
-      }
-    else
-      log "ERROR" "不支持的操作系统: $OS"
-      exit 1
-    fi
+    log "INFO" "正在安装 jq..."
+
+    case "$OS" in
+      "ubuntu"|"debian")
+        apt-get install -y jq || {
+          log "ERROR" "jq 安装失败"
+          read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+          SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
+        }
+        ;;
+      "centos"|"rhel"|"rocky"|"almalinux")
+        yum install -y jq || {
+          log "ERROR" "jq 安装失败"
+          read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+          SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
+        }
+        ;;
+      "openwrt")
+        opkg install jq || {
+          log "ERROR" "jq 安装失败"
+          read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
+          SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
+        }
+        ;;
+      *)
+        log "ERROR" "不支持的操作系统: $OS"
+        exit 1
+        ;;
+    esac
     log "INFO" "jq 已成功安装"
+  fi
+}
+
+# 拉取镜像（通用函数）
+pull_image() {
+  local image_name=$1
+  local image_tag=$2
+  local retries=3
+  local retry_delay=5
+  local pull_success=false
+
+  log "INFO" "正在拉取镜像 $image_name:$image_tag..."
+
+  for ((i=1; i<=retries; i++)); do
+    if docker pull "$image_name:$image_tag"; then
+      pull_success=true
+      break
+    else
+      log "WARN" "拉取镜像失败，重试 $i/$retries..."
+      sleep $retry_delay
+    fi
+  done
+
+  if ! $pull_success; then
+    log "ERROR" "拉取镜像 $image_name:$image_tag 失败，请检查网络或 Docker Hub 连接"
+    exit 1
   fi
 }
 
@@ -201,17 +307,17 @@ install_watchtower() {
   log "INFO" "正在查询所有正在运行的容器..."
   local containers
   mapfile -t containers < <(docker ps --format "{{.Names}}")
-  
+
   if [ ${#containers[@]} -eq 0 ]; then
     log "WARN" "没有找到运行中的容器，无法部署 Watchtower"
     return
   fi
-  
+
   echo "请选择要监控的容器（多个用空格分隔，推荐选择 substore）："
   for i in "${!containers[@]}"; do
     echo "$((i + 1)). ${containers[$i]}"
   done
-  
+
   read -p "请输入容器编号（例如: 1 2 3）: " user_input
   local selected_indices=($user_input)
   local selected_containers=()
@@ -263,25 +369,10 @@ install_watchtower() {
     log "INFO" "未找到现有的 Watchtower 容器，继续部署"
   fi
 
-  # 拉取 Watchtower 镜像（带重试机制）
-  log "INFO" "正在拉取最新 Watchtower 镜像..."
-  local retries=3
-  local retry_delay=5
-  local pull_success=false
-  for ((i=1; i<=retries; i++)); do
-    if docker pull "$WATCHTOWER_IMAGE_NAME:latest"; then
-      pull_success=true
-      break
-    else
-      log "WARN" "拉取 Watchtower 镜像失败，重试 $i/$retries..."
-      sleep $retry_delay
-    fi
-  done
-  if ! $pull_success; then
-    log "ERROR" "拉取 Watchtower 镜像失败，请检查网络或 Docker Hub 连接"
-    exit 1
-  fi
+  # 拉取 Watchtower 镜像
+  pull_image "$WATCHTOWER_IMAGE_NAME" "latest"
 
+  # 构建 Watchtower 命令
   local watchtower_cmd=(
     docker run -d
     --name "$WATCHTOWER_CONTAINER_NAME"
@@ -292,6 +383,7 @@ install_watchtower() {
     --schedule "0 */10 * * * *"
     --include-stopped
   )
+
   if [[ -n "$slack_webhook" ]]; then
     watchtower_cmd+=(
       --notifications slack
@@ -299,6 +391,7 @@ install_watchtower() {
       --notification-slack-webhook-url "$slack_webhook"
     )
   fi
+
   for container in "${selected_containers[@]}"; do
     watchtower_cmd+=("$container")
   done
@@ -321,20 +414,22 @@ install_watchtower() {
   # 运行一次性检查（带重试机制）
   log "INFO" "正在运行一次性检查以验证 Watchtower..."
   local check_success=false
-  for ((i=1; i<=retries; i++)); do
+  for ((i=1; i<=3; i++)); do
     if docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$WATCHTOWER_IMAGE_NAME:latest" --run-once "${selected_containers[@]}"; then
       check_success=true
       break
     else
-      log "WARN" "Watchtower 一次性检查失败，重试 $i/$retries..."
-      sleep $retry_delay
+      log "WARN" "Watchtower 一次性检查失败，重试 $i/3..."
+      sleep 5
     fi
   done
+
   if ! $check_success; then
     log "WARN" "Watchtower 一次性检查失败，请检查日志：docker logs $WATCHTOWER_CONTAINER_NAME"
   else
     log "INFO" "Watchtower 一次性检查完成"
   fi
+
   log "INFO" "请查看 Watchtower 日志以确认更新状态：docker logs $WATCHTOWER_CONTAINER_NAME"
 }
 
@@ -646,10 +741,7 @@ install_substore() {
   prompt_for_version
 
   log "INFO" "正在拉取镜像 $SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION..."
-  docker pull "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" || {
-    log "ERROR" "拉取 Sub-Store 镜像失败"
-    exit 1
-  }
+  pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION"
 
   while true; do
     read -p "请选择网络模式 (bridge 或 host) [默认: bridge]: " network_mode
