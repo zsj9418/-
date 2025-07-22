@@ -5,11 +5,14 @@
 RED='\e[31m'
 GREEN='\e[32m'
 YELLOW='\e[33m'
+BLUE='\e[34m'
+MAGENTA='\e[35m'
+CYAN='\e[36m'
 RESET='\e[0m'
 
 LOG_FILE="/var/log/mosdns_install.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "日志记录开始：$(date)"
+echo -e "${CYAN}日志记录开始：$(date)${RESET}"
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}错误：需要root权限运行此脚本${RESET}"
@@ -43,8 +46,35 @@ OPTIONAL_DEPS=("net-tools" "fzf" "dnsutils" "yamllint" "cron" "resolvconf" "dnsm
 INSTALLED_DEPS=()
 
 # 代理前缀数组
-PROXY_PREFIXES=("https://ghfast.top/" "https://ghproxy.com/")
+PROXY_PREFIXES=("https://un.ax18.ggff.net/" "https://cdn.yyds9527.nyc.mn/")
 
+# 规则文件URL
+BASE_RULES_URL1="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
+BASE_RULES_URL2="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt"
+ADBLOCK_URL="https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
+CN_IP_CIDR_URL="https://raw.githubusercontent.com/Hackl0us/GeoIP2-CN/release/CN-ip-cidr.txt"
+GFW_URL="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
+
+# 显示美化的主菜单
+show_menu() {
+    clear
+    echo -e "${CYAN}==============================================${RESET}"
+    echo -e "${CYAN}          MosDNS 安装与管理脚本${RESET}"
+    echo -e "${CYAN}==============================================${RESET}"
+    echo -e "${YELLOW}1. 安装 MosDNS${RESET}"
+    echo -e "${YELLOW}2. 卸载清理 MosDNS${RESET}"
+    echo -e "${YELLOW}3. 更新规则${RESET}"
+    echo -e "${YELLOW}4. 固化 DNS 配置${RESET}"
+    echo -e "${YELLOW}5. 还原系统 DNS 配置${RESET}"
+    echo -e "${YELLOW}6. 查看 MosDNS 状态${RESET}"
+    echo -e "${YELLOW}7. 查看 /etc/resolv.conf${RESET}"
+    echo -e "${YELLOW}8. 配置双ADG接入${RESET}"
+    echo -e "${YELLOW}9. 退出${RESET}"
+    echo -e "${CYAN}==============================================${RESET}"
+    echo -n -e "${CYAN}请选择操作（1-9）：${RESET}"
+}
+
+# 检查并安装依赖
 check_install_deps() {
     echo -e "${YELLOW}检查并安装依赖...${RESET}"
     [ "$PKG_MANAGER" != "none" ] && $PKG_MANAGER update 2>/dev/null
@@ -64,6 +94,7 @@ check_install_deps() {
     [ "${#INSTALLED_DEPS[@]}" -gt 0 ] && echo -e "${GREEN}已安装核心依赖：${INSTALLED_DEPS[*]}${RESET}"
 }
 
+# 下载文件带重试
 download_with_retry() {
     local url="$1"
     local output="$2"
@@ -94,6 +125,7 @@ download_with_retry() {
     return 1
 }
 
+# 处理 adblock 文件格式
 process_adblock_file() {
     local input_file="$1"
     local output_file="$2"
@@ -107,8 +139,45 @@ process_adblock_file() {
     fi
 }
 
+# 处理 CN-ip-cidr 文件格式
+process_cn_ip_cidr_file() {
+    local input_file="$1"
+    local output_file="$2"
+    echo -e "${YELLOW}处理 CN-ip-cidr 文件格式以适配 MosDNS...${RESET}"
+    sed 's/^#.*//; /^$/d; /^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+\/[0-9]\+$/!d' "$input_file" > "$output_file"
+    if [ -s "$output_file" ]; then
+        echo -e "${GREEN}成功：CN-ip-cidr 文件已处理并保存到 $output_file${RESET}"
+    else
+        echo -e "${RED}错误：处理后的 CN-ip-cidr 文件为空${RESET}"
+        exit 1
+    fi
+}
+
+# 处理 gfw 文件格式
+process_gfw_file() {
+    local input_file="$1"
+    local output_file="$2"
+    echo -e "${YELLOW}处理 gfw 文件格式以适配 MosDNS...${RESET}"
+    sed 's/^#.*//; /^$/d; /^[a-zA-Z0-9-]\+\.[a-zA-Z0-9-]\+\.[a-zA-Z0-9-]\+\.[a-zA-Z0-9-]\+$/!d' "$input_file" > "$output_file"
+    if [ -s "$output_file" ]; then
+        echo -e "${GREEN}成功：gfw 文件已处理并保存到 $output_file${RESET}"
+    else
+        echo -e "${RED}错误：处理后的 gfw 文件为空${RESET}"
+        exit 1
+    fi
+}
+
+# 配置 dnsmasq 以转发 DNS 请求到 MosDNS
 configure_dnsmasq_for_mosdns() {
     echo -e "${YELLOW}配置 dnsmasq 以转发 DNS 请求到 MosDNS...${RESET}"
+
+    # 检查是否安装了 dnsmasq
+    if ! command -v dnsmasq >/dev/null 2>&1; then
+        echo -e "${RED}错误：未安装 dnsmasq，无法配置${RESET}"
+        return 1
+    fi
+
+    # 检查是否有活动的 NetworkManager 连接
     if command -v nmcli >/dev/null 2>&1; then
         ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
         if [ -n "$ACTIVE_CON" ]; then
@@ -147,26 +216,51 @@ EOF
                         echo "1. 确认 /etc/NetworkManager/dnsmasq.d/mosdns.conf 权限为 644"
                         echo "2. 检查是否存在其他 dnsmasq 配置文件干扰"
                         echo "3. 手动运行 'nmcli con reload' 并重启 NetworkManager"
-                        exit 1
+                        return 1
                     fi
                 else
                     echo -e "${RED}错误：NetworkManager 的 dnsmasq 未正确重启${RESET}"
                     journalctl -u NetworkManager | tail -n 20
-                    exit 1
+                    return 1
                 fi
             else
                 echo -e "${YELLOW}警告：未检测到 'shared' 模式，跳过 dnsmasq 配置${RESET}"
+                return 0
             fi
         else
             echo -e "${RED}错误：未找到活动 NetworkManager 连接${RESET}"
-            exit 1
+            return 1
         fi
     else
-        echo -e "${RED}错误：未安装 nmcli，无法配置${RESET}"
-        exit 1
+        echo -e "${YELLOW}警告：未安装 nmcli，尝试直接配置 dnsmasq${RESET}"
+
+        # 尝试直接配置 dnsmasq
+        if [ -f /etc/dnsmasq.conf ]; then
+            echo -e "${YELLOW}配置 /etc/dnsmasq.conf 以转发到 MosDNS${RESET}"
+            if ! grep -q "server=127.0.0.1#53" /etc/dnsmasq.conf; then
+                echo "server=127.0.0.1#53" >> /etc/dnsmasq.conf
+                echo "log-queries" >> /etc/dnsmasq.conf
+                systemctl restart dnsmasq
+                sleep 2
+                if netstat -tuln | grep -q ":53"; then
+                    echo -e "${GREEN}成功：dnsmasq 已配置并运行${RESET}"
+                    return 0
+                else
+                    echo -e "${RED}错误：dnsmasq 未正确重启${RESET}"
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}警告：dnsmasq 已配置转发到 MosDNS${RESET}"
+                return 0
+            fi
+        else
+            echo -e "${RED}错误：未找到 /etc/dnsmasq.conf${RESET}"
+            return 1
+        fi
     fi
 }
 
+# 固化 resolv.conf
 lock_resolv_conf() {
     echo -e "${YELLOW}正在固化 /etc/resolv.conf 为 MosDNS 解析...${RESET}"
     if [ -f /etc/resolv.conf ] && [ ! -f /etc/resolv.conf.bak ]; then
@@ -187,6 +281,7 @@ lock_resolv_conf() {
     fi
 }
 
+# 还原 resolv.conf
 restore_resolv_conf() {
     echo -e "${YELLOW}正在还原 /etc/resolv.conf 为系统默认设置...${RESET}"
     chattr -i /etc/resolv.conf 2>/dev/null
@@ -212,6 +307,7 @@ restore_resolv_conf() {
     fi
 }
 
+# 检查 MosDNS 状态
 check_mosdns_status() {
     echo -e "${YELLOW}检查 MosDNS 运行状态...${RESET}"
     if command -v systemctl >/dev/null 2>&1; then
@@ -247,11 +343,131 @@ check_mosdns_status() {
     fi
 }
 
+# 查看 resolv.conf
 view_resolv_conf() {
     echo -e "${YELLOW}当前 /etc/resolv.conf 的内容：${RESET}"
     cat /etc/resolv.conf
 }
 
+# 配置双ADG接入
+configure_adg() {
+    CONFIG_PATH="/etc/mosdns"
+    if [ ! -d "$CONFIG_PATH" ]; then
+        echo -e "${RED}错误：MosDNS未安装${RESET}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}配置双ADG接入...${RESET}"
+
+    # 获取当前配置
+    if [ -f "$CONFIG_PATH/config.yaml" ]; then
+        cp "$CONFIG_PATH/config.yaml" "$CONFIG_PATH/config.yaml.bak"
+    fi
+
+    # 获取国内DNS和国外DNS地址
+    echo -e "\n${YELLOW}请输入国内DNS地址（默认 https://223.5.5.5/dns-query）：${RESET}"
+    read -p "> " DOMESTIC_DNS
+    DOMESTIC_DNS=${DOMESTIC_DNS:-https://223.5.5.5/dns-query}
+
+    echo -e "\n${YELLOW}请输入国外DNS地址（默认 1.1.1.1）：${RESET}"
+    read -p "> " FOREIGN_DNS
+    FOREIGN_DNS=${FOREIGN_DNS:-1.1.1.1}
+
+    # 更新配置文件
+    cat > "$CONFIG_PATH/config.yaml" <<EOF
+log:
+  level: info
+  file: "$CONFIG_PATH/mosdns.log"
+
+plugins:
+  - tag: "direct_domain"
+    type: domain_set
+    args:
+      files:
+        - "$CONFIG_PATH/cn_domains.txt"
+        - "$CONFIG_PATH/cn_ip_cidr.txt"
+
+  - tag: "remote_domain"
+    type: domain_set
+    args:
+      files:
+        - "$CONFIG_PATH/non_cn_domains.txt"
+        - "$CONFIG_PATH/gfw.txt"
+
+  - tag: "block_list"
+    type: domain_set
+    args:
+      files:
+        - "$CONFIG_PATH/adblock.txt"
+
+  - tag: "local_forward"
+    type: forward
+    args:
+      concurrent: 4
+      upstreams:
+        - addr: "$DOMESTIC_DNS"
+
+  - tag: "remote_forward"
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: "$FOREIGN_DNS"
+
+  - tag: "local_sequence"
+    type: sequence
+    args:
+      - exec: \$local_forward
+
+  - tag: "remote_sequence"
+    type: sequence
+    args:
+      - exec: \$remote_forward
+
+  - tag: "main_sequence"
+    type: sequence
+    args:
+      - matches: "qname \$block_list"
+        exec: reject
+      - matches: "qname \$direct_domain"
+        exec: goto local_sequence
+      - matches: "qname \$remote_domain"
+        exec: goto remote_sequence
+      - exec: goto remote_sequence
+
+  - type: udp_server
+    args:
+      entry: main_sequence
+      listen: 127.0.0.1:53
+EOF
+
+    # 重启 MosDNS 服务
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart mosdns
+        sleep 3
+        if systemctl status mosdns.service | grep -q "running"; then
+            echo -e "${GREEN}双ADG配置更新成功${RESET}"
+        else
+            echo -e "${RED}重启失败，回滚配置...${RESET}"
+            mv "$CONFIG_PATH/config.yaml.bak" "$CONFIG_PATH/config.yaml"
+            systemctl restart mosdns
+            exit 1
+        fi
+    else
+        killall mosdns 2>/dev/null
+        /usr/local/bin/mosdns start -c "$CONFIG_PATH/config.yaml" &
+        sleep 3
+        if ps -ef | grep -q "[m]osdns start"; then
+            echo -e "${GREEN}双ADG配置更新成功${RESET}"
+        else
+            echo -e "${RED}重启失败，回滚配置...${RESET}"
+            mv "$CONFIG_PATH/config.yaml.bak" "$CONFIG_PATH/config.yaml"
+            exit 1
+        fi
+    fi
+}
+
+# 安装 MosDNS
 install_mosdns() {
     if [ -f /etc/resolv.conf ]; then
         cp /etc/resolv.conf /etc/resolv.conf.bak
@@ -301,19 +517,20 @@ install_mosdns() {
     FOREIGN_DNS=${FOREIGN_DNS:-1.1.1.1}
 
     BASE_GITHUB_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
-    BASE_RULES_URL1="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
-    BASE_RULES_URL2="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt"
-    ADBLOCK_URL="https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
-    
+
     download_with_retry "$BASE_GITHUB_URL" "mosdns.zip" || exit 1
     download_with_retry "$BASE_RULES_URL1" "$CONFIG_PATH/cn_domains.txt" || exit 1
     download_with_retry "$BASE_RULES_URL2" "$CONFIG_PATH/non_cn_domains.txt" || exit 1
     download_with_retry "$ADBLOCK_URL" "$CONFIG_PATH/adblock_raw.txt" || exit 1
+    download_with_retry "$CN_IP_CIDR_URL" "$CONFIG_PATH/cn_ip_cidr_raw.txt" || exit 1
+    download_with_retry "$GFW_URL" "$CONFIG_PATH/gfw_raw.txt" || exit 1
 
     process_adblock_file "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/adblock.txt"
-    rm -f "$CONFIG_PATH/adblock_raw.txt"
+    process_cn_ip_cidr_file "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/cn_ip_cidr.txt"
+    process_gfw_file "$CONFIG_PATH/gfw_raw.txt" "$CONFIG_PATH/gfw.txt"
+    rm -f "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/gfw_raw.txt"
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ]; then
+    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ] || [ ! -s "$CONFIG_PATH/cn_ip_cidr.txt" ] || [ ! -s "$CONFIG_PATH/gfw.txt" ]; then
         echo -e "${RED}错误：规则文件为空${RESET}"
         exit 1
     fi
@@ -335,12 +552,14 @@ plugins:
     args:
       files:
         - "$CONFIG_PATH/cn_domains.txt"
+        - "$CONFIG_PATH/cn_ip_cidr.txt"
 
   - tag: "remote_domain"
     type: domain_set
     args:
       files:
         - "$CONFIG_PATH/non_cn_domains.txt"
+        - "$CONFIG_PATH/gfw.txt"
 
   - tag: "block_list"
     type: domain_set
@@ -448,6 +667,7 @@ EOF
     echo -e "${GREEN}MosDNS 已启动并监听 127.0.0.1:53，dnsmasq 将转发请求${RESET}"
 }
 
+# 卸载 MosDNS
 uninstall_mosdns() {
     echo -e "${YELLOW}开始卸载MosDNS...${RESET}"
     if command -v systemctl >/dev/null 2>&1; then
@@ -467,6 +687,7 @@ uninstall_mosdns() {
     echo -e "${GREEN}MosDNS 已卸载${RESET}"
 }
 
+# 更新规则
 update_rules() {
     CONFIG_PATH="/etc/mosdns"
     if [ ! -d "$CONFIG_PATH" ]; then
@@ -477,27 +698,42 @@ update_rules() {
     cp "$CONFIG_PATH/cn_domains.txt" "$CONFIG_PATH/cn_domains.txt.bak" 2>/dev/null
     cp "$CONFIG_PATH/non_cn_domains.txt" "$CONFIG_PATH/non_cn_domains.txt.bak" 2>/dev/null
     cp "$CONFIG_PATH/adblock.txt" "$CONFIG_PATH/adblock.txt.bak" 2>/dev/null
+    cp "$CONFIG_PATH/cn_ip_cidr.txt" "$CONFIG_PATH/cn_ip_cidr.txt.bak" 2>/dev/null
+    cp "$CONFIG_PATH/gfw.txt" "$CONFIG_PATH/gfw.txt.bak" 2>/dev/null
 
-    download_with_retry "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "$CONFIG_PATH/cn_domains.txt" || {
+    download_with_retry "$BASE_RULES_URL1" "$CONFIG_PATH/cn_domains.txt" || {
         [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
         exit 1
     }
-    download_with_retry "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt" "$CONFIG_PATH/non_cn_domains.txt" || {
+    download_with_retry "$BASE_RULES_URL2" "$CONFIG_PATH/non_cn_domains.txt" || {
         [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
         exit 1
     }
-    download_with_retry "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt" "$CONFIG_PATH/adblock_raw.txt" || {
+    download_with_retry "$ADBLOCK_URL" "$CONFIG_PATH/adblock_raw.txt" || {
         [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
         exit 1
     }
-    process_adblock_file "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/adblock.txt"
-    rm -f "$CONFIG_PATH/adblock_raw.txt"
+    download_with_retry "$CN_IP_CIDR_URL" "$CONFIG_PATH/cn_ip_cidr_raw.txt" || {
+        [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
+        exit 1
+    }
+    download_with_retry "$GFW_URL" "$CONFIG_PATH/gfw_raw.txt" || {
+        [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
+        exit 1
+    }
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ]; then
+    process_adblock_file "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/adblock.txt"
+    process_cn_ip_cidr_file "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/cn_ip_cidr.txt"
+    process_gfw_file "$CONFIG_PATH/gfw_raw.txt" "$CONFIG_PATH/gfw.txt"
+    rm -f "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/gfw_raw.txt"
+
+    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ] || [ ! -s "$CONFIG_PATH/cn_ip_cidr.txt" ] || [ ! -s "$CONFIG_PATH/gfw.txt" ]; then
         echo -e "${RED}规则文件为空，回滚...${RESET}"
         [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
         [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
         [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
+        [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
+        [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
         exit 1
     fi
 
@@ -511,6 +747,8 @@ update_rules() {
             [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
             [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
             [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
+            [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
+            [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
             systemctl restart mosdns
             exit 1
         fi
@@ -525,28 +763,31 @@ update_rules() {
             [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
             [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
             [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
+            [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
+            [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
             exit 1
         fi
     fi
 }
 
-while true; do
-    echo -e "${YELLOW}MosDNS 安装与管理脚本${RESET}"
-    PS3="请选择操作（输入数字）："
-    OPTIONS=("安装MosDNS" "卸载清理MosDNS" "更新规则" "固化 DNS 配置" "还原系统 DNS 配置" "查看 MosDNS 状态" "查看 /etc/resolv.conf" "退出")
-    select opt in "${OPTIONS[@]}"; do
-        case $opt in
-            "安装MosDNS") check_install_deps; install_mosdns; break ;;
-            "卸载清理MosDNS") uninstall_mosdns; break ;;
-            "更新规则") update_rules; break ;;
-            "固化 DNS 配置") lock_resolv_conf; break ;;
-            "还原系统 DNS 配置") restore_resolv_conf; break ;;
-            "查看 MosDNS 状态") check_mosdns_status; break ;;
-            "查看 /etc/resolv.conf") view_resolv_conf; break ;;
-            "退出") echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
-            *) echo -e "${RED}无效选项${RESET}" ;;
+# 主程序
+main() {
+    while true; do
+        show_menu
+        read -r choice
+        case $choice in
+            1) check_install_deps; install_mosdns; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            2) uninstall_mosdns; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            3) update_rules; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            4) lock_resolv_conf; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            5) restore_resolv_conf; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            6) check_mosdns_status; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            7) view_resolv_conf; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            8) configure_adg; read -n 1 -s -r -p "按任意键继续..."; break ;;
+            9) echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
+            *) echo -e "${RED}无效选项，请重新选择${RESET}"; sleep 1 ;;
         esac
     done
-done
+}
 
-echo "日志记录结束：$(date)"
+main "$@"
