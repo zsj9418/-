@@ -18,7 +18,41 @@ declare -A ARCH_MAP=(
     ["i686"]="386"
     ["ppc64le"]="ppc64le"
     ["riscv64"]="riscv64"
+    ["mips"]="mips"
+    ["mips64"]="mips64"
+    ["mipsel"]="mipsle"
+    ["mips64el"]="mips64le"
 )
+
+# 检查是否有sudo
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        echo "警告: 当前用户不是root且未安装sudo，部分操作可能失败。"
+        SUDO=""
+    fi
+fi
+
+# 检测包管理器
+detect_package_manager() {
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MGR="opkg"
+    elif command -v apt-get >/dev/null 2>&1; then
+        PKG_MGR="apt"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MGR="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MGR="dnf"
+    elif command -v apk >/dev/null 2>&1; then
+        PKG_MGR="apk"
+    elif command -v zypper >/dev/null 2>&1; then
+        PKG_MGR="zypper"
+    else
+        PKG_MGR=""
+    fi
+}
 
 # 增强系统检测
 detect_system() {
@@ -31,7 +65,7 @@ detect_system() {
             alpine) SYSTEM_TYPE="Alpine" ;;
             *) SYSTEM_TYPE="Other" ;;
         esac
-        
+
         # 检测init系统
         if [ -d /run/systemd/system ]; then
             INIT_SYSTEM="systemd"
@@ -46,6 +80,7 @@ detect_system() {
         SYSTEM_TYPE="Unknown"
         INIT_SYSTEM="unknown"
     fi
+    detect_package_manager
 }
 
 # 获取所有Caddy版本（标签）
@@ -73,7 +108,9 @@ get_caddy_download_url() {
     local version_tag=$1
     local arch=$(uname -m)
     local mapped_arch=${ARCH_MAP[$arch]:-$arch}
-    echo "https://github.com/caddyserver/caddy/releases/download/$version_tag/caddy_${version_tag}_linux_${mapped_arch}.tar.gz"
+    # 去掉v前缀
+    local version_nov=$(echo "$version_tag" | sed 's/^v//')
+    echo "https://github.com/caddyserver/caddy/releases/download/$version_tag/caddy_${version_nov}_linux_${mapped_arch}.tar.gz"
 }
 
 # 安装Caddy（支持版本选择）
@@ -84,7 +121,7 @@ install_caddy() {
         echo "未能获取版本信息"
         return 1
     fi
-    
+
     echo "你选择的版本：$version"
     download_url=$(get_caddy_download_url "$version")
     if [ -z "$download_url" ]; then
@@ -97,24 +134,32 @@ install_caddy() {
     mkdir -p "$(dirname "$CADDY_BIN_PATH")"
     mkdir -p "$CADDY_CONF_DIR"
     mkdir -p "$CADDY_LOG_DIR"
-    
+
     # 设置用户权限
     if id "$CADDY_USER" &>/dev/null; then
-        sudo chown -R "$CADDY_USER":"$CADDY_USER" "$CADDY_CONF_DIR" "$CADDY_LOG_DIR"
+        $SUDO chown -R "$CADDY_USER":"$CADDY_USER" "$CADDY_CONF_DIR" "$CADDY_LOG_DIR"
     fi
 
     # 下载压缩包
     TMP_DIR="/tmp/caddy_install"
     mkdir -p "$TMP_DIR"
-    wget -O "$TMP_DIR/caddy.tar.gz" "$download_url" || { echo "下载失败"; return 1; }
-    
+    if ! wget -O "$TMP_DIR/caddy.tar.gz" "$download_url"; then
+        echo "下载失败"
+        return 1
+    fi
+
     # 解压
-    tar -xzf "$TMP_DIR/caddy.tar.gz" -C "$TMP_DIR"
-    
+    tar -xzf "$TMP_DIR/caddy.tar.gz" -C "$TMP_DIR" || { echo "解压失败"; return 1; }
+
     # 复制二进制
-    sudo cp "$TMP_DIR/caddy" "$CADDY_BIN_PATH" || { echo "复制失败"; return 1; }
-    sudo chmod +x "$CADDY_BIN_PATH"
-    
+    if [ -f "$TMP_DIR/caddy" ]; then
+        $SUDO cp "$TMP_DIR/caddy" "$CADDY_BIN_PATH" || { echo "复制失败"; return 1; }
+        $SUDO chmod +x "$CADDY_BIN_PATH"
+    else
+        echo "未找到caddy二进制文件"
+        return 1
+    fi
+
     # 清理
     rm -rf "$TMP_DIR"
     echo "Caddy已安装到 $CADDY_BIN_PATH"
@@ -123,34 +168,36 @@ install_caddy() {
 # 检查依赖
 check_and_install() {
     local cmd=$1
-    if ! command -v "$cmd" >/dev/null; then
-        case $cmd in
-            caddy) install_caddy ;;
-            netstat)
-                install_dependencies net-tools
-                ;;
-            ps)
-                install_dependencies procps
-                ;;
-        esac
+    local pkg=$2
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        install_dependencies "$pkg"
     fi
 }
 
 # 安装依赖
 install_dependencies() {
     local package=$1
-    case $INIT_SYSTEM in
-        systemd)
-            sudo apt-get update && sudo apt-get install -y "$package"
+    case $PKG_MGR in
+        opkg)
+            $SUDO opkg update && $SUDO opkg install "$package"
             ;;
-        openrc)
-            sudo emerge --sync && sudo emerge "$package"
+        apt)
+            $SUDO apt-get update && $SUDO apt-get install -y "$package"
             ;;
-        sysvinit)
-            sudo apt-get update && sudo apt-get install -y "$package"
+        yum)
+            $SUDO yum install -y "$package"
+            ;;
+        dnf)
+            $SUDO dnf install -y "$package"
+            ;;
+        apk)
+            $SUDO apk add "$package"
+            ;;
+        zypper)
+            $SUDO zypper install -y "$package"
             ;;
         *)
-            sudo apt-get update && sudo apt-get install -y "$package"
+            echo "未知包管理器，无法自动安装 $package"
             ;;
     esac
 }
@@ -200,18 +247,20 @@ validate_caddy_config() {
 # 启动caddy
 start_caddy() {
     prepare_caddy_config
-    if ! pgrep -x "caddy" > /dev/null; then
-        echo "启动caddy..."
-        caddy run --config "$CADDY_CONF_FILE" &>/dev/null &
-        sleep 3
-    fi
-    if validate_caddy_config; then
-        echo "配置验证通过，caddy已启动"
-        CADDY_RUNNING=1
-    else
+    if ! validate_caddy_config; then
         echo "配置有误，caddy未启动"
         CADDY_RUNNING=0
+        SERVICE_STATUS="caddy"
+        save_state
+        return 1
     fi
+    if ! pgrep -x "caddy" > /dev/null; then
+        echo "启动caddy..."
+        $SUDO "$CADDY_BIN_PATH" run --config "$CADDY_CONF_FILE" &>/dev/null &
+        sleep 3
+    fi
+    echo "配置验证通过，caddy已启动"
+    CADDY_RUNNING=1
     SERVICE_STATUS="caddy"
     save_state
 }
@@ -224,6 +273,7 @@ configure_caddy() {
     echo "示例："
     echo "example.com 192.168.1.10:8080"
     echo "请输入配置："
+    cp "$CADDY_CONF_FILE" "$CADDY_CONF_FILE.bak.$(date +%s)"
     > "$CADDY_CONF_FILE"
     while true; do
         read -rp "输入： " line
@@ -254,6 +304,7 @@ add_new_proxy() {
         echo "输入无效"
         return
     fi
+    cp "$CADDY_CONF_FILE" "$CADDY_CONF_FILE.bak.$(date +%s)"
     echo "$domain {
   encode gzip
   reverse_proxy $target
@@ -269,17 +320,17 @@ view_status() {
     echo "服务状态：$SERVICE_STATUS"
     echo "Caddy运行：$([ "$CADDY_RUNNING" -eq 1 ] && echo "是" || echo "否")"
     echo "端口占用："
-    netstat -tulnp | grep -E ':(80|443|8080)'
+    netstat -tulnp 2>/dev/null | grep -E ':(80|443|8080)'
 
     # 显示当前运行的端口
     echo "当前运行的端口："
     if pgrep -x "caddy" > /dev/null; then
         echo "Caddy 正在运行，监听端口："
-        netstat -tulnp | grep -E 'caddy' | awk '{print $4}' | cut -d':' -f2 | sort -u
+        netstat -tulnp 2>/dev/null | grep -E 'caddy' | awk '{print $4}' | cut -d':' -f2 | sort -u
     fi
     if pgrep -x "uhttpd" > /dev/null; then
         echo "uHTTPd 正在运行，监听端口："
-        netstat -tulnp | grep -E 'uhttpd' | awk '{print $4}' | cut -d':' -f2 | sort -u
+        netstat -tulnp 2>/dev/null | grep -E 'uhttpd' | awk '{print $4}' | cut -d':' -f2 | sort -u
     fi
 }
 
@@ -308,10 +359,12 @@ stop_ports() {
     esac
     # 杀残留进程
     local PIDS
-    PIDS=$(netstat -tulnp | grep -E ':(80|443) ' | awk '{print $7}' | cut -d'/' -f1)
+    PIDS=$(netstat -tulnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$' | sort -u)
     for pid in $PIDS; do
-        echo "杀掉进程ID：$pid"
-        kill "$pid" 2>/dev/null || kill -9 "$pid"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "杀掉进程ID：$pid"
+            kill "$pid" 2>/dev/null || kill -9 "$pid"
+        fi
     done
     SERVICE_STATUS="stopped"
     save_state
@@ -341,24 +394,29 @@ start_both_ports() {
 # 停止服务
 stop_service() {
     local svc=$1
-    case $INIT_SYSTEM in
-        systemd)
-            sudo systemctl stop $svc
-            sudo systemctl disable $svc
-            ;;
-        openrc)
-            sudo rc-service $svc stop
-            sudo rc-update del $svc
-            ;;
-        sysvinit)
-            sudo service $svc stop
-            sudo update-rc.d $svc remove
-            ;;
-        *)
-            sudo /etc/init.d/$svc stop
-            sudo /etc/init.d/$svc disable
-            ;;
-    esac
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        /etc/init.d/$svc stop
+        /etc/init.d/$svc disable 2>/dev/null
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl stop $svc
+                $SUDO systemctl disable $svc
+                ;;
+            openrc)
+                $SUDO rc-service $svc stop
+                $SUDO rc-update del $svc
+                ;;
+            sysvinit)
+                $SUDO service $svc stop
+                $SUDO update-rc.d $svc remove
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc stop
+                $SUDO /etc/init.d/$svc disable
+                ;;
+        esac
+    fi
     echo "$svc已停止并禁用"
 }
 
@@ -367,24 +425,29 @@ get_service_status() {
     local svc_name=$1
     local running="否"
     local enabled="否"
-    case $INIT_SYSTEM in
-        systemd)
-            sudo systemctl is-active --quiet $svc_name && running="是"
-            sudo systemctl is-enabled --quiet $svc_name && enabled="是"
-            ;;
-        openrc)
-            sudo rc-service $svc_name status &>/dev/null && running="是"
-            sudo rc-update show | grep -q $svc_name && enabled="是"
-            ;;
-        sysvinit)
-            sudo service $svc_name status &>/dev/null && running="是"
-            [ -x /etc/init.d/$svc_name ] && enabled="是"
-            ;;
-        *)
-            sudo /etc/init.d/$svc_name status &>/dev/null && running="是"
-            sudo /etc/init.d/$svc_name enabled &>/dev/null && enabled="是"
-            ;;
-    esac
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        /etc/init.d/$svc_name status 2>/dev/null | grep -q running && running="是"
+        /etc/init.d/$svc_name enabled 2>/dev/null | grep -q enabled && enabled="是"
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl is-active --quiet $svc_name && running="是"
+                $SUDO systemctl is-enabled --quiet $svc_name && enabled="是"
+                ;;
+            openrc)
+                $SUDO rc-service $svc_name status &>/dev/null && running="是"
+                $SUDO rc-update show | grep -q $svc_name && enabled="是"
+                ;;
+            sysvinit)
+                $SUDO service $svc_name status &>/dev/null && running="是"
+                [ -x /etc/init.d/$svc_name ] && enabled="是"
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc_name status &>/dev/null && running="是"
+                $SUDO /etc/init.d/$svc_name enabled &>/dev/null && enabled="是"
+                ;;
+        esac
+    fi
     echo "$running|$enabled"
 }
 
@@ -395,7 +458,12 @@ modify_uhttpd_port() {
         echo "无效的端口号"
         return
     fi
-    sudo sed -i "/listen_http/s/[0-9]\+/\"$new_port\"/" "$UHTTPD_CONF_FILE"
+    # 只替换 option listen_http 行
+    if grep -q "option listen_http" "$UHTTPD_CONF_FILE"; then
+        $SUDO sed -i "s/^KATEX_INLINE_OPEN.*option listen_http[[:space:]]*KATEX_INLINE_CLOSE[0-9]\+/\1$new_port/" "$UHTTPD_CONF_FILE"
+    else
+        echo "option listen_http $new_port" >> "$UHTTPD_CONF_FILE"
+    fi
     echo "uHTTPd端口已修改为 $new_port"
     restart_service uhttpd
 }
@@ -403,51 +471,60 @@ modify_uhttpd_port() {
 # 重启服务
 restart_service() {
     local svc=$1
-    case $INIT_SYSTEM in
-        systemd)
-            sudo systemctl restart $svc
-            ;;
-        openrc)
-            sudo rc-service $svc restart
-            ;;
-        sysvinit)
-            sudo service $svc restart
-            ;;
-        *)
-            sudo /etc/init.d/$svc restart
-            ;;
-    esac
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        /etc/init.d/$svc restart
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl restart $svc
+                ;;
+            openrc)
+                $SUDO rc-service $svc restart
+                ;;
+            sysvinit)
+                $SUDO service $svc restart
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc restart
+                ;;
+        esac
+    fi
     echo "$svc已重启"
 }
 
 # 启动服务
 start_service() {
     local svc=$1
-    case $INIT_SYSTEM in
-        systemd)
-            sudo systemctl start $svc
-            sudo systemctl enable $svc
-            ;;
-        openrc)
-            sudo rc-service $svc start
-            sudo rc-update add $svc default
-            ;;
-        sysvinit)
-            sudo service $svc start
-            sudo update-rc.d $svc defaults
-            ;;
-        *)
-            sudo /etc/init.d/$svc start
-            sudo /etc/init.d/$svc enable
-            ;;
-    esac
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        /etc/init.d/$svc start
+        /etc/init.d/$svc enable
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl start $svc
+                $SUDO systemctl enable $svc
+                ;;
+            openrc)
+                $SUDO rc-service $svc start
+                $SUDO rc-update add $svc default
+                ;;
+            sysvinit)
+                $SUDO service $svc start
+                $SUDO update-rc.d $svc defaults
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc start
+                $SUDO /etc/init.d/$svc enable
+                ;;
+        esac
+    fi
     echo "$svc已启动并启用"
 }
 
 # 卸载caddy
 uninstall_caddy() {
     stop_service caddy
-    sudo rm -f "$CADDY_BIN_PATH"
+    $SUDO rm -f "$CADDY_BIN_PATH"
     echo "已卸载caddy"
 }
 
@@ -465,10 +542,14 @@ main_menu() {
     detect_system
     load_state
     check_and_install "netstat" "net-tools"
-    check_and_install "ps" "procps"
+    check_and_install "ps" "procps-ng"
+    check_and_install "wget" "wget"
+    check_and_install "curl" "curl"
+    check_and_install "awk" "awk"
+    check_and_install "sed" "sed"
+    check_and_install "tar" "tar"
 
     while true; do
-        clear
         echo "=============================="
         echo "  交互式部署菜单"
         echo "=============================="
@@ -525,7 +606,7 @@ main_menu() {
                 read -rp "选择要启动的服务 (uhttpd/caddy): " svc_to_start
                 start_service "$svc_to_start"
                 ;;
-            6) 
+            6)
                 if command -v caddy >/dev/null 2>&1; then
                     configure_caddy
                 else
@@ -537,14 +618,14 @@ main_menu() {
             9) uninstall_caddy ;;
             10) modify_uhttpd_port ;;
             11) restart_service uhttpd ;;
-            12) 
+            12)
                 uhttpd_status=$(get_service_status uhttpd)
                 echo "uhttpd状态：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
                 ;;
             13) echo "退出"; exit 0 ;;
             *) echo "无效选择" ;;
         esac
-        read -rp "按回车键继续..." 
+        read -rp "按回车键继续..."
     done
 }
 
