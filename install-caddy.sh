@@ -24,6 +24,17 @@ declare -A ARCH_MAP=(
     ["mips64el"]="mips64le"
 )
 
+# 命令与包名映射
+declare -A CMD_PKG_MAP=(
+    ["netstat"]="net-tools"
+    ["ps"]="procps-ng"
+    ["wget"]="wget"
+    ["curl"]="curl"
+    ["awk"]="awk"
+    ["sed"]="sed"
+    ["tar"]="tar"
+)
+
 # 检查是否有sudo
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -81,6 +92,29 @@ detect_system() {
         INIT_SYSTEM="unknown"
     fi
     detect_package_manager
+}
+
+# 服务存在性检测
+service_exists() {
+    local svc=$1
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        [ -x "/etc/init.d/$svc" ] && return 0
+        pgrep -x "$svc" >/dev/null && return 0
+        return 1
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl list-unit-files | grep -q "^$svc" && return 0
+                ;;
+            openrc)
+                $SUDO rc-service --exists "$svc" && return 0
+                ;;
+            sysvinit)
+                [ -x "/etc/init.d/$svc" ] && return 0
+                ;;
+        esac
+        return 1
+    fi
 }
 
 # 获取所有Caddy版本（标签）
@@ -168,7 +202,7 @@ install_caddy() {
 # 检查依赖
 check_and_install() {
     local cmd=$1
-    local pkg=$2
+    local pkg=${CMD_PKG_MAP[$cmd]:-$cmd}
     if ! command -v "$cmd" >/dev/null 2>&1; then
         install_dependencies "$pkg"
     fi
@@ -357,14 +391,16 @@ stop_ports() {
             return
             ;;
     esac
-    # 杀残留进程
-    local PIDS
-    PIDS=$(netstat -tulnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$' | sort -u)
-    for pid in $PIDS; do
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            echo "杀掉进程ID：$pid"
-            kill "$pid" 2>/dev/null || kill -9 "$pid"
-        fi
+    # 只杀caddy和uhttpd残留进程
+    for pname in caddy uhttpd; do
+        local PIDS
+        PIDS=$(pgrep -x $pname)
+        for pid in $PIDS; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                echo "杀掉进程ID：$pid ($pname)"
+                kill "$pid" 2>/dev/null || kill -9 "$pid"
+            fi
+        done
     done
     SERVICE_STATUS="stopped"
     save_state
@@ -394,9 +430,41 @@ start_both_ports() {
 # 停止服务
 stop_service() {
     local svc=$1
+    if ! service_exists "$svc"; then
+        echo "服务 $svc 不存在，无法停止。"
+        return 1
+    fi
     if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-        /etc/init.d/$svc stop
-        /etc/init.d/$svc disable 2>/dev/null
+        if [ "$svc" = "caddy" ]; then
+            local PIDS
+            PIDS=$(pgrep -x caddy)
+            if [ -n "$PIDS" ]; then
+                echo "正在杀掉caddy进程: $PIDS"
+                kill $PIDS 2>/dev/null
+                sleep 2
+                PIDS=$(pgrep -x caddy)
+                if [ -n "$PIDS" ]; then
+                    echo "强制杀掉caddy进程: $PIDS"
+                    kill -9 $PIDS 2>/dev/null
+                fi
+            else
+                echo "未检测到caddy进程"
+            fi
+        else
+            if [ -x "/etc/init.d/$svc" ]; then
+                /etc/init.d/$svc stop
+                /etc/init.d/$svc disable 2>/dev/null
+            else
+                local PIDS
+                PIDS=$(pgrep -x "$svc")
+                if [ -n "$PIDS" ]; then
+                    kill $PIDS 2>/dev/null
+                    sleep 2
+                    PIDS=$(pgrep -x "$svc")
+                    [ -n "$PIDS" ] && kill -9 $PIDS 2>/dev/null
+                fi
+            fi
+        fi
     else
         case $INIT_SYSTEM in
             systemd)
@@ -420,14 +488,110 @@ stop_service() {
     echo "$svc已停止并禁用"
 }
 
+# 启动服务
+start_service() {
+    local svc=$1
+    if ! service_exists "$svc"; then
+        echo "服务 $svc 不存在，无法启动。"
+        return 1
+    fi
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        if [ "$svc" = "caddy" ]; then
+            start_caddy
+        else
+            if [ -x "/etc/init.d/$svc" ]; then
+                /etc/init.d/$svc start
+                /etc/init.d/$svc enable
+            else
+                "$svc" &  # 仅适用于可直接运行的二进制
+            fi
+        fi
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl start $svc
+                $SUDO systemctl enable $svc
+                ;;
+            openrc)
+                $SUDO rc-service $svc start
+                $SUDO rc-update add $svc default
+                ;;
+            sysvinit)
+                $SUDO service $svc start
+                $SUDO update-rc.d $svc defaults
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc start
+                $SUDO /etc/init.d/$svc enable
+                ;;
+        esac
+    fi
+    echo "$svc已启动并启用"
+}
+
+# 重启服务
+restart_service() {
+    local svc=$1
+    if ! service_exists "$svc"; then
+        echo "服务 $svc 不存在，无法重启。"
+        return 1
+    fi
+    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
+        if [ "$svc" = "caddy" ]; then
+            stop_service caddy
+            start_caddy
+        else
+            if [ -x "/etc/init.d/$svc" ]; then
+                /etc/init.d/$svc restart
+            else
+                local PIDS
+                PIDS=$(pgrep -x "$svc")
+                if [ -n "$PIDS" ]; then
+                    kill $PIDS 2>/dev/null
+                    sleep 2
+                    PIDS=$(pgrep -x "$svc")
+                    [ -n "$PIDS" ] && kill -9 $PIDS 2>/dev/null
+                fi
+                "$svc" &
+            fi
+        fi
+    else
+        case $INIT_SYSTEM in
+            systemd)
+                $SUDO systemctl restart $svc
+                ;;
+            openrc)
+                $SUDO rc-service $svc restart
+                ;;
+            sysvinit)
+                $SUDO service $svc restart
+                ;;
+            *)
+                $SUDO /etc/init.d/$svc restart
+                ;;
+        esac
+    fi
+    echo "$svc已重启"
+}
+
 # 获取服务状态（运行和启用）
 get_service_status() {
     local svc_name=$1
     local running="否"
     local enabled="否"
     if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-        /etc/init.d/$svc_name status 2>/dev/null | grep -q running && running="是"
-        /etc/init.d/$svc_name enabled 2>/dev/null | grep -q enabled && enabled="是"
+        if [ "$svc_name" = "caddy" ]; then
+            pgrep -x caddy >/dev/null && running="是"
+            enabled="否"
+        else
+            if [ -x "/etc/init.d/$svc_name" ]; then
+                /etc/init.d/$svc_name status 2>/dev/null | grep -q running && running="是"
+                /etc/init.d/$svc_name enabled 2>/dev/null | grep -q enabled && enabled="是"
+            else
+                pgrep -x "$svc_name" >/dev/null && running="是"
+                enabled="否"
+            fi
+        fi
     else
         case $INIT_SYSTEM in
             systemd)
@@ -468,59 +632,6 @@ modify_uhttpd_port() {
     restart_service uhttpd
 }
 
-# 重启服务
-restart_service() {
-    local svc=$1
-    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-        /etc/init.d/$svc restart
-    else
-        case $INIT_SYSTEM in
-            systemd)
-                $SUDO systemctl restart $svc
-                ;;
-            openrc)
-                $SUDO rc-service $svc restart
-                ;;
-            sysvinit)
-                $SUDO service $svc restart
-                ;;
-            *)
-                $SUDO /etc/init.d/$svc restart
-                ;;
-        esac
-    fi
-    echo "$svc已重启"
-}
-
-# 启动服务
-start_service() {
-    local svc=$1
-    if [ "$SYSTEM_TYPE" = "OpenWrt" ]; then
-        /etc/init.d/$svc start
-        /etc/init.d/$svc enable
-    else
-        case $INIT_SYSTEM in
-            systemd)
-                $SUDO systemctl start $svc
-                $SUDO systemctl enable $svc
-                ;;
-            openrc)
-                $SUDO rc-service $svc start
-                $SUDO rc-update add $svc default
-                ;;
-            sysvinit)
-                $SUDO service $svc start
-                $SUDO update-rc.d $svc defaults
-                ;;
-            *)
-                $SUDO /etc/init.d/$svc start
-                $SUDO /etc/init.d/$svc enable
-                ;;
-        esac
-    fi
-    echo "$svc已启动并启用"
-}
-
 # 卸载caddy
 uninstall_caddy() {
     stop_service caddy
@@ -541,13 +652,9 @@ restore_previous() {
 main_menu() {
     detect_system
     load_state
-    check_and_install "netstat" "net-tools"
-    check_and_install "ps" "procps-ng"
-    check_and_install "wget" "wget"
-    check_and_install "curl" "curl"
-    check_and_install "awk" "awk"
-    check_and_install "sed" "sed"
-    check_and_install "tar" "tar"
+    for cmd in netstat ps wget curl awk sed tar; do
+        check_and_install "$cmd"
+    done
 
     while true; do
         echo "=============================="
