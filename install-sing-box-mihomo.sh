@@ -802,6 +802,11 @@ install_mihomo_alpha_smart() {
     local selected_model_url=$(echo "$selected_model" | cut -d'|' -f1)
     local selected_model_name=$(echo "$selected_model" | cut -d'|' -f2)
 
+    # 确保目标目录存在
+    log "创建 Model 文件目标目录: $MH_BASE_DIR"
+    mkdir -p "$MH_BASE_DIR" || { red "创建目录 $MH_BASE_DIR 失败"; cleanup; return 1; }
+    chmod 755 "$MH_BASE_DIR" || { red "设置目录 $MH_BASE_DIR 权限失败"; cleanup; return 1; }
+
     # 下载 Model 文件（带重试机制，最多3次）
     log "正在下载 $selected_model_name 到 $MODEL_BIN_PATH..."
     local retry=0
@@ -825,11 +830,13 @@ install_mihomo_alpha_smart() {
         green "$selected_model_name 下载成功并保存为 $MODEL_BIN_PATH。"
     else
         red "下载 $selected_model_name 失败。请手动从 $selected_model_url 下载并放置到 $MODEL_BIN_PATH。"
+        cleanup
+        return 1
     fi
 
     # 确保文件权限
     if [ -f "$MODEL_BIN_PATH" ]; then
-        chmod 644 "$MODEL_BIN_PATH"
+        chmod 644 "$MODEL_BIN_PATH" || { red "设置文件 $MODEL_BIN_PATH 权限失败"; cleanup; return 1; }
     fi
 
     cleanup
