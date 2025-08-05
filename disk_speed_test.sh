@@ -133,23 +133,33 @@ for DISK in "${SELECTED_DISKS[@]}"; do
         fi
     fi
 
-    # dd 测试写入速度
-    if [ -z "$DD_RESULT" ] && [ -n "$TEST_FILE" ]; then
-        echo "正在进行写入测试（1GB），请稍候..."
-        DD_RESULT=$( (dd if=/dev/zero of=$TEST_FILE bs=1M count=1024 oflag=direct status=progress 2>&1) | grep -o "[0-9\.]\+ MB/s" | tail -1 )
-        sync && rm -f $TEST_FILE
-    fi
+# dd 测试写入速度
+   if [ -z "$DD_RESULT" ] && [ -n "$TEST_FILE" ]; then
+       echo "正在进行写入测试（1GB），请稍候..."
+       DD_RESULT=$( (dd if=/dev/zero of=$TEST_FILE bs=1M count=1024 oflag=direct status=progress 2>&1) | grep -o "[0-9\.]\+ MB/s" | tail -1 )
+       sync && rm -f $TEST_FILE
+   fi
 
-    # iostat 监测磁盘IO
-    IOSTAT_RESULT=$(iostat -d -x $DEVICE 1 3 | awk 'NR>3{print $0}' | tail -n 1)
-    # 兼容不同iostat版本
-    IOSTAT_RMB=$(echo "$IOSTAT_RESULT" | awk '{print $(NF-1)}')
-    IOSTAT_WMB=$(echo "$IOSTAT_RESULT" | awk '{print $NF}')
+    # iostat 监测磁盘IO（健壮处理）
+    IOSTAT_RESULT=$(iostat -d -x $DEVICE 1 3 2>/dev/null | awk 'NF>0 && $1 ~ /^[a-zA-Z0-9]/ {line=$0} END{print line}')
+    if [ -n "$IOSTAT_RESULT" ]; then
+        FIELD_COUNT=$(echo "$IOSTAT_RESULT" | awk '{print NF}')
+        if [ "$FIELD_COUNT" -ge 7 ]; then
+            IOSTAT_RMB=$(echo "$IOSTAT_RESULT" | awk '{print $(NF-1)}')
+            IOSTAT_WMB=$(echo "$IOSTAT_RESULT" | awk '{print $NF}')
+        else
+            IOSTAT_RMB="未检测"
+            IOSTAT_WMB="未检测"
+        fi
+    else
+        IOSTAT_RMB="未检测"
+        IOSTAT_WMB="未检测"
+    fi
 
     RESULTS[$DISK]="
     **$DISK 设备:**
     读取速度: 缓存读取速度高达 ${CACHED_READ:-"未知"} MB/sec，缓冲磁盘读取速度为 ${BUFFERED_READ:-"未知"} MB/sec。
-    写入速度: ${DD_RESULT:-"未知"} MB/s。
+    写入速度: ${DD_RESULT:-"未知"}
     I/O 性能: 读取性能 ${IOSTAT_RMB:-"未检测"} MB/s，写入性能 ${IOSTAT_WMB:-"未检测"} MB/s。
     "
 done
