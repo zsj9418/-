@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 配置区（默认值）
-DATA_DIR="/opt/sun-panel/data"
-BACKUP_DIR="/opt/sun-panel/backup"
+DATA_DIR="$HOME/opt/sun-panel/data"
+BACKUP_DIR="$HOME/opt/sun-panel/backup"
 LOG_FILE="/var/log/docker_management.log"
 LOG_MAX_SIZE=1048576  # 1M
 CONTAINER_NAME="sun-panel"
