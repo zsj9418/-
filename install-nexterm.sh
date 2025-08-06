@@ -13,7 +13,7 @@ docker_name="nexterm"
 # docker_img="germannewsmaker/nexterm:latest" # 将在部署时根据用户选择动态设定
 default_port=6989
 internal_port=6989  # 容器内部服务端口
-CONFIG_DIR="/home/docker/nexterm"
+CONFIG_DIR="$HOME/docker/nexterm"
 LOG_FILE="/var/log/nexterm-deploy.log"
 LOG_MAX_SIZE=1048576 # 1M
 
