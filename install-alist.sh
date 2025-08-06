@@ -3,12 +3,12 @@ set -euo pipefail
 
 ALIST_IMAGE="xhofe/alist:latest"
 ALIST_NAME="alist"
-ALIST_CONFIG_DIR="/home/docker/alist/conf"
+ALIST_CONFIG_DIR="$HOME/docker/alist/conf"
 ALIST_DEFAULT_PORT=5244
 
 OPENLIST_IMAGE="openlistteam/openlist:latest"
 OPENLIST_NAME="openlist"
-OPENLIST_CONFIG_DIR="/home/docker/openlist/conf"
+OPENLIST_CONFIG_DIR="$HOME/docker/openlist/conf"
 OPENLIST_DEFAULT_PORT=5245
 
 LOG_FILE="/var/log/alist-openlist-deploy.log"
