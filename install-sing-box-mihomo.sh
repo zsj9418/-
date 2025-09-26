@@ -745,7 +745,7 @@ install_mihomo_alpha_smart() {
     local MODEL_BIN_PATH="$MH_BASE_DIR/model.bin"
     log "正在获取 LightGBM Model 版本列表..."
     local releases_info
-    releases_info=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases/tags/LightGBM-Model") || {
+    releases_info=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases/tag/LightGBM-Model") || {
         red "无法获取 LightGBM Model 版本信息，请检查网络或 GitHub API 限制。"
         return 1
     }
@@ -763,7 +763,7 @@ install_mihomo_alpha_smart() {
     done < <(echo "$releases_info" | jq -c '.assets[]')
 
     if [ ${#model_assets[@]} -eq 0 ]; then
-        red "未找到可用的 LightGBM Model 文件。请手动从 https://github.com/vernesong/mihomo/releases/tags/LightGBM-Model 下载。"
+        red "未找到可用的 LightGBM Model 文件。请手动从 https://github.com/vernesong/mihomo/releases/tag/LightGBM-Model 下载。"
         return 1
     fi
 
