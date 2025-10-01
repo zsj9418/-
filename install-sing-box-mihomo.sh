@@ -138,6 +138,7 @@ download_file_with_proxy() {
     fi
 }
 
+
 # 安装依赖（增强 OpenWrt 变种兼容，处理 opkg 源问题）
 install_deps() {
     if [ -f "$DEPS_INSTALLED_MARKER" ]; then
@@ -878,6 +879,7 @@ install_mihomo_alpha_smart() {
     return 0
 }
 
+# 生成初始 Mihomo 配置（更新为配置二的详细版本）
 generate_initial_mihomo_config() {
     log "生成初始 Mihomo 配置文件到 $MH_CONFIG_FILE..."
     mkdir -p "$(dirname "$MH_CONFIG_FILE")"
@@ -1093,7 +1095,7 @@ update_config_and_start_service() {
     return 0
 }
 
-# 设置服务文件（新增配置二的详细版本）
+# 设置服务文件（修复：根据 service_type 区分 ExecStart 和 procd command）
 setup_service_files() {
     local service_type="$1"
     local bin_path
@@ -1101,6 +1103,7 @@ setup_service_files() {
     local base_dir
     local env_file
     local service_name
+    local exec_start  # 新增：区分命令
     
     case "$service_type" in
         "singbox")
@@ -1109,6 +1112,7 @@ setup_service_files() {
             base_dir="$SB_BASE_DIR"
             env_file="$SB_ENV_FILE"
             service_name="$SB_SERVICE_NAME"
+            exec_start="$bin_path run -c $config_file"  # Sing-box 命令
             ;;
         "mihomo")
             bin_path="$MH_BIN_PATH"
@@ -1116,6 +1120,7 @@ setup_service_files() {
             base_dir="$MH_BASE_DIR"
             env_file="$MH_ENV_FILE"
             service_name="$MH_SERVICE_NAME"
+            exec_start="$bin_path -d $base_dir"  # Mihomo 命令（目录模式）
             ;;
         *)
             red "无效的服务类型: $service_type"
@@ -1151,7 +1156,7 @@ Type=simple
 User=root
 WorkingDirectory=$base_dir
 EnvironmentFile=-$env_file
-ExecStart=$bin_path run -D $config_file
+ExecStart=$exec_start
 Restart=always
 RestartSec=3
 LimitNPROC=500
@@ -1190,9 +1195,7 @@ fi
 
 start_service() {
     procd_open_instance
-    procd_set_param command "$bin_path"
-    procd_append_param command run -D "\$CONFIG_FILE" 
-    # procd_append_param command "\$TUN_ARGS" # 如果有额外的启动参数
+    procd_set_param command $exec_start
     procd_set_param user root
     procd_set_param stdout 1
     procd_set_param stderr 1
