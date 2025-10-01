@@ -138,7 +138,6 @@ download_file_with_proxy() {
     fi
 }
 
-
 # 安装依赖（增强 OpenWrt 变种兼容，处理 opkg 源问题）
 install_deps() {
     if [ -f "$DEPS_INSTALLED_MARKER" ]; then
@@ -363,6 +362,48 @@ configure_network_forwarding_nat() {
     return 0
 }
 
+# 清理所有系统配置（新增功能）
+clean_up_system_configs() {
+    log "正在清理系统配置..."
+
+    # 移除转发配置
+    yellow "正在移除 sysctl 中的 IPv4/IPv6 转发配置..."
+    sed -i '/^net.ipv4.ip_forward=/d' /etc/sysctl.conf
+    sed -i '/^net.ipv6.conf.all.forwarding=/d' /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1 || yellow "sysctl -p 失败。"
+    
+    # 移除 NAT 规则（只移除脚本添加的特定规则）
+    local NAT_SOURCE_CIDR="192.168.0.0/16"
+    local NAT_SOURCE_CIDR_V6="fc00::/7"
+    
+    yellow "尝试移除 IPv4 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR)..."
+    if iptables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE
+        green "IPv4 NAT 规则移除成功。"
+        if command -v iptables-save >/dev/null 2>&1 && [ ! "$SYSTEM_TYPE" = "openwrt" ]; then
+            iptables-save > /etc/iptables/rules.v4
+        fi
+    else
+        yellow "未找到 IPv4 NAT 规则，跳过。"
+    fi
+    
+    if command -v ip6tables >/dev/null 2>&1; then
+        yellow "尝试移除 IPv6 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR_V6)..."
+        if ip6tables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null; then
+            ip6tables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE
+            green "IPv6 NAT 规则移除成功。"
+            if command -v ip6tables-save >/dev/null 2>&1 && [ ! "$SYSTEM_TYPE" = "openwrt" ]; then
+                ip6tables-save > /etc/iptables/rules.v6
+            fi
+        else
+            yellow "未找到 IPv6 NAT 规则，跳过。"
+        fi
+    fi
+    
+    green "系统配置清理完成。注意：此操作不会卸载任何核心程序。"
+    return 0
+}
+
 # 加载环境变量
 load_service_env() {
     local env_file="$1"
@@ -382,6 +423,22 @@ load_service_env() {
     fi
 }
 
+# 获取配置管理工具的 URL（新增，用于菜单显示）
+get_config_manager_url() {
+    local service_type="$1"
+    local env_file
+    case "$service_type" in
+        "singbox") env_file="$SB_ENV_FILE" ;;
+        "mihomo") env_file="$MH_ENV_FILE" ;;
+        *) return "" ;;
+    esac
+    
+    if load_service_env "$env_file"; then
+        echo "$PROXY_API_URL"
+    else
+        return ""
+    fi
+}
 # 设置环境变量
 setup_service_env() {
     local env_file="$1"
@@ -481,7 +538,7 @@ get_singbox_versions() {
     return 0
 }
 
-# 安装 Sing-box (交互式版本选择)
+# 安装 Sing-box (交互式版本选择，使用下载加速)
 install_singbox() {
     log "开始安装 Sing-box..."
     check_network || return 1
@@ -525,9 +582,8 @@ install_singbox() {
     local TAR_PATH="$TEMP_DIR/$FILENAME"
 
     log "下载 Sing-box $VERSION_TAG ($local_arch)..."
-    # 使用代理下载函数
     if ! download_file_with_proxy "$DOWNLOAD_URL" "$TAR_PATH"; then
-        red "下载 Sing-box 失败！"; cleanup; return 1
+        red "下载 Sing-box 失败！URL: ${DOWNLOAD_URL}"; cleanup; return 1
     fi
 
     log "解压文件..."
@@ -608,7 +664,7 @@ get_mihomo_latest_version() {
     return 0
 }
 
-# 安装 Mihomo 稳定版（已更新下载逻辑）
+# 安装 Mihomo 稳定版（增强架构兼容，使用下载加速）
 install_mihomo() {
     log "开始安装 Mihomo..."
     check_network || return 1
@@ -635,7 +691,6 @@ install_mihomo() {
     local GZ_PATH="$TEMP_DIR/$FILENAME"
 
     log "下载 Mihomo ${latest_version} (${local_arch})..."
-    # 使用代理下载函数
     if ! download_file_with_proxy "$DOWNLOAD_URL" "$GZ_PATH"; then
         red "下载 Mihomo 失败！"; cleanup; return 1
     fi
@@ -668,7 +723,7 @@ install_mihomo() {
     return 0
 }
 
-# 获取 Mihomo Alpha 版本列表 (此函数已修复，避免未找到命令的错误)
+# 获取 Mihomo Alpha 版本列表
 get_mihomo_alpha_versions() {
     local arch="$1"
     local page=1
@@ -710,7 +765,7 @@ get_mihomo_alpha_versions() {
     return 0
 }
 
-# 安装 Mihomo Alpha 版（已更新下载逻辑，Model 下载失败不中断安装）
+# 安装 Mihomo Alpha 版（动态获取版本，使用下载加速；Model 下载失败不中断，固定URL）
 install_mihomo_alpha_smart() {
     log "开始安装 Mihomo Alpha with Smart Group 版本..."
     check_network || return 1
@@ -741,7 +796,8 @@ install_mihomo_alpha_smart() {
     read -r choice
 
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#version_array[@]}" ]; then
-        red "无效选项 '$choice'，安装取消。"; return 1
+        red "无效选项 '$choice'，安装取消。"
+        return 1
     fi
 
     local selected_version=${version_map[$choice]}
@@ -753,7 +809,6 @@ install_mihomo_alpha_smart() {
     local GZ_PATH="$TEMP_DIR/$FILENAME"
 
     log "下载 Mihomo Alpha ($VERSION_DISPLAY)..."
-    # 使用代理下载函数
     if ! download_file_with_proxy "$DOWNLOAD_URL" "$GZ_PATH"; then
         red "下载失败！"; cleanup; return 1
     fi
@@ -775,122 +830,54 @@ install_mihomo_alpha_smart() {
     cp "$MIHOMO_BIN_UNPACKED" "$MH_BIN_PATH"
     chmod +x "$MH_BIN_PATH"
 
-    # 动态获取 LightGBM Model 版本列表
+    # 固定 LightGBM Model 下载地址（用户指定）
     local MODEL_BIN_PATH="$MH_BASE_DIR/model.bin"
-    log "正在获取 LightGBM Model 版本列表..."
-    local releases_info
-    releases_info=$(curl -s "https://api.github.com/repos/vernesong/mihomo/releases/tag/LightGBM-Model") || {
-        red "无法获取 LightGBM Model 版本信息，请检查网络或 GitHub API 限制。";
-        # Model获取失败不是致命错误，继续安装核心
-    }
+    local FIXED_MODEL_URL="https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/model.bin"
+    local selected_model_name="model.bin"
 
-    local model_assets=()
-    local i=0
-    if [ -n "$releases_info" ]; then
-        while IFS= read -r asset_info; do
-            local asset_name download_url
-            asset_name=$(echo "$asset_info" | jq -r '.name')
-            if [[ "$asset_name" =~ ^model(-[a-zA-Z0-9]+)?\.bin$ ]]; then
-                download_url=$(echo "$asset_info" | jq -r '.browser_download_url')
-                model_assets[$i]="$asset_name|$download_url"
-                ((i++))
-            fi
-        done < <(echo "$releases_info" | jq -c '.assets[]')
-    fi
+    # 确保目标目录存在
+    log "创建 Model 文件目标目录: $MH_BASE_DIR"
+    mkdir -p "$MH_BASE_DIR" || { red "创建目录 $MH_BASE_DIR 失败"; cleanup; return 1; }
+    chmod 755 "$MH_BASE_DIR" || { red "设置目录 $MH_BASE_DIR 权限失败"; cleanup; return 1; }
+
+    # 下载 Model 文件（使用代理下载函数，下载失败不中断安装）
+    log "正在下载 $selected_model_name 到 $MODEL_BIN_PATH (固定URL: $FIXED_MODEL_URL)..."
+    local model_download_success=false
     
-    local model_choice=0
-    if [ ${#model_assets[@]} -eq 0 ]; then
-        yellow "未找到可用的 LightGBM Model 文件。请手动从 GitHub 下载。"
+    if download_file_with_proxy "$FIXED_MODEL_URL" "$MODEL_BIN_PATH"; then
+        model_download_success=true
+    fi
+
+    if [ "$model_download_success" = true ]; then
+        # 验证文件（如果 md5sum 可用）
+        if command -v md5sum >/dev/null 2>&1; then
+            local local_md5=$(md5sum "$MODEL_BIN_PATH" | cut -d' ' -f1)
+            log "$selected_model_name MD5: $local_md5 (验证通过如果非空)"
+        fi
+        green "$selected_model_name 下载成功并保存为 $MODEL_BIN_PATH。"
     else
-        # 显示 Model 选择界面
-        clear
-        printf "\n%b=== 选择 LightGBM Model 版本 ===%b\n" "$GREEN" "$NC"
-        local j=1
-        declare -A model_map
-        for asset_info in "${model_assets[@]}"; do
-            IFS='|' read -r asset_name download_url <<< "$asset_info"
-            case "$asset_name" in
-                "model-large.bin") description="大模型，推荐用于高性能设备" ;;
-                "model.bin") description="标准模型，适合通用设备" ;;
-                *) description="其他模型" ;;
-            esac
-            printf "  %d) %s (%s)\n" "$j" "$asset_name" "$description"
-            model_map[$j]="$download_url|$asset_name"
-            ((j++))
-        done
-        printf "%b================================%b\n" "$GREEN" "$NC"
-        printf "请输入选项 (1-%d): " "${#model_assets[@]}"
-        read -r model_choice_input
-        
-        if ! [[ "$model_choice_input" =~ ^[0-9]+$ ]] || [ "$model_choice_input" -lt 1 ] || [ "$model_choice_input" -gt "${#model_assets[@]}" ]; then
-            red "无效选项 '$model_choice_input'，将尝试使用默认 model.bin。"
-            # 尝试查找默认 model.bin 的索引
-            for i in "${!model_assets[@]}"; do 
-                if [[ "${model_assets[$i]}" =~ model\.bin$ ]]; then model_choice=$((i+1)); break; fi 
-            done
-            if [ "$model_choice" -eq 0 ]; then
-                yellow "未找到默认 model.bin，将跳过 Model 文件下载。"
-            fi
-        else
-            model_choice="$model_choice_input"
-        fi
+        # 下载失败不中断安装
+        red "下载 $selected_model_name 失败。请手动从 $FIXED_MODEL_URL 下载并放置到 $MODEL_BIN_PATH。"
+        yellow "警告：LightGBM Model 下载失败不中断安装，但 Smart Group 功能可能受限，安装将继续。"
     fi
 
-    if [ "$model_choice" -gt 0 ]; then
-        local selected_model=${model_map[$model_choice]}
-        local selected_model_url=$(echo "$selected_model" | cut -d'|' -f1)
-        local selected_model_name=$(echo "$selected_model" | cut -d'|' -f2)
-
-        # 确保目标目录存在
-        log "创建 Model 文件目标目录: $MH_BASE_DIR"
-        mkdir -p "$MH_BASE_DIR" || { red "创建目录 $MH_BASE_DIR 失败"; cleanup; return 1; }
-        chmod 755 "$MH_BASE_DIR" || { red "设置目录 $MH_BASE_DIR 权限失败"; cleanup; return 1; }
-
-        # 下载 Model 文件（使用代理下载函数，下载失败不中断安装）
-        log "正在下载 $selected_model_name 到 $MODEL_BIN_PATH..."
-        local model_download_success=false
-        
-        if download_file_with_proxy "$selected_model_url" "$MODEL_BIN_PATH"; then
-            model_download_success=true
-        fi
-
-        if [ "$model_download_success" = true ]; then
-            # 验证文件（如果 md5sum 可用）
-            if command -v md5sum >/dev/null 2>&1; then
-                local local_md5=$(md5sum "$MODEL_BIN_PATH" | cut -d' ' -f1)
-                log "$selected_model_name MD5: $local_md5 (验证通过如果非空)"
-            fi
-            green "$selected_model_name 下载成功并保存为 $MODEL_BIN_PATH。"
-        else
-            # 修复点：Model 下载失败不中断安装
-            red "下载 $selected_model_name 失败。请手动从 $selected_model_url 下载并放置到 $MODEL_BIN_PATH。"
-            yellow "警告：LightGBM Model 下载失败不中断安装，但 Smart Group 功能可能受限，安装将继续。"
-        fi
-
-        # 确保文件权限
-        if [ -f "$MODEL_BIN_PATH" ]; then
-            chmod 644 "$MODEL_BIN_PATH" || {
-                # 修复点：Model 权限失败不中断安装
-                red "设置文件 $MODEL_BIN_PATH 权限失败。"; 
-                yellow "警告：Model 文件权限设置失败，请手动检查（文件路径：$MODEL_BIN_PATH）。"
-            }
-        fi
+    # 确保文件权限
+    if [ -f "$MODEL_BIN_PATH" ]; then
+        chmod 644 "$MODEL_BIN_PATH" || {
+            yellow "警告：Model 文件权限设置失败，请手动检查（文件路径：$MODEL_BIN_PATH）。"
+        }
     fi
-    
-    # 清理 Mihomo 安装的临时文件
+
     cleanup
-    
     green "Mihomo Alpha with Smart Group ($VERSION_DISPLAY) 安装成功！"
 
     if [ ! -f "$MH_CONFIG_FILE" ]; then generate_initial_mihomo_config; fi
     setup_service "mihomo"
     manage_autostart_internal "mihomo" "enable"
-
     green "Mihomo Alpha 部署完成。默认已设置为开机自启。"
     return 0
 }
 
-# 生成初始 Mihomo 配置
 generate_initial_mihomo_config() {
     log "生成初始 Mihomo 配置文件到 $MH_CONFIG_FILE..."
     mkdir -p "$(dirname "$MH_CONFIG_FILE")"
@@ -909,16 +896,14 @@ allow-lan: true
 mode: rule
 log-level: info
 external-controller: 0.0.0.0:9090
-
 tun:
   enable: true
   stack: system
   auto-route: true
   auto-detect-interface: true
   inet4-address: 198.18.0.1/16
-  dns-hijack:
-    - "any:53"
-
+dns-hijack:
+  - "any:53"
 dns:
   enable: true
   listen: 0.0.0.0:53
@@ -926,6 +911,9 @@ dns:
   nameserver:
     - 8.8.8.8
     - 1.1.1.1
+  fallback:
+    - https://dns.google/dns-query
+  fallback-filter: { geoip: true, geoip-code: CN }
 
 proxies:
   # 示例: 替换为您的实际节点配置
@@ -1005,27 +993,7 @@ EOF
     yellow "警告：默认配置中包含示例代理节点，请使用外部配置文件管理工具更新您的订阅！"
     return 0
 }
-
-
-# 获取配置管理工具的 URL
-get_config_manager_url() {
-    local service_type="$1"
-    local env_file
-    case "$service_type" in
-        "singbox") env_file="$SB_ENV_FILE" ;;
-        "mihomo") env_file="$MH_ENV_FILE" ;;
-        *) return "" ;;
-    esac
-    
-    if load_service_env "$env_file"; then
-        echo "$PROXY_API_URL"
-    else
-        return ""
-    fi
-}
-
-
-# 更新配置并重启服务
+# 更新配置并运行（替换为配置二的版本，支持模式切换）
 update_config_and_start_service() {
     local service_type="$1"
     local proxy_bin_path
@@ -1125,7 +1093,7 @@ update_config_and_start_service() {
     return 0
 }
 
-# 设置服务文件（Systemd 或 OpenWrt Init.d）
+# 设置服务文件（新增配置二的详细版本）
 setup_service_files() {
     local service_type="$1"
     local bin_path
@@ -1251,8 +1219,7 @@ EOF
     return 0
 }
 
-
-# 设置服务 (安装配置、服务文件、启动自启)
+# 设置服务 (替换为配置二的版本)
 setup_service() {
     local service_type="$1"
     local service_name_display
@@ -1297,137 +1264,7 @@ setup_service() {
     return 0
 }
 
-
-# 服务管理内部函数
-manage_service_internal() {
-    local service_type="$1"
-    local action="$2"
-    local service_name
-    
-    case "$service_type" in
-        "singbox") service_name="$SB_SERVICE_NAME" ;;
-        "mihomo") service_name="$MH_SERVICE_NAME" ;;
-        *) red "无效的服务类型: $service_type"; return 1 ;;
-    esac
-    
-    log "正在对 $service_name 执行操作: $action..."
-    
-    if [ "$SYSTEM_TYPE" = "systemd" ]; then
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl "$action" "$service_name" || yellow "Systemd $action $service_name 失败或服务不存在。"
-            return 0
-        else
-            red "Systemd 系统但未找到 systemctl 命令。"
-            return 1
-        fi
-    elif [ "$SYSTEM_TYPE" = "openwrt" ]; then
-        if [ -f "/etc/init.d/$service_name" ]; then
-            /etc/init.d/"$service_name" "$action" || yellow "OpenWrt Init.d $action $service_name 失败。"
-            return 0
-        else
-            red "OpenWrt 系统但未找到 /etc/init.d/$service_name 脚本。"
-            return 1
-        fi
-    else
-        red "当前系统类型 ($SYSTEM_TYPE) 不支持自动服务管理，请手动执行操作。"
-        return 1
-    fi
-}
-
-
-# 自动启动管理内部函数
-manage_autostart_internal() {
-    local service_type="$1"
-    local action="$2"
-    local service_name
-    
-    case "$service_type" in
-        "singbox") service_name="$SB_SERVICE_NAME" ;;
-        "mihomo") service_name="$MH_SERVICE_NAME" ;;
-        *) red "无效的服务类型: $service_type"; return 1 ;;
-    esac
-    
-    log "正在为 $service_name 设置开机自启: $action..."
-    
-    if [ "$SYSTEM_TYPE" = "systemd" ]; then
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl "$action" "$service_name" || yellow "Systemd $action $service_name 自动启动失败。"
-            return 0
-        fi
-    elif [ "$SYSTEM_TYPE" = "openwrt" ]; then
-        if [ -f "/etc/init.d/$service_name" ]; then
-            /etc/init.d/"$service_name" "$action" || yellow "OpenWrt Init.d $action $service_name 自动启动失败。"
-            return 0
-        fi
-    fi
-    
-    yellow "当前系统类型 ($SYSTEM_TYPE) 不支持自动设置开机自启，请手动配置。"
-    return 1
-}
-
-
-# 设置 Cron Job 内部函数
-setup_cron_job_internal() {
-    local service_type="$1"
-    local interval="$2" # 分钟
-    local service_name_display
-    
-    case "$service_type" in
-        "singbox") service_name_display="Sing-box" ;;
-        "mihomo") service_name_display="Mihomo" ;;
-        *) red "无效的服务类型: $service_type"; return 1 ;;
-    esac
-
-    if [ "$interval" -eq 0 ]; then
-        disable_scheduled_update_internal "$service_type"
-        return 0
-    fi
-    
-    local cron_entry="*/$interval * * * * $SCRIPT_PATH --update $service_type"
-    
-    log "正在设置 $service_name_display 的 Cron 自动更新任务 (每 $interval 分钟)..."
-    
-    # 移除旧的 Cron 任务
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --update $service_type"; echo "$cron_entry") | crontab -
-    
-    if [ "$?" -eq 0 ]; then
-        green "$service_name_display 自动更新任务设置成功！"
-    else
-        red "设置 Cron 任务失败，请检查 cron 服务是否运行。"
-        return 1
-    fi
-    
-    return 0
-}
-
-
-# 禁用定时更新内部函数
-disable_scheduled_update_internal() {
-    local service_type="$1"
-    local service_name_display
-    
-    case "$service_type" in
-        "singbox") service_name_display="Sing-box" ;;
-        "mihomo") service_name_display="Mihomo" ;;
-        *) red "无效的服务类型: $service_type"; return 1 ;;
-    esac
-    
-    log "正在禁用 $service_name_display 的 Cron 自动更新任务..."
-    
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --update $service_type") | crontab -
-    
-    if [ "$?" -eq 0 ]; then
-        yellow "$service_name_display 自动更新任务已禁用。"
-    else
-        red "禁用 Cron 任务失败，请检查 cron 服务是否运行。"
-        return 1
-    fi
-    
-    return 0
-}
-
-
-# 移除所有文件和服务
+# 卸载服务（替换为配置二的版本，更全面移除）
 remove_all_files_and_service() {
     local service_type="$1"
     local bin_path
@@ -1457,6 +1294,14 @@ remove_all_files_and_service() {
             red "无效的服务类型: $service_type"; return 1 ;;
     esac
     
+    yellow "警告：这将完全卸载 ${service_name_display} 及其所有相关文件。"
+    printf "您确定要继续吗？(y/N): "
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+        green "卸载已取消。"
+        return 0
+    fi
+    
     log "正在卸载 $service_name_display..."
     
     # 停止并禁用服务
@@ -1480,55 +1325,299 @@ remove_all_files_and_service() {
     log "移除配置文件和数据目录: $base_dir"
     rm -rf "$base_dir"
     
-    green "$service_name_display 卸载完成。请手动清理 iptables/ip6tables 规则。"
+    green "$service_name_display 已成功卸载。请手动清理 iptables/ip6tables 规则。"
     return 0
 }
 
-# 清理系统配置
-clean_up_system_configs() {
-    log "正在清理系统配置..."
-    
-    # 移除转发配置
-    yellow "正在移除 sysctl 中的 IPv4/IPv6 转发配置..."
-    sed -i '/^net.ipv4.ip_forward=/d' /etc/sysctl.conf
-    sed -i '/^net.ipv6.conf.all.forwarding=/d' /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1 || yellow "sysctl -p 失败。"
-    
-    # 移除 NAT 规则（只移除脚本添加的特定规则）
-    local NAT_SOURCE_CIDR="192.168.0.0/16"
-    local NAT_SOURCE_CIDR_V6="fc00::/7"
-    
-    yellow "尝试移除 IPv4 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR)..."
-    if iptables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE
-        green "IPv4 NAT 规则移除成功。"
-        if command -v iptables-save >/dev/null 2>&1 && [ ! "$SYSTEM_TYPE" = "openwrt" ]; then
-            iptables-save > /etc/iptables/rules.v4
-        fi
-    else
-        yellow "未找到 IPv4 NAT 规则，跳过。"
+# 验证配置文件
+validate_config_internal() {
+    local service_type="$1"
+    local config_file_override=${2:-}
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
     fi
-    
-    if command -v ip6tables >/dev/null 2>&1; then
-        yellow "尝试移除 IPv6 NAT 规则 (MASQUERADE for $NAT_SOURCE_CIDR_V6)..."
-        if ip6tables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null; then
-            ip6tables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE
-            green "IPv6 NAT 规则移除成功。"
-            if command -v ip6tables-save >/dev/null 2>&1 && [ ! "$SYSTEM_TYPE" = "openwrt" ]; then
-                ip6tables-save > /etc/iptables/rules.v6
-            fi
+    local service_name bin_path config_path
+    case "$service_type" in
+        singbox) service_name="Sing-box"; bin_path="$SB_BIN_PATH"; config_path="$SB_CONFIG_FILE" ;;
+        mihomo) service_name="Mihomo"; bin_path="$MH_BIN_PATH"; config_path="$MH_BASE_DIR" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    if [ ! -f "$bin_path" ]; then red "${service_name} 未安装。"; return 1; fi
+
+    local validation_output exit_code
+    if [ "$service_type" = "singbox" ]; then
+        local file_to_check=${config_file_override:-$config_path}
+        if [ ! -f "$file_to_check" ]; then red "配置文件 $file_to_check 不存在。"; return 1; fi
+        validation_output=$("$bin_path" check -c "$file_to_check" 2>&1)
+        exit_code=$?
+    else # mihomo
+        local dir_to_check; local temp_dir_created=false
+        if [ -n "$config_file_override" ]; then
+            dir_to_check=$(mktemp -d); temp_dir_created=true
+            cp "$config_file_override" "$dir_to_check/config.yaml"
+            [ -f "$MH_BASE_DIR/model.bin" ] && cp "$MH_BASE_DIR/model.bin" "$dir_to_check/"
         else
-            yellow "未找到 IPv6 NAT 规则，跳过。"
+            dir_to_check="$config_path"
         fi
+        if [ ! -f "$dir_to_check/config.yaml" ]; then red "配置文件 $dir_to_check/config.yaml 不存在。"; $temp_dir_created && rm -rf "$dir_to_check"; return 1; fi
+        validation_output=$("$bin_path" -d "$dir_to_check" -t 2>&1)
+        exit_code=$?
+        $temp_dir_created && rm -rf "$dir_to_check"
     fi
-    
-    green "系统配置清理完成。注意：此操作不会卸载任何核心程序。"
-    read -r -p "按 [Enter] 键继续..."
+
+    if [ $exit_code -eq 0 ]; then
+        [ -z "$config_file_override" ] && green "🎉 ${service_name} 配置文件验证通过！"
+        return 0
+    else
+        red "❌ ${service_name} 配置文件验证失败！"
+        if [ -z "$config_file_override" ]; then
+            yellow "--- 错误详情 ---"
+            printf "%s\n" "$validation_output"
+            yellow "------------------"
+        fi
+        return 1
+    fi
+}
+
+# 管理服务（启动/停止/重启/状态）
+manage_service_internal() {
+    local service_type="$1"
+    local action="$2"
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local service_name=""
+    case "$service_type" in
+        singbox) service_name="$SB_SERVICE_NAME" ;;
+        mihomo) service_name="$MH_SERVICE_NAME" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    local bin_path; if [ "$service_type" = "singbox" ]; then bin_path="$SB_BIN_PATH"; else bin_path="$MH_BIN_PATH"; fi
+    if [ ! -f "$bin_path" ]; then red "${service_name} 未安装。"; return 1; fi
+
+    log "正在对 ${service_name} 执行操作: $action..."
+    if [ "$SYSTEM_TYPE" = "openwrt" ]; then
+        local init_script="/etc/init.d/$service_name"
+        if [ -f "$init_script" ]; then "$init_script" "$action"; fi
+    else
+        systemctl "$action" "$service_name"
+    fi
+    return $?
+}
+
+# 管理自启动
+manage_autostart_internal() {
+    local service_type="$1"
+    local action=${2:-}
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local service_name
+    case "$service_type" in
+        singbox) service_name="$SB_SERVICE_NAME" ;;
+        mihomo) service_name="$MH_SERVICE_NAME" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    if [ -z "$action" ]; then
+        clear
+        printf "\n%b=== 管理 %s 自启动 ===%b\n" "$GREEN" "$service_name" "$NC"
+        printf "当前状态: "; manage_autostart_internal "$service_type" "status"
+        printf "\n  1) %b启用%b 开机自启动\n" "$GREEN" "$NC"
+        printf "  2) %b禁用%b 开机自启动\n" "$RED" "$NC"
+        printf "  q) 返回\n"
+        printf "%b========================%b\n" "$GREEN" "$NC"
+        read -r -p "请输入选项: " choice
+        case "$choice" in
+            1) manage_autostart_internal "$service_type" "enable" ;;
+            2) manage_autostart_internal "$service_type" "disable" ;;
+            q|Q) return 0 ;;
+            *) red "无效选项"; return 1 ;;
+        esac
+        return 0
+    fi
+
+    if [ "$SYSTEM_TYPE" = "openwrt" ]; then
+        local init_script="/etc/init.d/$service_name"
+        if [ ! -f "$init_script" ]; then red "服务未安装。"; return 1; fi
+        case "$action" in
+            enable) "$init_script" enable &>/dev/null; green "${service_name} 已设置为开机自启。" ;;
+            disable) "$init_script" disable &>/dev/null; red "${service_name} 已禁止开机自启。" ;;
+            status) if [ -L "/etc/rc.d/S95${service_name}" ]; then green "已启用"; else red "已禁用"; fi ;;
+        esac
+    else
+        case "$action" in
+            enable) systemctl enable "$service_name" &>/dev/null; green "${service_name} 已设置为开机自启。" ;;
+            disable) systemctl disable "$service_name" &>/dev/null; red "${service_name} 已禁止开机自启。" ;;
+            status) if systemctl is-enabled "$service_name" &>/dev/null; then green "已启用"; else red "已禁用"; fi ;;
+        esac
+    fi
     return 0
 }
 
+# 查看日志
+view_log_internal() {
+    local service_type="$1"
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local log_cmd
+    case "$service_type" in
+        singbox) log_cmd="journalctl -u $SB_SERVICE_NAME -n 50 --no-pager"; [ "$SYSTEM_TYPE" = "openwrt" ] && log_cmd="logread -e $SB_SERVICE_NAME | tail -n 50" ;;
+        mihomo) log_cmd="journalctl -u $MH_SERVICE_NAME -n 50 --no-pager"; [ "$SYSTEM_TYPE" = "openwrt" ] && log_cmd="logread -e $MH_SERVICE_NAME | tail -n 50" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
 
-# Sing-box 管理菜单
+    clear
+    yellow "--- ${service_type} 服务日志 (最近50条) ---"
+    eval "$log_cmd" || yellow "无法获取日志（OpenWrt 变种请检查 logread）。"
+    yellow "----------------------------------------"
+    yellow "--- 脚本自身日志 ($LOG_FILE) (最近50行) ---"
+    tail -n 50 "$LOG_FILE" || yellow "无法读取脚本日志。"
+    yellow "----------------------------------------"
+    return 0
+}
+
+# 设置 cron 任务
+setup_cron_job_internal() {
+    local service_type="$1"
+    local interval="$2"
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local service_name
+    case "$service_type" in
+        singbox) service_name="Sing-box" ;;
+        mihomo) service_name="Mihomo" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    log "正在为 ${service_name} 设置自动更新 (每 ${interval} 分钟)..."
+    local cron_job_id="${service_type}_proxy_update"
+    local cron_entry="*/${interval} * * * * bash $SCRIPT_PATH --update $service_type >> $LOG_FILE 2>&1"
+
+    (crontab -l 2>/dev/null | grep -v "$cron_job_id") | crontab -
+    (crontab -l 2>/dev/null; echo "# $cron_job_id"; echo "$cron_entry") | crontab -
+
+    if [ "$SYSTEM_TYPE" = "openwrt" ] && command -v crond >/dev/null 2>&1; then
+        /etc/init.d/cron restart 2>/dev/null || yellow "OpenWrt cron 重启失败，请手动检查。"
+    fi
+
+    green "${service_name} 自动更新已设置为每 ${interval} 分钟执行一次。"
+    return 0
+}
+
+# 禁用自动更新
+disable_scheduled_update_internal() {
+    local service_type="$1"
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local service_name
+    case "$service_type" in
+        singbox) service_name="Sing-box" ;;
+        mihomo) service_name="Mihomo" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    log "正在禁用 ${service_name} 自动更新..."
+    local cron_job_id="${service_type}_proxy_update"
+    (crontab -l 2>/dev/null | grep -v "$cron_job_id") | crontab -
+    green "${service_name} 自动更新已禁用。"
+    return 0
+}
+
+# 管理自动更新菜单
+manage_scheduled_update_menu() {
+    local service_type="$1"
+    if [ -z "$service_type" ]; then
+        red "错误：service_type 未定义。"
+        return 1
+    fi
+    local service_name env_file
+    case "$service_type" in
+        singbox) service_name="Sing-box"; env_file="$SB_ENV_FILE" ;;
+        mihomo) service_name="Mihomo"; env_file="$MH_ENV_FILE" ;;
+        *) red "无效的服务类型: $service_type"; return 1 ;;
+    esac
+
+    # 检查是否已设置订阅链接
+    if ! load_service_env "$env_file" || [ -z "${PROXY_API_URL:-}" ]; then
+        red "必须先在“设置环境变量”中配置订阅链接，才能管理自动更新。"
+        return 1
+    fi
+    local current_interval=${CRON_INTERVAL:-0}
+
+    clear
+    printf "\n%b=== 管理 %s 自动更新 ===%b\n" "$GREEN" "$service_name" "$NC"
+    if [ "$current_interval" -eq 0 ]; then
+        printf "当前状态: %b已禁用%b\n" "$RED" "$NC"
+    else
+        printf "当前状态: %b已启用%b (每 %s 分钟一次)\n" "$GREEN" "$NC" "$current_interval"
+    fi
+    printf "\n  1) 设置/更改更新间隔\n"
+    printf "  2) 禁用自动更新\n"
+    printf "  q) 返回\n"
+    printf "%b==============================%b\n" "$GREEN" "$NC"
+    read -r -p "请输入选项: " choice
+
+    case "$choice" in
+        1)
+            printf "请输入新的自动更新间隔 (分钟, 0 表示禁用): "
+            read -r new_interval
+            if ! [[ "$new_interval" =~ ^[0-9]+$ ]]; then
+                red "无效输入，必须是数字。"
+                return 1
+            fi
+
+            # 更新 .env 文件
+            local current_api_url=${PROXY_API_URL}
+            local current_mode=${PROXY_MODE:-rule}
+            cat << EOF > "$env_file"
+# This file stores environment variables for ${service_name}.
+PROXY_API_URL="$current_api_url"
+PROXY_MODE="$current_mode"
+CRON_INTERVAL="$new_interval"
+EOF
+            chmod 600 "$env_file"
+
+            if [ "$new_interval" -gt 0 ]; then
+                setup_cron_job_internal "$service_type" "$new_interval"
+            else
+                disable_scheduled_update_internal "$service_type"
+            fi
+            ;;
+        2)
+            # 更新 .env 文件
+            local current_api_url=${PROXY_API_URL}
+            local current_mode=${PROXY_MODE:-rule}
+            cat << EOF > "$env_file"
+# This file stores environment variables for ${service_name}.
+PROXY_API_URL="$current_api_url"
+PROXY_MODE="$current_mode"
+CRON_INTERVAL="0"
+EOF
+            chmod 600 "$env_file"
+            disable_scheduled_update_internal "$service_type"
+            ;;
+        q|Q)
+            return 0
+            ;;
+        *)
+            red "无效选项"
+            ;;
+    esac
+    return 0
+}
+# Sing-box 管理菜单（增强 UI/UX，显示状态）
 singbox_management_menu() {
     while true; do
         clear
@@ -1542,32 +1631,43 @@ singbox_management_menu() {
         printf "状态: %s | 配置: %s\n" "$service_status" "$config_status"
         printf "API URL: %s\n" "${api_url:-未设置}"
         printf "%b=========================%b\n" "$GREEN" "$NC"
-        printf "  1) 安装/更新 Sing-box\n"
-        printf "  2) 设置/修改配置和更新链接\n"
-        printf "  3) 启动/重启服务\n"
-        printf "  4) 停止服务\n"
-        printf "  5) 从 API 更新配置并重启\n"
-        printf "  6) 卸载 Sing-box\n"
-        printf "  q) 返回主菜单\n"
-        printf "%b=========================%b\n" "$GREEN" "$NC"
-        read -r -p "请选择操作: " choice
+        printf " 1) 安装/更新 Sing-box (可选版本)\n"
+        printf " 2) 设置环境变量 (订阅等)\n"
+        printf " 3) 更新配置并重启\n"
+        printf " 4) 启动服务\n"
+        printf " 5) 停止服务\n"
+        printf " 6) 重启服务\n"
+        printf " 7) 查看服务状态\n"
+        printf " 8) %b管理自动更新%b\n" "$YELLOW" "$NC"
+        printf " 9) 卸载 Sing-box\n"
+        printf " e) 管理服务自启动\n"
+        printf " c) 验证配置文件\n"
+        printf " v) 查看日志\n"
+        printf " q) 返回主菜单\n"
+        printf "%b========================%b\n" "$GREEN" "$NC"
+        read -r -p "请输入选项: " choice
 
         case "$choice" in
-            1) install_deps; install_singbox ;;\
-            2) install_deps; setup_service_env "$SB_ENV_FILE" "Sing-box" "(tun/mixed 模式)" ;;\
-            3) manage_service_internal "singbox" "restart" ;;\
-            4) manage_service_internal "singbox" "stop" ;;\
-            5) install_deps; update_config_and_start_service "singbox" ;;\
-            6) remove_all_files_and_service "singbox" ;;\
-            q|Q) return 0 ;;\
-            *) red "无效选项" ;;\
+            1) install_singbox ;;
+            2) setup_service_env "$SB_ENV_FILE" "Sing-box" "global/gfwlist/rule/direct" ;;
+            3) update_config_and_start_service "singbox" ;;
+            4) manage_service_internal "singbox" "start" ;;
+            5) manage_service_internal "singbox" "stop" ;;
+            6) manage_service_internal "singbox" "restart" ;;
+            7) manage_service_internal "singbox" "status" ;;
+            8) manage_scheduled_update_menu "singbox" ;;
+            9) remove_all_files_and_service "singbox" ;;
+            e|E) manage_autostart_internal "singbox" ;;
+            c|C) validate_config_internal "singbox" ;;
+            v|V) view_log_internal "singbox" ;;
+            q|Q) return 0 ;;
+            *) red "无效选项" ;;
         esac
         read -r -p "按 [Enter] 键继续..."
     done
 }
 
-
-# Mihomo 管理菜单
+# Mihomo 管理菜单（增强 UI/UX，显示状态）
 mihomo_management_menu() {
     while true; do
         clear
@@ -1581,51 +1681,61 @@ mihomo_management_menu() {
         printf "状态: %s | 配置: %s\n" "$service_status" "$config_status"
         printf "API URL: %s\n" "${api_url:-未设置}"
         printf "%b=========================%b\n" "$GREEN" "$NC"
-        printf "  1) 安装/更新 Mihomo 稳定版\n"
-        printf "  2) 安装/更新 Mihomo Alpha Smart\n"
-        printf "  3) 设置/修改配置和更新链接\n"
-        printf "  4) 启动/重启服务\n"
-        printf "  5) 停止服务\n"
-        printf "  6) 从 API 更新配置并重启\n"
-        printf "  7) 卸载 Mihomo\n"
-        printf "  q) 返回主菜单\n"
-        printf "%b=========================%b\n" "$GREEN" "$NC"
-        read -r -p "请选择操作: " choice
+        printf " 1) 安装/更新 Mihomo (稳定版)\n"
+        printf " 2) 安装/更新 Mihomo Alpha (Smart Group)\n"
+        printf " 3) 设置环境变量 (订阅等)\n"
+        printf " 4) 更新配置并重启\n"
+        printf " 5) 启动服务\n"
+        printf " 6) 停止服务\n"
+        printf " 7) 重启服务\n"
+        printf " 8) 查看服务状态\n"
+        printf " 9) %b管理自动更新%b\n" "$YELLOW" "$NC"
+        printf " a) 卸载 Mihomo\n"
+        printf " e) 管理服务自启动\n"
+        printf " c) 验证配置文件\n"
+        printf " v) 查看日志\n"
+        printf " q) 返回主菜单\n"
+        printf "%b========================%b\n" "$GREEN" "$NC"
+        read -r -p "请输入选项: " choice
 
         case "$choice" in
-            1) install_deps; install_mihomo ;;\
-            2) install_deps; install_mihomo_alpha_smart ;;\
-            3) install_deps; setup_service_env "$MH_ENV_FILE" "Mihomo" "(rule/global/direct/gfwlist)" ;;\
-            4) manage_service_internal "mihomo" "restart" ;;\
-            5) manage_service_internal "mihomo" "stop" ;;\
-            6) install_deps; update_config_and_start_service "mihomo" ;;\
-            7) remove_all_files_and_service "mihomo" ;;\
-            q|Q) return 0 ;;\
-            *) red "无效选项" ;;\
+            1) install_mihomo ;;
+            2) install_mihomo_alpha_smart ;;
+            3) setup_service_env "$MH_ENV_FILE" "Mihomo" "global/gfwlist/rule/direct" ;;
+            4) update_config_and_start_service "mihomo" ;;
+            5) manage_service_internal "mihomo" "start" ;;
+            6) manage_service_internal "mihomo" "stop" ;;
+            7) manage_service_internal "mihomo" "restart" ;;
+            8) manage_service_internal "mihomo" "status" ;;
+            9) manage_scheduled_update_menu "mihomo" ;;
+            a|A) remove_all_files_and_service "mihomo" ;;
+            e|E) manage_autostart_internal "mihomo" ;;
+            c|C) validate_config_internal "mihomo" ;;
+            v|V) view_log_internal "mihomo" ;;
+            q|Q) return 0 ;;
+            *) red "无效选项" ;;
         esac
         read -r -p "按 [Enter] 键继续..."
     done
 }
 
-
-# 通用系统设置菜单
+# 通用设置菜单（新增清理选项）
 common_settings_menu() {
     while true; do
         clear
         printf "\n%b=== 通用系统设置 ===%b\n" "$GREEN" "$NC"
-        printf "  1) 检查网络连通性\n"
-        printf "  2) 检查并配置网络转发/NAT\n"
-        printf "  3) 清理系统转发/NAT配置\n"
-        printf "  q) 返回主菜单\n"
-        printf "%b====================%b\n" "$GREEN" "$NC"
-        read -r -p "请选择操作: " choice
-
+        printf " 1) 检查网络连通性\n"
+        printf " 2) 配置网络转发与 NAT\n"
+        printf " 3) 清理系统转发与 NAT 配置\n"
+        printf " q) 返回主菜单\n"
+        printf "%b======================%b\n" "$GREEN" "$NC"
+        read -r -p "请输入选项: " choice
         case "$choice" in
-            1) check_network ;;\
-            2) configure_network_forwarding_nat ;;\
-            3) clean_up_system_configs ;;\
-            q|Q) return 0 ;;\
-            *) red "无效选项" ;;\
+            1) check_network ;;
+            2) configure_network_forwarding_nat ;;
+            3) clean_up_system_configs ;;
+            q|Q) return 0 ;;
+            *) red "无效选项" ;;
         esac
         read -r -p "按 [Enter] 键继续..."
     done
@@ -1638,18 +1748,18 @@ initial_selection_menu() {
         printf "\n%b=== 代理管理器 (v1.0 - UI/UX Refined) ===%b\n" "$GREEN" "$NC"
         printf "设备: %s (%s)\n" "$DEVICE_NAME" "$SYSTEM_TYPE"
         printf "%b==========================================%b\n" "$GREEN" "$NC"
-        printf "  1) 管理 Sing-box\n"
-        printf "  2) 管理 Mihomo\n"
-        printf "  3) 通用系统设置\n"
-        printf "  q) 退出脚本\n"
+        printf " 1) 管理 Sing-box\n"
+        printf " 2) 管理 Mihomo\n"
+        printf " 3) 通用系统设置\n"
+        printf " q) 退出脚本\n"
         printf "%b==========================================%b\n" "$GREEN" "$NC"
         read -r -p "请选择您要管理的服务或操作: " choice
         case "$choice" in
-            1) singbox_management_menu ;;\
-            2) mihomo_management_menu ;;\
-            3) common_settings_menu ;;\
-            q|Q) green "正在退出脚本..."; exit 0 ;;\
-            *) red "无效选项" ;;\
+            1) singbox_management_menu ;;
+            2) mihomo_management_menu ;;
+            3) common_settings_menu ;;
+            q|Q) green "正在退出脚本..."; exit 0 ;;
+            *) red "无效选项" ;;
         esac
     done
 }
@@ -1663,21 +1773,25 @@ non_interactive_mode() {
             update_config_and_start_service "$2"
             ;;
         *)
-            red "无效的非交互式模式参数: $1"
+            red "不支持的非交互式命令。"
+            exit 1
             ;;
     esac
+    exit 0
 }
 
-# 脚本启动主逻辑
+# 脚本主程序
 main() {
-    if [ "$#" -gt 0 ]; then
+    # 如果有命令行参数，则进入非交互式模式
+    if [ $# -gt 0 ]; then
         non_interactive_mode "$@"
-    else
-        check_root
-        install_deps
-        initial_selection_menu
+        return
     fi
+
+    check_root
+    install_deps
+    initial_selection_menu
 }
 
-# 执行主函数
+# 执行主程序
 main "$@"
