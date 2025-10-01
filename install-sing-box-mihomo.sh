@@ -1187,12 +1187,6 @@ STOP=01
 # 默认配置路径
 CONFIG_FILE="$config_file"
 
-# 检查 PROXY_MODE 并设置启动参数
-TUN_ARGS=""
-if [ "\$PROXY_MODE" = "global" ]; then
-    TUN_ARGS="-g" # 假设 -g 代表全局模式，具体需根据脚本作者约定
-fi
-
 start_service() {
     procd_open_instance
     procd_set_param command $exec_start
@@ -1620,7 +1614,44 @@ EOF
     esac
     return 0
 }
-# Sing-box 管理菜单（增强 UI/UX，显示状态）
+
+# 新增：查看版本函数
+view_version_internal() {
+    local service_type="$1"
+    local bin_path version_cmd version_output
+    
+    case "$service_type" in
+        singbox)
+            bin_path="$SB_BIN_PATH"
+            version_cmd="$bin_path version"
+            service_name_display="Sing-box"
+            ;;
+        mihomo)
+            bin_path="$MH_BIN_PATH"
+            version_cmd="$bin_path -v"
+            service_name_display="Mihomo"
+            ;;
+        *)
+            red "无效的服务类型: $service_type"
+            return 1
+            ;;
+    esac
+    
+    if [ ! -x "$bin_path" ]; then
+        red "$service_name_display 未安装，无法查看版本。"
+        return 1
+    fi
+    
+    log "正在查看 $service_name_display 版本..."
+    version_output=$($version_cmd 2>&1)
+    if [ $? -eq 0 ]; then
+        green "$service_name_display 版本信息：\n$version_output"
+    else
+        red "查看版本失败：\n$version_output"
+    fi
+    return 0
+}
+# Sing-box 管理菜单（增强 UI/UX，显示状态，添加查看版本）
 singbox_management_menu() {
     while true; do
         clear
@@ -1643,6 +1674,7 @@ singbox_management_menu() {
         printf " 7) 查看服务状态\n"
         printf " 8) %b管理自动更新%b\n" "$YELLOW" "$NC"
         printf " 9) 卸载 Sing-box\n"
+        printf " 10) 查看 Sing-box 版本\n"
         printf " e) 管理服务自启动\n"
         printf " c) 验证配置文件\n"
         printf " v) 查看日志\n"
@@ -1660,6 +1692,7 @@ singbox_management_menu() {
             7) manage_service_internal "singbox" "status" ;;
             8) manage_scheduled_update_menu "singbox" ;;
             9) remove_all_files_and_service "singbox" ;;
+            10) view_version_internal "singbox" ;;
             e|E) manage_autostart_internal "singbox" ;;
             c|C) validate_config_internal "singbox" ;;
             v|V) view_log_internal "singbox" ;;
@@ -1670,7 +1703,7 @@ singbox_management_menu() {
     done
 }
 
-# Mihomo 管理菜单（增强 UI/UX，显示状态）
+# Mihomo 管理菜单（增强 UI/UX，显示状态，添加查看版本）
 mihomo_management_menu() {
     while true; do
         clear
@@ -1693,6 +1726,7 @@ mihomo_management_menu() {
         printf " 7) 重启服务\n"
         printf " 8) 查看服务状态\n"
         printf " 9) %b管理自动更新%b\n" "$YELLOW" "$NC"
+        printf " 10) 查看 Mihomo 版本\n"
         printf " a) 卸载 Mihomo\n"
         printf " e) 管理服务自启动\n"
         printf " c) 验证配置文件\n"
@@ -1711,6 +1745,7 @@ mihomo_management_menu() {
             7) manage_service_internal "mihomo" "restart" ;;
             8) manage_service_internal "mihomo" "status" ;;
             9) manage_scheduled_update_menu "mihomo" ;;
+            10) view_version_internal "mihomo" ;;
             a|A) remove_all_files_and_service "mihomo" ;;
             e|E) manage_autostart_internal "mihomo" ;;
             c|C) validate_config_internal "mihomo" ;;
