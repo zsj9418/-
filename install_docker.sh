@@ -1,338 +1,425 @@
 #!/bin/bash
+# Docker/Compose 一键安装脚本（修复版）
+# - 自动补齐 iptables/nftables/iproute2 等必需组件
+# - 自动加载内核模块、配置 sysctl
+# - 必要时切换 iptables 后端以兼容厂商内核
+# - 支持 apt/yum/dnf
+# - 支持静态二进制安装 Docker 与 Compose
+# - 同时支持 `docker compose` 与 `docker-compose`
 
-# 依赖列表 (gnupg 和 lsb-release 根据常见系统情况添加)
-DEPS=("curl" "wget" "jq" "fzf")
+set -o pipefail
+
+#====================== 基本配置 ======================#
+
+# 必需依赖与可选依赖（fzf 可选，用于更友好的交互选择）
+REQ_DEPS=("curl" "wget" "jq")
+OPT_DEPS=("fzf")
+
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
-# 新增代理前缀列表
-PROXY_PREFIXES=("https://un.ax18.ggff.net/" "https://cdn.yyds9527.nyc.mn/")
+# 代理前缀（按顺序尝试）
+PROXY_PREFIXES=(
+  "https://un.ax18.ggff.net/"
+  "https://cdn.yyds9527.nyc.mn/"
+)
 
-# 全局变量
-INSTALL_STATUS=$(mktemp)  # 记录依赖安装状态
+# 默认镜像加速源（daemon.json 用）
+REGISTRY_MIRRORS_DEFAULT=(
+  "https://docker.m.daocloud.io"
+  "https://hub.rat.dev"
+  "https://dockerpull.com"
+)
+
+# 颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+INSTALL_STATUS=$(mktemp)
 DOCKER_URL=""
 DOCKER_INSTALL_DIR=""
 ARCH=""
 OS=""
 PKG_MANAGER=""
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+#====================== 通用工具函数 ======================#
 
-# 函数: 检查是否具有 sudo 权限
 check_sudo() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}此脚本需要 root 权限运行，请以 root 用户运行或使用 'sudo' 执行。${NC}"
-        exit 1
-    fi
+  if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}此脚本需要 root 权限运行。请使用 sudo 或切换到 root。${NC}"
+    exit 1
+  fi
 }
 
-# 函数: 检测系统包管理工具
 detect_package_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
-        PKG_MANAGER="apt-get"
-    elif command -v yum >/dev/null 2>&1; then
-        PKG_MANAGER="yum"
-    elif command -v dnf >/dev/null 2>&1; then
-        PKG_MANAGER="dnf"
-    else
-        echo -e "${RED}无法检测到支持的包管理工具 (apt-get/yum/dnf)，请手动安装必要的依赖后重试。${NC}"
-        exit 1
-    fi
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt-get"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+  else
+    echo -e "${RED}未检测到受支持的包管理器（apt-get/dnf/yum）。${NC}"
+    exit 1
+  fi
 }
 
-# 函数: 安装依赖
+# 按不同包管理器安装依赖（必需 + 可选）
 install_dependencies() {
-    echo "正在检测并安装缺失的依赖..."
-    local installed_deps=($(dpkg-query -f '${binary:Package}\n' -W | grep -Fxf <(printf "%s\n" "${DEPS[@]}") 2>/dev/null || true))
-    local needs_install=()
-
-    for DEP in "${DEPS[@]}"; do
-        if [[ ! " ${installed_deps[@]} " =~ " ${DEP} " ]]; then
-            needs_install+=("$DEP")
-        fi
-    done
-
-    if [[ ${#needs_install[@]} -gt 0 ]]; then
-        echo "需要安装以下依赖: ${needs_install[*]}"
-        for DEP in "${needs_install[@]}"; do
-            echo "安装依赖：$DEP"
-            case "$PKG_MANAGER" in
-                apt-get) sudo apt-get install -y --no-install-recommends "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
-                yum) sudo yum install -y "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
-                dnf) sudo dnf install -y "$DEP" || { echo -e "${RED}安装 $DEP 失败${NC}"; exit 1; } ;;
-            esac
-            echo "$DEP" >> "$INSTALL_STATUS"
-        done
-    else
-        echo "所有依赖已安装，跳过..."
-    fi
+  echo "正在检测并安装缺失的依赖..."
+  case "$PKG_MANAGER" in
+    apt-get)
+      apt-get update || true
+      # 安装必需依赖
+      apt-get install -y --no-install-recommends "${REQ_DEPS[@]}" || {
+        echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
+      # 安装可选依赖（失败不退出）
+      apt-get install -y --no-install-recommends "${OPT_DEPS[@]}" 2>/dev/null || true
+      ;;
+    dnf|yum)
+      # 必需依赖
+      "${PKG_MANAGER}" install -y "${REQ_DEPS[@]}" || {
+        echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
+      # 可选依赖（失败不退出）
+      "${PKG_MANAGER}" install -y "${OPT_DEPS[@]}" 2>/dev/null || true
+      ;;
+  esac
 }
 
-# 函数: 获取系统架构
 get_architecture() {
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) ARCH="x86_64" ;;
-        aarch64) ARCH="aarch64" ;;
-        armv7l) ARCH="armv7l" ;;
-        armv6l) ARCH="armv6l" ;;
-        *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exit 1 ;;
-    esac
-    echo "$ARCH"
+  local m=$(uname -m)
+  case "$m" in
+    x86_64) ARCH="x86_64" ;;
+    aarch64) ARCH="aarch64" ;;
+    armv7l) ARCH="armv7l" ;;
+    armv6l) ARCH="armv6l" ;;
+    *) echo -e "${RED}不支持的架构: $m${NC}"; exit 1 ;;
+  esac
+  echo "$ARCH"
 }
 
-# 函数: 获取系统版本
 get_os_version() {
-    if [ -f /etc/os-release ]; then
-        OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
-        OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
-    else
-        echo -e "${RED}无法检测系统版本。请确保 /etc/os-release 文件存在并且格式正确。${NC}"
-        exit 1
-    fi
+  if [ -f /etc/os-release ]; then
+    OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
+    OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     echo "$OS_NAME $OS_VERSION"
+  else
+    echo -e "${RED}无法检测系统版本（缺少 /etc/os-release）。${NC}"
+    exit 1
+  fi
 }
 
-# 函数: 检查磁盘空间并选择安装目录
+# 选择安装目录并做空间检查
 check_and_set_install_dir() {
-    local REQUIRED_SPACE=500  # 需要至少 500MB 空间
+  local REQUIRED_SPACE=500  # MB
+  local realpath_cmd
+  if command -v realpath >/dev/null 2>&1; then
+    realpath_cmd="realpath"
+  else
+    realpath_cmd="readlink -f"
+  fi
+  local DIR
+  DIR=$(dirname "$($realpath_cmd "$0")")
+  local DEFAULT_DIR="${DIR}/docker_install"
 
-    # 获取脚本的存放目录
-    local DIR=$(dirname "$(realpath "$0")")
-    local DEFAULT_DIR="${DIR}/docker_install"
+  mkdir -p "$DEFAULT_DIR" 2>/dev/null || {
+    echo -e "${RED}无法创建默认目录 $DEFAULT_DIR${NC}"; exit 1; }
 
-    # 确保默认目录存在
-    mkdir -p "$DEFAULT_DIR" 2>/dev/null || {
-        echo -e "${RED}无法创建默认目录 $DEFAULT_DIR，请检查权限。${NC}"
-        exit 1
-    }
+  local AVAILABLE_SPACE
+  AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+  if [[ -z "$AVAILABLE_SPACE" ]]; then
+    echo -e "${RED}无法检测目录 $DEFAULT_DIR 的可用空间。${NC}"
+    exit 1
+  fi
 
-    # 检查默认目录的可用空间
-    local AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-    if [[ -z "$AVAILABLE_SPACE" ]]; then
-        echo -e "${RED}无法检测目录 $DEFAULT_DIR 的磁盘空间，请检查系统状态。${NC}"
-        exit 1
+  echo -e "${YELLOW}默认目录: $DEFAULT_DIR (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
+  read -r -p "是否指定自定义安装目录？(回车使用默认): " CUSTOM_DIR
+
+  if [[ -n "$CUSTOM_DIR" ]]; then
+    mkdir -p "$CUSTOM_DIR" 2>/dev/null || { echo -e "${RED}无法创建 $CUSTOM_DIR${NC}"; exit 1; }
+    AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+    [[ -z "$AVAILABLE_SPACE" ]] && { echo -e "${RED}无法检测 $CUSTOM_DIR 可用空间${NC}"; exit 1; }
+    if (( AVAILABLE_SPACE < REQUIRED_SPACE )); then
+      echo -e "${RED}$CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
+      exit 1
     fi
-
-    echo -e "${YELLOW}默认目录: $DEFAULT_DIR (可用空间: ${AVAILABLE_SPACE}MB, 需要空间: ${REQUIRED_SPACE}MB)${NC}"
-    read -r -p "是否需要指定自定义安装目录？(直接回车使用默认目录): " CUSTOM_DIR
-
-    if [[ -n "$CUSTOM_DIR" ]]; then
-        # 确保自定义目录存在
-        mkdir -p "$CUSTOM_DIR" 2>/dev/null || {
-            echo -e "${RED}无法创建自定义目录 $CUSTOM_DIR，请检查权限。${NC}"
-            exit 1
-        }
-        AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-        if [[ -z "$AVAILABLE_SPACE" ]]; then
-            echo -e "${RED}无法检测目录 $CUSTOM_DIR 的磁盘空间，请检查系统状态。${NC}"
-            exit 1
-        fi
-        if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
-            echo -e "${RED}自定义目录 $CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)，退出脚本。${NC}"
-            exit 1
-        fi
-        DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
-        echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
-    else
-        if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]]; then
-            echo -e "${RED}默认目录 $DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需要: ${REQUIRED_SPACE}MB)，退出脚本。${NC}"
-            exit 1
-        fi
-        DOCKER_INSTALL_DIR="$DEFAULT_DIR"
-        echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR (可用空间: ${AVAILABLE_SPACE}MB)${NC}"
+    DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
+    echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR${NC}"
+  else
+    if (( AVAILABLE_SPACE < REQUIRED_SPACE )); then
+      echo -e "${RED}$DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
+      exit 1
     fi
+    DOCKER_INSTALL_DIR="$DEFAULT_DIR"
+    echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR${NC}"
+  fi
 
-    mkdir -p "$DOCKER_INSTALL_DIR" || {
-        echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败，请检查权限或磁盘空间。${NC}"
-        exit 1
-    }
+  mkdir -p "$DOCKER_INSTALL_DIR" || {
+    echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败${NC}"; exit 1; }
 }
 
-# 函数: 检测是否安装 Docker
 check_docker_installed() {
-    if command -v docker >/dev/null 2>&1; then
-        echo -e "${GREEN}Docker 已安装，版本信息如下：${NC}"
-        docker --version
-        return 0
-    else
-        echo -e "${YELLOW}Docker 未安装。${NC}"
-        return 1
-    fi
+  if command -v docker >/dev/null 2>&1; then
+    echo -e "${GREEN}Docker 已安装：$(docker --version)${NC}"
+    return 0
+  fi
+  echo -e "${YELLOW}Docker 未安装。${NC}"
+  return 1
 }
 
-# 函数: 检测是否安装 Docker Compose
 check_docker_compose_installed() {
-    if command -v docker-compose >/dev/null 2>&1; then
-        echo -e "${GREEN}Docker Compose 已安装，版本信息如下：${NC}"
-        docker-compose --version
-        return 0
-    else
-        echo -e "${YELLOW}Docker Compose 未安装。${NC}"
-        return 1
-    fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    echo -e "${GREEN}docker-compose 已安装：$(docker-compose --version)${NC}"
+    return 0
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    echo -e "${GREEN}Docker Compose 插件已安装：$(docker compose version | head -n1)${NC}"
+    return 0
+  fi
+  echo -e "${YELLOW}Docker Compose 未安装。${NC}"
+  return 1
 }
 
-# 函数: 获取 Docker 版本列表并进行过滤
+#====================== Docker 前置准备 ======================#
+
+ensure_docker_prereqs() {
+  echo "检查并准备 Docker 运行所需组件..."
+
+  # 1) 安装用户态工具（iptables/nftables/iproute2/CA）
+  case "$PKG_MANAGER" in
+    apt-get)
+      apt-get update || true
+      apt-get install -y --no-install-recommends iptables nftables iproute2 ca-certificates || {
+        echo -e "${RED}安装 iptables/nftables/iproute2 失败${NC}"; exit 1; }
+      ;;
+    dnf|yum)
+      "${PKG_MANAGER}" install -y iptables nftables iproute ca-certificates || true
+      ;;
+  esac
+
+  # 2) 加载内核模块（失败不致命）
+  modprobe overlay 2>/dev/null || true
+  modprobe br_netfilter 2>/dev/null || true
+  printf "overlay\nbr_netfilter\n" >/etc/modules-load.d/docker.conf
+
+  # 3) sysctl 开启转发与桥接
+  cat >/etc/sysctl.d/99-docker.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+
+  # 4) 校验 iptables 和 NAT 表
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo -e "${RED}iptables 未安装成功，退出。${NC}"
+    exit 1
+  fi
+
+  # 确保 NAT 表可用；不通则尝试加载 legacy 模块
+  if ! iptables -t nat -L >/dev/null 2>&1; then
+    modprobe iptable_nat nf_nat 2>/dev/null || true
+  fi
+
+  # 后备：仍失败则尝试切换为 legacy 后端（Debian/Ubuntu 常见）
+  if ! iptables -t nat -L >/dev/null 2>&1; then
+    if command -v update-alternatives >/dev/null 2>&1 && [ -e /usr/sbin/iptables-legacy ]; then
+      echo "切换 iptables 到 legacy 后端以提高兼容性..."
+      update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+      update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+    fi
+  fi
+
+  # 再测一次
+  if ! iptables -t nat -L >/dev/null 2>&1; then
+    echo -e "${YELLOW}警告：仍无法访问 iptables NAT 表。Docker 可能无法创建 DOCKER NAT 链。${NC}"
+  fi
+
+  # 5) 提示 cgroup（仅提示）
+  local cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
+  if [[ "$cg" != "cgroup2fs" && -n "$cg" ]]; then
+    echo -e "${YELLOW}注意：当前未使用 cgroup v2 统一层级，建议在内核参数启用（可选）。${NC}"
+  fi
+
+  echo -e "${GREEN}Docker 前置检查/准备完成。${NC}"
+}
+
+# 生成/补全 daemon.json（若不存在则创建）
+ensure_daemon_json() {
+  mkdir -p /etc/docker
+  if [ ! -s /etc/docker/daemon.json ]; then
+cat >/etc/docker/daemon.json <<EOF
+{
+  "iptables": true,
+  "ip6tables": true,
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "registry-mirrors": [
+    "${REGISTRY_MIRRORS_DEFAULT[0]}",
+    "${REGISTRY_MIRRORS_DEFAULT[1]}",
+    "${REGISTRY_MIRRORS_DEFAULT[2]}"
+  ]
+}
+EOF
+  fi
+
+  # 如内核无 overlay，尝试 fuse-overlayfs
+  if ! grep -qw overlay /proc/filesystems; then
+    case "$PKG_MANAGER" in
+      apt-get) apt-get install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
+      dnf|yum) "${PKG_MANAGER}" install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
+    esac
+    if command -v jq >/dev/null 2>&1; then
+      tmp=$(mktemp)
+      jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+    else
+      # 简化追加
+cat >/etc/docker/daemon.json <<'EOF'
+{
+  "iptables": true,
+  "ip6tables": true,
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "fuse-overlayfs"
+}
+EOF
+    fi
+  fi
+}
+
+#====================== 版本获取/选择 ======================#
+
 fetch_docker_versions() {
-    local CACHE_FILE="$DOCKER_INSTALL_DIR/docker_versions_cache"
-    if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE") -gt $(($(date +%s) - 3600)) ]]; then
-        cat "$CACHE_FILE"
-        return
-    fi
-
-    ARCH=$(get_architecture)
-    local URL="$DOCKER_VERSIONS_URL$ARCH/"
-    local VERSIONS
-    VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
-    if [ -z "$VERSIONS" ]; then
-        echo -e "${RED}无法获取版本列表，请检查网络连接或该架构是否支持。${NC}"
-        exit 1
-    fi
-    echo "$VERSIONS" > "$CACHE_FILE"
-    echo "$VERSIONS"
+  local CACHE_FILE="$DOCKER_INSTALL_DIR/docker_versions_cache"
+  if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE") -gt $(($(date +%s) - 3600)) ]]; then
+    cat "$CACHE_FILE"
+    return
+  fi
+  ARCH=$(get_architecture)
+  local URL="$DOCKER_VERSIONS_URL$ARCH/"
+  local VERSIONS
+  VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
+  if [ -z "$VERSIONS" ]; then
+    echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}"
+    exit 1
+  fi
+  echo "$VERSIONS" > "$CACHE_FILE"
+  echo "$VERSIONS"
 }
 
-# 函数: 选择版本（通用函数）
 select_version() {
-    local VERSIONS=("$@")
-    
-    if command -v fzf >/dev/null 2>&1; then
-        local HEADER="选择版本"
-        local SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
-            --prompt="请选择版本 > " \
-            --header="$HEADER" \
-            --height=20 \
-            --reverse \
-            --border)
-        
-        if [ -n "$SELECTED_VERSION" ]; then
-            echo "$SELECTED_VERSION"
-            return
-        else
-            echo -e "${YELLOW}未选择版本，将安装最新版本...${NC}"
-            echo "${VERSIONS[0]}"  # 返回第一个(最新)版本
-            return
-        fi
-    fi
-
-    # 如果没有fzf，则使用简单的选择菜单
-    echo "可用版本列表:"
-    PS3="请选择版本 (默认1将安装最新版本): "
-    select VERSION in "${VERSIONS[@]}" "取消"; do
-        case $REPLY in
-            [1-9]|[1-9][0-9])
-                if [ $REPLY -le ${#VERSIONS[@]} ]; then
-                    echo "${VERSIONS[$((REPLY-1))]}"
-                    return
-                fi
-                ;;
-            *)
-                echo -e "${YELLOW}未选择版本，将安装最新版本...${NC}"
-                echo "${VERSIONS[0]}"
-                return
-                ;;
-        esac
-    done
-}
-
-# 函数: 获取 Docker Compose 版本列表
-fetch_docker_compose_versions() {
-    local VERSIONS
-    VERSIONS=$(curl -s "$COMPOSE_RELEASES_URL" | jq -r '.[].tag_name' | sort -Vr | uniq)
-    if [ -z "$VERSIONS" ]; then
-        echo -e "${RED}无法获取 Docker Compose 版本列表，请检查网络连接。${NC}"
-        exit 1
-    fi
-    echo "$VERSIONS"
-}
-
-# 函数: 安装 Docker
-install_docker() {
-    if check_docker_installed; then
-        read -r -p "Docker 已安装，版本信息如下：$(docker --version) 是否重新安装？(y/n): " REINSTALL
-        if [[ "$REINSTALL" != "y" ]]; then
-            echo -e "${YELLOW}跳过 Docker 安装。${NC}"
-            return
-        fi
-    fi
-
-    ARCH=$(get_architecture)
-    echo "正在获取可用的 Docker 版本列表..."
-    local VERSION=$(fetch_docker_versions)
-    VERSION=$(select_version $VERSION)
-    check_and_set_install_dir
-
-    if [ -z "$VERSION" ]; then
-        echo -e "${RED}无法获取Docker版本号${NC}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}您选择安装的 Docker 版本为：$VERSION${NC}"
-    DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
-
-    echo "正在下载 Docker 二进制包：$DOCKER_URL"
-    if ! curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
-        echo -e "${RED}直连下载失败，尝试使用代理下载...${NC}"
-        local DOWNLOAD_SUCCESS=false
-        for PROXY_PREFIX in "${PROXY_PREFIXES[@]}"; do
-            local PROXY_DOCKER_URL="${PROXY_PREFIXES}${DOCKER_URL}"
-            echo "尝试通过代理下载：$PROXY_DOCKER_URL"
-            if curl -fSL --retry 3 "$PROXY_DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
-                echo -e "${GREEN}通过代理下载成功！${NC}"
-                DOWNLOAD_SUCCESS=true
-                break
-            else
-                echo -e "${YELLOW}代理下载失败：${PROXY_DOCKER_URL}${NC}"
-            fi
-        done
-
-        if ! $DOWNLOAD_SUCCESS; then
-            echo -e "${RED}所有下载尝试均失败，请检查网络连接、代理设置或版本号。${NC}"
-            echo -e "${YELLOW}尝试的原始URL: $DOCKER_URL${NC}"
-            rm -rf "$DOCKER_INSTALL_DIR"
-            exit 1
-        fi
-    fi
-
-    echo "正在解压 Docker 包到临时文件夹..."
-    if ! tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR"; then
-        echo -e "${RED}解压失败，可能是空间不足或权限问题。${NC}"
-        rm -rf "$DOCKER_INSTALL_DIR"
-        exit 1
-    fi
-
-    echo "正在安装 Docker 二进制文件..."
-    sudo chown root:root "$DOCKER_INSTALL_DIR/docker/"*
-    if ! sudo mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/; then
-        echo -e "${RED}移动 Docker 文件失败，请检查权限或磁盘空间。${NC}"
-        exit 1
-    fi
-
-    echo "创建 Docker 用户组..."
-    sudo groupadd -f docker
-
-    echo "将当前用户添加到 Docker 用户组..."
-    if ! sudo gpasswd -a "$USER" docker >/dev/null 2>&1; then
-        echo -e "${YELLOW}警告：无法将用户 '$USER' 添加到 'docker' 组，请手动执行 'sudo gpasswd -a $USER docker'。${NC}"
+  local VERSIONS=("$@")
+  if command -v fzf >/dev/null 2>&1; then
+    local SELECTED_VERSION
+    SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
+      --prompt="请选择版本 > " \
+      --header="选择版本（回车确认）" \
+      --height=20 --reverse --border)
+    if [ -n "$SELECTED_VERSION" ]; then
+      echo "$SELECTED_VERSION"; return
     else
-        echo -e "${GREEN}用户 '$USER' 已成功添加到 'docker' 组。${NC}"
+      echo -e "${YELLOW}未选择，使用最新版本...${NC}"
+      echo "${VERSIONS[0]}"; return
     fi
+  fi
 
-    echo "配置 Docker 服务..."
-    cat <<EOF | sudo tee /etc/systemd/system/docker.service
+  echo "可用版本列表:"
+  PS3="请选择版本 (默认1为最新): "
+  select VERSION in "${VERSIONS[@]}" "取消"; do
+    case $REPLY in
+      ''|1) echo "${VERSIONS[0]}"; return ;;
+      [2-9]|[1-9][0-9]) 
+        if [ "$REPLY" -le "${#VERSIONS[@]}" ]; then
+          echo "${VERSIONS[$((REPLY-1))]}"; return
+        fi ;;
+      *) echo -e "${YELLOW}未选择，使用最新版本...${NC}"; echo "${VERSIONS[0]}"; return ;;
+    esac
+  done
+}
+
+fetch_docker_compose_versions() {
+  local VERSIONS
+  VERSIONS=$(curl -s "$COMPOSE_RELEASES_URL" | jq -r '.[].tag_name' | sort -Vr | uniq)
+  if [ -z "$VERSIONS" ]; then
+    echo -e "${RED}无法获取 Docker Compose 版本列表。${NC}"
+    exit 1
+  fi
+  echo "$VERSIONS"
+}
+
+#====================== 核心：安装/卸载 ======================#
+
+install_docker() {
+  if check_docker_installed; then
+    read -r -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
+    [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker 安装。${NC}"; return; }
+  fi
+
+  # 前置准备：iptables、内核模块、sysctl 等
+  ensure_docker_prereqs
+
+  ARCH=$(get_architecture)
+  echo "获取可用 Docker 版本..."
+  check_and_set_install_dir
+  local VERSION
+  VERSION=$(fetch_docker_versions)
+  VERSION=$(select_version $VERSION)
+  [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
+
+  echo -e "${GREEN}选择的 Docker 版本：$VERSION${NC}"
+  DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
+
+  echo "下载 Docker 二进制包：$DOCKER_URL"
+  if ! curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
+    echo -e "${YELLOW}直连失败，尝试代理...${NC}"
+    local DOWNLOAD_SUCCESS=false
+    for PROXY_PREFIX in "${PROXY_PREFIXES[@]}"; do
+      local PROXY_DOCKER_URL="${PROXY_PREFIX}${DOCKER_URL}"
+      echo "代理下载：$PROXY_DOCKER_URL"
+      if curl -fSL --retry 3 "$PROXY_DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
+        echo -e "${GREEN}代理下载成功${NC}"
+        DOWNLOAD_SUCCESS=true
+        break
+      else
+        echo -e "${YELLOW}代理下载失败：${PROXY_DOCKER_URL}${NC}"
+      fi
+    done
+    $DOWNLOAD_SUCCESS || { echo -e "${RED}所有下载方式均失败${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+  fi
+
+  echo "解压 Docker 包..."
+  tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || {
+    echo -e "${RED}解压失败${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+
+  echo "安装 Docker 二进制到 /usr/local/bin ..."
+  chown root:root "$DOCKER_INSTALL_DIR/docker/"*
+  mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || {
+    echo -e "${RED}移动文件失败${NC}"; exit 1; }
+
+  echo "创建 docker 用户组并加入当前用户（可选）..."
+  groupadd -f docker
+  CURRENT_USER="${SUDO_USER:-$USER}"
+  if [[ -n "$CURRENT_USER" && "$CURRENT_USER" != "root" ]]; then
+    gpasswd -a "$CURRENT_USER" docker >/dev/null 2>&1 || true
+  fi
+
+  # 生成/补全 daemon.json
+  ensure_daemon_json
+
+  echo "写入 systemd Unit ..."
+cat >/etc/systemd/system/docker.service <<'EOF'
 [Unit]
 Description=Docker Application Container Engine
 Documentation=https://docs.docker.com
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/dockerd
-ExecReload=/bin/kill -s HUP \$MAINPID
+ExecReload=/bin/kill -s HUP $MAINPID
 LimitNOFILE=infinity
 LimitNPROC=infinity
 LimitCORE=infinity
@@ -344,172 +431,139 @@ OOMScoreAdjust=-500
 WantedBy=multi-user.target
 EOF
 
-    echo "启动 Docker 服务..."
-    sudo systemctl daemon-reload
-    sudo systemctl enable docker >/dev/null 2>&1
-    sudo systemctl start docker >/dev/null 2>&1
+  systemctl daemon-reload
+  systemctl enable docker >/dev/null 2>&1 || true
+  echo "启动 Docker ..."
+  if ! systemctl start docker; then
+    echo -e "${YELLOW}启动失败，查看日志：journalctl -u docker -n 200 --no-pager${NC}"
+    exit 1
+  fi
 
-    if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
-        echo -e "${GREEN}Docker 安装成功！版本信息：${NC}"
-        docker --version
-        echo -e "${YELLOW}请重新登录或重启 shell 以应用 'docker' 组更改。${NC}"
-    else
-        echo -e "${RED}Docker 安装失败或服务启动失败，请检查日志：sudo journalctl -u docker${NC}"
-        exit 1
-    fi
+  if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
+    echo -e "${GREEN}Docker 安装并启动成功！${NC}"
+    echo -e "${YELLOW}若需要无 sudo 运行，请重新登录以应用用户组变更。${NC}"
+  else
+    echo -e "${RED}Docker 安装或启动失败，请查看日志。${NC}"
+    exit 1
+  fi
 
-    echo "清理临时文件..."
-    rm -rf "$DOCKER_INSTALL_DIR"
+  echo "清理临时文件..."
+  rm -rf "$DOCKER_INSTALL_DIR"
 }
 
-# 函数: 安装 Docker Compose
 install_docker_compose() {
-    if check_docker_compose_installed; then
-        read -r -p "Docker Compose 已安装，版本信息如下：$(docker-compose --version) 是否重新安装？(y/n): " REINSTALL
-        if [[ "$REINSTALL" != "y" ]]; then
-            echo -e "${YELLOW}跳过 Docker Compose 安装。${NC}"
-            return
-        fi
-    fi
+  if check_docker_compose_installed; then
+    read -r -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
+    [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker Compose 安装。${NC}"; return; }
+  fi
 
-    echo "正在获取可用的 Docker Compose 版本列表..."
-    local COMPOSE_VERSIONS=$(fetch_docker_compose_versions)
-    local COMPOSE_VERSION=$(select_version $COMPOSE_VERSIONS)
+  echo "获取 Docker Compose 版本列表..."
+  local COMPOSE_VERSIONS
+  COMPOSE_VERSIONS=$(fetch_docker_compose_versions)
+  local COMPOSE_VERSION
+  COMPOSE_VERSION=$(select_version $COMPOSE_VERSIONS)
+  if [ -z "$COMPOSE_VERSION" ]; then
+    echo -e "${YELLOW}未选择，将安装最新版本...${NC}"
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+  else
+    COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
+  fi
+  echo -e "${GREEN}选择的 Docker Compose 版本：$COMPOSE_VERSION${NC}"
 
-    if [ -z "$COMPOSE_VERSION" ]; then
-        echo -e "${YELLOW}未选择版本，安装最新版本的 Docker Compose...${NC}"
-        COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-    else
-        echo -e "${GREEN}您选择安装的 Docker Compose 版本为：$COMPOSE_VERSION${NC}"
-        COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
-    fi
+  local os_name arch_name compose_file
+  os_name=$(uname -s)
+  arch_name=$(uname -m)
+  case "$os_name" in
+    Linux)
+      case "$arch_name" in
+        x86_64) compose_file="docker-compose-linux-x86_64" ;;
+        aarch64) compose_file="docker-compose-linux-aarch64" ;;
+        armv7l) compose_file="docker-compose-linux-armv7" ;;
+        armv6l) compose_file="docker-compose-linux-armv6" ;;
+        *) echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"; exit 1 ;;
+      esac ;;
+    Darwin)
+      case "$arch_name" in
+        x86_64) compose_file="docker-compose-darwin-x86_64" ;;
+        arm64)  compose_file="docker-compose-darwin-aarch64" ;;
+        *) echo -e "${RED}不支持的 macOS 架构: $arch_name${NC}"; exit 1 ;;
+      esac ;;
+    *)
+      echo -e "${RED}不支持的操作系统: $os_name${NC}"; exit 1 ;;
+  esac
 
-    ARCH=$(get_architecture)
-    os_name=$(uname -s)
-    arch_name=$(uname -m)
+  echo "下载 Docker Compose：$COMPOSE_VERSION"
+  curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" \
+      -o /usr/local/bin/docker-compose || { echo -e "${RED}下载失败${NC}"; exit 1; }
+  chmod +x /usr/local/bin/docker-compose
 
-    case "$os_name" in
-        Linux)
-            case "$arch_name" in
-                x86_64) compose_file="docker-compose-linux-x86_64" ;;
-                aarch64) compose_file="docker-compose-linux-aarch64" ;;
-                armv7l) compose_file="docker-compose-linux-armv7" ;;
-                armv6l) compose_file="docker-compose-linux-armv6" ;;
-                *)
-                    echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"
-                    exit 1
-                    ;;
-            esac
-            ;;
-        Darwin) # macOS
-            case "$arch_name" in
-                x86_64) compose_file="docker-compose-darwin-x86_64" ;;
-                arm64) compose_file="docker-compose-darwin-aarch64" ;; # Apple Silicon
-                *)
-                    echo -e "${RED}不支持的 macOS 架构: $arch_name${NC}"
-                    exit 1
-                    ;;
-            esac
-            ;;
-        *)
-            echo -e "${RED}不支持的操作系统: $os_name${NC}"
-            exit 1
-            ;;
-    esac
+  # 安装为 CLI 插件，支持 `docker compose`
+  mkdir -p /usr/local/lib/docker/cli-plugins
+  cp /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 
-    echo "正在安装 Docker Compose 版本：$COMPOSE_VERSION"
-    sudo curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" -o /usr/local/bin/docker-compose || { echo -e "${RED}下载 Docker Compose 失败${NC}"; exit 1; }
-    sudo chmod +x /usr/local/bin/docker-compose
-    
-    # 创建符号链接 docker-compose -> docker compose (v2)
-    if [[ ! -f /usr/local/bin/docker-compose ]]; then
-        sudo ln -s /usr/local/bin/docker-compose /usr/local/bin/docker-compose
-    fi
-    
-    echo -e "${GREEN}Docker Compose 安装完成。${NC}"
+  echo -e "${GREEN}Docker Compose 安装完成（支持 docker compose 与 docker-compose）。${NC}"
 }
 
-# 函数: 卸载 Docker
 uninstall_docker() {
-    echo "正在卸载 Docker..."
+  echo "正在卸载 Docker..."
 
-    # 1. 停止 Docker 服务
-    sudo systemctl stop docker.service 2>/dev/null || true # 忽略停止失败
+  # 优先清理镜像/容器（若可用）
+  docker system prune -a -f 2>/dev/null || true
 
-    # 2. 禁用 Docker 服务
-    sudo systemctl disable docker.service 2>/dev/null || true # 忽略禁用失败
+  # 停止与禁用服务
+  systemctl stop docker.service 2>/dev/null || true
+  systemctl disable docker.service 2>/dev/null || true
 
-    # 3. 移除 Docker 包 (根据包管理器)
-    case "$PKG_MANAGER" in
-        apt-get) sudo apt-get remove -y --purge docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;; # 忽略移除失败，包含 docker-ce
-        yum|dnf) sudo yum remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;; # 忽略移除失败，包含 docker-ce
-    esac
+  # 移除可能通过包管理器安装的包（忽略失败）
+  case "$PKG_MANAGER" in
+    apt-get) apt-get remove -y --purge docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
+    dnf|yum) "${PKG_MANAGER}" remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
+  esac
 
-    # 4. 移除相关文件和目录
-    sudo rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker  # 删除 /opt/docker
-    sudo rm -f /etc/systemd/system/docker.service
-    sudo rm -f /etc/systemd/system/docker.socket
-    sudo rm -rf /var/run/docker
-    sudo rm -rf /var/log/docker*
+  # 删除静态二进制与目录
+  rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker
+  rm -f /etc/systemd/system/docker.service /etc/systemd/system/docker.socket
+  rm -rf /var/run/docker /var/log/docker*
 
-    # 5. 移除 Docker 用户组
-    sudo groupdel docker 2>/dev/null || true # 忽略用户组删除失败
+  # 清理 containerd/runc 残留
+  rm -rf /var/lib/containerd /run/containerd /usr/local/bin/containerd* /usr/local/bin/runc 2>/dev/null || true
 
-    # 6. 清理镜像、容器、网络和卷
-    echo "清理 Docker 镜像，容器，网络和卷..."
-    docker system prune -a -f 2>/dev/null || true  # 忽略清理失败
+  # 删除 docker 组
+  groupdel docker 2>/dev/null || true
 
-    # 7. 尝试清理 containerd 和 runc 的残留
-    echo "尝试清理 containerd 和 runc 的残留..."
-    sudo rm -rf /var/lib/containerd 2>/dev/null || true
-    sudo rm -rf /run/containerd 2>/dev/null || true
-    sudo rm -rf /usr/local/bin/containerd 2>/dev/null || true
-    sudo rm -rf /usr/local/bin/runc 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed 2>/dev/null || true
 
-    # 8. 清理日志 (可选)
-    echo "尝试清理 Docker 日志..."
-    sudo find /var/log -name "docker*" -delete 2>/dev/null || true
-
-    # 9. 更新 systemd
-    sudo systemctl daemon-reload 2>/dev/null || true
-    sudo systemctl reset-failed 2>/dev/null || true
-
-    echo -e "${GREEN}Docker 已卸载，残留文件已清理。${NC}"
+  echo -e "${GREEN}Docker 已卸载并清理。${NC}"
 }
 
-# 函数: 卸载 Docker Compose
 uninstall_docker_compose() {
-    echo "正在卸载 Docker Compose..."
-    sudo rm -rf /usr/local/bin/docker-compose ~/.docker/compose
-    sudo rm -rf /opt/docker-compose # 删除可能的compose安装目录
-    echo -e "${GREEN}Docker Compose 残留文件已清理。${NC}"
+  echo "正在卸载 Docker Compose..."
+  rm -f /usr/local/bin/docker-compose
+  rm -f /usr/local/lib/docker/cli-plugins/docker-compose
+  rm -rf ~/.docker/compose 2>/dev/null || true
+  rm -rf /opt/docker-compose 2>/dev/null || true
+  echo -e "${GREEN}Docker Compose 已卸载。${NC}"
 }
 
-# 函数: 生成 daemon.json 配置文件
+# 交互生成 daemon.json（保留你的原功能）
 generate_daemon_config() {
-    echo "正在生成 Docker daemon.json 配置文件..."
+  echo "正在生成 Docker daemon.json 配置文件..."
+  local DEFAULT_DATA_ROOT="/opt/docker"
+  local DEFAULT_LOG_MAX_SIZE="5m"
+  local DEFAULT_LOG_MAX_FILE="3"
 
-    local DEFAULT_DATA_ROOT="/opt/docker"
-    local DEFAULT_REGISTRY_MIRRORS=(
-        "https://registry.cn-chengdu.aliyuncs.com"
-        "https://mirror.ccs.tencentyun.com"
-        "https://docker.mirrors.huaweicloud.com"
-        "https://dockerproxy.net"
-    )
-    local DEFAULT_LOG_MAX_SIZE="5m"
-    local DEFAULT_LOG_MAX_FILE="3"
+  read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
+  DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
 
-    read -r -p "请输入 Docker data-root 路径 (留空默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
-    DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
+  local REGISTRY_MIRRORS_JSON
+  REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
 
-    # 使用 jq 确保 registry-mirrors 正确生成 JSON 数组
-    local REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${DEFAULT_REGISTRY_MIRRORS[@]}" | jq -R . | jq -s .)
-
-    # 使用 heredoc 和变量替换生成完整的 JSON 配置
-    DAEMON_CONFIG=$(cat <<EOF
+  DAEMON_CONFIG=$(cat <<EOF
 {
   "iptables": true,
   "ip6tables": true,
+  "exec-opts": ["native.cgroupdriver=systemd"],
   "registry-mirrors": ${REGISTRY_MIRRORS_JSON},
   "data-root": "${DATA_ROOT}",
   "log-driver": "json-file",
@@ -520,72 +574,70 @@ generate_daemon_config() {
 }
 EOF
 )
+  echo "daemon.json 内容："
+  echo "$DAEMON_CONFIG"
 
-    echo "daemon.json 文件内容如下："
-    echo "$DAEMON_CONFIG"
+  if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
+    echo -e "${RED}生成的 JSON 格式不正确（请确认 jq 可用）。${NC}"
+    exit 1
+  fi
 
-    # 验证 JSON 格式是否正确
-    if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
-        echo -e "${RED}错误：生成的 daemon.json 格式不正确，请检查脚本依赖（如 jq）。${NC}"
-        exit 1
-    fi
+  mkdir -p /etc/docker
+  echo "$DAEMON_CONFIG" > /etc/docker/daemon.json
 
-    sudo mkdir -p /etc/docker
-    echo "$DAEMON_CONFIG" | sudo tee /etc/docker/daemon.json > /dev/null
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}/etc/docker/daemon.json 文件生成成功。${NC}"
-        echo "正在重启 Docker 服务以应用配置..."
-        sudo systemctl restart docker
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Docker 服务重启成功，新配置已加载。${NC}"
-        else
-            echo -e "${YELLOW}Docker 服务重启失败，请手动重启: sudo systemctl restart docker${NC}"
-        fi
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}/etc/docker/daemon.json 生成成功。${NC}"
+    echo "重启 Docker 以应用配置..."
+    if systemctl restart docker; then
+      echo -e "${GREEN}Docker 重启成功。${NC}"
     else
-        echo -e "${RED}/etc/docker/daemon.json 文件生成失败，请检查权限或重试。${NC}"
+      echo -e "${YELLOW}Docker 重启失败，请手动执行：systemctl restart docker${NC}"
     fi
+  else
+    echo -e "${RED}写入 /etc/docker/daemon.json 失败。${NC}"
+  fi
 }
 
-# 主函数: 脚本入口
+#====================== 主菜单 ======================#
+
 main() {
-    check_sudo
-    detect_package_manager
-    install_dependencies
+  check_sudo
+  detect_package_manager
+  install_dependencies
 
-    echo "欢迎使用 Docker 和 Docker Compose 一键安装脚本"
-    echo "检测系统信息..."
-    ARCH=$(get_architecture)
-    OS=$(get_os_version)
-    echo "系统架构: $ARCH"
-    echo "系统版本: $OS"
+  echo "欢迎使用 Docker/Compose 一键安装脚本"
+  echo "检测系统信息..."
+  ARCH=$(get_architecture)
+  OS=$(get_os_version)
+  echo "系统架构: $ARCH"
+  echo "系统版本: $OS"
 
-    while true; do
-        echo -e "${YELLOW}请选择要执行的操作：${NC}"
-        echo -e "${GREEN}1. 安装 Docker${NC}"
-        echo -e "${GREEN}2. 安装 Docker Compose${NC}"
-        echo -e "${GREEN}3. 安装 Docker 和 Docker Compose${NC}"
-        echo -e "${RED}4. 卸载 Docker${NC}"
-        echo -e "${RED}5. 卸载 Docker Compose${NC}"
-        echo -e "${RED}6. 卸载 Docker 和 Docker Compose${NC}"
-        echo -e "${YELLOW}7. 查询 Docker 和 Docker Compose 的安装状态${NC}"
-        echo -e "${YELLOW}8. 生成 daemon.json 配置文件${NC}"
-        echo -e "${RED}9. 退出脚本${NC}"
-        read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
+  while true; do
+    echo -e "${YELLOW}请选择要执行的操作：${NC}"
+    echo -e "${GREEN}1. 安装 Docker${NC}"
+    echo -e "${GREEN}2. 安装 Docker Compose${NC}"
+    echo -e "${GREEN}3. 安装 Docker 和 Docker Compose${NC}"
+    echo -e "${RED}4. 卸载 Docker${NC}"
+    echo -e "${RED}5. 卸载 Docker Compose${NC}"
+    echo -e "${RED}6. 卸载 Docker 和 Docker Compose${NC}"
+    echo -e "${YELLOW}7. 查询 Docker 和 Docker Compose 的安装状态${NC}"
+    echo -e "${YELLOW}8. 生成 daemon.json 配置文件${NC}"
+    echo -e "${RED}9. 退出脚本${NC}"
+    read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
 
-        case "$CHOICE" in
-            1) install_docker ;;
-            2) install_docker_compose ;;
-            3) install_docker; install_docker_compose ;;
-            4) uninstall_docker ;;
-            5) uninstall_docker_compose ;;
-            6) uninstall_docker; uninstall_docker_compose ;;
-            7) check_docker_installed; check_docker_compose_installed ;;
-            8) generate_daemon_config ;;
-            9) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
-            *) echo -e "${RED}无效的选择，请重新输入。${NC}" ;;
-        esac
-    done
+    case "$CHOICE" in
+      1) install_docker ;;
+      2) install_docker_compose ;;
+      3) install_docker; install_docker_compose ;;
+      4) uninstall_docker ;;
+      5) uninstall_docker_compose ;;
+      6) uninstall_docker; uninstall_docker_compose ;;
+      7) check_docker_installed; check_docker_compose_installed ;;
+      8) generate_daemon_config ;;
+      9) echo -e "${GREEN}退出脚本。${NC}"; break ;;
+      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+    esac
+  done
 }
 
 main
