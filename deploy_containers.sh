@@ -28,8 +28,8 @@ SPEEDTEST_IMAGE="ghcr.io/librespeed/speedtest"
 WEBSSH_CONTAINER_NAME_V1="webssh_v1"
 WEBSSH_CONTAINER_NAME_V2="webssh_v2"
 WEBSSH_DEFAULT_TAG_V2="latest"
-WEBSSH_DEFAULT_PORT_V1="5032"
-WEBSSH_DEFAULT_PORT_V2="8888"
+WEBSSH_DEFAULT_PORT_V1="2222"
+WEBSSH_DEFAULT_PORT_V2="2222"
 WEBSSH_DEFAULT_DATA_V2="/opt/webssh/data"
 WEBSSH_MAX_LOG_SIZE="1m"
 WEBSSH_RETRY_COUNT=3
@@ -467,7 +467,7 @@ function looking_glass_menu() {
     case $sel in
       1)
         validate_port 80
-        deploy_panel_service "looking-glass" "$LOOKING_GLASS_IMAGE" 80 "$PORT"
+        deploy_panel_service "looking-glass" "$LOOKING_GLASS_IMAGE" 100 "$PORT"
         ;;
       2)
         uninstall_panel_service "looking-glass"
