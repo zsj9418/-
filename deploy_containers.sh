@@ -466,8 +466,8 @@ function looking_glass_menu() {
     read -p "请选择: " sel
     case $sel in
       1)
-        validate_port 80
-        deploy_panel_service "looking-glass" "$LOOKING_GLASS_IMAGE" 100 "$PORT"
+        validate_port 100
+        deploy_panel_service "looking-glass" "$LOOKING_GLASS_IMAGE" 80 "$PORT"
         ;;
       2)
         uninstall_panel_service "looking-glass"
