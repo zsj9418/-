@@ -1,12 +1,4 @@
 #!/bin/bash
-# Docker/Compose 一键安装脚本（修复版）
-# - 自动补齐 iptables/nftables/iproute2 等必需组件
-# - 自动加载内核模块、配置 sysctl
-# - 必要时切换 iptables 后端以兼容厂商内核
-# - 支持 apt/yum/dnf
-# - 支持静态二进制安装 Docker 与 Compose
-# - 同时支持 `docker compose` 与 `docker-compose`
-
 set -o pipefail
 
 #====================== 基本配置 ======================#
@@ -69,21 +61,50 @@ detect_package_manager() {
 # 按不同包管理器安装依赖（必需 + 可选）
 install_dependencies() {
   echo "正在检测并安装缺失的依赖..."
+  local missing_req_deps=()
+  for dep in "${REQ_DEPS[@]}"; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      missing_req_deps+=("$dep")
+    fi
+  done
+
+  local missing_opt_deps=()
+  for dep in "${OPT_DEPS[@]}"; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      missing_opt_deps+=("$dep")
+    fi
+  done
+
+  # 如果没有任何依赖缺失，则直接返回
+  if [ ${#missing_req_deps[@]} -eq 0 ] && [ ${#missing_opt_deps[@]} -eq 0 ]; then
+    echo -e "${GREEN}所有依赖均已安装。${NC}"
+    return 0
+  fi
+
+  # 只有在需要安装时才执行包管理器操作
   case "$PKG_MANAGER" in
     apt-get)
       apt-get update || true
-      # 安装必需依赖
-      apt-get install -y --no-install-recommends "${REQ_DEPS[@]}" || {
-        echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
-      # 安装可选依赖（失败不退出）
-      apt-get install -y --no-install-recommends "${OPT_DEPS[@]}" 2>/dev/null || true
+      if [ ${#missing_req_deps[@]} -gt 0 ]; then
+        echo "正在安装必需依赖: ${missing_req_deps[*]}"
+        apt-get install -y --no-install-recommends "${missing_req_deps[@]}" || {
+          echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
+      fi
+      if [ ${#missing_opt_deps[@]} -gt 0 ]; then
+        echo "正在安装可选依赖: ${missing_opt_deps[*]}"
+        apt-get install -y --no-install-recommends "${missing_opt_deps[@]}" 2>/dev/null || true
+      fi
       ;;
     dnf|yum)
-      # 必需依赖
-      "${PKG_MANAGER}" install -y "${REQ_DEPS[@]}" || {
-        echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
-      # 可选依赖（失败不退出）
-      "${PKG_MANAGER}" install -y "${OPT_DEPS[@]}" 2>/dev/null || true
+      if [ ${#missing_req_deps[@]} -gt 0 ]; then
+        echo "正在安装必需依赖: ${missing_req_deps[*]}"
+        "${PKG_MANAGER}" install -y "${missing_req_deps[@]}" || {
+          echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
+      fi
+      if [ ${#missing_opt_deps[@]} -gt 0 ]; then
+        echo "正在安装可选依赖: ${missing_opt_deps[*]}"
+        "${PKG_MANAGER}" install -y "${missing_opt_deps[@]}" 2>/dev/null || true
+      fi
       ;;
   esac
 }
@@ -212,33 +233,46 @@ net.bridge.bridge-nf-call-ip6tables=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 
-  # 4) 校验 iptables 和 NAT 表
-  if ! command -v iptables >/dev/null 2>&1; then
-    echo -e "${RED}iptables 未安装成功，退出。${NC}"
-    exit 1
-  fi
-
-  # 确保 NAT 表可用；不通则尝试加载 legacy 模块
-  if ! iptables -t nat -L >/dev/null 2>&1; then
-    modprobe iptable_nat nf_nat 2>/dev/null || true
-  fi
-
-  # 后备：仍失败则尝试切换为 legacy 后端（Debian/Ubuntu 常见）
-  if ! iptables -t nat -L >/dev/null 2>&1; then
-    if command -v update-alternatives >/dev/null 2>&1 && [ -e /usr/sbin/iptables-legacy ]; then
-      echo "切换 iptables 到 legacy 后端以提高兼容性..."
-      update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
-      update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+  # 4) 【核心】智能检测并切换 iptables 后端
+  # 在新版系统（如 Debian 11+）中，iptables 默认使用 nf_tables 后端，
+  # Docker 对其支持不完善，可能导致网络问题。因此，主动检测并切换到 legacy 模式是最佳实践。
+  if command -v update-alternatives >/dev/null 2>&1 && [ -f /usr/sbin/iptables-legacy ]; then
+    if iptables -V | grep -q 'nf_tables'; then
+      echo -e "${YELLOW}检测到系统正在使用 iptables-nft 后端，可能与 Docker 存在兼容性问题。${NC}"
+      echo -e "${YELLOW}正在自动切换到 iptables-legacy 后端以提高稳定性...${NC}"
+      
+      update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1
+      update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1
+      
+      # 验证切换结果
+      if iptables -V | grep -q 'legacy'; then
+        echo -e "${GREEN}iptables 后端已成功切换到 legacy 模式。${NC}"
+      else
+        echo -e "${RED}iptables 后端切换失败。Docker 网络可能无法正常工作。${NC}"
+        echo -e "${RED}请尝试手动执行: sudo update-alternatives --config iptables 并选择 legacy 版本。${NC}"
+      fi
+    else
+      echo -e "${GREEN}iptables 后端检查完成，当前为 legacy 模式或无需切换。${NC}"
     fi
   fi
 
-  # 再测一次
+  # 5) 最终校验 iptables 和 NAT 表
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo -e "${RED}iptables 命令不存在，Docker 将无法运行。${NC}"
+    exit 1
+  fi
+  # 确保 NAT 表可用；不通则尝试加载相关内核模块
   if ! iptables -t nat -L >/dev/null 2>&1; then
-    echo -e "${YELLOW}警告：仍无法访问 iptables NAT 表。Docker 可能无法创建 DOCKER NAT 链。${NC}"
+    modprobe iptable_nat nf_nat 2>/dev/null || true
+    # 再测一次
+    if ! iptables -t nat -L >/dev/null 2>&1; then
+      echo -e "${YELLOW}警告：系统无法访问 iptables NAT 表。Docker 的端口映射等网络功能可能无法使用。${NC}"
+    fi
   fi
 
-  # 5) 提示 cgroup（仅提示）
-  local cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
+  # 6) 提示 cgroup（仅提示）
+  local cg
+  cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
   if [[ "$cg" != "cgroup2fs" && -n "$cg" ]]; then
     echo -e "${YELLOW}注意：当前未使用 cgroup v2 统一层级，建议在内核参数启用（可选）。${NC}"
   fi
@@ -546,7 +580,6 @@ uninstall_docker_compose() {
   echo -e "${GREEN}Docker Compose 已卸载。${NC}"
 }
 
-# 交互生成 daemon.json（保留你的原功能）
 generate_daemon_config() {
   echo "正在生成 Docker daemon.json 配置文件..."
   local DEFAULT_DATA_ROOT="/opt/docker"
@@ -598,6 +631,30 @@ EOF
   fi
 }
 
+check_iptables_mode() {
+  echo "正在检测 iptables 后端模式..."
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo -e "${RED}系统中未找到 iptables 命令。${NC}"
+    return
+  fi
+
+  local iptables_version
+  iptables_version=$(iptables -V 2>/dev/null)
+
+  if echo "$iptables_version" | grep -q 'nf_tables'; then
+    echo -e "当前 iptables 后端为: ${YELLOW}nf_tables${NC}"
+    echo -e "版本信息: $iptables_version"
+    echo -e "${YELLOW}提示: Docker 目前对 nf_tables 支持不完善，建议使用 legacy 模式以获得最佳兼容性。${NC}"
+  elif echo "$iptables_version" | grep -q 'legacy'; then
+    echo -e "当前 iptables 后端为: ${GREEN}legacy${NC}"
+    echo -e "版本信息: $iptables_version"
+    echo -e "${GREEN}提示: 此模式与 Docker 兼容性良好。${NC}"
+  else
+    echo -e "${YELLOW}无法明确识别 iptables 后端模式。${NC}"
+    echo -e "版本信息: $iptables_version"
+  fi
+}
+
 #====================== 主菜单 ======================#
 
 main() {
@@ -613,7 +670,7 @@ main() {
   echo "系统版本: $OS"
 
   while true; do
-    echo -e "${YELLOW}请选择要执行的操作：${NC}"
+    echo -e "\n${YELLOW}请选择要执行的操作：${NC}"
     echo -e "${GREEN}1. 安装 Docker${NC}"
     echo -e "${GREEN}2. 安装 Docker Compose${NC}"
     echo -e "${GREEN}3. 安装 Docker 和 Docker Compose${NC}"
@@ -622,8 +679,9 @@ main() {
     echo -e "${RED}6. 卸载 Docker 和 Docker Compose${NC}"
     echo -e "${YELLOW}7. 查询 Docker 和 Docker Compose 的安装状态${NC}"
     echo -e "${YELLOW}8. 生成 daemon.json 配置文件${NC}"
-    echo -e "${RED}9. 退出脚本${NC}"
-    read -r -p "请输入数字 (1/2/3/4/5/6/7/8/9): " CHOICE
+    echo -e "${GREEN}9. 查看当前 iptables 后端模式${NC}"
+    echo -e "${RED}10. 退出脚本${NC}"
+    read -r -p "请输入数字 (1-10): " CHOICE
 
     case "$CHOICE" in
       1) install_docker ;;
@@ -634,9 +692,11 @@ main() {
       6) uninstall_docker; uninstall_docker_compose ;;
       7) check_docker_installed; check_docker_compose_installed ;;
       8) generate_daemon_config ;;
-      9) echo -e "${GREEN}退出脚本。${NC}"; break ;;
+      9) check_iptables_mode ;;
+      10) echo -e "${GREEN}退出脚本。${NC}"; break ;;
       *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
     esac
+    [[ -n "$CHOICE" && "$CHOICE" -ne 10 ]] && read -n 1 -s -r -p "按任意键返回主菜单..."
   done
 }
 
