@@ -223,7 +223,10 @@ ensure_docker_prereqs() {
   # 2) 加载内核模块（失败不致命）
   modprobe overlay 2>/dev/null || true
   modprobe br_netfilter 2>/dev/null || true
-  printf "overlay\nbr_netfilter\n" >/etc/modules-load.d/docker.conf
+  modprobe iptable_raw 2>/dev/null || true # <-- 新增加载 raw 表模块
+
+  # 将所有必需模块写入配置文件，确保开机自启
+  printf "overlay\nbr_netfilter\niptable_raw\n" >/etc/modules-load.d/docker.conf
 
   # 3) sysctl 开启转发与桥接
   cat >/etc/sysctl.d/99-docker.conf <<'EOF'
