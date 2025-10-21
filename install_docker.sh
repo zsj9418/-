@@ -5,7 +5,7 @@ set -o pipefail
 
 # 必需依赖（脚本自身 + Docker 运行时）与可选依赖
 # 将所有依赖集中于此，一次性安装
-REQ_DEPS=("curl" "wget" "jq" "iptables" "nftables" "iproute2" "ca-certificates")
+REQ_DEPS=("curl" "wget" "jq")
 OPT_DEPS=("fzf")
 
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
