@@ -13,8 +13,9 @@ COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
 # 代理前缀（按顺序尝试）
 PROXY_PREFIXES=(
-  "https://ghproxy.com/"
-  "https://mirror.ghproxy.com/"
+  "https://fastly.jsdelivr.net/"
+  "https://gitclone.com/"
+  "https://gitdl.cn/"
 )
 
 # 默认镜像加速源（daemon.json 用）
