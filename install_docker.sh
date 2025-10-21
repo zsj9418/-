@@ -3,8 +3,9 @@ set -o pipefail
 
 #====================== 基本配置 ======================#
 
-# 必需依赖与可选依赖（fzf 可选，用于更友好的交互选择）
-REQ_DEPS=("curl" "wget" "jq")
+# 必需依赖（脚本自身 + Docker 运行时）与可选依赖
+# 将所有依赖集中于此，一次性安装
+REQ_DEPS=("curl" "wget" "jq" "iptables" "nftables" "iproute2" "ca-certificates")
 OPT_DEPS=("fzf")
 
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
@@ -62,9 +63,9 @@ detect_package_manager() {
   fi
 }
 
-# 按不同包管理器安装依赖（必需 + 可选）
+# 按不同包管理器安装所有依赖（必需 + 可选），只在脚本启动时执行一次
 install_dependencies() {
-  echo "正在检测并安装缺失的依赖..."
+  echo "正在检测并安装所有缺失的依赖..."
   local missing_req_deps=()
   for dep in "${REQ_DEPS[@]}"; do
     if ! command -v "$dep" >/dev/null 2>&1; then
@@ -136,7 +137,6 @@ get_os_version() {
   fi
 }
 
-# 选择安装目录并做空间检查
 check_and_set_install_dir() {
   local REQUIRED_SPACE=500  # MB
   local realpath_cmd
@@ -210,28 +210,16 @@ check_docker_compose_installed() {
 #====================== Docker 前置准备 ======================#
 
 ensure_docker_prereqs() {
-  echo "检查并准备 Docker 运行所需组件..."
+  echo "正在配置 Docker 运行环境..."
 
-  # 1) 安装用户态工具（iptables/nftables/iproute2/CA）
-  case "$PKG_MANAGER" in
-    apt-get)
-      apt-get update || true
-      apt-get install -y --no-install-recommends iptables nftables iproute2 ca-certificates || {
-        echo -e "${RED}安装 iptables/nftables/iproute2 失败${NC}"; exit 1; }
-      ;;
-    dnf|yum)
-      "${PKG_MANAGER}" install -y iptables nftables iproute ca-certificates || true
-      ;;
-  esac
-
-  # 2) 【核心】检查并加载 Docker 必需的内核模块
+  # 1) 【核心】检查并加载 Docker 必需的内核模块
   echo "检查 Docker 必需的内核模块..."
   
-  # 2a) 检查并加载基础模块
+  # 1a) 检查并加载基础模块
   modprobe overlay 2>/dev/null || true
   modprobe br_netfilter 2>/dev/null || true
 
-  # 2b) 【智能降级检测】检查 iptable_raw 模块
+  # 1b) 【智能降级检测】检查 iptable_raw 模块
   if ! iptables -t raw -L >/dev/null 2>&1; then
     echo -e "${YELLOW}检测到 iptables 'raw' 表不可用，新版 Docker (>=28) 强依赖此功能。${NC}"
     echo -e "${YELLOW}正在尝试加载 'iptable_raw' 内核模块...${NC}"
@@ -249,7 +237,7 @@ ensure_docker_prereqs() {
       echo -e "${GREEN}iptables 'raw' 表可用，兼容性良好。${NC}"
   fi
   
-  # 3) 将必需模块写入配置文件，确保开机自启
+  # 2) 将必需模块写入配置文件，确保开机自启
   if [[ "$FORCE_LEGACY_DOCKER" == "false" ]]; then
     # 正常模式下，添加所有模块
     printf "overlay\nbr_netfilter\niptable_raw\n" >/etc/modules-load.d/docker.conf
@@ -258,7 +246,7 @@ ensure_docker_prereqs() {
     printf "overlay\nbr_netfilter\n" >/etc/modules-load.d/docker.conf
   fi
 
-  # 4) sysctl 开启转发与桥接
+  # 3) sysctl 开启转发与桥接
   cat >/etc/sysctl.d/99-docker.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
@@ -266,7 +254,7 @@ net.bridge.bridge-nf-call-ip6tables=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 
-  # 5) 智能检测并切换 iptables 后端
+  # 4) 智能检测并切换 iptables 后端
   if command -v update-alternatives >/dev/null 2>&1 && [ -f /usr/sbin/iptables-legacy ]; then
     if iptables -V | grep -q 'nf_tables'; then
       echo -e "${YELLOW}检测到系统正在使用 iptables-nft 后端... 正在切换到 legacy...${NC}"
@@ -282,11 +270,7 @@ EOF
     fi
   fi
 
-  # 6) 最终校验 iptables 和 NAT 表
-  if ! command -v iptables >/dev/null 2>&1; then
-    echo -e "${RED}iptables 命令不存在，Docker 将无法运行。${NC}"
-    exit 1
-  fi
+  # 5) 最终校验 NAT 表
   # 确保 NAT 表可用；不通则尝试加载相关内核模块
   if ! iptables -t nat -L >/dev/null 2>&1; then
     modprobe iptable_nat nf_nat 2>/dev/null || true
@@ -296,14 +280,14 @@ EOF
     fi
   fi
 
-  # 7) 提示 cgroup（仅提示）
+  # 6) 提示 cgroup（仅提示）
   local cg
   cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
   if [[ "$cg" != "cgroup2fs" && -n "$cg" ]]; then
     echo -e "${YELLOW}注意：当前未使用 cgroup v2 统一层级，建议在内核参数启用（可选）。${NC}"
   fi
 
-  echo -e "${GREEN}Docker 前置检查/准备完成。${NC}"
+  echo -e "${GREEN}Docker 运行环境配置完成。${NC}"
 }
 
 # 生成/补全 daemon.json（若不存在则创建）
@@ -417,7 +401,7 @@ install_docker() {
     [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker 安装。${NC}"; return; }
   fi
 
-  # 前置准备：iptables、内核模块、sysctl 等
+  # 配置 Docker 运行环境（内核模块、sysctl 等）
   # 这一步会根据系统情况设置 FORCE_LEGACY_DOCKER 标志
   ensure_docker_prereqs
 
@@ -601,7 +585,6 @@ uninstall_docker() {
   # 删除静态二进制与目录
   rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker
   rm -f /etc/systemd/system/docker.service /etc/systemd/system/docker.socket
-  rm -rf /var/run/docker /var/log/docker*
   rm -f /etc/modules-load.d/docker.conf /etc/sysctl.d/99-docker.conf
 
   # 清理 containerd/runc 残留
@@ -705,6 +688,7 @@ check_iptables_mode() {
 main() {
   check_sudo
   detect_package_manager
+  # 在脚本开始时，一次性安装所有依赖
   install_dependencies
 
   echo "欢迎使用 Docker/Compose 智能安装脚本"
