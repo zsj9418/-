@@ -12,8 +12,8 @@ COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
 # 代理前缀（按顺序尝试）
 PROXY_PREFIXES=(
-  "https://un.ax18.ggff.net/"
-  "https://cdn.yyds9527.nyc.mn/"
+  "https://ghproxy.com/"
+  "https://mirror.ghproxy.com/"
 )
 
 # 默认镜像加速源（daemon.json 用）
@@ -29,12 +29,16 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+# 全局变量
 INSTALL_STATUS=$(mktemp)
 DOCKER_URL=""
 DOCKER_INSTALL_DIR=""
 ARCH=""
 OS=""
 PKG_MANAGER=""
+FORCE_LEGACY_DOCKER="false"
+RECOMMENDED_LEGACY_DOCKER_VERSION="27.3.1"
+
 
 #====================== 通用工具函数 ======================#
 
@@ -114,8 +118,8 @@ get_architecture() {
   case "$m" in
     x86_64) ARCH="x86_64" ;;
     aarch64) ARCH="aarch64" ;;
-    armv7l) ARCH="armv7l" ;;
-    armv6l) ARCH="armv6l" ;;
+    armv7l) ARCH="armv7" ;; # 注意 Docker 静态包的命名 armv7
+    armv6l) ARCH="armv6" ;; # 注意 Docker 静态包的命名 armv6
     *) echo -e "${RED}不支持的架构: $m${NC}"; exit 1 ;;
   esac
   echo "$ARCH"
@@ -220,15 +224,41 @@ ensure_docker_prereqs() {
       ;;
   esac
 
-  # 2) 加载内核模块（失败不致命）
+  # 2) 【核心】检查并加载 Docker 必需的内核模块
+  echo "检查 Docker 必需的内核模块..."
+  
+  # 2a) 检查并加载基础模块
   modprobe overlay 2>/dev/null || true
   modprobe br_netfilter 2>/dev/null || true
-  modprobe iptable_raw 2>/dev/null || true # <-- 新增加载 raw 表模块
 
-  # 将所有必需模块写入配置文件，确保开机自启
-  printf "overlay\nbr_netfilter\niptable_raw\n" >/etc/modules-load.d/docker.conf
+  # 2b) 【智能降级检测】检查 iptable_raw 模块
+  if ! iptables -t raw -L >/dev/null 2>&1; then
+    echo -e "${YELLOW}检测到 iptables 'raw' 表不可用，新版 Docker (>=28) 强依赖此功能。${NC}"
+    echo -e "${YELLOW}正在尝试加载 'iptable_raw' 内核模块...${NC}"
+    modprobe iptable_raw
+    # 再次检查，如果仍然失败，则设置降级标志
+    if ! iptables -t raw -L >/dev/null 2>&1; then
+      echo -e "${RED}警告: 'iptable_raw' 内核模块加载失败！${NC}"
+      echo -e "${YELLOW}这通常发生在内核过于精简或在特殊的虚拟化环境（如 OpenVZ）中。${NC}"
+      echo -e "${GREEN}为了保证可用性，脚本将自动为您安装兼容的旧版 Docker (${RECOMMENDED_LEGACY_DOCKER_VERSION})。${NC}"
+      FORCE_LEGACY_DOCKER="true"
+    else
+      echo -e "${GREEN}'iptable_raw' 模块加载成功，系统支持最新版 Docker。${NC}"
+    fi
+  else
+      echo -e "${GREEN}iptables 'raw' 表可用，兼容性良好。${NC}"
+  fi
+  
+  # 3) 将必需模块写入配置文件，确保开机自启
+  if [[ "$FORCE_LEGACY_DOCKER" == "false" ]]; then
+    # 正常模式下，添加所有模块
+    printf "overlay\nbr_netfilter\niptable_raw\n" >/etc/modules-load.d/docker.conf
+  else
+    # 降级模式下，不需要 raw 模块
+    printf "overlay\nbr_netfilter\n" >/etc/modules-load.d/docker.conf
+  fi
 
-  # 3) sysctl 开启转发与桥接
+  # 4) sysctl 开启转发与桥接
   cat >/etc/sysctl.d/99-docker.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
@@ -236,30 +266,23 @@ net.bridge.bridge-nf-call-ip6tables=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 
-  # 4) 【核心】智能检测并切换 iptables 后端
-  # 在新版系统（如 Debian 11+）中，iptables 默认使用 nf_tables 后端，
-  # Docker 对其支持不完善，可能导致网络问题。因此，主动检测并切换到 legacy 模式是最佳实践。
+  # 5) 智能检测并切换 iptables 后端
   if command -v update-alternatives >/dev/null 2>&1 && [ -f /usr/sbin/iptables-legacy ]; then
     if iptables -V | grep -q 'nf_tables'; then
-      echo -e "${YELLOW}检测到系统正在使用 iptables-nft 后端，可能与 Docker 存在兼容性问题。${NC}"
-      echo -e "${YELLOW}正在自动切换到 iptables-legacy 后端以提高稳定性...${NC}"
-      
+      echo -e "${YELLOW}检测到系统正在使用 iptables-nft 后端... 正在切换到 legacy...${NC}"
       update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1
       update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1
-      
-      # 验证切换结果
       if iptables -V | grep -q 'legacy'; then
         echo -e "${GREEN}iptables 后端已成功切换到 legacy 模式。${NC}"
       else
-        echo -e "${RED}iptables 后端切换失败。Docker 网络可能无法正常工作。${NC}"
-        echo -e "${RED}请尝试手动执行: sudo update-alternatives --config iptables 并选择 legacy 版本。${NC}"
+        echo -e "${RED}iptables 后端切换失败。${NC}"
       fi
     else
       echo -e "${GREEN}iptables 后端检查完成，当前为 legacy 模式或无需切换。${NC}"
     fi
   fi
 
-  # 5) 最终校验 iptables 和 NAT 表
+  # 6) 最终校验 iptables 和 NAT 表
   if ! command -v iptables >/dev/null 2>&1; then
     echo -e "${RED}iptables 命令不存在，Docker 将无法运行。${NC}"
     exit 1
@@ -273,7 +296,7 @@ EOF
     fi
   fi
 
-  # 6) 提示 cgroup（仅提示）
+  # 7) 提示 cgroup（仅提示）
   local cg
   cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
   if [[ "$cg" != "cgroup2fs" && -n "$cg" ]]; then
@@ -395,15 +418,33 @@ install_docker() {
   fi
 
   # 前置准备：iptables、内核模块、sysctl 等
+  # 这一步会根据系统情况设置 FORCE_LEGACY_DOCKER 标志
   ensure_docker_prereqs
 
   ARCH=$(get_architecture)
-  echo "获取可用 Docker 版本..."
   check_and_set_install_dir
+
   local VERSION
-  VERSION=$(fetch_docker_versions)
-  VERSION=$(select_version $VERSION)
-  [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
+
+  # 【核心智能降级逻辑】
+  if [[ "$FORCE_LEGACY_DOCKER" == "true" ]]; then
+    echo -e "${YELLOW}由于系统环境限制，将为您安装兼容性最好的旧版 Docker。${NC}"
+    VERSION="$RECOMMENDED_LEGACY_DOCKER_VERSION"
+    # 检查推荐的版本是否存在
+    local available_versions
+    available_versions=$(fetch_docker_versions)
+    if ! echo "$available_versions" | grep -q "^${VERSION}$"; then
+      echo -e "${RED}推荐的兼容版本 ${VERSION} 不在可用列表中！${NC}"
+      echo -e "${RED}安装中止。请检查网络或手动选择一个可用版本。${NC}"
+      exit 1
+    fi
+  else
+    echo "获取可用 Docker 版本..."
+    local VERSIONS
+    VERSIONS=$(fetch_docker_versions)
+    VERSION=$(select_version $VERSIONS)
+    [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
+  fi
 
   echo -e "${GREEN}选择的 Docker 版本：$VERSION${NC}"
   DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
@@ -561,6 +602,7 @@ uninstall_docker() {
   rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker
   rm -f /etc/systemd/system/docker.service /etc/systemd/system/docker.socket
   rm -rf /var/run/docker /var/log/docker*
+  rm -f /etc/modules-load.d/docker.conf /etc/sysctl.d/99-docker.conf
 
   # 清理 containerd/runc 残留
   rm -rf /var/lib/containerd /run/containerd /usr/local/bin/containerd* /usr/local/bin/runc 2>/dev/null || true
@@ -585,8 +627,8 @@ uninstall_docker_compose() {
 
 generate_daemon_config() {
   echo "正在生成 Docker daemon.json 配置文件..."
-  local DEFAULT_DATA_ROOT="/opt/docker"
-  local DEFAULT_LOG_MAX_SIZE="5m"
+  local DEFAULT_DATA_ROOT="/var/lib/docker"
+  local DEFAULT_LOG_MAX_SIZE="10m"
   local DEFAULT_LOG_MAX_FILE="3"
 
   read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
@@ -665,7 +707,7 @@ main() {
   detect_package_manager
   install_dependencies
 
-  echo "欢迎使用 Docker/Compose 一键安装脚本"
+  echo "欢迎使用 Docker/Compose 智能安装脚本"
   echo "检测系统信息..."
   ARCH=$(get_architecture)
   OS=$(get_os_version)
