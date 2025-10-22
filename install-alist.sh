@@ -77,7 +77,6 @@ check_port_is_free() {
     return 0
 }
 
-# 【优化】对于 --user 0:0 方案，chown 不再是必须的，但保留作为最佳实践
 prepare_and_set_perms() {
     local dir_path="$1"
     local owner_id="$2"
@@ -112,7 +111,6 @@ ask_mount_directories() {
             continue
         fi
 
-        # 依然尝试设置权限，但在失败时不中断
         prepare_and_set_perms "$dir" "$owner_id"
         
         mount_array_ref+=("-v" "$dir:$dir")
@@ -177,7 +175,6 @@ alist_start() {
     prepare_and_set_perms "$ALIST_CONFIG_DIR" "$ALIST_UID_GID" || return 1
     
     local -a docker_args=()
-    # 【终极修复】添加 --user 0:0，强制容器以root身份运行，解决一切文件系统权限问题
     docker_args+=("-d" "--name" "$ALIST_NAME" "--user" "0:0" "-p" "${port}:${ALIST_INTERNAL_PORT}" "-v" "$ALIST_CONFIG_DIR:/opt/alist/data" "--restart" "unless-stopped")
     
     ask_mount_directories "$ALIST_UID_GID" docker_args
@@ -210,19 +207,26 @@ alist_status() {
 
 alist_uninstall() {
     yellow "卸载 Alist..."
-    if docker ps -a -q -f name="^$ALIST_NAME$" > /dev/null 2>&1; then
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^$ALIST_NAME$"; then
+        yellow "未发现 Alist 容器，无需卸载。"
+        return
+    fi
+    
+    if confirm_operation "确定要卸载 Alist 吗？"; then
         docker stop "$ALIST_NAME" >/dev/null || true
         docker rm "$ALIST_NAME" >/dev/null || true
         green "Alist 容器已停止并移除。"
+        if confirm_operation "是否删除 Alist 的镜像 ($ALIST_IMAGE)?"; then
+            docker rmi "$ALIST_IMAGE" 2>/dev/null || yellow "镜像可能不存在或被其他容器使用。"
+        fi
+        if confirm_operation "【高危】是否删除 Alist 的所有配置文件 ($ALIST_CONFIG_DIR)?"; then
+            run_as_root rm -rf "$ALIST_CONFIG_DIR"
+            green "配置文件目录已删除。"
+        fi
+        green "Alist 已卸载完成。"
+    else
+        yellow "卸载操作已取消。"
     fi
-    if confirm_operation "是否删除 Alist 的镜像 ($ALIST_IMAGE)?"; then
-        docker rmi "$ALIST_IMAGE" 2>/dev/null || yellow "镜像可能不存在或被其他容器使用。"
-    fi
-    if confirm_operation "是否删除 Alist 的配置文件 ($ALIST_CONFIG_DIR)?"; then
-        run_as_root rm -rf "$ALIST_CONFIG_DIR"
-        green "配置文件目录已删除。"
-    fi
-    green "Alist 已卸载完成。"
 }
 
 alist_reset_pwd() {
@@ -240,12 +244,14 @@ alist_reset_pwd() {
     fi
 }
 
+# 【菜单优化】
 alist_manage_menu() {
     while true; do
         echo
         echo "-------- Alist 管理 --------"
         echo "  1. 部署/重装 Alist"
-        echo "  2. 返回上级"
+        echo "  2. 卸载 Alist"
+        echo "  3. 返回上级"
         echo "----------------------------"
         read -rp "请选择: " sel
         case $sel in
@@ -260,7 +266,10 @@ alist_manage_menu() {
                 alist_pull_image
                 alist_start
                 ;;
-            2) break ;;
+            2)
+                alist_uninstall
+                ;;
+            3) break ;;
             *) red "无效选项。" ;;
         esac
     done
@@ -283,7 +292,6 @@ openlist_start() {
     prepare_and_set_perms "$OPENLIST_CONFIG_DIR" "$OPENLIST_UID_GID" || return 1
     
     local -a docker_args=()
-    # 【终极修复】添加 --user 0:0，强制容器以root身份运行，解决一切文件系统权限问题
     docker_args+=("-d" "--name" "$OPENLIST_NAME" "--user" "0:0" "-p" "${port}:${OPENLIST_INTERNAL_PORT}" "-v" "$OPENLIST_CONFIG_DIR:/opt/openlist/data" "--restart" "unless-stopped")
 
     ask_mount_directories "$OPENLIST_UID_GID" docker_args
@@ -316,19 +324,26 @@ openlist_status() {
 
 openlist_uninstall() {
     yellow "卸载 OpenList..."
-    if docker ps -a -q -f name="^$OPENLIST_NAME$" > /dev/null 2>&1; then
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^$OPENLIST_NAME$"; then
+        yellow "未发现 OpenList 容器，无需卸载。"
+        return
+    fi
+    
+    if confirm_operation "确定要卸载 OpenList 吗？"; then
         docker stop "$OPENLIST_NAME" >/dev/null || true
         docker rm "$OPENLIST_NAME" >/dev/null || true
         green "OpenList 容器已停止并移除。"
+        if confirm_operation "是否删除 OpenList 的镜像 ($OPENLIST_IMAGE)?"; then
+            docker rmi "$OPENLIST_IMAGE" 2>/dev/null || yellow "镜像可能不存在或被其他容器使用。"
+        fi
+        if confirm_operation "【高危】是否删除 OpenList 的所有配置文件 ($OPENLIST_CONFIG_DIR)?"; then
+            run_as_root rm -rf "$OPENLIST_CONFIG_DIR"
+            green "配置文件目录已删除。"
+        fi
+        green "OpenList 已卸载完成。"
+    else
+        yellow "卸载操作已取消。"
     fi
-    if confirm_operation "是否删除 OpenList 的镜像 ($OPENLIST_IMAGE)?"; then
-        docker rmi "$OPENLIST_IMAGE" 2>/dev/null || yellow "镜像可能不存在或被其他容器使用。"
-    fi
-    if confirm_operation "是否删除 OpenList 的配置文件 ($OPENLIST_CONFIG_DIR)?"; then
-        run_as_root rm -rf "$OPENLIST_CONFIG_DIR"
-        green "配置文件目录已删除。"
-    fi
-    green "OpenList 已卸载完成。"
 }
 
 openlist_reset_pwd() {
@@ -346,12 +361,14 @@ openlist_reset_pwd() {
     fi
 }
 
+# 【菜单优化】
 openlist_manage_menu() {
     while true; do
         echo
         echo "-------- OpenList 管理 --------"
         echo "  1. 部署/重装 OpenList"
-        echo "  2. 返回上级"
+        echo "  2. 卸载 OpenList"
+        echo "  3. 返回上级"
         echo "-------------------------------"
         read -rp "请选择: " sel
         case $sel in
@@ -366,7 +383,10 @@ openlist_manage_menu() {
                 openlist_pull_image
                 openlist_start
                 ;;
-            2) break ;;
+            2)
+                openlist_uninstall
+                ;;
+            3) break ;;
             *) red "无效选项。" ;;
         esac
     done
@@ -383,7 +403,6 @@ add_mount_to_container() {
     container_info=$(docker inspect "$cname")
 
     local -a new_run_args=()
-    # 【终极修复】重建时也强制使用root用户
     new_run_args+=("-d" "--name" "$cname" "--user" "0:0")
 
     local -a orig_ports
@@ -423,7 +442,7 @@ main_menu() {
         echo "  2. OpenList 管理"
         echo "  3. 设置 OpenList/Alist 管理员密码"
         echo "  4. 查看 OpenList/Alist 容器状态"
-        echo "  5. 卸载清理 OpenList/Alist"
+        echo "  5. 卸载并清理所有 (Alist & OpenList)"
         echo "  6. 为已有容器追加挂载目录"
         echo "  7. 退出"
         echo "----------------------------------------"
@@ -439,10 +458,15 @@ main_menu() {
                 echo "1) 查看 Alist 容器状态"; echo "2) 查看 OpenList 容器状态"
                 read -rp "请选择(1/2): " sel
                 case $sel in 1) alist_status ;; 2) openlist_status ;; *) red "无效选项。" ;; esac ;;
-            5)
-                echo "1) 卸载 Alist"; echo "2) 卸载 OpenList"; echo "3) 卸载全部"
-                read -rp "请选择(1/2/3): " sel
-                case $sel in 1) alist_uninstall ;; 2) openlist_uninstall ;; 3) alist_uninstall; openlist_uninstall ;; *) red "无效选项。" ;; esac ;;
+            5) # 【菜单优化】简化为全部卸载
+                if confirm_operation "【终极警告】确定要卸载 Alist 和 OpenList 的所有组件吗？"; then
+                    alist_uninstall
+                    openlist_uninstall
+                    green "所有组件已全部卸载完成。"
+                else
+                    yellow "操作已取消。"
+                fi
+                ;;
             6)
                 echo "1) 追加 Alist 挂载"; echo "2) 追加 OpenList 挂载"
                 read -rp "请选择(1/2): " sel
