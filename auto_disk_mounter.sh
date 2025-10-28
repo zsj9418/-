@@ -1,6 +1,4 @@
 #!/bin/bash
-
-# 定义 auto_block 脚本和 udev 规则文件的内容
 AUTO_BLOCK_CONTENT="#!/bin/bash
 [ \"\$DEVTYPE\" = \"partition\" ]||exit 0
 suuid=(\${ID_FS_UUID//-/ })
@@ -12,6 +10,7 @@ case \"\$ACTION\" in
 add)
 [ -d \"\$gzpath\" ]||mkdir \$gzpath
 systemd-mount --no-block --collect \$devnode \"\$DEVNAME\" \"\$gzpath\"
+chmod -R 777 \"\$gzpath\"  # 设置挂载点权限为777
 ;;
 remove)
 systemd-mount -u \"\$gzpath\" 2>/dev/null
@@ -41,7 +40,7 @@ install_full() {
     # 重新加载 udev 规则
     udevadm control --reload
 
-    echo "自动挂载功能安装完成，请重启设备以生效。"
+    echo "自动挂载功能安装完成，请重启设备以生效。注意: 新挂载的设备将自动设置为777权限。"
 }
 
 # 函数：仅创建 auto_block 脚本
@@ -342,5 +341,5 @@ while true; do
         *) echo "无效选项，请重试。" ;;
     esac
 
-    echo # 输出空行以增加可读性
+    echo
 done
