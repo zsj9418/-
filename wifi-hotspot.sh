@@ -1,25 +1,19 @@
 #!/bin/bash
 
 # 脚本版本
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="0.1"
 
-# 全局变量，用于保存自定义 Wi-Fi 名称和密码
+# 全局变量
 CUSTOM_WIFI_NAME=""
 CUSTOM_WIFI_PASSWORD=""
 
-# 脚本名称
 SCRIPT_NAME=$(basename "$0")
-
-# 配置文件目录
 CONFIG_DIR="/var/lib/wifi_auto_switch"
-# 网线接口名称文件
 INTERFACE_NAME_FILE="$CONFIG_DIR/eth_iface"
-# 日志文件
 LOG_FILE="/var/log/wifi_auto_switch.log"
-# 日志最大大小（1MB = 1048576 字节）
 MAX_LOG_SIZE=1048576
 
-# 检查并限制日志文件大小
+# 日志管理
 restrict_log_size() {
     if [[ -f "$LOG_FILE" ]]; then
         local LOG_SIZE=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
@@ -29,20 +23,16 @@ restrict_log_size() {
         fi
     fi
 }
-
-# 记录日志的函数
 log() {
     restrict_log_size
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || echo "警告：日志写入失败，可能是磁盘空间不足。"
 }
-
-# 初始化日志
 log "脚本启动，版本: $SCRIPT_VERSION"
 
-# 检测操作系统类型
+# 检查操作系统
 OS_TYPE=$(uname -s)
 if [[ "$OS_TYPE" == "Linux" ]]; then
-    DISTRO=$(cat /etc/os-release | grep "^ID=" | cut -d'=' -f2 | tr -d '"')
+    DISTRO=$(grep "^ID=" /etc/os-release | cut -d'=' -f2 | tr -d '"')
     if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
         echo "检测到 Debian/Ubuntu 系统。" | tee -a "$LOG_FILE"
     elif [[ "$DISTRO" == "centos" || "$DISTRO" == "rhel" ]]; then
@@ -56,7 +46,7 @@ else
     exit 1
 fi
 
-# 检查是否安装 nmcli
+# 检查nmcli
 if ! command -v nmcli &> /dev/null; then
     log "nmcli 未安装，正在安装 NetworkManager 工具..."
     if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
@@ -66,27 +56,24 @@ if ! command -v nmcli &> /dev/null; then
     fi
 fi
 
-# 确保 NetworkManager 在系统启动时自动启动
 systemctl enable NetworkManager
 systemctl start NetworkManager
 
-# 检查是否为 root 用户
+# 检查root
 if [[ $EUID -ne 0 ]]; then
     echo "请以 root 权限运行此脚本。" | tee -a "$LOG_FILE"
     exit 1
 fi
 
-# 动态检测无线网卡
+# 检测无线网卡
 detect_wifi_interface() {
-    nmcli dev | grep wifi | awk '{print $1}' | head -n 1
+    nmcli dev | awk '$2=="wifi"{print $1}' | head -n 1
 }
-
-# 自动检测网线接口
+# 检测有线网卡
 detect_ethernet_interface() {
-    nmcli dev | grep ethernet | awk '{print $1}' | head -n 1
+    nmcli dev | awk '$2=="ethernet"{print $1}' | head -n 1
 }
-
-# 检查网线是否已经断开
+# 检查网线是否断开
 is_ethernet_disconnected() {
     local interface=$1
     if [[ -f "/sys/class/net/$interface/carrier" ]]; then
@@ -103,7 +90,7 @@ is_ethernet_disconnected() {
     fi
 }
 
-# 清理旧的热点配置
+# 清理旧热点
 clear_old_hotspots() {
     local HOTSPOT_PREFIX="AutoHotspot-"
     local OLD_HOTSPOTS=$(nmcli con | grep "$HOTSPOT_PREFIX" | awk '{print $1}')
@@ -117,7 +104,7 @@ clear_old_hotspots() {
     fi
 }
 
-# 创建 Wi-Fi 热点
+# 创建热点
 create_wifi_hotspot() {
     local INTERFACE=$1
     local WIFI_NAME=${2:-"4G-WIFI"}
@@ -141,22 +128,37 @@ create_wifi_hotspot() {
     fi
 }
 
-# 手动连接 Wi-Fi 网络
+# 连接WiFi
 connect_wifi_network() {
     local INTERFACE=$1
     local SSID=$2
     local PASSWORD=$3
 
     log "尝试手动连接 Wi-Fi: $SSID"
+    # 先清理热点，避免AP模式下无法扫描
+    clear_old_hotspots
+    sleep 2
+    nmcli dev wifi rescan ifname "$INTERFACE"
+    sleep 2
+    nmcli dev wifi list ifname "$INTERFACE" | tee -a "$LOG_FILE"
+    # 先尝试普通连接
     nmcli dev wifi connect "$SSID" password "$PASSWORD" ifname "$INTERFACE" 2>&1 | tee -a "$LOG_FILE"
     if [[ $? -eq 0 ]]; then
         log "成功连接到 Wi-Fi 网络：$SSID"
     else
-        log "连接 $SSID 失败，请检查网络名称或密码。"
+        # 尝试隐藏SSID
+        log "普通连接失败，尝试以隐藏SSID方式连接..."
+        nmcli dev wifi connect "$SSID" password "$PASSWORD" ifname "$INTERFACE" --hidden yes 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -eq 0 ]]; then
+            log "以隐藏SSID方式成功连接到 Wi-Fi 网络：$SSID"
+        else
+            log "连接 $SSID 失败，请检查网络名称或密码。"
+            echo "连接 $SSID 失败，请检查网络名称或密码，或确认该WiFi信号在附近。"
+        fi
     fi
 }
 
-# 智能连接 Wi-Fi（尝试保存的配置和扫描可用网络）
+# 智能连接WiFi
 smart_connect_wifi() {
     local INTERFACE=$1
     local MAX_RETRIES=3
@@ -166,7 +168,11 @@ smart_connect_wifi() {
 
     log "正在尝试智能连接 Wi-Fi..."
 
-    # 第一步：尝试已保存的非自建 Wi-Fi
+    # 先清理热点
+    clear_old_hotspots
+    sleep 2
+
+    # 尝试已保存的非自建 Wi-Fi
     log "尝试连接已保存的非自建 Wi-Fi 网络..."
     local SAVED_CONNECTIONS=$(nmcli con show | grep wifi | grep -v "$HOTSPOT_PREFIX" | awk '{print $1}')
     if [[ -n "$SAVED_CONNECTIONS" ]]; then
@@ -192,7 +198,7 @@ smart_connect_wifi() {
         log "未找到已保存的非自建 Wi-Fi 网络。"
     fi
 
-    # 第二步：扫描可用 Wi-Fi 并尝试连接
+    # 扫描可用 Wi-Fi 并尝试连接
     log "未连接保存的网络，开始扫描可用 Wi-Fi..."
     nmcli dev wifi rescan ifname "$INTERFACE" > /dev/null 2>&1
     sleep 2
@@ -204,15 +210,12 @@ smart_connect_wifi() {
             local SECURITY=$(echo "$line" | awk '{print $3}')
             if [[ -n "$SSID" && "$SSID" != "--" ]]; then
                 log "发现可用 Wi-Fi: SSID=$SSID, 信号强度=$SIGNAL, 安全性=$SECURITY"
-                if [[ "$SECURITY" == "-" || $(nmcli con show | grep -q "$SSID") ]]; then
-                    log "尝试连接可用网络: $SSID (信号强度: $SIGNAL)"
-                    nmcli dev wifi connect "$SSID" ifname "$INTERFACE" > /dev/null 2>&1
-                    if [[ $? -eq 0 ]]; then
-                        log "成功连接到扫描到的 Wi-Fi 网络：$SSID"
-                        return 0
-                    else
-                        log "连接 $SSID 失败，继续尝试其他网络..."
-                    fi
+                nmcli dev wifi connect "$SSID" ifname "$INTERFACE" > /dev/null 2>&1
+                if [[ $? -eq 0 ]]; then
+                    log "成功连接到扫描到的 Wi-Fi 网络：$SSID"
+                    return 0
+                else
+                    log "连接 $SSID 失败，继续尝试其他网络..."
                 fi
             fi
         done <<< "$AVAILABLE_WIFI"
@@ -224,7 +227,7 @@ smart_connect_wifi() {
     return 1
 }
 
-# 自动切换 Wi-Fi 模式
+# 自动切换WiFi模式
 auto_switch_wifi_mode() {
     log "自动切换 Wi-Fi 模式触发..."
 
@@ -254,7 +257,7 @@ auto_switch_wifi_mode() {
     fi
 }
 
-# 后台运行自动切换模式
+# 后台服务
 start_background_service() {
     local DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/wifi-auto-switch.sh"
 
@@ -268,7 +271,7 @@ start_background_service() {
     log "检测到网线接口: $ETH_INTERFACE"
     echo "$ETH_INTERFACE" > "$INTERFACE_NAME_FILE"
 
-    # 等待系统网络服务就绪
+    # 等待网络服务就绪
     local TIMEOUT=30
     local COUNT=0
     while [[ $(nmcli networking connectivity) != "full" && $COUNT -lt $TIMEOUT ]]; do
@@ -330,15 +333,15 @@ stop_and_uninstall_service() {
             rm "/usr/local/bin/$SCRIPT_NAME"
             rm -rf "$CONFIG_DIR"
             log "后台服务已卸载。"
-            exit 0  # 退出脚本
+            exit 0
         fi
     else
         log "后台服务未运行。"
-        exit 0  # 退出脚本
+        exit 0
     fi
 }
 
-# 查看保存的 Wi-Fi 网络并添加新网络
+# 管理保存的WiFi
 manage_saved_wifi() {
     echo "以下是设备保存的 Wi-Fi 网络："
     nmcli con show | grep wifi | awk '{print $1}'
@@ -351,13 +354,13 @@ manage_saved_wifi() {
     fi
 }
 
-# 处理命令行参数，避免进入交互模式
+# 处理命令行参数
 if [[ "$1" == "auto-switch-dispatcher" ]]; then
     auto_switch_wifi_mode
     exit 0
 fi
 
-# 主菜单逻辑（仅在交互模式下运行）
+# 主菜单
 if [[ -t 0 ]]; then
     while true; do
         echo "请选择操作:"
@@ -392,6 +395,9 @@ if [[ -t 0 ]]; then
                     echo "未检测到无线网卡，请检查硬件配置。" | tee -a "$LOG_FILE"
                     continue
                 fi
+                # 关闭所有AutoHotspot-热点
+                clear_old_hotspots
+                sleep 2
                 read -p "请输入要连接的 Wi-Fi 网络名称: " TARGET_SSID
                 read -p "请输入要连接的 Wi-Fi 网络密码: " TARGET_PASSWORD
                 connect_wifi_network "$INTERFACE" "$TARGET_SSID" "$TARGET_PASSWORD"
