@@ -1,283 +1,222 @@
 #!/bin/bash
 # --- 配置区 ---
 SCRIPT_NAME="开源 NVR 部署平台"
-SCRIPT_VERSION="1.0"
-STATE_FILE="/etc/nvr_installer.state"
-HOST_ARCH=""
-PKG_MANAGER=""
-declare -A PROJECTS=(
+SCRIPT_VERSION="1.1"
+declare -A PROJECTS
+PROJECTS=(
     ["frigate"]="Frigate AI智能NVR"
     ["shinobi"]="Shinobi 全功能NVR"
     ["go2rtc"]="go2rtc 流媒体网关"
 )
-
+DEFAULT_FRIGATE_CONFIG_DIR="/root/frigate_config"
+DEFAULT_SHINOBI_CONFIG_DIR="/root/shinobi_config"
+DEFAULT_GO2RTC_CONFIG_FILE="/root/go2rtc.yml"
+HOST_ARCH="" # 全局变量，存储系统架构
+HOST_IP=""   # 全局变量，存储主机IP
 # --- 颜色定义 ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; RESET='\033[0m'
-
 # --- 辅助函数 ---
 check_root() { if [ "$(id -u)" != "0" ]; then echo -e "${RED}错误: 请以root权限运行此脚本。${RESET}"; exit 1; fi; }
 get_host_ip() { HOST_IP=$(hostname -I | awk '{print $1}'); }
-get_host_arch() { HOST_ARCH=$(uname -m); }
-press_any_key() { read -n1 -s -r -p "按任意键返回主菜单..."; }
-
-detect_pkg_manager() {
-    if command -v apt-get &>/dev/null; then PKG_MANAGER="apt-get";
-    elif command -v dnf &>/dev/null; then PKG_MANAGER="dnf";
-    elif command -v yum &>/dev/null; then PKG_MANAGER="yum";
-    else echo -e "${RED}❌ 未能识别您的系统包管理器 (apt, dnf, yum)。${RESET}"; exit 1; fi
-    echo -e "${CYAN}ℹ️  检测到包管理器: ${PKG_MANAGER}${RESET}"
+get_host_arch() { HOST_ARCH=$(uname -m); echo -e "${CYAN}ℹ️ 检测到您的系统架构为: ${HOST_ARCH}${RESET}"; }
+detect_package_manager() {
+    if grep -qi 'ubuntu\|debian' /etc/os-release; then
+        PKG_MANAGER="apt-get"
+        INSTALL_CMD="$PKG_MANAGER update -y && $PKG_MANAGER install -y"
+    elif grep -qi 'centos\|rhel\|fedora' /etc/os-release; then
+        PKG_MANAGER="yum"
+        INSTALL_CMD="$PKG_MANAGER install -y"
+    else
+        echo -e "${RED}❌ 不支持的系统发行版。请手动安装依赖。${RESET}"; exit 1
+    fi
 }
-
 check_dependency() {
-    local dep=$1
+    local dep=$1; local pkg=$2
     if ! command -v $dep &>/dev/null; then
         read -p "$(echo -e ${YELLOW}"⚠️ 未检测到 ${dep}，是否自动安装？[Y/n]: "${RESET})" choice
         choice=${choice:-Y}
         if [[ "$choice" =~ [yY] ]]; then
-            echo -e "${CYAN}🔧 正在安装 ${dep}...${RESET}"
-            case $PKG_MANAGER in
-                "apt-get") sudo apt-get update -y && sudo apt-get install -y $1 ;;
-                "dnf") sudo dnf install -y $1 ;;
-                "yum") sudo yum install -y $1 ;;
-            esac
-            if ! command -v $dep &>/dev/null; then echo -e "${RED}❌ 安装失败。${RESET}"; exit 1; fi
-            echo -e "${GREEN}✅ ${dep} 安装成功。${RESET}"
-        else echo -e "${RED}❌ 用户取消安装。${RESET}"; exit 1; fi
+            echo -e "${CYAN}🔧 正在安装 ${dep}...${RESET}"; if eval "$INSTALL_CMD $pkg"; then echo -e "${GREEN}✅ ${dep} 安装成功。${RESET}"; else echo -e "${RED}❌ ${dep} 安装失败。${RESET}"; exit 1; fi
+        else echo -e "${RED}❌ 用户取消安装，脚本无法继续。${RESET}"; exit 1; fi
     fi
 }
-
-# 状态管理函数
-read_state() { grep "^$1=" "$STATE_FILE" 2>/dev/null | cut -d'=' -f2; }
-write_state() {
-    mkdir -p "$(dirname "$STATE_FILE")"
-    if grep -q "^$1=" "$STATE_FILE" 2>/dev/null; then
-        sed -i "s|^$1=.*|$1=$2|" "$STATE_FILE"
-    else
-        echo "$1=$2" >> "$STATE_FILE"
-    fi
-}
-remove_state() { sed -i "/^$1=/d" "$STATE_FILE" 2>/dev/null; }
-get_installed_services() { INSTALLED_SERVICES=($(cut -d'=' -f1 "$STATE_FILE" 2>/dev/null)); }
-
-check_port() {
-    local port=$1
-    if ss -tuln | grep -q ":${port} "; then
-        echo -e "${YELLOW}⚠️ 端口 ${port} 已被占用。${RESET}"; return 1
-    else
-        return 0
-    fi
-}
-prompt_for_port() {
-    local service_name=$1
-    local default_port=$2
-    local host_port=$default_port
-    while true; do
-        read -p "请输入 ${service_name} 的主机端口 [默认: ${default_port}]: " input_port
-        host_port=${input_port:-$default_port}
-        if ! [[ "$host_port" =~ ^[0-9]+$ ]] || [ "$host_port" -lt 1 ] || [ "$host_port" -gt 65535 ]; then
-            echo -e "${RED}❌ 请输入 1-65535 之间的有效端口号。${RESET}"; continue
-        fi
-        if check_port "$host_port"; then echo -e "${GREEN}✅ 端口 ${host_port} 可用。${RESET}"; break; else continue; fi
+press_any_key() { read -n1 -s -r -p "按任意键返回主菜单..."; }
+get_installed_containers() {
+    INSTALLED_CONTAINERS=()
+    for name in "${!PROJECTS[@]}"; do
+        if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then INSTALLED_CONTAINERS+=("$name"); fi
     done
-    echo "$host_port"
 }
-
-
+show_logs_on_failure() {
+    local container=$1
+    echo -e "${RED}❌ 启动失败。显示最后10行日志：${RESET}"
+    docker logs --tail 10 "$container"
+}
 # --- 部署逻辑 ---
 deploy_menu() {
-    # 省略菜单显示部分，与v5.2一致
-    clear; echo -e "${GREEN}🚀 NVR 部署中心${RESET}\n------------------------------------------------------------------\n请选择您想要部署的NVR项目:\n"
-    echo -e "${CYAN}1. Frigate${RESET} - ${YELLOW}AI智能识别NVR${RESET}\n   特点: 强大的AI物体识别，专为智能事件录像设计。\n"
-    echo -e "${CYAN}2. Shinobi CCTV${RESET} - ${YELLOW}功能全面的传统NVR${RESET}\n   特点: 7x24录像、移动侦测、时间线回放、多用户管理。\n"
-    echo -e "${CYAN}3. go2rtc${RESET} - ${YELLOW}极致轻量的流媒体网关${RESET}\n   特点: 极低资源占用，专注于流媒体接收与转换，${RED}无录像功能${RESET}。\n"
-    echo "4. 返回\n------------------------------------------------------------------"; read -p "选择[1-4]: " choice
-    case $choice in 1) deploy_frigate ;; 2) deploy_shinobi ;; 3) deploy_go2rtc ;; 4) return ;; *) echo -e "${RED}❌ 无效。${RESET}"; sleep 1 ;; esac
+    clear
+    echo -e "${GREEN}🚀 NVR 部署中心${RESET}\n------------------------------------------------------------------\n请选择您想要部署的NVR项目:\n"
+    echo -e "${CYAN}1. Frigate${RESET} - ${YELLOW}AI智能识别NVR${RESET}\n 特点: 强大的AI物体识别，专为智能事件录像设计。\n 适用: 追求高准确率智能侦测，构建自动化家庭安防。\n"
+    echo -e "${CYAN}2. Shinobi CCTV${RESET} - ${YELLOW}功能全面的传统NVR${RESET}\n 特点: 7x24录像、移动侦测、时间线回放、多用户管理。\n 适用: 需要一个稳定、功能完整的传统网络硬盘录像机。\n"
+    echo -e "${CYAN}3. go2rtc${RESET} - ${YELLOW}极致轻量的流媒体网关${RESET}\n 特点: 极低资源占用，专注于流媒体接收与转换，${RED}无录像功能${RESET}。\n 适用: 实时观看、解决协议兼容问题，或作为其他NVR的前端。\n"
+    echo "4. 返回主菜单\n------------------------------------------------------------------"; read -p "请输入您的选择 [1-4]: " choice
+    case $choice in 1) deploy_frigate ;; 2) deploy_shinobi ;; 3) deploy_go2rtc ;; 4) return ;; *) echo -e "${RED}❌ 无效选择。${RESET}"; sleep 1 ;; esac
 }
-
 deploy_frigate() {
-    echo -e "\n${GREEN}--- 部署 Frigate ---${RESET}"; local name="frigate"
-    if [ -n "$(read_state ${name})" ]; then echo -e "${RED}❌ Frigate 已部署。${RESET}"; press_any_key; return; fi
-    local image="ghcr.io/blakeblackshear/frigate:stable"; if [[ "$HOST_ARCH" == "aarch64" ]]; then image="ghcr.io/blakeblackshear/frigate:stable-arm64"; fi
-    echo -e "${CYAN}镜像: ${YELLOW}${image}${RESET}"
-    read -p "存储目录 [/root/frigate_config]: " STORAGE_PATH; STORAGE_PATH=${STORAGE_PATH:-/root/frigate_config}; mkdir -p "${STORAGE_PATH}/config" "${STORAGE_PATH}/media"
-    local frigate_port=$(prompt_for_port "Frigate" 5000)
-    read -p "为Frigate分配的共享内存大小? 1)小(64M) 2)中(256M) 3)大(512M) [1]: " shm_choice
-    case $shm_choice in 2) shm="256mb";; 3) shm="512mb";; *) shm="64mb";; esac
-    
-    echo -e "${CYAN}---摄像头配置 (可添加多个)---${RESET}"
-    local cameras_yaml=""
-    local count=1
+    echo -e "\n${GREEN}--- 正在为您部署 Frigate ---${RESET}"
+    local name="frigate"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then echo -e "${RED}❌ Frigate 容器已存在。${RESET}"; press_any_key; return; fi
+    local frigate_image="ghcr.io/blakeblackshear/frigate:stable"
+    echo -e "${CYAN}为您选择的 Frigate 镜像: ${YELLOW}${frigate_image} (multi-arch, 自动适配 ${HOST_ARCH})${RESET}"
+    read -p "请输入 Frigate 的存储目录 [默认: ${DEFAULT_FRIGATE_CONFIG_DIR}]: " STORAGE_PATH; STORAGE_PATH=${STORAGE_PATH:-$DEFAULT_FRIGATE_CONFIG_DIR}
+    mkdir -p "${STORAGE_PATH}/config"; mkdir -p "${STORAGE_PATH}/media"
+   
+    # 支持多个摄像头
+    echo -e "${CYAN}--- 请配置您的摄像头信息 (支持多个，按空行结束) ---${RESET}"
+    declare -a CAMERAS
     while true; do
-        echo -e "${BLUE}--- 添加第 ${count} 个摄像头 ---${RESET}"
-        read -p "IP地址: " CAM_IP; while [ -z "$CAM_IP" ]; do read -p "${RED}IP不能为空: ${RESET}" CAM_IP; done
-        read -p "用户名[admin]: " CAM_USER; CAM_USER=${CAM_USER:-admin}; read -p "密码[无]: " CAM_PASS
-        read -p "RTSP端口[554]: " CAM_PORT; CAM_PORT=${CAM_PORT:-554}
-        echo "RTSP路径模板: 1)/stream1 2)海康 3)大华 4)手动"; read -p "选择[1-4]: " p_choice
-        case $p_choice in 1) p="/stream1";; 2) p="/ch1/main/av_stream";; 3) p="/cam/realmonitor?channel=1&subtype=0";; 4) read -p "路径: " p;; *) p="/stream1";; esac
+        read -p "IP地址 (空行结束): " CAM_IP
+        if [ -z "$CAM_IP" ]; then break; fi
+        read -p "用户名 [admin]: " CAM_USER; CAM_USER=${CAM_USER:-admin}
+        read -s -p "密码 [无]: " CAM_PASS; echo ""
+        read -p "RTSP端口 [554]: " CAM_PORT; CAM_PORT=${CAM_PORT:-554}
+        echo "RTSP路径模板: 1)/stream1(通用) 2)/ch1/main/av_stream(海康) 3)/cam/realmonitor?channel=1&subtype=0(大华) 4)/onvif1(ONVIF) 5)手动"; read -p "选择[1-5]: " p_choice
+        case $p_choice in 1) p="/stream1";; 2) p="/ch1/main/av_stream";; 3) p="/cam/realmonitor?channel=1&subtype=0";; 4) p="/onvif1";; 5) read -p "路径: " p;; *) p="/stream1";; esac
         if [ -n "$CAM_PASS" ]; then RTSP_URL="rtsp://${CAM_USER}:${CAM_PASS}@${CAM_IP}:${CAM_PORT}${p}"; else RTSP_URL="rtsp://${CAM_USER}@${CAM_IP}:${CAM_PORT}${p}"; fi
-        
-        cameras_yaml+=$(cat <<EOF
-  ${CAM_IP//./_}:
-    ffmpeg:
-      inputs:
-        - path: ${RTSP_URL}
-          roles:
-            - record
-            - detect
-    detect:
-      enabled: True
-    record:
-      enabled: True
-EOF
-)
-        read -p "是否继续添加下一个摄像头？[y/N]: " add_more; if [[ ! "$add_more" =~ [yY] ]]; then break; fi; ((count++))
+        echo -e "${GREEN}添加: ${YELLOW}${RTSP_URL}${RESET}"
+        CAMERAS+=("${CAM_IP//./_}:${RTSP_URL}")
     done
-
+    if [ ${#CAMERAS[@]} -eq 0 ]; then echo -e "${RED}❌ 至少添加一个摄像头。${RESET}"; press_any_key; return; fi
+   
     COMPOSE_FILE="${STORAGE_PATH}/docker-compose.yml"
     cat > "$COMPOSE_FILE" << EOF
 version: "3.9"
 services:
-  frigate: {container_name: frigate, privileged: true, restart: unless-stopped, image: ${image}, shm_size: ${shm}, volumes: ["${STORAGE_PATH}/config:/config", "${STORAGE_PATH}/media:/media/frigate", "/etc/localtime:/etc/localtime:ro"], ports: ["${frigate_port}:5000", "8554:8554"]}
+  frigate:
+    container_name: frigate
+    privileged: true
+    restart: unless-stopped
+    image: ${frigate_image}
+    shm_size: 64mb
+    volumes:
+      - ${STORAGE_PATH}/config:/config
+      - ${STORAGE_PATH}/media:/media/frigate
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "5000:5000"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
 EOF
     cat > "${STORAGE_PATH}/config/config.yml" << EOF
 mqtt: {enabled: False}
 cameras:
-${cameras_yaml}
 EOF
-
-    echo -e "${CYAN}🚀 启动中...${RESET}"; docker-compose -f "$COMPOSE_FILE" up -d
-    if [ $? -eq 0 ]; then get_host_ip; write_state $name $STORAGE_PATH; echo -e "\n${GREEN}✅ 部署成功！\n${BLUE}📢 Web UI: ${GREEN}http://${HOST_IP}:${frigate_port}${RESET}"; else echo -e "\n${RED}❌ 失败。${RESET}"; fi; press_any_key
+    for cam in "${CAMERAS[@]}"; do
+        IFS=':' read -r cam_name rtsp_url <<< "$cam"
+        cat >> "${STORAGE_PATH}/config/config.yml" << EOF
+  ${cam_name}:
+    ffmpeg: {inputs: [{path: ${rtsp_url}, roles: [record, detect]}]}
+    detect: {enabled: True, width: 1280, height: 720}
+    record: {enabled: True, retain: {days: 7, mode: motion}}
+EOF
+    done
+    echo -e "${CYAN}🚀 正在启动 Frigate 服务...${RESET}"; docker-compose -f "$COMPOSE_FILE" up -d
+    if [ $? -eq 0 ]; then get_host_ip; echo -e "\n${GREEN}✅ Frigate 部署成功！\n${BLUE}📢 Web UI: ${GREEN}http://${HOST_IP}:5000${RESET}"; else echo -e "\n${RED}❌ 部署失败。${RESET}"; show_logs_on_failure "frigate"; fi
+    press_any_key
 }
-
 deploy_shinobi() {
-    echo -e "\n${GREEN}--- 部署 Shinobi ---${RESET}"; local name="shinobi"
-    if [ -n "$(read_state ${name})" ]; then echo -e "${RED}❌ Shinobi 已部署。${RESET}"; press_any_key; return; fi
-    local image="shinobisystems/shinobi:dev"; echo -e "${CYAN}镜像: ${YELLOW}${image}${RESET}"
-    read -p "存储目录 [/root/shinobi_config]: " STORAGE_PATH; STORAGE_PATH=${STORAGE_PATH:-/root/shinobi_config}; mkdir -p "$STORAGE_PATH/config" "$STORAGE_PATH/videos"; echo -e "${YELLOW}⚠️ 为确保权限，将对目录 ${STORAGE_PATH} 执行 'chmod -R 777'。${RESET}"; chmod -R 777 "$STORAGE_PATH"
-    local shinobi_port=$(prompt_for_port "Shinobi" 8080)
-    
-    echo -e "${CYAN}🚀 启动中...${RESET}"
-    docker run -d --name ${name} --restart=always -p ${shinobi_port}:8080 -v "${STORAGE_PATH}/config":/config -v "${STORAGE_PATH}/videos":/var/lib/shinobi/videos -v /dev/shm/shinobi-shm:/dev/shm ${image}
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${CYAN}⏳ 等待服务初始化...${RESET}"; sleep 15
-        if ! docker ps --format '{{.Names}}' | grep -q "^${name}$"; then echo -e "\n${RED}❌ 容器启动后意外退出。${RESET}"; else
-            get_host_ip; write_state $name $STORAGE_PATH; echo -e "\n${GREEN}✅ 部署成功！\n${BLUE}📢 超级面板: ${GREEN}http://${HOST_IP}:${shinobi_port}/super${RESET}"; fi
-    else echo -e "\n${RED}❌ 部署失败。${RESET}"; fi
-    press_any_key
-}
-
-deploy_go2rtc() {
-    # 逻辑与Frigate类似，增加了多摄像头和端口选择
-    echo -e "\n${GREEN}--- 部署 go2rtc ---${RESET}"; local name="go2rtc"
-    if [ -n "$(read_state ${name})" ]; then echo -e "${RED}❌ go2rtc 已部署。${RESET}"; press_any_key; return; fi
-    local image="alexxit/go2rtc:latest"; echo -e "${CYAN}镜像: ${YELLOW}${image}${RESET}"
-    read -p "配置文件路径 [/root/go2rtc.yml]: " CONFIG_FILE; CONFIG_FILE=${CONFIG_FILE:-/root/go2rtc.yml}
-    local go2rtc_port=$(prompt_for_port "go2rtc" 1984)
-
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${CYAN}---摄像头配置 (可添加多个)---${RESET}"
-        local streams_yaml=""
-        while true; do
-            read -p "为此摄像头流命名 (如 living_room): " stream_name; [ -z "$stream_name" ] && continue
-            read -p "输入摄像头RTSP地址: " rtsp_url; [ -z "$rtsp_url" ] && continue
-            streams_yaml+=$(printf "\n  %s: %s" "$stream_name" "$rtsp_url")
-            read -p "是否继续添加下一个？[y/N]: " add_more; if [[ ! "$add_more" =~ [yY] ]]; then break; fi
-        done
-        echo "streams:${streams_yaml}" > "$CONFIG_FILE"
-        echo -e "${GREEN}✅ 配置文件已生成于 ${CONFIG_FILE}${RESET}"
+    echo -e "\n${GREEN}--- 正在为您部署 Shinobi CCTV ---${RESET}"
+    local name="shinobi"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then echo -e "${RED}❌ Shinobi 容器已存在。${RESET}"; press_any_key; return; fi
+   
+    local shinobi_image=""
+    if [[ "$HOST_ARCH" == "x86_64" ]]; then
+        shinobi_image="shinobisystems/shinobi:latest"
+    elif [[ "$HOST_ARCH" == "aarch64" || "$HOST_ARCH" == "armv7l" ]]; then
+        shinobi_image="migoller/shinobi:latest"
+        echo -e "${YELLOW}⚠️ ARM架构使用社区fork镜像，可能非官方最新版。${RESET}"
     else
-        echo -e "${YELLOW}⚠️ 检测到已有配置文件 ${CONFIG_FILE}，将直接使用。${RESET}"
+        echo -e "${RED}❌ 不支持的系统架构: ${HOST_ARCH}。无法为 Shinobi 自动选择镜像。${RESET}"; press_any_key; return
     fi
-
-    echo -e "${CYAN}🚀 启动中...${RESET}"
-    docker run -d --name ${name} --restart=always -p ${go2rtc_port}:1984 -p 8555:8555/udp -v "${CONFIG_FILE}":/config.yml ${image}
-    if [ $? -eq 0 ]; then get_host_ip; write_state $name $CONFIG_FILE; echo -e "\n${GREEN}✅ 部署成功！\n${BLUE}📢 Web UI: ${GREEN}http://${HOST_IP}:${go2rtc_port}${RESET}"; else echo -e "\n${RED}❌ 失败。${RESET}"; fi
-    press_any_key
-}
-
-
-# --- 管理逻辑 ---
-scan_network() { clear; echo -e "${BLUE}📡 扫描摄像头${RESET}..."; sleep 1; press_any_key; } # 省略，与v5.2一致
-
-uninstall_menu() {
-    clear; echo -e "${YELLOW}🗑️ 卸载服务${RESET}"; get_installed_services
-    if [ ${#INSTALLED_SERVICES[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 无已安装服务。${RESET}"; press_any_key; return; fi
-    echo "选择要卸载的服务:"; for i in "${!INSTALLED_SERVICES[@]}"; do echo "$((i+1)). ${PROJECTS[${INSTALLED_SERVICES[$i]}]}"; done; echo "$(( ${#INSTALLED_SERVICES[@]} + 1 )). 返回"; read -p "选择: " choice
-    if [[ "$choice" -gt 0 && "$choice" -le "${#INSTALLED_SERVICES[@]}" ]]; then
-        local service_name=${INSTALLED_SERVICES[$((choice-1))]}
-        read -p "$(echo -e ${RED}"确定卸载 ${service_name}？[y/N]: "${RESET})" confirm
-        if [[ "$confirm" =~ [yY] ]]; then
-            docker rm -f "$service_name" &>/dev/null; echo -e "${GREEN}✅ ${service_name} 已移除。${RESET}"
-            read -p "删除其配置和数据？[y/N]: " del_data
-            if [[ "$del_data" =~ [yY] ]]; then rm -rf "$(read_state "$service_name")"; remove_state "$service_name"; echo -e "${GREEN}✅ 数据已删除。${RESET}"; fi
-        fi
-    fi
-    press_any_key
-}
-
-update_menu() {
-    clear; echo -e "${BLUE}🔄 更新服务${RESET}"; get_installed_services
-    if [ ${#INSTALLED_SERVICES[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 无已安装服务。${RESET}"; press_any_key; return; fi
-    echo "选择要更新的服务 (将拉取最新镜像并重建容器):"; for i in "${!INSTALLED_SERVICES[@]}"; do echo "$((i+1)). ${PROJECTS[${INSTALLED_SERVICES[$i]}]}"; done; echo "$(( ${#INSTALLED_SERVICES[@]} + 1 )). 返回"; read -p "选择: " choice
-    if [[ "$choice" -gt 0 && "$choice" -le "${#INSTALLED_SERVICES[@]}" ]]; then
-        local service_name=${INSTALLED_SERVICES[$((choice-1))]}
-        echo -e "${CYAN}正在更新 ${service_name}...${RESET}"
-        local config_path=$(read_state "$service_name")
-        if [[ "$service_name" == "frigate" ]]; then
-            docker-compose -f "${config_path}/docker-compose.yml" pull && docker-compose -f "${config_path}/docker-compose.yml" up -d
+    echo -e "${CYAN}为您选择的 Shinobi 镜像: ${YELLOW}${shinobi_image}${RESET}"
+    read -p "请输入 Shinobi 的存储目录 [默认: ${DEFAULT_SHINOBI_CONFIG_DIR}]: " STORAGE_PATH; STORAGE_PATH=${STORAGE_PATH:-$DEFAULT_SHINOBI_CONFIG_DIR}
+    mkdir -p "$STORAGE_PATH/config"; mkdir -p "$STORAGE_PATH/videos"; chmod -R 777 "$STORAGE_PATH"
+    echo -e "${CYAN}🚀 正在启动 Shinobi 服务...${RESET}"
+    docker run -d --name ${name} --restart=always -p 8080:8080 -v "${STORAGE_PATH}/config":/config -v "${STORAGE_PATH}/videos":/var/lib/shinobi/videos -v /dev/shm/shinobi-shm:/dev/shm ${shinobi_image}
+   
+    if [ $? -eq 0 ]; then
+        echo -e "${CYAN}⏳ 等待 Shinobi 服务初始化... (约15秒)${RESET}"; sleep 15
+        if ! docker ps --format '{{.Names}}' | grep -q "^${name}$"; then
+             echo -e "\n${RED}❌ Shinobi 容器启动后意外退出。请使用管理菜单查看日志。${RESET}"
+             show_logs_on_failure "shinobi"
         else
-            local image=$(docker inspect --format='{{.Config.Image}}' $service_name)
-            docker pull "$image" && docker rm -f "$service_name"
-            # 重新部署
-            if [[ "$service_name" == "shinobi" ]]; then deploy_shinobi;
-            elif [[ "$service_name" == "go2rtc" ]]; then deploy_go2rtc;
-            fi
+            get_host_ip; echo -e "\n${GREEN}✅ Shinobi 部署成功！\n${BLUE}📢 首次访问超级面板:\n 地址: ${GREEN}http://${HOST_IP}:8080/super\n ${RESET}用户: ${YELLOW}admin@shinobi.video${RESET} | 密码: ${YELLOW}admin${RESET}\n${YELLOW}⚠️ 请立即更改默认密码以确保安全。${RESET}"
         fi
-        echo -e "${GREEN}✅ ${service_name} 更新完成！${RESET}"
-    fi
+    else echo -e "\n${RED}❌ Shinobi 部署失败。${RESET}"; show_logs_on_failure "shinobi"; fi
     press_any_key
 }
-
-status_menu() { clear; echo -e "${BLUE}🔍 查看状态${RESET}"; get_installed_services; if [ ${#INSTALLED_SERVICES[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 无已安装服务。${RESET}"; press_any_key; return; fi; echo -e "${GREEN}当前服务状态:${RESET}"; docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | { read -r header; echo -e "${YELLOW}$header${RESET}"; grep -E "$(IFS="|"; echo "${INSTALLED_SERVICES[*]}")" || echo -e "${YELLOW}无正在运行的服务。${RESET}"; }; press_any_key; }
-manage_menu() { clear; echo -e "${CYAN}⚙️ 管理服务${RESET}"; get_installed_services; if [ ${#INSTALLED_SERVICES[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 无已安装服务。${RESET}"; press_any_key; return; fi; echo "选择要管理的服务:"; for i in "${!INSTALLED_SERVICES[@]}"; do echo "$((i+1)). ${PROJECTS[${INSTALLED_SERVICES[$i]}]}"; done; echo "$(( ${#INSTALLED_SERVICES[@]} + 1 )). 返回"; read -p "选择: " choice; if [[ "$choice" -gt 0 && "$choice" -le "${#INSTALLED_SERVICES[@]}" ]]; then local CONTAINER=${INSTALLED_SERVICES[$((choice-1))]}; echo "操作: 1.启动 2.停止 3.重启 4.日志"; read -p "选择[1-4]: " op; case $op in 1) docker start "$CONTAINER";; 2) docker stop "$CONTAINER";; 3) docker restart "$CONTAINER";; 4) docker logs -f "$CONTAINER";; esac; fi; press_any_key; }
-
+deploy_go2rtc() {
+    echo -e "\n${GREEN}--- 正在为您部署 go2rtc ---${RESET}"
+    local name="go2rtc"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then echo -e "${RED}❌ go2rtc 容器已存在。${RESET}"; press_any_key; return; fi
+   
+    local go2rtc_image="alexxit/go2rtc:latest"
+    echo -e "${CYAN}为您选择的 go2rtc 镜像: ${YELLOW}${go2rtc_image}${RESET} (此镜像支持多架构)"
+    read -p "请输入 go2rtc 配置文件路径 [默认: ${DEFAULT_GO2RTC_CONFIG_FILE}]: " CONFIG_FILE; CONFIG_FILE=${CONFIG_FILE:-$DEFAULT_GO2RTC_CONFIG_FILE}
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}⚠️ 配置文件不存在，将创建示例。${RESET}";
+        cat > "$CONFIG_FILE" << EOF
+streams:
+  example_cam:
+    - rtsp://user:pass@192.168.1.100:554/stream1  # 请替换为您的实际摄像头地址
+EOF
+        echo -e "✅ 示例文件已创建于 ${GREEN}${CONFIG_FILE}${RESET}。请部署后编辑它并重启容器。";
+    fi
+    echo -e "${CYAN}🚀 正在启动 go2rtc 服务...${RESET}"
+    docker run -d --name ${name} --restart=always -p 1984:1984 -p 8555:8555/udp -v "${CONFIG_FILE}":/config.yml ${go2rtc_image}
+    if [ $? -eq 0 ]; then get_host_ip; echo -e "\n${GREEN}✅ go2rtc 部署成功！\n${BLUE}📢 Web UI: ${GREEN}http://${HOST_IP}:1984${RESET}"; else echo -e "\n${RED}❌ go2rtc 部署失败。${RESET}"; show_logs_on_failure "go2rtc"; fi
+    press_any_key
+}
+# --- 管理逻辑 ---
+scan_network() { clear; echo -e "${BLUE}📡 扫描局域网摄像头${RESET}\n--------------------------------------"; DEFAULT_SUBNET=$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -1); read -p "请输入要扫描的网段 [默认: ${DEFAULT_SUBNET}]: " SUBNET; SUBNET=${SUBNET:-$DEFAULT_SUBNET}; echo -e "${CYAN}🚀 正在扫描网段 ${SUBNET} ...${RESET}"; SCAN_RESULTS=$(nmap -p 80,554,8000,37777,5544,8099 --open ${SUBNET} -oG - | awk '/Up$/{print $2, $4}'); if [ -z "$SCAN_RESULTS" ]; then echo -e "${RED}❌ 未发现开放了常见摄像头端口的设备。${RESET}"; else echo -e "${GREEN}✅ 扫描完成！发现以下潜在设备：${RESET}\n--------------------------------------\n${YELLOW}IP 地址\t\t开放的端口${RESET}"; echo "$SCAN_RESULTS" | while read -r ip ports; do printf "%-16s\t%s\n" "$ip" "$(echo $ports | sed 's|/tcp(open)|,|g' | sed 's/,$//')"; done; echo "--------------------------------------\n常见的RTSP端口是 ${GREEN}554${RESET} 或 ${GREEN}5544${RESET}。"; fi; press_any_key; }
+uninstall_menu() { clear; echo -e "${YELLOW}🗑️ 卸载 NVR 服务${RESET}\n--------------------------------------"; get_installed_containers; if [ ${#INSTALLED_CONTAINERS[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 未发现任何已安装的 NVR 服务。${RESET}"; press_any_key; return; fi; echo "请选择要卸载的服务:"; for i in "${!INSTALLED_CONTAINERS[@]}"; do echo "$((i+1)). ${PROJECTS[${INSTALLED_CONTAINERS[$i]}]}"; done; echo "$(( ${#INSTALLED_CONTAINERS[@]} + 1 )). 返回"; read -p "请选择: " choice; if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#INSTALLED_CONTAINERS[@]}" ]; then CONTAINER_TO_UNINSTALL=${INSTALLED_CONTAINERS[$((choice-1))]}; read -p "$(echo -e ${RED}"确定要卸载 ${CONTAINER_TO_UNINSTALL} 吗？[y/N]: "${RESET})" confirm; if [[ "$confirm" =~ [yY] ]]; then docker stop "$CONTAINER_TO_UNINSTALL" &>/dev/null; docker rm "$CONTAINER_TO_UNINSTALL" &>/dev/null; echo -e "${GREEN}✅ ${CONTAINER_TO_UNINSTALL} 容器已移除。${RESET}"; read -p "是否删除其所有配置文件和数据？[y/N]: " del_data; if [[ "$del_data" =~ [yY] ]]; then case $CONTAINER_TO_UNINSTALL in frigate) rm -rf "$DEFAULT_FRIGATE_CONFIG_DIR" ;; shinobi) rm -rf "$DEFAULT_SHINOBI_CONFIG_DIR" ;; go2rtc) rm -f "$DEFAULT_GO2RTC_CONFIG_FILE" ;; esac; echo -e "${GREEN}✅ 相关数据已删除。${RESET}"; fi; fi; elif [ "$choice" != "$(( ${#INSTALLED_CONTAINERS[@]} + 1 ))" ]; then echo -e "${RED}❌ 无效选择。${RESET}"; fi; press_any_key; }
+status_menu() { clear; echo -e "${BLUE}🔍 查看运行状态${RESET}\n--------------------------------------"; get_installed_containers; if [ ${#INSTALLED_CONTAINERS[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 未发现任何已安装的 NVR 服务。${RESET}"; press_any_key; return; fi; echo -e "${GREEN}当前已安装的服务状态:${RESET}"; docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | { read -r header; echo -e "${YELLOW}$header${RESET}"; grep -E "$(IFS="|"; echo "${INSTALLED_CONTAINERS[*]}")" || echo -e "${YELLOW}没有正在运行的相关服务。${RESET}"; }; press_any_key; }
+manage_menu() { clear; echo -e "${CYAN}⚙️ 管理 NVR 服务${RESET}\n--------------------------------------"; get_installed_containers; if [ ${#INSTALLED_CONTAINERS[@]} -eq 0 ]; then echo -e "${YELLOW}⚠️ 未发现任何已安装的 NVR 服务。${RESET}"; press_any_key; return; fi; echo "请选择要管理的服务:"; for i in "${!INSTALLED_CONTAINERS[@]}"; do echo "$((i+1)). ${PROJECTS[${INSTALLED_CONTAINERS[$i]}]}"; done; echo "$(( ${#INSTALLED_CONTAINERS[@]} + 1 )). 返回"; read -p "请选择: " choice; if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#INSTALLED_CONTAINERS[@]}" ]; then CONTAINER_TO_MANAGE=${INSTALLED_CONTAINERS[$((choice-1))]}; echo "请选择操作: 1.启动 2.停止 3.重启 4.查看日志"; read -p "操作[1-4]: " op; case $op in 1) docker start "$CONTAINER_TO_MANAGE";; 2) docker stop "$CONTAINER_TO_MANAGE";; 3) docker restart "$CONTAINER_TO_MANAGE";; 4) echo -e "${BLUE}📜 按 Ctrl+C 退出日志...${RESET}"; docker logs -f "$CONTAINER_TO_MANAGE";; *) echo -e "${RED}❌ 无效操作。${RESET}";; esac; elif [ "$choice" != "$(( ${#INSTALLED_CONTAINERS[@]} + 1 ))" ]; then echo -e "${RED}❌ 无效选择。${RESET}"; fi; press_any_key; }
 # --- 主菜单与主逻辑 ---
 main_menu() {
     clear
     echo -e "${BLUE}==========================================${RESET}"
-    echo -e "      ${GREEN}${SCRIPT_NAME} v${SCRIPT_VERSION}${RESET}"
-    echo -e "      ${CYAN}System Arch: ${HOST_ARCH} | Pkg Manager: ${PKG_MANAGER}${RESET}"
+    echo -e " ${GREEN}${SCRIPT_NAME} v${SCRIPT_VERSION}${RESET}"
+    echo -e " ${CYAN}System Arch: ${HOST_ARCH}${RESET}"
     echo -e "${BLUE}==========================================${RESET}"
-    echo -e " 1. ${GREEN}部署 NVR 服务${RESET}"
-    echo -e " 2. ${BLUE}更新 NVR 服务${RESET}"
-    echo -e " 3. ${CYAN}扫描 局域网摄像头${RESET}"
-    echo -e " 4. ${RED}卸载 NVR 服务${RESET}"
-    echo -e " 5. ${YELLOW}管理 NVR 服务${RESET} (启/停/日志)"
-    echo -e " 6. ${BLUE}查看 运行状态${RESET}"
-    echo -e " 7. ${RED}退出 脚本${RESET}"
+    echo -e " 1. ${GREEN}部署 NVR 服务${RESET} (Frigate, Shinobi...)"
+    echo -e " 2. ${CYAN}扫描${RESET} 局域网摄像头"
+    echo -e " 3. ${RED}卸载${RESET} NVR 服务"
+    echo -e " 4. ${BLUE}查看${RESET} 运行状态"
+    echo -e " 5. ${YELLOW}管理${RESET} NVR 服务 (启/停/日志)"
+    echo -e " 6. ${RED}退出${RESET} 脚本"
     echo -e "${BLUE}==========================================${RESET}"
 }
-
 main() {
-    check_root; clear; echo "正在初始化和检查环境..."; sleep 1
-    detect_pkg_manager
-    check_dependency "docker"
-    check_dependency "docker-compose"
-    check_dependency "nmap"
+    check_root
+    echo "正在初始化和检查环境..."; sleep 1
+    detect_package_manager
+    check_dependency "docker" "docker.io"
+    check_dependency "docker-compose" "docker-compose"
+    check_dependency "nmap" "nmap"
     get_host_arch
-    
+   
     while true; do
         main_menu
-        read -p "请输入您的选择 [1-7]: " CHOICE
+        read -p "请输入您的选择 [1-6]: " CHOICE
         case $CHOICE in
-            1) deploy_menu ;; 2) update_menu ;; 3) scan_network ;;
-            4) uninstall_menu ;; 5) manage_menu ;; 6) status_menu ;;
-            7) echo -e "${GREEN}👋 感谢使用！${RESET}"; exit 0 ;;
+            1) deploy_menu ;; 2) scan_network ;; 3) uninstall_menu ;;
+            4) status_menu ;; 5) manage_menu ;;
+            6) echo -e "${GREEN}👋 感谢使用！${RESET}"; exit 0 ;;
             *) echo -e "${RED}❌ 无效选择。${RESET}"; sleep 1 ;;
         esac
     done
 }
-
 # --- 脚本入口 ---
 main
