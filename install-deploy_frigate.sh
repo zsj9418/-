@@ -1,7 +1,7 @@
 #!/bin/bash
 # --- 配置区 ---
 SCRIPT_NAME="开源 NVR 部署平台"
-SCRIPT_VERSION="5.1"
+SCRIPT_VERSION="1.0"
 declare -A PROJECTS
 PROJECTS=(
     ["frigate"]="Frigate AI智能NVR"
