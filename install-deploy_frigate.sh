@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_NAME="开源 NVR 部署平台"
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.2"
 declare -A PROJECTS
 PROJECTS=(
     ["frigate"]="Frigate AI智能NVR"
@@ -8,20 +8,16 @@ PROJECTS=(
     ["go2rtc"]="go2rtc 流媒体网关"
 )
 
-# 默认路径
 DEFAULT_FRIGATE_CONFIG_DIR="/opt/frigate"
 DEFAULT_SHINOBI_CONFIG_DIR="/opt/shinobi"
 DEFAULT_GO2RTC_CONFIG_FILE="/opt/go2rtc.yaml"
 SCAN_LOG_DIR="/tmp"
 
-# 全局变量
 HOST_ARCH=""
 HOST_IP=""
 
-# 颜色定义
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; RESET='\033[0m'
 
-# --- 辅助函数 ---
 check_root() { [[ "$(id -u)" -eq 0 ]] || { echo -e "${RED}错误: 请以 root 权限运行此脚本。${RESET}"; exit 1; }; }
 get_host_ip() { HOST_IP=$(hostname -I | awk '{print $1}'); }
 get_host_arch() { HOST_ARCH=$(uname -m); echo -e "${CYAN}检测到系统架构: ${HOST_ARCH}${RESET}"; }
@@ -50,6 +46,26 @@ check_dependency() {
     fi
 }
 
+# 新增：检查并启动 Docker 服务
+check_docker_service() {
+    if ! systemctl is-active --quiet docker 2>/dev/null; then
+        echo -e "${YELLOW}Docker 服务未运行，尝试启动...${RESET}"
+        if systemctl start docker; then
+            echo -e "${GREEN}Docker 服务已启动。${RESET}"
+            sleep 3
+        else
+            echo -e "${RED}无法启动 Docker 服务。${RESET}"
+            echo -e "${RED}请手动执行: systemctl start docker${RESET}"
+            exit 1
+        fi
+    fi
+    # 再次确认 Docker 可连接
+    if ! docker info >/dev/null 2>&1; then
+        echo -e "${RED}Docker 守护进程不可用，请检查 Docker 安装。${RESET}"
+        exit 1
+    fi
+}
+
 press_any_key() { read -n1 -s -r -p "按任意键继续..."; echo; }
 
 get_installed_containers() {
@@ -70,7 +86,6 @@ port_in_use() {
     ss -tuln | grep -q ":$port " && return 0 || return 1
 }
 
-# --- 部署菜单 ---
 deploy_menu() {
     clear
     echo -e "${GREEN}NVR 部署中心${RESET}\n$(printf '─%.0s' {1..60})\n"
@@ -92,18 +107,16 @@ deploy_menu() {
     esac
 }
 
-# --- Frigate 部署 ---
 deploy_frigate() {
     clear; echo -e "${GREEN}正在部署 Frigate AI NVR${RESET}"
     local name="frigate"
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
         echo -e "${RED}Frigate 容器已存在。${RESET}"; press_any_key; return
     fi
-
     port_in_use 5000 && echo -e "${YELLOW}警告: 5000 端口被占用${RESET}"
 
     local image="ghcr.io/blakeblackshear/frigate:stable"
-    echo -e "${CYAN}镜像: ${YELLOW}${image} (multi-arch)${RESET}"
+    echo -e "${CYAN}镜像: ${YELLOW}${image}${RESET}"
 
     read -p "存储目录 [默认: $DEFAULT_FRIGATE_CONFIG_DIR]: " path
     path=${path:-$DEFAULT_FRIGATE_CONFIG_DIR}
@@ -119,14 +132,7 @@ deploy_frigate() {
         read -p "RTSP端口 [554]: " port; port=${port:-554}
         echo "路径模板: 1)通用 2)海康 3)大华 4)ONVIF 5)手动"
         read -p "选择[1-5]: " t
-        case $t in
-            1) p="/stream1" ;;
-            2) p="/ch1/main/av_stream" ;;
-            3) p="/cam/realmonitor?channel=1&subtype=0" ;;
-            4) p="/onvif1" ;;
-            5) read -p "路径: " p ;;
-            *) p="/stream1" ;;
-        esac
+        case $t in 1) p="/stream1";; 2) p="/ch1/main/av_stream";; 3) p="/cam/realmonitor?channel=1&subtype=0";; 4) p="/onvif1";; 5) read -p "路径: " p;; *) p="/stream1";; esac
         url=$( [[ -n "$pass" ]] && echo "rtsp://$user:$pass@$ip:$port$p" || echo "rtsp://$user@$ip:$port$p" )
         echo -e "${GREEN}添加: ${YELLOW}$url${RESET}"
         CAMS+=("${ip//./_}:$url")
@@ -198,14 +204,12 @@ EOF
     press_any_key
 }
 
-# --- Shinobi 部署（官方自带数据库，100% 可登录）---
 deploy_shinobi() {
     clear; echo -e "${GREEN}正在部署 Shinobi (官方自带数据库)${RESET}"
     local name="shinobi"
     if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
         echo -e "${RED}Shinobi 容器已存在。${RESET}"; press_any_key; return
     fi
-
     port_in_use 8080 && echo -e "${YELLOW}警告: 8080 端口被占用${RESET}"
 
     local image="registry.gitlab.com/shinobi-systems/shinobi:dev"
@@ -216,10 +220,9 @@ deploy_shinobi() {
     mkdir -p "$path/videos" "$path/config"
     chmod -R 777 "$path"
 
-    # 随机生成强密码
     SUPER_PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
 
-    echo -e "${CYAN}正在启动 Shinobi...${RESET}"
+    echo -e "${CYAN}正在拉取镜像并启动 Shinobi...${RESET}"
     if docker run -d \
         --name shinobi \
         --restart=always \
@@ -247,7 +250,6 @@ deploy_shinobi() {
     press_any_key
 }
 
-# --- go2rtc 部署 ---
 deploy_go2rtc() {
     clear; echo -e "${GREEN}正在部署 go2rtc 流媒体网关${RESET}"
     local name="go2rtc"
@@ -256,7 +258,7 @@ deploy_go2rtc() {
     fi
 
     local image="alexxit/go2rtc:latest"
-    echo -e "${CYAN}镜像: ${YELLOW}${image} (multi-arch)${RESET}"
+    echo -e "${CYAN}镜像: ${YELLOW}${image}${RESET}"
 
     read -p "配置文件路径 [默认: $DEFAULT_GO2RTC_CONFIG_FILE]: " cfg
     cfg=${cfg:-$DEFAULT_GO2RTC_CONFIG_FILE}
@@ -269,8 +271,6 @@ api:
 streams:
   cam1:
     - rtsp://user:pass@192.168.1.100:554/stream1
-  cam2:
-    - rtsp://user:pass@192.168.1.101:554/stream1
 webrtc:
   candidates:
     - host:1984
@@ -292,7 +292,6 @@ EOF
     press_any_key
 }
 
-# --- 局域网扫描（100% 准确）---
 scan_network() {
     clear
     echo -e "${BLUE}扫描局域网摄像头${RESET}\n$(printf '─%.0s' {1..40})"
@@ -336,7 +335,6 @@ scan_network() {
     press_any_key
 }
 
-# --- 管理功能 ---
 uninstall_menu() {
     clear; echo -e "${YELLOW}卸载 NVR 服务${RESET}\n$(printf '─%.0s' {1..30})"
     get_installed_containers
@@ -410,7 +408,6 @@ manage_menu() {
     press_any_key
 }
 
-# --- 主菜单 ---
 main_menu() {
     clear
     echo -e "${BLUE}╔══════════════════════════════════════╗${RESET}"
@@ -426,7 +423,6 @@ main_menu() {
     echo -e "${BLUE}╚══════════════════════════════════════╝${RESET}"
 }
 
-# --- 主逻辑 ---
 main() {
     check_root
     echo "正在初始化环境..."
@@ -434,6 +430,10 @@ main() {
     check_dependency "docker" "docker.io"
     check_dependency "docker-compose" "docker-compose"
     check_dependency "nmap" "nmap"
+    
+    # 关键修复：确保 Docker 服务运行
+    check_docker_service
+    
     get_host_arch
 
     while true; do
@@ -451,5 +451,4 @@ main() {
     done
 }
 
-# --- 脚本入口 ---
 main
