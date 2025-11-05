@@ -1,11 +1,4 @@
 #!/bin/bash
-# ================================================
-# 开源 NVR 部署平台 v2.0 - 最终稳定版
-# 支持: Frigate | Shinobi (自带DB) | go2rtc
-# 架构: x86_64 / aarch64 / armv7l
-# 系统: Ubuntu/Debian/CentOS/Fedora
-# ================================================
-
 SCRIPT_NAME="开源 NVR 部署平台"
 SCRIPT_VERSION="2.0"
 declare -A PROJECTS
