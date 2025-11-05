@@ -224,6 +224,7 @@ DEFAULT_OPTIONS=(
     "39. openwrt固定MAC"
     "40. 安装docker版青龙面板"
     "41. 设备网关设置"
+    "42. 部署监控存盘到局域网服务器"
     "98. 快捷键管理"
 )
 
@@ -270,6 +271,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["39"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openwrt_mac.sh"
     ["40"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/ql.sh"
     ["41"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/ipwg.sh"
+    ["42"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-deploy_frigate.sh"
 )
 
 # 声明全局变量
