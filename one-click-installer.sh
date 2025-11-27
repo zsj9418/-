@@ -225,6 +225,7 @@ DEFAULT_OPTIONS=(
     "40. 安装docker版青龙面板"
     "41. 设备网关设置"
     "42. 部署监控存盘到局域网服务器"
+    "43. 设备硬盘健康检测修复工具"
     "98. 快捷键管理"
 )
 
@@ -272,6 +273,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["40"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/ql.sh"
     ["41"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/ipwg.sh"
     ["42"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-deploy_frigate.sh"
+    ["43"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/disk_repair_tool.sh"
 )
 
 # 声明全局变量
