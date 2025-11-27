@@ -2,8 +2,8 @@
 
 #===============================================================================
 # PVE 硬盘智能检测与修复工具
-# 版本: 1.1
-# 功能: 自动检测硬盘健康状态，提供菜单式修复选项
+# 版本: 1.2 (加强版)
+# 功能: 自动检测硬盘健康状态，提供菜单式修复选项，增强多系统/多架构兼容和检测
 #===============================================================================
 
 # 颜色定义
@@ -20,10 +20,57 @@ LOG_DIR="/var/log/disk_repair"
 LOG_FILE="$LOG_DIR/repair_$(date +%Y%m%d_%H%M%S).log"
 
 #===============================================================================
+# 系统兼容性检测
+#===============================================================================
+
+check_os_support() {
+    local os_type
+    os_type="$(uname -s)"
+    if [[ "$os_type" != "Linux" ]]; then
+        echo -e "${RED}错误: 仅支持 Linux 系统，当前为 $os_type${NC}"
+        exit 1
+    fi
+}
+
+check_package_manager() {
+    if command -v apt-get &>/dev/null; then
+        PKG_INSTALL="apt-get install -y"
+        PKG_UPDATE="apt-get update -qq"
+        PKG_NAME_FMT=""
+    elif command -v yum &>/dev/null; then
+        PKG_INSTALL="yum install -y"
+        PKG_UPDATE="yum makecache fast"
+        PKG_NAME_FMT=""
+    elif command -v dnf &>/dev/null; then
+        PKG_INSTALL="dnf install -y"
+        PKG_UPDATE="dnf makecache"
+        PKG_NAME_FMT=""
+    elif command -v pacman &>/dev/null; then
+        PKG_INSTALL="pacman -Sy --noconfirm"
+        PKG_UPDATE="pacman -Sy"
+        PKG_NAME_FMT=""
+    elif command -v zypper &>/dev/null; then
+        PKG_INSTALL="zypper install -y"
+        PKG_UPDATE="zypper refresh"
+        PKG_NAME_FMT=""
+    elif command -v apk &>/dev/null; then
+        PKG_INSTALL="apk add"
+        PKG_UPDATE="apk update"
+        PKG_NAME_FMT=""
+    else
+        echo -e "${RED}错误: 未检测到支持的 Linux 包管理器${NC}"
+        exit 1
+    fi
+}
+
+#===============================================================================
 # 基础函数
 #===============================================================================
 
 init() {
+    check_os_support
+    check_package_manager
+
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}错误: 此脚本需要 root 权限运行${NC}"
         exit 1
@@ -43,8 +90,10 @@ install_dependencies() {
 
     if [[ $need_install -eq 1 ]]; then
         echo -e "${YELLOW}正在安装必要工具...${NC}"
-        apt update -qq 2>/dev/null
-        apt install -y smartmontools hdparm e2fsprogs parted > /dev/null 2>&1
+        $PKG_UPDATE &>/dev/null
+        local pkgs="smartmontools hdparm e2fsprogs parted"
+        # Alpine Linux包含badblocks在e2fsprogs内，默认可用
+        $PKG_INSTALL $pkgs &>/dev/null
     fi
 }
 
@@ -55,16 +104,16 @@ log() {
 print_header() {
     clear
     echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║           PVE 硬盘智能检测与修复工具 v1.1                        ║"
-    echo "║                                                                  ║"
-    echo "║  ⚠️  警告: 修复操作可能导致数据丢失，请先备份重要数据！          ║"
-    echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+    echo "║           PVE 硬盘智能检测与修复工具 v1.2 （多系统兼容加强版）                  ║"
+    echo "║                                                                               ║"
+    echo "║  ⚠️  警告: 修复操作可能导致数据丢失，请先备份重要数据！                         ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
 print_separator() {
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 pause() {
@@ -80,27 +129,35 @@ confirm() {
 }
 
 #===============================================================================
-# 硬盘检测函数
+# 硬盘/分区检测。兼容多协议
 #===============================================================================
 
 get_all_disks() {
-    lsblk -d -n -o NAME,TYPE | awk '$2=="disk" {print $1}'
+    # 支持 NVMe/SATA/SCSI。过滤 loop、ram 盘
+    lsblk -d -n -o NAME,TYPE | awk '$2=="disk" {print $1}' | grep -v "^loop" | grep -v "^ram"
 }
 
 get_disk_info() {
     local disk="/dev/$1"
-    local model size health pending reallocated uncorrectable hours temp
+    local devtype
+    if [[ $1 == nvme* ]]; then
+        devtype="nvme"
+    else
+        devtype="normal"
+    fi
 
-    model=$(smartctl -i "$disk" 2>/dev/null | grep -E "Device Model|Model Family" | head -1 | cut -d: -f2 | xargs 2>/dev/null)
+    local model size health pending reallocated uncorrectable hours temp
+    model=$(smartctl -i "$disk" 2>/dev/null | grep -E "Device Model|Model Family|Model Number" | head -1 | cut -d: -f2 | xargs 2>/dev/null)
     size=$(lsblk -d -n -o SIZE "$disk" 2>/dev/null)
 
-    if smartctl -i "$disk" 2>/dev/null | grep -q "SMART support is: Enabled"; then
+    # SMART支持情况检查
+    if smartctl -i "$disk" 2>/dev/null | grep -q -E 'SMART support is: Enabled|SMART overall-health'; then
         health=$(smartctl -H "$disk" 2>/dev/null | grep "overall-health" | awk '{print $NF}')
-        pending=$(smartctl -A "$disk" 2>/dev/null | grep "Current_Pending_Sector" | awk '{print $NF}')
-        reallocated=$(smartctl -A "$disk" 2>/dev/null | grep "Reallocated_Sector_Ct" | awk '{print $NF}')
-        uncorrectable=$(smartctl -A "$disk" 2>/dev/null | grep "Offline_Uncorrectable" | awk '{print $NF}')
-        hours=$(smartctl -A "$disk" 2>/dev/null | grep "Power_On_Hours" | awk '{print $NF}')
-        temp=$(smartctl -A "$disk" 2>/dev/null | grep "Temperature_Celsius" | awk '{print $NF}')
+        pending=$(smartctl -A "$disk" 2>/dev/null | grep -E "Current_Pending_Sector|Current Pending Sector" | awk '{print $NF}')
+        reallocated=$(smartctl -A "$disk" 2>/dev/null | grep -E "Reallocated_Sector_Ct|Reallocated Sector Ct" | awk '{print $NF}')
+        uncorrectable=$(smartctl -A "$disk" 2>/dev/null | grep -E "Offline_Uncorrectable|Offline Uncorrectable" | awk '{print $NF}')
+        hours=$(smartctl -A "$disk" 2>/dev/null | grep -E "Power_On_Hours|Power On Hours" | awk '{print $NF}')
+        temp=$(smartctl -A "$disk" 2>/dev/null | grep -E "Temperature_Celsius|Temperature Sensor|Temperature" | awk '{print $NF}')
     else
         health="N/A"
         pending="N/A"
@@ -115,18 +172,14 @@ get_disk_info() {
 
 check_disk_mounted() {
     local disk="/dev/$1"
-    if mount | grep -q "^${disk}"; then
-        return 0
-    fi
-    if lsblk -n -o MOUNTPOINT "$disk" 2>/dev/null | grep -q "/"; then
-        return 0
-    fi
+    mount | grep -q "^${disk}" && return 0
+    lsblk -n -o MOUNTPOINT "$disk" | grep -q "/" && return 0
     return 1
 }
 
 check_disk_in_use() {
     local disk="$1"
-    
+
     # 检查是否是系统盘
     local root_device=$(findmnt -n -o SOURCE / 2>/dev/null)
     if [[ -n "$root_device" ]]; then
@@ -156,7 +209,8 @@ get_disk_status() {
     local reallocated="$2"
     local health="$3"
 
-    if [[ "$health" == "PASSED" ]] && [[ "$pending" == "0" || "$pending" == "N/A" || -z "$pending" ]]; then
+    # pending为数字或N/A
+    if [[ "$health" == "PASSED" ]] && ([[ "$pending" == "0" ]] || [[ "$pending" == "N/A" ]] || [[ -z "$pending" ]]); then
         echo -e "${GREEN}健康${NC}"
     elif [[ "$pending" != "N/A" && -n "$pending" ]] && [[ "$pending" -gt 0 && "$pending" -lt 50 ]] 2>/dev/null; then
         echo -e "${YELLOW}警告${NC}"
@@ -187,7 +241,7 @@ show_main_menu() {
     echo ""
     print_separator
     read -p "请输入选项 [0-6]: " choice
-    
+
     case $choice in
         1) scan_all_disks ;;
         2) view_disk_detail ;;
@@ -210,7 +264,7 @@ scan_all_disks() {
     echo ""
     print_separator
 
-    printf "%-6s %-25s %-8s %-8s %-10s %-10s %-8s %-6s %-8s\n" \
+    printf "%-8s %-25s %-8s %-8s %-10s %-10s %-8s %-6s %-10s\n" \
         "设备" "型号" "容量" "状态" "待处理" "已重映射" "运行时" "温度" "可操作"
     print_separator
 
@@ -237,7 +291,7 @@ scan_all_disks() {
             ((problem_count++))
         fi
 
-        printf "%-6s %-25s %-8s %-18b %-10s %-10s %-8s %-6s %-18b\n" \
+        printf "%-8s %-25s %-8s %-18b %-10s %-10s %-8s %-6s %-18b\n" \
             "$disk" "${model:-未知}" "$size" "$status" "${pending:-N/A}" "${reallocated:-N/A}" \
             "${hours:-N/A}h" "${temp:-N/A}C" "$operable"
     done
@@ -266,13 +320,13 @@ view_disk_detail() {
 
     echo "可用硬盘列表:"
     print_separator
-    
+
     local i=1
     local -a disks
     for disk in $(get_all_disks); do
         disks+=("$disk")
         local size=$(lsblk -d -n -o SIZE "/dev/$disk")
-        local model=$(smartctl -i "/dev/$disk" 2>/dev/null | grep "Device Model" | cut -d: -f2 | xargs 2>/dev/null)
+        local model=$(smartctl -i "/dev/$disk" 2>/dev/null | grep -E "Device Model|Model Number" | cut -d: -f2 | xargs 2>/dev/null)
         echo "  $i) /dev/$disk - ${model:-未知} ($size)"
         ((i++))
     done
@@ -299,7 +353,7 @@ show_disk_detail() {
     print_separator
 
     echo -e "${CYAN}【基本信息】${NC}"
-    smartctl -i "/dev/$disk" 2>/dev/null | grep -E "Model|Serial|Capacity|Sector|Firmware"
+    smartctl -i "/dev/$disk" 2>/dev/null | grep -E "Model|Serial|Capacity|Sector|Firmware|Model Number"
 
     echo ""
     echo -e "${CYAN}【健康状态】${NC}"
@@ -310,7 +364,7 @@ show_disk_detail() {
     printf "%-30s %-10s %-10s %-10s\n" "指标" "当前值" "阈值" "原始值"
     print_separator
 
-    smartctl -A "/dev/$disk" 2>/dev/null | grep -E "Reallocated_Sector|Current_Pending|Offline_Uncorrectable|Power_On_Hours|Temperature|Raw_Read_Error" | \
+    smartctl -A "/dev/$disk" 2>/dev/null | grep -E "Reallocated|Current_Pending|Offline_Uncorrectable|Power_On_Hours|Temperature|Raw_Read_Error" | \
     while read -r line; do
         local name=$(echo "$line" | awk '{print $2}')
         local value=$(echo "$line" | awk '{print $4}')
@@ -341,7 +395,7 @@ repair_disk_menu() {
 
     echo "可修复硬盘列表:"
     print_separator
-    
+
     local i=1
     local -a disks
 
@@ -493,7 +547,7 @@ scan_badblocks_readonly() {
     echo -e "${GREEN}📝 只读扫描坏块 /dev/$disk${NC}"
     print_separator
 
-    echo -e "${YELLOW}此操作不���修改数据，但需要较长时间${NC}"
+    echo -e "${YELLOW}此操作不修改数据，但需要较长时间${NC}"
     echo ""
 
     if ! confirm "确认开始扫描?"; then
@@ -638,14 +692,14 @@ destructive_repair() {
     echo -e "${RED}💪 强力修复（破坏性） /dev/$disk${NC}"
     print_separator
 
-    echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║                    ⚠️  严重警告 ⚠️                            ║${NC}"
-    echo -e "${RED}║                                                              ║${NC}"
-    echo -e "${RED}║  此操作将完全清除硬盘上的所有数据！                          ║${NC}"
-    echo -e "${RED}║  包括所有分区、文件系统和文件！                              ║${NC}"
-    echo -e "${RED}║                                                              ║${NC}"
-    echo -e "${RED}║  此操作不可逆！请确保已备份重要数据！                        ║${NC}"
-    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗"
+    echo -e "${RED}║                    ⚠️  严重警告 ⚠️                                         ║${NC}"
+    echo -e "${RED}║                                                                              ║${NC}"
+    echo -e "${RED}║  此操作将完全清除硬盘上的所有数据！                                        ║${NC}"
+    echo -e "${RED}║  包括所有分区、文件系统和文件！                                            ║${NC}"
+    echo -e "${RED}║                                                                              ║${NC}"
+    echo -e "${RED}║  此操作不可逆！请确保已备份重要数据！                                      ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝"
     echo ""
 
     if check_disk_mounted "$disk"; then
@@ -699,17 +753,17 @@ full_rebuild() {
     echo -e "${RED}🔄 完整重建 /dev/$disk${NC}"
     print_separator
 
-    echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║                    ⚠️  最高级别警告 ⚠️                        ║${NC}"
-    echo -e "${RED}║                                                              ║${NC}"
-    echo -e "${RED}║  此操作将:                                                   ║${NC}"
-    echo -e "${RED}║    1. 完全清除硬盘所有数据                                   ║${NC}"
-    echo -e "${RED}║    2. 破坏性扫描修复全部坏道                                 ║${NC}"
-    echo -e "${RED}║    3. 重新创建分区表                                         ║${NC}"
-    echo -e "${RED}║    4. 格式化为 ext4 文件系统                                 ║${NC}"
-    echo -e "${RED}║                                                              ║${NC}"
-    echo -e "${RED}║  此操作绝对不可逆！                                          ║${NC}"
-    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${RED}╔════════════════════════════════════════════════════════════════════════════════╗"
+    echo -e "${RED}║                    ⚠️  最高级别警告 ⚠️                                    ║${NC}"
+    echo -e "${RED}║                                                                              ║${NC}"
+    echo -e "${RED}║  此操作将:                                                                  ║${NC}"
+    echo -e "${RED}║    1. 完全清除硬盘所有数据                                                  ║${NC}"
+    echo -e "${RED}║    2. 破坏性扫描修复全部坏道                                                ║${NC}"
+    echo -e "${RED}║    3. 重新创建分区表                                                        ║${NC}"
+    echo -e "${RED}║    4. 格式化为 ext4 文件系统                                                ║${NC}"
+    echo -e "${RED}║                                                                              ║${NC}"
+    echo -e "${RED}║  此操作绝对不可逆！                                                          ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════════════════════════╝"
     echo ""
 
     if check_disk_mounted "$disk"; then
@@ -719,7 +773,7 @@ full_rebuild() {
     fi
 
     local disk_size=$(lsblk -d -n -o SIZE "/dev/$disk")
-    local disk_model=$(smartctl -i "/dev/$disk" 2>/dev/null | grep "Device Model" | cut -d: -f2 | xargs 2>/dev/null)
+    local disk_model=$(smartctl -i "/dev/$disk" 2>/dev/null | grep -E "Device Model|Model Number" | cut -d: -f2 | xargs 2>/dev/null)
 
     echo -e "目标硬盘: ${RED}/dev/$disk${NC}"
     echo -e "型号: ${CYAN}${disk_model:-未知}${NC}"
@@ -781,9 +835,9 @@ full_rebuild() {
     smartctl -A "/dev/$disk" | grep -E "Reallocated|Current_Pending|Offline_Uncorrectable"
 
     echo ""
-    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}✅ 完整重建完成！${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════════${NC}"
 
     if [[ -s "$badblocks_file" ]]; then
         local count=$(wc -l < "$badblocks_file")
@@ -897,10 +951,10 @@ view_logs() {
 
     local -a logs
     local i=1
-    
+
     echo "日志文件列表:"
     echo ""
-    
+
     while IFS= read -r -d '' log_file; do
         logs+=("$log_file")
         local size=$(du -h "$log_file" 2>/dev/null | cut -f1)
@@ -967,6 +1021,12 @@ show_help() {
 【日志位置】
 
   $LOG_DIR/
+
+【兼容性说明】
+
+  此脚本仅适用于 Linux，并智能识别包管理器（Debian/Ubuntu/RedHat/CentOS/Fedora/Arch/SUSE/Alpine）。
+  Windows/macOS/OpenWrt 等无法兼容，请勿运行！
+  部分 RAID/NVMe/嵌入式环境可能功能受限。
 "
     pause
 }
