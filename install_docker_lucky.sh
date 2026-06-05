@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ==============================================
-# Lucky Docker 终极部署管理器 v4.0
-# 功能：IPv6智能检测 | 双网络模式 | 全生命周期管理
+# Lucky Docker 终极部署管理器 v4.2 (完整版)
+# 功能：IPv6检测 | 双网络模式 | 无损更新 | 版本选择
 # ==============================================
 
 # 配置区
 SCRIPT_NAME="Lucky Docker 终极部署管理器"
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.2"
 CONTAINER_NAME="lucky"
 IMAGE_NAME="gdy666/lucky"
 CONFIG_DIR="/root/luckyconf"
@@ -52,6 +52,60 @@ check_docker() {
     fi
 }
 
+# 获取版本列表（不依赖 jq，原生解析）
+get_lucky_versions() {
+    local versions=""
+    # 尝试 3 次，每次超时 10 秒
+    for i in {1..3}; do
+        # 利用 grep 提取 json 中的 name 字段，排除latest，提取带有数字的版本号
+        versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/gdy666/lucky/tags/?page_size=30" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -v 'latest' | grep -E '^[0-9v]' | sort -ur)
+        if [ -n "$versions" ]; then break; fi
+        sleep 2
+    done
+    
+    if [ -n "$versions" ]; then
+        echo "latest $versions"
+    else
+        echo ""
+    fi
+}
+
+# 提示用户选择版本
+prompt_for_version() {
+    echo -e "${CYAN}🔄 正在从 Docker Hub 获取可用版本列表，请稍候...${RESET}"
+    
+    local versions_str=$(get_lucky_versions)
+    local versions=($versions_str)
+    local num_versions=${#versions[@]}
+
+    # 降级方案：如果网络不通获取不到列表，允许手动输入
+    if [ $num_versions -eq 0 ]; then
+        echo -e "${YELLOW}⚠️ 无法自动获取版本列表（可能由于国内网络被墙）。${RESET}"
+        read -p "请输入您要使用的版本标签 [直接回车默认使用: latest]: " manual_version
+        TARGET_VERSION=${manual_version:-latest}
+        echo -e "${GREEN}✅ 已确认版本: $TARGET_VERSION${RESET}"
+        return
+    fi
+
+    echo -e "\n${BLUE}请选择版本：${RESET}"
+    for i in "${!versions[@]}"; do
+        echo "$((i + 1)). ${versions[$i]}"
+    done
+
+    while true; do
+        read -p "请输入版本编号 [直接回车默认选择 1 (latest)]: " version_choice
+        version_choice=${version_choice:-1}
+        
+        if [[ $version_choice =~ ^[0-9]+$ ]] && [ "$version_choice" -ge 1 ] && [ "$version_choice" -le "$num_versions" ]; then
+            TARGET_VERSION=${versions[$((version_choice - 1))]}
+            break
+        else
+            echo -e "${RED}❌ 无效的选择，请输入 1 到 $num_versions 之间的数字。${RESET}"
+        fi
+    done
+    echo -e "${GREEN}✅ 已选择版本: $TARGET_VERSION${RESET}"
+}
+
 # 部署容器
 deploy_lucky() {
     clear
@@ -60,7 +114,7 @@ deploy_lucky() {
 
     # 检查容器是否已存在
     if docker inspect $CONTAINER_NAME &>/dev/null; then
-        echo -e "${RED}❌ 容器已存在，请先卸载${RESET}"
+        echo -e "${RED}❌ 容器已存在，请先卸载或选择更新功能${RESET}"
         read -n1 -p "按任意键返回主菜单..."
         return
     fi
@@ -70,6 +124,9 @@ deploy_lucky() {
         echo -e "${RED}❌ 无法创建配置目录 $CONFIG_DIR${RESET}"
         return 1
     }
+
+    prompt_for_version
+    echo ""
 
     # 选择网络模式
     echo -e "${BLUE}请选择网络模式：${RESET}"
@@ -84,8 +141,8 @@ deploy_lucky() {
             read -p "是否继续？[y/N]: " CONFIRM
             [[ ! $CONFIRM =~ [yY] ]] && return
 
-            echo -e "${CYAN}🔧 正在拉取镜像...${RESET}"
-            docker pull $IMAGE_NAME || {
+            echo -e "${CYAN}🔧 正在拉取镜像 ($IMAGE_NAME:$TARGET_VERSION)...${RESET}"
+            docker pull $IMAGE_NAME:$TARGET_VERSION || {
                 echo -e "${RED}❌ 镜像拉取失败${RESET}"
                 return 1
             }
@@ -95,7 +152,7 @@ deploy_lucky() {
                 --restart=always \
                 --net=host \
                 -v $CONFIG_DIR:/goodluck \
-                $IMAGE_NAME || {
+                $IMAGE_NAME:$TARGET_VERSION || {
                 echo -e "${RED}❌ 容器启动失败${RESET}"
                 return 1
             }
@@ -125,8 +182,8 @@ deploy_lucky() {
                 fi
             done
 
-            echo -e "${CYAN}🔧 正在拉取镜像...${RESET}"
-            docker pull $IMAGE_NAME || {
+            echo -e "${CYAN}🔧 正在拉取镜像 ($IMAGE_NAME:$TARGET_VERSION)...${RESET}"
+            docker pull $IMAGE_NAME:$TARGET_VERSION || {
                 echo -e "${RED}❌ 镜像拉取失败${RESET}"
                 return 1
             }
@@ -136,7 +193,7 @@ deploy_lucky() {
                 --restart=always \
                 -p $HOST_PORT:$CONTAINER_PORT \
                 -v $CONFIG_DIR:/goodluck \
-                $IMAGE_NAME || {
+                $IMAGE_NAME:$TARGET_VERSION || {
                 echo -e "${RED}❌ 容器启动失败${RESET}"
                 return 1
             }
@@ -155,6 +212,75 @@ deploy_lucky() {
     esac
 
     echo -e "\n配置目录: ${YELLOW}$CONFIG_DIR${RESET}"
+    read -n1 -p "按任意键返回主菜单..."
+}
+
+# 更新容器 (无损保留配置)
+upgrade_lucky() {
+    clear
+    echo -e "${CYAN}🔄 更新Lucky容器${RESET}"
+    echo "--------------------------------------"
+
+    # 1. 检查是否存在
+    if ! docker inspect $CONTAINER_NAME &>/dev/null; then
+        echo -e "${RED}❌ 未检测到 Lucky 容器，无法升级。请先选择 [1. 部署容器]${RESET}"
+        read -n1 -p "按任意键返回主菜单..."
+        return
+    fi
+
+    echo -e "${YELLOW}ℹ️ 您的旧容器配置（网络模式、端口映射、配置文件）将会被完美保留。${RESET}\n"
+    
+    # 2. 选择版本并拉取
+    prompt_for_version
+    echo -e "\n${CYAN}⬇️ 正在拉取镜像 ($IMAGE_NAME:$TARGET_VERSION)...${RESET}"
+    if ! docker pull $IMAGE_NAME:$TARGET_VERSION; then
+        echo -e "${RED}❌ 镜像拉取失败，请检查网络连接${RESET}"
+        read -n1 -p "按任意键返回主菜单..."
+        return
+    fi
+
+    # 3. 提取现有配置
+    echo -e "${CYAN}📦 正在提取当前容器网络和端口配置...${RESET}"
+    NET_MODE=$(docker inspect -f '{{.HostConfig.NetworkMode}}' $CONTAINER_NAME)
+    
+    HOST_PORT=""
+    if [ "$NET_MODE" != "host" ]; then
+        HOST_PORT=$(docker inspect $CONTAINER_NAME | grep -A 3 "\"$CONTAINER_PORT/tcp\":" | grep '"HostPort"' | cut -d '"' -f 4 | head -n 1)
+        HOST_PORT=${HOST_PORT:-$CONTAINER_PORT}
+    fi
+
+    # 4. 停用并删除旧容器
+    echo -e "${CYAN}🗑️ 正在停止并删除旧容器...${RESET}"
+    docker stop $CONTAINER_NAME &>/dev/null
+    docker rm $CONTAINER_NAME &>/dev/null
+
+    # 5. 重建容器
+    echo -e "${CYAN}🚀 正在使用新镜像重建容器...${RESET}"
+    if [ "$NET_MODE" == "host" ]; then
+        docker run -d \
+            --name $CONTAINER_NAME \
+            --restart=always \
+            --net=host \
+            -v $CONFIG_DIR:/goodluck \
+            $IMAGE_NAME:$TARGET_VERSION
+    else
+        docker run -d \
+            --name $CONTAINER_NAME \
+            --restart=always \
+            -p $HOST_PORT:$CONTAINER_PORT \
+            -v $CONFIG_DIR:/goodluck \
+            $IMAGE_NAME:$TARGET_VERSION
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo -e "\n${GREEN}✅ Lucky 容器已成功更新至 $TARGET_VERSION 并启动！${RESET}"
+        echo -e "网络模式: ${YELLOW}$NET_MODE${RESET}"
+        [ "$NET_MODE" != "host" ] && echo -e "映射端口: ${YELLOW}$HOST_PORT → $CONTAINER_PORT${RESET}"
+    else
+        echo -e "\n${RED}❌ 升级后容器启动失败，请检查系统或 Docker 日志。${RESET}"
+    fi
+
+    echo ""
     read -n1 -p "按任意键返回主菜单..."
 }
 
@@ -193,8 +319,10 @@ show_status() {
         echo -e "${GREEN}● 容器已安装${RESET}"
         NET_MODE=$(docker inspect -f '{{.HostConfig.NetworkMode}}' $CONTAINER_NAME)
         STATE=$(docker inspect -f '{{.State.Status}}' $CONTAINER_NAME)
+        IMAGE_TAG=$(docker inspect -f '{{.Config.Image}}' $CONTAINER_NAME)
         
         echo -e "运行状态: ${YELLOW}$STATE${RESET}"
+        echo -e "当前镜像: ${CYAN}$IMAGE_TAG${RESET}"
         echo -e "网络模式: ${YELLOW}$NET_MODE${RESET}"
 
         if [ "$NET_MODE" == "host" ]; then
@@ -272,10 +400,11 @@ main_menu() {
     echo -e "  ${GREEN}$SCRIPT_NAME v$SCRIPT_VERSION${RESET}"
     echo -e "${BLUE}======================================${RESET}"
     echo -e "1. 部署容器"
-    echo -e "2. 卸载容器"
-    echo -e "3. 查看状态"
-    echo -e "4. 管理容器"
-    echo -e "5. 退出"
+    echo -e "2. 更新容器 ${YELLOW}[一键无损保留配置]${RESET}"
+    echo -e "3. 卸载容器"
+    echo -e "4. 查看状态"
+    echo -e "5. 管理容器"
+    echo -e "6. 退出"
     echo -e "${BLUE}======================================${RESET}"
 }
 
@@ -286,14 +415,15 @@ main() {
     
     while true; do
         main_menu
-        read -p "请选择操作 [1-5]: " CHOICE
+        read -p "请选择操作 [1-6]: " CHOICE
 
         case $CHOICE in
             1) deploy_lucky ;;
-            2) uninstall_lucky ;;
-            3) show_status ;;
-            4) manage_container ;;
-            5) echo -e "${GREEN}👋 感谢使用，再见！${RESET}"; exit 0 ;;
+            2) upgrade_lucky ;;
+            3) uninstall_lucky ;;
+            4) show_status ;;
+            5) manage_container ;;
+            6) echo -e "${GREEN}👋 感谢使用，再见！${RESET}"; exit 0 ;;
             *) echo -e "${RED}❌ 无效选择${RESET}"; sleep 1 ;;
         esac
     done
