@@ -44,7 +44,7 @@ check_environment() {
     log "Grep 版本：$(grep --version | head -n1)"
     # 检查jq，如果未安装则提示
     if ! command -v jq &> /dev/null; then
-        log "提示：未安装 'jq'，部分功能（如获取登录地址）可能不够精确。建议安装 'jq' (例如: apt install jq)。"
+        log "提示：未安装 'jq'，无损升级功能和部分解析依赖它。建议安装 'jq' (例如: apt install jq)。"
     fi
 }
 
@@ -61,14 +61,8 @@ set_architecture_and_images() {
             ARCH_DESC="Intel/AMD 64位设备"
             ;;
         aarch64 | arm64) # aarch64 是 ARM 64位架构的正式名称，arm64 是常见别名
-            # 尝试更细致的 ARM 平台识别，例如树莓派4B
-            # 注意：uname -m 对于不同树莓派可能都是 aarch64 或 armv7l
-            # 这里默认指向 armv8，因为它包含了大多数 aarch64 设备
-            # 如果需要更精确的 rpi4/rpi3 识别，需要更复杂的逻辑，例如检查 /proc/cpuinfo
-            # 当前的镜像标签armv8通常代表aarch64
             DOCKER_IMAGE="sulinggg/openwrt:armv8"
             ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:armv8"
-            # 对于 aarch64，rpi4 是一个常见的备用选择，因为它也是 aarch64
             FALLBACK_IMAGE="sulinggg/openwrt:rpi4" 
             ARCH_DESC="ARM64 (aarch64) 设备（如树莓派4B、N1等）"
             ;;
@@ -78,9 +72,6 @@ set_architecture_and_images() {
             FALLBACK_IMAGE="" # ARMv7目前没有特定备选
             ARCH_DESC="ARMv7 设备（如NanoPi R2S/R4S、树莓派2B/3B/3B+等）"
             
-            # 进一步细分树莓派
-            # 警告：以下识别逻辑基于 /proc/cpuinfo，在某些非 Raspbian 系统上可能不准确
-            # 更精确的识别可能需要检查 /sys/firmware/devicetree/base/model
             if [ -f "/proc/cpuinfo" ]; then
                 CPU_MODEL=$(grep -m 1 'Hardware' /proc/cpuinfo | awk '{print $NF}')
                 case "$CPU_MODEL" in
@@ -88,8 +79,8 @@ set_architecture_and_images() {
                         log "检测到为树莓派 1B / Zero 架构 (BCM2835)."
                         DOCKER_IMAGE="sulinggg/openwrt:rpi1"
                         ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:rpi1"
-                        ARCH_DESC="树莓派 1B / Zero (ARMv6)" # rpi1镜像通常为armv6，但此处为了简化归类到armv7段
-                        FALLBACK_IMAGE="sulinggg/openwrt:armv7" # rpi1如果不存在，可以尝试armv7
+                        ARCH_DESC="树莓派 1B / Zero (ARMv6)"
+                        FALLBACK_IMAGE="sulinggg/openwrt:armv7"
                         ;;
                     BCM2836) # Raspberry Pi 2B
                         log "检测到为树莓派 2B 架构 (BCM2836)."
@@ -98,31 +89,29 @@ set_architecture_and_images() {
                         ARCH_DESC="树莓派 2B (ARMv7)"
                         FALLBACK_IMAGE="sulinggg/openwrt:armv7"
                         ;;
-                    BCM2837 | BCM2837A0 | BCM2837B0) # Raspberry Pi 3B / 3B+ (CPU是64位，但系统可能运行在32位模式，即armv7l)
-                        # 如果 uname -m 是 aarch64，则会走 aarch64 分支，这里处理的是 armv7l 的情况
+                    BCM2837 | BCM2837A0 | BCM2837B0) 
                         log "检测到为树莓派 3B / 3B+ 架构 (BCM2837/BCM2837A0/BCM2837B0)."
                         DOCKER_IMAGE="sulinggg/openwrt:rpi3"
                         ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:rpi3"
                         ARCH_DESC="树莓派 3B / 3B+ (ARMv7，宿主机可能运行在32位模式)"
                         FALLBACK_IMAGE="sulinggg/openwrt:armv7"
                         ;;
-                    BCM2711) # Raspberry Pi 4B (CPU是64位，但在某些32位系统下也可能是armv7l)
-                        # 这种情况通常会通过 aarch64 识别，这里是备用处理
+                    BCM2711) 
                         log "检测到为树莓派 4B 架构 (BCM2711)，但系统运行在32位模式。"
                         DOCKER_IMAGE="sulinggg/openwrt:rpi4"
                         ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:rpi4"
                         ARCH_DESC="树莓派 4B (ARMv7，宿主机运行在32位模式)"
-                        FALLBACK_IMAGE="sulinggg/openwrt:armv8" # 尝试aarch64备用，因为rpi4镜像本身就是aarch64
+                        FALLBACK_IMAGE="sulinggg/openwrt:armv8" 
                         ;;
                 esac
             fi
             ;;
-        armv6l) # 树莓派 1B/Zero 专属，通常包含在 rpi1 镜像中
+        armv6l) 
             log "检测到为 ARMv6 设备 (如树莓派 1B/Zero)."
             DOCKER_IMAGE="sulinggg/openwrt:rpi1"
             ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:rpi1"
             ARCH_DESC="树莓派 1B / Zero (ARMv6)"
-            FALLBACK_IMAGE="sulinggg/openwrt:armv7" # 作为一个不太理想的备选
+            FALLBACK_IMAGE="sulinggg/openwrt:armv7"
             ;;
         *)
             error "不支持的架构：$ARCH"
@@ -149,7 +138,6 @@ calculate_network_address() {
         return 1
     fi
 
-    # 使用 ipcalc 或手动计算（如果ipcalc不存在）
     if command -v ipcalc &> /dev/null; then
         echo $(ipcalc -n "$ip_cidr" | awk '/Network:/ {print $2}')
     else
@@ -174,7 +162,6 @@ detect_lan_subnet_gateway() {
         return 1
     fi
 
-    # 检查网卡是否支持混杂模式并开启
     if ! ip link show "$default_iface" | grep -q "PROMISC"; then
         log "检测到网卡 $default_iface 未开启混杂模式，正在尝试开启..."
         ip link set "$default_iface" promisc on
@@ -215,7 +202,6 @@ detect_lan_subnet_gateway() {
     return 0
 }
 
-# 检查子网是否与现有 Docker 网络冲突
 check_network_conflict() {
     local subnet=$1
     log "检查子网 $subnet 是否与现有 Docker 网络冲突..."
@@ -232,20 +218,17 @@ check_network_conflict() {
     return 0
 }
 
-# 验证 IP 是否在子网内
 validate_ip_in_subnet() {
     local ip=$1
     local subnet=$2
     local network=$(echo "$subnet" | cut -d'/' -f1)
     local cidr=$(echo "$subnet" | cut -d'/' -f2)
 
-    # 验证 IP 格式 (简单的正则匹配)
     if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         error "无效的 IP 地址格式: $ip (必须为 x.x.x.x)"
         return 1
     fi
 
-    # 使用 awk 来进行IP范围检查，更健壮
     local ip_parts=( $(echo "$ip" | tr '.' ' ') )
     local net_parts=( $(echo "$network" | tr '.' ' ') )
 
@@ -260,18 +243,15 @@ validate_ip_in_subnet() {
         fi
     done
 
-    # 再次尝试用 ipcalc 验证，如果不存在则进行位运算
     if command -v ipcalc &> /dev/null; then
         if ! ipcalc -c "$ip" "$subnet" &> /dev/null; then
             error "IP $ip 不在子网 $subnet 内。"
             return 1
         fi
     else
-        # 手动位运算检查
         local ip_int=$(( (${ip_parts[0]} << 24) + (${ip_parts[1]} << 16) + (${ip_parts[2]} << 8) + ${ip_parts[3]} ))
         local network_int=$(( (${net_parts[0]} << 24) + (${net_parts[1]} << 16) + (${net_parts[2]} << 8) + ${net_parts[3]} ))
-        local mask=$(( 0xFFFFFFFF << (32 - cidr) )) # 32位掩码
-
+        local mask=$(( 0xFFFFFFFF << (32 - cidr) ))
         if (( (ip_int & mask) != (network_int & mask) )); then
             error "IP $ip 不在子网 $subnet 内。"
             return 1
@@ -281,7 +261,6 @@ validate_ip_in_subnet() {
     return 0
 }
 
-# 检查 IP 是否被占用
 check_ip_occupied() {
     local ip=$1
     log "检查 IP $ip 是否被占用 (ping 测试)..."
@@ -293,7 +272,6 @@ check_ip_occupied() {
     return 0
 }
 
-# 检查端口是否被占用
 check_port_usage() {
     local port=$1
     log "检查端口 $port 是否被占用..."
@@ -315,10 +293,8 @@ check_port_usage() {
     return 0
 }
 
-# 获取宿主机 IP
 get_host_ip() {
     local ip_addr
-    # 优先获取非 Docker 桥接网卡 IP
     ip_addr=$(ip -o -4 addr show | awk '!/^[0-9]*: ?lo|link\/ether|docker0/ {gsub("/", " "); print $4}' | grep -v '172.*' | head -n1)
     if [[ -z "$ip_addr" ]]; then
         ip_addr=$(hostname -I | awk '{print $1}')
@@ -330,10 +306,8 @@ get_host_ip() {
     fi
 }
 
-# 检查 LuCI 和 uhttpd 状态并在容器内安装/启动
 check_luci_status() {
     log "检查 OpenWrt 容器内 LuCI 和 uhttpd 状态..."
-    # 检查 LuCI 是否安装
     if ! docker exec openwrt /bin/sh -c "opkg list-installed | grep -q luci"; then
         log "OpenWrt 容器内 LuCI 未安装，正在尝试安装..."
         if ! docker exec openwrt /bin/sh -c "opkg update && opkg install luci-ssl luci-app-opkg luci-base"; then
@@ -345,8 +319,7 @@ check_luci_status() {
         log "LuCI 已安装。"
     fi
 
-    # 检查 uhttpd 服务是否运行
-    if ! docker exec openwrt /bin/sh -c "ps | grep -q '[u]httpd'"; then # 使用 [] 避免 grep 自身
+    if ! docker exec openwrt /bin/sh -c "ps | grep -q '[u]httpd'"; then 
         log "uhttpd 服务未运行，正在尝试启动..."
         if ! docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable"; then
             error "uhttpd 启动失败！请检查容器状态。"
@@ -359,7 +332,6 @@ check_luci_status() {
     return 0
 }
 
-# 验证 Web 界面可访问性
 verify_web_access() {
     local ip=$1
     local port=$2
@@ -374,23 +346,15 @@ verify_web_access() {
     fi
 }
 
-# 清理残留 Docker 资源
 cleanup_residual() {
     log "清理可能残留的 Docker 资源 (容器 'openwrt' 及网络)..."
     docker stop openwrt >/dev/null 2>&1
     docker rm openwrt >/dev/null 2>&1
     docker network rm openwrt_net >/dev/null 2>&1
     docker network rm openwrt_bridge >/dev/null 2>&1
-    # 谨慎使用 docker system prune -f，它会删除所有停止的容器、未使用的网络、悬空镜像等
-    # read -rp "是否执行 'docker system prune -f' 清理所有 Docker 冗余数据？(谨慎操作，会删除所有未使用的容器/镜像/网络) [y/N]: " PRUNE_CONFIRM
-    # if [[ "$PRUNE_CONFIRM" =~ [Yy] ]]; then
-    #     log "正在清理 Docker 冗余数据..."
-    #     docker system prune -f
-    # fi
     success "Docker 容器 'openwrt' 及相关网络已清理完毕。"
 }
 
-# 尝试拉取镜像
 pull_image() {
     local image=$1
     log "正在拉取镜像 '$image'..."
@@ -403,7 +367,124 @@ pull_image() {
     fi
 }
 
-# 显示系统及Docker信息
+# ================= 核心修复函数：解决部署后无法登录 =================
+fix_openwrt_network() {
+    local net_mode=$1
+    local ip=$2
+    local gateway=$3
+    local cidr=$4
+    
+    log "正在注入底层防失联补丁：强制对齐 OpenWrt 内部路由表与 Docker 分配 IP..."
+    
+    if [ "$net_mode" -eq 2 ]; then
+        # Macvlan 模式
+        local mask="255.255.255.0"
+        if [ -n "$cidr" ]; then
+            local prefix=$(echo "$cidr" | cut -d'/' -f2)
+            if [[ "$prefix" =~ ^[0-9]+$ ]]; then
+                local value=$(( 0xffffffff ^ ((1 << (32 - prefix)) - 1) ))
+                mask="$(( (value >> 24) & 0xff )).$(( (value >> 16) & 0xff )).$(( (value >> 8) & 0xff )).$(( value & 0xff ))"
+            fi
+        fi
+        docker exec openwrt /bin/sh -c "uci set network.lan.proto='static' && uci set network.lan.ipaddr='$ip' && uci set network.lan.netmask='$mask' && uci set network.lan.gateway='$gateway' && uci set network.lan.dns='$gateway' && uci commit network && /etc/init.d/network restart" >/dev/null 2>&1
+    else
+        # Bridge 模式必须为 DHCP 才能获取 Docker 网段
+        docker exec openwrt /bin/sh -c "uci set network.lan.proto='dhcp' && uci commit network && /etc/init.d/network restart" >/dev/null 2>&1
+    fi
+    
+    # 无条件放行防火墙，彻底杜绝外网拒绝连接
+    docker exec openwrt /bin/sh -c "uci set firewall.@zone[0].input='ACCEPT' && uci set firewall.@zone[0].forward='ACCEPT' && uci set firewall.@zone[0].output='ACCEPT' && uci commit firewall && /etc/init.d/firewall restart" >/dev/null 2>&1
+
+    docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd restart" >/dev/null 2>&1
+    success "配置修正完毕，面板接口已安全暴露。"
+}
+
+# ================= 核心升级函数：一键无损保留配置更新 =================
+upgrade_openwrt() {
+    echo -e "\n\033[36m--- 🔄 一键更新 OpenWrt 容器 ---\033[0m"
+    if ! command -v jq &> /dev/null; then
+        error "无损更新功能依赖 'jq' 解析器，请先安装 (例如: apt install jq) 后再重试。"
+        return 1
+    fi
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^openwrt$"; then 
+        error "未检测到已安装的 OpenWrt 容器，无法进行更新操作。请先选择 [1) 安装] 进行部署！"
+        return 1
+    fi
+
+    log "正在提取当前容器网络、端口及挂载卷配置信息..."
+    local container_info=$(docker inspect openwrt)
+
+    local net_mode_name=$(echo "$container_info" | jq -r '.[0].HostConfig.NetworkMode')
+    local macvlan_ip=""
+    if [ "$net_mode_name" != "bridge" ] && [ "$net_mode_name" != "host" ]; then
+        macvlan_ip=$(echo "$container_info" | jq -r ".[0].NetworkSettings.Networks[\"$net_mode_name\"].IPAddress")
+    fi
+
+    local -a run_args=("-d" "--name" "openwrt" "--restart" "unless-stopped" "--privileged")
+
+    # 提取端口映射
+    local -a orig_ports
+    mapfile -t orig_ports < <(echo "$container_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key | split("/")[0])" else empty end')
+    if (( ${#orig_ports[@]} > 0 )); then run_args+=("${orig_ports[@]}"); fi
+
+    # 提取挂载卷
+    local -a orig_mounts
+    mapfile -t orig_mounts < <(echo "$container_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"')
+    if (( ${#orig_mounts[@]} > 0 )); then run_args+=("${orig_mounts[@]}"); fi
+
+    if [ -n "$net_mode_name" ] && [ "$net_mode_name" != "null" ]; then
+        run_args+=("--network" "$net_mode_name")
+        if [ "$net_mode_name" == "openwrt_net" ] && [ -n "$macvlan_ip" ]; then
+            run_args+=("--ip" "$macvlan_ip")
+        fi
+    fi
+
+    echo -e "\n\033[33m请选择要用于更新的 OpenWrt 镜像源：\033[0m"
+    echo "1) 保持当前默认镜像 ($DOCKER_IMAGE)"
+    if [ -n "$ALIYUN_IMAGE" ]; then echo "2) 阿里云镜像 ($ALIYUN_IMAGE)"; fi
+    if [ -n "$FALLBACK_IMAGE" ]; then echo "3) 备选镜像 ($FALLBACK_IMAGE)"; fi
+    read -rp "请选择 [默认1]: " img_choice
+    local target_image="$DOCKER_IMAGE"
+    case "$img_choice" in
+        2) [ -n "$ALIYUN_IMAGE" ] && target_image="$ALIYUN_IMAGE" ;;
+        3) [ -n "$FALLBACK_IMAGE" ] && target_image="$FALLBACK_IMAGE" ;;
+    esac
+
+    if ! pull_image "$target_image"; then 
+        error "镜像拉取失败，更新终止。"
+        return 1
+    fi
+
+    log "正在停止并销毁旧容器..."
+    docker stop openwrt >/dev/null 2>&1
+    docker rm openwrt >/dev/null 2>&1
+
+    run_args+=("$target_image" "/sbin/init")
+
+    log "正在使用新镜像和旧配置重建容器..."
+    if ! docker run "${run_args[@]}" >/dev/null 2>&1; then
+        error "容器升级重建失败！请检查系统或Docker日志。"
+        return 1
+    fi
+
+    success "OpenWrt 容器升级重建成功！"
+    log "等待容器系统加载启动 (约10秒)..."
+    sleep 10
+    
+    # 对新版固件再次打入防失联网络补丁
+    if [ "$net_mode_name" == "openwrt_net" ] && [ -n "$macvlan_ip" ]; then
+        local gateway=$(docker network inspect "$net_mode_name" | jq -r '.[0].IPAM.Config[0].Gateway')
+        local subnet=$(docker network inspect "$net_mode_name" | jq -r '.[0].IPAM.Config[0].Subnet')
+        fix_openwrt_network 2 "$macvlan_ip" "$gateway" "$subnet"
+    else
+        fix_openwrt_network 1
+    fi
+
+    check_luci_status
+    success "🎉 无损更新与配置注入全部完成！"
+}
+# ====================================================================
+
 show_system_info() {
     clear
     echo -e "\033[34m====================================\033[0m"
@@ -440,12 +521,13 @@ while true; do
     echo ""
     echo -e "\033[36m[ 主菜单 ]\033[0m"
     echo "1) 安装 OpenWrt 容器"
-    echo "2) 完全卸载 OpenWrt 容器及相关网络"
-    echo "3) 查看 OpenWrt 容器状态"
-    echo "4) 查看 OpenWrt 容器实时日志"
-    echo "5) 显示 OpenWrt Web/SSH 登录地址"
-    echo "6) 退出脚本"
-    read -rp "请输入操作编号 (1-6): " ACTION
+    echo "2) 更新 OpenWrt 容器 (无损保留配置)"
+    echo "3) 完全卸载 OpenWrt 容器及相关网络"
+    echo "4) 查看 OpenWrt 容器状态"
+    echo "5) 查看 OpenWrt 容器实时日志"
+    echo "6) 显示 OpenWrt Web/SSH 登录地址"
+    echo "7) 退出脚本"
+    read -rp "请输入操作编号 (1-7): " ACTION
 
     case "$ACTION" in
         1)
@@ -470,7 +552,6 @@ while true; do
             read -rp "请选择网络类型 [1/2, 默认2]: " NET_MODE
             NET_MODE=${NET_MODE:-2}
 
-            # 默认网卡和网络参数初始化
             DEFAULT_NIC=$(get_default_interface)
             if [ -z "$DEFAULT_NIC" ]; then
                 error "无法自动检测默认网卡，请手动输入。"
@@ -485,8 +566,8 @@ while true; do
             MACVLAN_IP=""
             WEB_PORT="8080"
             SSH_PORT="2222"
-            DEFAULT_SUBNET="192.168.3.0/24" # 示例默认值
-            DEFAULT_GATEWAY="192.168.3.1" # 示例默认值
+            DEFAULT_SUBNET="192.168.3.0/24"
+            DEFAULT_GATEWAY="192.168.3.1"
 
             if [ "$NET_MODE" -eq 2 ]; then
                 echo -e "\n\033[33m» Macvlan 参数配置 «\033[0m"
@@ -519,7 +600,7 @@ while true; do
                     ip link show
                     continue
                 fi
-                # 再次尝试开启混杂模式，确保万无一失
+                
                 if ! ip link show "$TARGET_NIC" | grep -q "PROMISC"; then
                     log "正在开启网卡 $TARGET_NIC 的混杂模式..."
                     ip link set "$TARGET_NIC" promisc on
@@ -571,7 +652,7 @@ while true; do
                     log "Macvlan 网络 'openwrt_net' 已存在。"
                 fi
                 NET_NAME="openwrt_net"
-            else # Bridge 模式
+            else 
                 if ! docker network inspect openwrt_bridge >/dev/null 2>&1; then
                     log "正在创建 Bridge 网络 'openwrt_bridge'..."
                     if ! docker network create openwrt_bridge; then
@@ -618,7 +699,6 @@ while true; do
                 log "未启用数据持久化，容器删除后配置将丢失。"
             fi
 
-            # 检查同名容器是否已存在
             if docker ps -a --format '{{.Names}}' | grep -q "^openwrt$"; then
                 echo -e "\n\033[33m警告：名为 'openwrt' 的容器已存在。\033[0m"
                 read -rp "是否要先停止并删除现有容器再继续安装？[y/N]: " REMOVE_EXISTING
@@ -633,14 +713,12 @@ while true; do
                 fi
             fi
 
-            # 尝试拉取镜像，如果失败则尝试备用镜像
             if ! pull_image "$SELECTED_IMAGE"; then
                 if [ -n "$FALLBACK_IMAGE" ]; then
                     echo -e "\033[33m尝试拉取备选镜像 '$FALLBACK_IMAGE'...\033[0m"
                     if ! pull_image "$FALLBACK_IMAGE"; then
                         error "所有镜像拉取失败！"
                         echo -e "\033[33m请检查您的网络连接、Docker 配置 (如镜像加速器) 或手动访问 Docker Hub 确认镜像标签是否存在。\033[0m"
-                        echo -e "\033[33m建议：手动配置 Docker 镜像加速器 (编辑 /etc/docker/daemon.json) 后重启 Docker。\033[0m"
                         cleanup_residual
                         read -rp "是否重试拉取镜像？[y/N]: " RETRY_PULL
                         if [[ "$RETRY_PULL" =~ [Yy] ]]; then
@@ -695,6 +773,15 @@ while true; do
             log "等待容器初始化 (约10秒)..."
             sleep 10
 
+            # -------------------------------------------------------------
+            # 【注入】底层防断网与无响应补丁（根据网络模式和传入参数分配策略）
+            if [ "$NET_MODE" -eq 2 ]; then
+                fix_openwrt_network 2 "$MACVLAN_IP" "$GATEWAY" "$SUBNET"
+            else
+                fix_openwrt_network 1
+            fi
+            # -------------------------------------------------------------
+
             log "检查容器状态..."
             if ! docker ps -q --filter name=openwrt >/dev/null; then
                 error "容器启动后未保持运行状态！"
@@ -706,7 +793,6 @@ while true; do
             fi
 
             log "配置 OpenWrt 环境 (尝试安装 LuCI 和启动 uhttpd)..."
-            # 移除可能导致启动问题的 preinit 行
             docker exec openwrt /bin/sh -c "sed -i 's/.*preinit.*//g' /etc/preinit" >/dev/null 2>&1 || log "警告：无法修改 preinit 配置，可能导致首次启动问题。"
             
             if ! check_luci_status; then
@@ -741,10 +827,15 @@ while true; do
             echo -e "\n\033[36mOpenWrt 容器已成功部署！\033[0m"
             echo -e "\033[36m正在显示登录地址...请稍候。\033[0m"
             sleep 2
-            bash "$0" 5 # 调用显示登录地址的逻辑
+            bash "$0" 6 
             ;;
 
         2)
+            # --- 调用新增无损更新函数 ---
+            upgrade_openwrt
+            ;;
+
+        3)
             # --- 卸载逻辑 ---
             echo -e "\n\033[33m警告：这将停止并删除名为 'openwrt' 的 Docker 容器及其相关的所有 Macvlan/Bridge 网络 'openwrt_net' 和 'openwrt_bridge'。\033[0m"
             read -rp "确定要完全卸载 OpenWrt 容器吗？此操作不可逆！[y/N]: " CONFIRM_UNINSTALL
@@ -752,7 +843,6 @@ while true; do
                 log "正在执行完全卸载操作..."
                 cleanup_residual
                 
-                # 提示用户手动删除持久化目录
                 if [[ -n "$CONFIG_PATH" && -d "$CONFIG_PATH" ]]; then
                     echo -e "\033[33m请注意：您之前设置的配置文件挂载目录 \033[36m$CONFIG_PATH\033[33m 未被自动删除。\033[0m"
                     read -rp "是否要手动删除此目录？[y/N]: " DELETE_VOLUME_DIR
@@ -766,7 +856,7 @@ while true; do
             fi
             ;;
 
-        3)
+        4)
             # --- 查看容器状态 ---
             echo -e "\n\033[36m--- OpenWrt 容器状态 ---\033[0m"
             if ! docker ps -a --filter name=openwrt --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"; then
@@ -775,7 +865,7 @@ while true; do
             echo -e "\033[34m------------------------\033[0m"
             ;;
 
-        4)
+        5)
             # --- 查看实时日志 ---
             echo -e "\n\033[36m--- OpenWrt 容器实时日志 (按 Ctrl+C 退出) ---\033[0m"
             if ! docker logs -f openwrt; then
@@ -790,7 +880,7 @@ while true; do
             echo -e "  3. \033[32m如果未运行，尝试启动：\033[0m /etc/init.d/uhttpd start"
             ;;
 
-        5)
+        6)
             # --- 查看登录地址 ---
             echo -e "\n\033[36m正在查询 OpenWrt 容器登录信息...\033[0m"
             CONTAINER_ID=$(docker ps -q --filter name=openwrt)
@@ -801,7 +891,6 @@ while true; do
             
             INSPECT_JSON=$(docker inspect "$CONTAINER_ID")
             
-            # 使用 jq 优先解析，如果未安装则回退到 grep/awk
             NET_INFO=""
             WEB_HOST_PORT=""
             SSH_HOST_PORT=""
@@ -812,17 +901,14 @@ while true; do
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | jq -r '.[0].HostConfig.PortBindings."22/tcp"[0].HostPort // empty')
             else
                 log "提示：未安装 jq，将使用 grep/awk 尝试解析，结果可能不精确。建议安装 jq (例: apt install jq)。"
-                # 尝试从 Networks 部分提取网络名称和 IP
                 NET_INFO=$(echo "$INSPECT_JSON" | grep -E '"Name": "(openwrt_net|openwrt_bridge)"' -A 4 | grep '"IPAddress":' | head -n 1 | sed -n 's/.*"IPAddress": "\(.*\)".*/\1/p')
-                # 还需要获取网络名称来判断是 Macvlan 还是 Bridge
                 NETWORK_NAME_RAW=$(echo "$INSPECT_JSON" | grep -E '"Name": "(openwrt_net|openwrt_bridge)"' | head -n 1 | sed -n 's/.*"Name": "\(.*\)".*/\1/p')
                 if [[ -n "$NET_INFO" && -n "$NETWORK_NAME_RAW" ]]; then
                     NET_INFO="${NETWORK_NAME_RAW}:${NET_INFO}"
                 else
-                    NET_INFO="" # 清空以避免不完整信息
+                    NET_INFO=""
                 fi
 
-                # 从 PortBindings 部分提取宿主机映射端口
                 WEB_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"80/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
                 SSH_HOST_PORT=$(echo "$INSPECT_JSON" | grep -A 2 '"22/tcp"' | grep '"HostPort":' | sed -n 's/.*"HostPort": "\(.*\)".*/\1/p' | head -n 1)
             fi
@@ -875,14 +961,13 @@ while true; do
             echo -e "  3. 如果是 Macvlan 模式，请确保宿主机网卡混杂模式已开启 (ip link set <网卡名称> promisc on)。"
             ;;
 
-        6)
+        7)
             # --- 退出脚本 ---
             echo -e "\n\033[33m感谢使用 OpenWrt Docker 一键管理脚本，再见！\033[0m"
             exit 0
             ;;
 
         *)
-            # --- 无效输入 ---
             error "无效的输入，请重新选择！"
             ;;
     esac
