@@ -137,33 +137,61 @@ install_dependencies() {
 
 # 获取 Sun-Panel 版本列表
 get_sunpanel_versions() {
-  log "INFO" "正在获取 Sun-Panel 版本列表..."
-  # 调用 Docker Hub API 获取版本信息
-  curl -s "https://hub.docker.com/v2/repositories/hslr/sun-panel/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-beta[0-9]+-[0-9]{2}-[0-9]{2})?$' | sort -r
+  local versions=""
+  # 增加重试机制：最多尝试 3 次，每次超时 10 秒
+  for i in {1..3}; do
+    # 放宽正则：抓取包含数字的版本号，排除 latest，以便我们后面把它放在第一位
+    versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/hslr/sun-panel/tags/?page_size=30" | jq -r '.results[].name' 2>/dev/null | grep -E '^[0-9v]' | sort -r)
+    
+    if [ -n "$versions" ]; then
+      break
+    fi
+    sleep 2
+  done
+  
+  # 始终将 latest 作为首选项提供
+  if [ -n "$versions" ]; then
+    echo "latest $versions"
+  else
+    # 如果实在获取不到，返回空
+    echo ""
+  fi
 }
 
 # 提示用户选择版本
 prompt_for_version() {
-  local versions=($(get_sunpanel_versions))
+  log "INFO" "正在向 Docker Hub 请求 Sun-Panel 版本列表..."
+  echo -e "${CYAN}正在获取可选版本列表，请稍候...${NC}"
+  
+  local versions_str=$(get_sunpanel_versions)
+  local versions=($versions_str)
   local num_versions=${#versions[@]}
 
+  # 降级方案：如果 API 完全不通，允许用户手动输入
   if [ $num_versions -eq 0 ]; then
-    log "ERROR" "无法获取 Sun-Panel 版本列表"
-    exit 1
+    log "WARN" "无法从 Docker Hub 自动获取版本列表。"
+    echo -e "${YELLOW}由于网络原因，无法自动获取版本列表。${NC}"
+    read -p "请输入您要安装/升级的 Sun-Panel 版本 (直接回车默认使用: latest): " manual_version
+    SUN_PANEL_VERSION=${manual_version:-latest}
+    log "INFO" "用户手动输入版本: $SUN_PANEL_VERSION"
+    return
   fi
 
-  echo "请选择 Sun-Panel 版本："
+  echo "请选择 Sun-Panel 版本（推荐直接回车选择 latest）："
   for i in "${!versions[@]}"; do
     echo "$((i + 1)). ${versions[$i]}"
   done
 
   while true; do
-    read -p "请输入版本编号: " version_choice
-    if [[ $version_choice =~ ^[0-9]+$ ]] && [ $version_choice -ge 1 ] && [ $version_choice -le $num_versions ]; then
+    read -p "请输入版本编号 [直接回车默认选择 1]: " version_choice
+    version_choice=${version_choice:-1} # 如果直接回车，默认为 1
+    
+    if [[ $version_choice =~ ^[0-9]+$ ]] && [ "$version_choice" -ge 1 ] && [ "$version_choice" -le "$num_versions" ]; then
       SUN_PANEL_VERSION=${versions[$((version_choice - 1))]}
       break
     else
       log "WARN" "无效的选择，请重新输入"
+      echo -e "${RED}错误：无效的编号，请输入 1 到 $num_versions 之间的数字。${NC}"
     fi
   done
 
@@ -263,6 +291,79 @@ install_sunpanel() {
   echo "3. 如需重置密码，请使用本脚本的'重置管理员密码'功能"
 }
 
+# 手动升级 Sun-Panel（保留原有配置）
+manual_upgrade_sunpanel() {
+  log "INFO" "正在准备升级 Sun-Panel..."
+
+  # 1. 前置检查（判断容器是否存在）
+  if ! docker ps -a --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    log "ERROR" "未检测到已部署的 Sun-Panel 容器，无法升级。"
+    echo -e "${RED}错误：未检测到正在运行或已停止的 Sun-Panel 容器，无法升级。请先选择安装。${NC}"
+    return
+  fi
+
+  # 2. 获取新版本并拉取镜像
+  prompt_for_version
+  
+  log "INFO" "正在拉取镜像 $SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION..."
+  docker pull "$SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION" || {
+    log "ERROR" "镜像拉取失败"
+    echo -e "${RED}错误：镜像拉取失败，请检查网络后重试。${NC}"
+    return
+  }
+
+  # 3. 提取当前容器的配置 (核心步骤)
+  log "INFO" "正在提取当前容器的配置参数..."
+  local old_network_mode
+  old_network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME")
+
+  local host_port
+  # 提取映射到宿主机的端口 (Sun-Panel 容器内使用的是 3002 端口)
+  host_port=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].HostConfig.PortBindings["3002/tcp"][0].HostPort // empty')
+
+  # 4. 停用并删除旧容器
+  log "INFO" "正在停止并删除旧容器..."
+  docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  docker rm "$CONTAINER_NAME" >/dev/null 2>&1
+
+  # 5. 使用旧配置和新镜像重建容器
+  log "INFO" "正在使用新镜像重建容器..."
+  local docker_cmd=(
+    docker run -d
+    --name "$CONTAINER_NAME"
+    --restart=always
+    -v "${DATA_DIR}/conf:/app/conf"
+    -v /var/run/docker.sock:/var/run/docker.sock
+    -e TZ="${TIMEZONE}"
+  )
+
+  # 恢复网络模式和端口映射
+  if [[ "$old_network_mode" == "host" ]]; then
+    docker_cmd+=(--network host)
+  else
+    if [ -n "$host_port" ]; then
+      docker_cmd+=(-p "${host_port}:3002")
+    else
+      # 容错处理：如果没提取到端口，回退到默认端口
+      docker_cmd+=(-p "${DEFAULT_SUN_PANEL_PORT}:3002")
+    fi
+  fi
+
+  # 加上镜像名作为最后参数
+  docker_cmd+=("$SUN_PANEL_IMAGE_NAME:$SUN_PANEL_VERSION")
+
+  # 执行拼接好的命令
+  "${docker_cmd[@]}" || {
+    log "ERROR" "升级后容器启动失败"
+    echo -e "${RED}错误：容器启动失败，请检查日志。${NC}"
+    return
+  }
+  
+  log "INFO" "Sun-Panel 已升级到 $SUN_PANEL_VERSION 并自动恢复原有配置"
+  echo -e "\n${GREEN}升级成功！Sun-Panel 已成功更新至 $SUN_PANEL_VERSION 版本。${NC}"
+  echo -e "${YELLOW}您的网络模式、端口配置及数据均已完全保留。${NC}"
+}
+
 # 查看所有容器状态
 check_all_containers_status() {
   log "INFO" "正在检查所有容器状态..."
@@ -339,23 +440,25 @@ interactive_menu() {
     echo -e "\n${CYAN}Sun-Panel 管理脚本${NC}"
     echo -e "${YELLOW}===================${NC}"
     echo "1. 部署 Sun-Panel"
-    echo "2. 查看所有容器状态"
-    echo "3. 卸载 Sun-Panel"
-    echo "4. 数据备份"
-    echo "5. 数据恢复"
-    echo "6. 重置管理员密码"
-    echo "7. 退出"
+    echo "2. 手动升级现有的 Sun-Panel"
+    echo "3. 查看所有容器状态"
+    echo "4. 卸载 Sun-Panel"
+    echo "5. 数据备份"
+    echo "6. 数据恢复"
+    echo "7. 重置管理员密码"
+    echo "8. 退出"
     echo -e "${YELLOW}===================${NC}"
     read -p "请输入选项编号: " choice
 
     case $choice in
       1) install_sunpanel ;;
-      2) check_all_containers_status ;;
-      3) uninstall_container $CONTAINER_NAME ;;
-      4) backup_data ;;
-      5) restore_data ;;
-      6) reset_admin_password ;;
-      7)
+      2) manual_upgrade_sunpanel ;;
+      3) check_all_containers_status ;;
+      4) uninstall_container $CONTAINER_NAME ;;
+      5) backup_data ;;
+      6) restore_data ;;
+      7) reset_admin_password ;;
+      8)
         log "INFO" "退出脚本"
         echo -e "${GREEN}感谢使用 Sun-Panel 管理脚本${NC}"
         exit 0
@@ -373,8 +476,8 @@ main() {
   # 显示欢迎信息
   echo -e "${CYAN}"
   echo "======================================"
-  echo " Sun-Panel Docker 管理脚本 v2.0"
-  echo " 支持部署、管理和维护 Sun-Panel"
+  echo " Sun-Panel Docker 管理脚本 v2.1"
+  echo " 支持部署、更新、管理和维护 Sun-Panel"
   echo "======================================"
   echo -e "${NC}"
   
