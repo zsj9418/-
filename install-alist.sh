@@ -30,6 +30,7 @@ LOG_FILE="/var/log/alist-openlist-deploy.log"
 red() { echo -e "\033[31m$@\033[0m"; }
 green() { echo -e "\033[32m$@\033[0m"; }
 yellow() { echo -e "\033[33m$@\033[0m"; }
+cyan() { echo -e "\033[36m$@\033[0m"; }
 
 run_as_root() {
     if [[ $EUID -eq 0 ]]; then
@@ -158,8 +159,119 @@ install_dependencies() {
     green "依赖检测完毕。"
 }
 
+# 获取 Docker Hub 版本列表
+get_docker_tags() {
+    local repo=$1
+    local versions=""
+    for i in {1..3}; do
+        versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/${repo}/tags/?page_size=30" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -v 'latest' | grep -E '^[vV0-9]' | sort -ur)
+        if [ -n "$versions" ]; then break; fi
+        sleep 2
+    done
+    if [ -n "$versions" ]; then echo "latest $versions"; else echo ""; fi
+}
+
+# 提示用户选择版本
+prompt_for_version() {
+    local repo=$1
+    local desc=$2
+    cyan "🔄 正在从 Docker Hub 获取 $desc 可用版本列表，请稍候..."
+    
+    local versions_str=$(get_docker_tags "$repo")
+    local versions=($versions_str)
+    local num_versions=${#versions[@]}
+
+    if [ $num_versions -eq 0 ]; then
+        yellow "⚠️ 无法自动获取版本列表（可能由于国内网络问题）。"
+        read -rp "请输入您要使用的版本标签 [直接回车默认使用: latest]: " manual_version
+        TARGET_VERSION=${manual_version:-latest}
+        green "✅ 已确认版本: $TARGET_VERSION"
+        return
+    fi
+
+    cyan "请选择 $desc 版本："
+    for i in "${!versions[@]}"; do
+        echo "$((i + 1)). ${versions[$i]}"
+    done
+
+    while true; do
+        read -rp "请输入版本编号 [直接回车默认选择 1 (latest)]: " version_choice
+        version_choice=${version_choice:-1}
+        
+        if [[ $version_choice =~ ^[0-9]+$ ]] && [ "$version_choice" -ge 1 ] && [ "$version_choice" -le "$num_versions" ]; then
+            TARGET_VERSION=${versions[$((version_choice - 1))]}
+            break
+        else
+            red "❌ 无效的选择，请输入 1 到 $num_versions 之间的数字。"
+        fi
+    done
+    green "✅ 已选择版本: $TARGET_VERSION"
+}
+
+# ========== 无损更新通用函数 ==========
+upgrade_container() {
+    local cname="$1"
+    local repo="$2"
+    local desc="$3"
+
+    if ! command -v jq &> /dev/null; then red "此功能需要 'jq' 命令，请先安装。"; return 1; fi
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^$cname$"; then 
+        red "$desc 容器未部署，无法进行更新操作。"
+        return 
+    fi
+
+    yellow "ℹ️ 准备更新 $desc，现有的配置（端口、外部媒体库等挂载目录）将被完整保留。"
+    
+    # 1. 选择并拉取新版本
+    TARGET_VERSION="latest"
+    prompt_for_version "$repo" "$desc"
+    local new_image="$repo:$TARGET_VERSION"
+
+    yellow "⬇️ 正在拉取镜像: $new_image"
+    docker pull "$new_image" || { red "镜像拉取失败。"; return 1; }
+
+    # 2. 精准提取当前容器配置
+    yellow "📦 正在提取当前容器配置信息..."
+    local container_info
+    container_info=$(docker inspect "$cname")
+
+    local -a new_run_args=()
+    new_run_args+=("-d" "--name" "$cname" "--user" "0:0")
+
+    # 提取端口映射
+    local -a orig_ports
+    mapfile -t orig_ports < <(echo "$container_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key | split("/")[0])" else empty end')
+    if (( ${#orig_ports[@]} > 0 )); then new_run_args+=("${orig_ports[@]}"); fi
+
+    # 提取卷挂载
+    local -a orig_mounts
+    mapfile -t orig_mounts < <(echo "$container_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"')
+    if (( ${#orig_mounts[@]} > 0 )); then new_run_args+=("${orig_mounts[@]}"); fi
+
+    # 提取自动重启策略
+    local restart_policy
+    restart_policy=$(echo "$container_info" | jq -r '.[0].HostConfig.RestartPolicy.Name')
+    if [[ -n "$restart_policy" && "$restart_policy" != "no" ]]; then new_run_args+=("--restart" "$restart_policy"); fi
+
+    # 3. 销毁旧容器重建
+    yellow "🗑️ 正在停止并删除旧容器..."
+    docker stop "$cname" &>/dev/null || true
+    docker rm "$cname" &>/dev/null || true
+    
+    yellow "🚀 正在使用新镜像重建容器..."
+    docker run "${new_run_args[@]}" "$new_image"
+    
+    if [ $? -eq 0 ]; then
+        green "✅ $desc 已成功更新至 $TARGET_VERSION 并启动！"
+    else
+        red "❌ $desc 更新后容器启动失败，请检查 Docker 日志。"
+    fi
+}
+
 # ========== Alist ==========
 alist_pull_image() {
+    prompt_for_version "xhofe/alist" "Alist"
+    ALIST_IMAGE="xhofe/alist:$TARGET_VERSION"
     yellow "拉取 Alist 镜像: $ALIST_IMAGE"
     docker pull "$ALIST_IMAGE" || { red "镜像拉取失败。"; exit 1; }
 }
@@ -244,15 +356,15 @@ alist_reset_pwd() {
     fi
 }
 
-# 【菜单优化】
 alist_manage_menu() {
     while true; do
         echo
-        echo "-------- Alist 管理 --------"
+        cyan "-------- Alist 管理 --------"
         echo "  1. 部署/重装 Alist"
-        echo "  2. 卸载 Alist"
-        echo "  3. 返回上级"
-        echo "----------------------------"
+        echo "  2. 更新 Alist [一键无损保留配置]"
+        echo "  3. 卸载 Alist"
+        echo "  4. 返回上级"
+        cyan "----------------------------"
         read -rp "请选择: " sel
         case $sel in
             1)
@@ -267,9 +379,12 @@ alist_manage_menu() {
                 alist_start
                 ;;
             2)
+                upgrade_container "$ALIST_NAME" "xhofe/alist" "Alist"
+                ;;
+            3)
                 alist_uninstall
                 ;;
-            3) break ;;
+            4) break ;;
             *) red "无效选项。" ;;
         esac
     done
@@ -277,6 +392,8 @@ alist_manage_menu() {
 
 # ========== OpenList ==========
 openlist_pull_image() {
+    prompt_for_version "openlistteam/openlist" "OpenList"
+    OPENLIST_IMAGE="openlistteam/openlist:$TARGET_VERSION"
     yellow "拉取 OpenList 镜像: $OPENLIST_IMAGE"
     docker pull "$OPENLIST_IMAGE" || { red "镜像拉取失败。"; exit 1; }
 }
@@ -361,15 +478,15 @@ openlist_reset_pwd() {
     fi
 }
 
-# 【菜单优化】
 openlist_manage_menu() {
     while true; do
         echo
-        echo "-------- OpenList 管理 --------"
+        cyan "-------- OpenList 管理 --------"
         echo "  1. 部署/重装 OpenList"
-        echo "  2. 卸载 OpenList"
-        echo "  3. 返回上级"
-        echo "-------------------------------"
+        echo "  2. 更新 OpenList [一键无损保留配置]"
+        echo "  3. 卸载 OpenList"
+        echo "  4. 返回上级"
+        cyan "-------------------------------"
         read -rp "请选择: " sel
         case $sel in
             1)
@@ -384,9 +501,12 @@ openlist_manage_menu() {
                 openlist_start
                 ;;
             2)
+                upgrade_container "$OPENLIST_NAME" "openlistteam/openlist" "OpenList"
+                ;;
+            3)
                 openlist_uninstall
                 ;;
-            3) break ;;
+            4) break ;;
             *) red "无效选项。" ;;
         esac
     done
@@ -406,11 +526,11 @@ add_mount_to_container() {
     new_run_args+=("-d" "--name" "$cname" "--user" "0:0")
 
     local -a orig_ports
-    mapfile -t orig_ports < <(echo "$container_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key | split("/")[0])" else "" end')
+    mapfile -t orig_ports < <(echo "$container_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key | split("/")[0])" else empty end')
     if (( ${#orig_ports[@]} > 0 )); then new_run_args+=("${orig_ports[@]}"); fi
 
     local -a orig_mounts
-    mapfile -t orig_mounts < <(echo "$container_info" | jq -r '.[0].Mounts[] | "-v", "\(.Source):\(.Destination)"')
+    mapfile -t orig_mounts < <(echo "$container_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"')
     if (( ${#orig_mounts[@]} > 0 )); then new_run_args+=("${orig_mounts[@]}"); fi
 
     local restart_policy
@@ -436,14 +556,14 @@ main_menu() {
     while true; do
         clear
         echo "========================================"
-        echo "      Alist & OpenList 一键管理脚本"
+        cyan "      Alist & OpenList 一键管理脚本"
         echo "========================================"
-        echo "  1. Alist 管理"
-        echo "  2. OpenList 管理"
+        echo "  1. Alist 管理菜单"
+        echo "  2. OpenList 管理菜单"
         echo "  3. 设置 OpenList/Alist 管理员密码"
         echo "  4. 查看 OpenList/Alist 容器状态"
         echo "  5. 卸载并清理所有 (Alist & OpenList)"
-        echo "  6. 为已有容器追加挂载目录"
+        echo "  6. 为已有容器追加媒体挂载目录"
         echo "  7. 退出"
         echo "----------------------------------------"
         read -rp "请输入选项编号: " choice
@@ -458,7 +578,7 @@ main_menu() {
                 echo "1) 查看 Alist 容器状态"; echo "2) 查看 OpenList 容器状态"
                 read -rp "请选择(1/2): " sel
                 case $sel in 1) alist_status ;; 2) openlist_status ;; *) red "无效选项。" ;; esac ;;
-            5) # 【菜单优化】简化为全部卸载
+            5)
                 if confirm_operation "【终极警告】确定要卸载 Alist 和 OpenList 的所有组件吗？"; then
                     alist_uninstall
                     openlist_uninstall
@@ -475,7 +595,7 @@ main_menu() {
                     2) add_mount_to_container "$OPENLIST_NAME" "$OPENLIST_IMAGE" "$OPENLIST_UID_GID" "OpenList" ;;
                     *) red "无效选项。" ;;
                 esac ;;
-            7) echo "感谢使用，再见！"; exit 0 ;;
+            7) green "感谢使用，再见！"; exit 0 ;;
             *) red "无效选项，请重新输入。"; sleep 1 ;;
         esac
         echo
