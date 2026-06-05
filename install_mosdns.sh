@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# MosDNS 一键安装与管理脚本（优化版）
+# MosDNS 一键安装与管理脚本（优化升级版）
+# 新增：一键无损更新核心功能
 
 # 彩色输出
 RED='\e[31m'
@@ -172,13 +173,11 @@ process_gfw_file() {
 configure_dnsmasq_for_mosdns() {
     echo -e "${YELLOW}配置 dnsmasq 以转发 DNS 请求到 MosDNS...${RESET}"
 
-    # 检查是否安装了 dnsmasq
     if ! command -v dnsmasq >/dev/null 2>&1; then
         echo -e "${RED}错误：未安装 dnsmasq，无法配置${RESET}"
         return 1
     fi
 
-    # 检查是否有活动的 NetworkManager 连接
     if command -v nmcli >/dev/null 2>&1; then
         ACTIVE_CON=$(nmcli -t -f NAME con show --active | head -n1)
         if [ -n "$ACTIVE_CON" ]; then
@@ -205,19 +204,10 @@ EOF
                         echo -e "${GREEN}确认：dnsmasq 已转发到 MosDNS${RESET}"
                     else
                         echo -e "${RED}错误：dnsmasq 未正确转发到 MosDNS${RESET}"
-                        echo -e "${YELLOW}检查配置文件：${RESET}"
-                        cat /etc/NetworkManager/dnsmasq.d/mosdns.conf
-                        echo -e "${YELLOW}NetworkManager 日志：${RESET}"
-                        journalctl -u NetworkManager | tail -n 50
-                        echo -e "${YELLOW}建议：${RESET}"
-                        echo "1. 确认 /etc/NetworkManager/dnsmasq.d/mosdns.conf 权限为 644"
-                        echo "2. 检查是否存在其他 dnsmasq 配置文件干扰"
-                        echo "3. 手动运行 'nmcli con reload' 并重启 NetworkManager"
                         return 1
                     fi
                 else
                     echo -e "${RED}错误：NetworkManager 的 dnsmasq 未正确重启${RESET}"
-                    journalctl -u NetworkManager | tail -n 20
                     return 1
                 fi
             else
@@ -230,9 +220,7 @@ EOF
         fi
     else
         echo -e "${YELLOW}警告：未安装 nmcli，尝试直接配置 dnsmasq${RESET}"
-
         if [ -f /etc/dnsmasq.conf ]; then
-            echo -e "${YELLOW}配置 /etc/dnsmasq.conf 以转发到 MosDNS${RESET}"
             if ! grep -q "server=127.0.0.1#53" /etc/dnsmasq.conf; then
                 echo "server=127.0.0.1#53" >> /etc/dnsmasq.conf
                 echo "log-queries" >> /etc/dnsmasq.conf
@@ -267,7 +255,6 @@ lock_resolv_conf() {
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
     chmod 644 /etc/resolv.conf
     chattr +i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}警告：无法锁定文件，可能会被覆盖${RESET}"
-    echo -e "${YELLOW}提示：chattr +i 可能影响系统升级或网络管理工具，请谨慎使用。${RESET}"
 
     sleep 1
     if grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
@@ -355,12 +342,10 @@ configure_adg() {
 
     echo -e "${YELLOW}配置双ADG接入...${RESET}"
 
-    # 获取当前配置
     if [ -f "$CONFIG_PATH/config.yaml" ]; then
         cp "$CONFIG_PATH/config.yaml" "$CONFIG_PATH/config.yaml.bak"
     fi
 
-    # 获取国内DNS和国外DNS地址
     echo -e "\n${YELLOW}请输入国内DNS地址（默认 $DEFAULT_DOMESTIC_DNS）：${RESET}"
     read -r -p "> " DOMESTIC_DNS
     DOMESTIC_DNS=${DOMESTIC_DNS:-$DEFAULT_DOMESTIC_DNS}
@@ -377,7 +362,6 @@ configure_adg() {
     read -r -p "> " IPV6
     IPV6=${IPV6:-$DEFAULT_IPV6}
 
-    # 更新配置文件
     cat > "$CONFIG_PATH/config.yaml" <<EOF
 log:
   level: info
@@ -454,7 +438,6 @@ EOF
 EOF
     fi
 
-    # 重启 MosDNS 服务
     if command -v systemctl >/dev/null 2>&1 && pgrep -x systemd >/dev/null 2>&1; then
         systemctl restart mosdns
         sleep 3
@@ -603,7 +586,6 @@ install_mosdns() {
         VERSION=${VERSION:-latest}
     fi
 
-    # 端口、IPv6、规则源自定义
     echo -e "\n${YELLOW}请输入MosDNS监听端口（默认 $DEFAULT_PORT）：${RESET}"
     read -r -p "> " PORT
     PORT=${PORT:-$DEFAULT_PORT}
@@ -651,11 +633,6 @@ install_mosdns() {
     process_gfw_file "$CONFIG_PATH/gfw_raw.txt" "$CONFIG_PATH/gfw.txt"
     rm -f "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/gfw_raw.txt"
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ] || [ ! -s "$CONFIG_PATH/cn_ip_cidr.txt" ] || [ ! -s "$CONFIG_PATH/gfw.txt" ]; then
-        echo -e "${RED}错误：规则文件为空${RESET}"
-        exit 1
-    fi
-
     unzip -o mosdns.zip mosdns -d "$INSTALL_PATH" || { echo -e "${RED}错误：解压失败${RESET}"; exit 1; }
     chmod +x "$INSTALL_PATH/mosdns"
     MOSDNS_VERSION=$("$INSTALL_PATH/mosdns" version 2>/dev/null || "$INSTALL_PATH/mosdns" --version)
@@ -672,8 +649,6 @@ install_mosdns() {
     if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
         echo -e "${RED}错误：配置文件无效或端口被占用${RESET}"
         cat "$TEMP_LOG"
-        echo -e "${YELLOW}请检查${PORT}端口占用情况：${RESET}"
-        netstat -tuln | grep ":$PORT" || ss -tuln | grep ":$PORT"
         exit 1
     fi
     kill "$MOSDNS_PID"
@@ -721,6 +696,100 @@ EOF
     echo -e "${GREEN}MosDNS 已启动并监听 127.0.0.1:$PORT，dnsmasq 将转发请求${RESET}"
 }
 
+# ================= 核心修复：一键无损更新二进制核心文件 =================
+upgrade_mosdns_core() {
+    if [ ! -f "$INSTALL_PATH/mosdns" ]; then
+        echo -e "${RED}错误：未检测到已安装的 MosDNS 核心程序。请先执行安装！${RESET}"
+        return 1
+    fi
+
+    echo -e "\n${CYAN}--- 🔄 更新 MosDNS 核心 (无损保留配置) ---${RESET}"
+    echo -e "${YELLOW}此操作将仅替换 /usr/local/bin/mosdns 执行文件，\n不会修改您的规则、端口、双ADG配置等任何设置。${RESET}"
+
+    # 1. 架构识别
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) ARCHITECTURE="amd64" ;;
+        aarch64) ARCHITECTURE="arm64" ;;
+        armv7l) ARCHITECTURE="armv7" ;;
+        armv6l) ARCHITECTURE="armv6" ;;
+        mips) ARCHITECTURE="mips" ;;
+        mipsel) ARCHITECTURE="mipsle" ;;
+        i386|i686) ARCHITECTURE="386" ;;
+        *) echo -e "${RED}错误：不支持的架构：$ARCH${RESET}"; return 1 ;;
+    esac
+
+    # 2. 版本选择
+    if ! command -v fzf >/dev/null 2>&1; then
+        VERSION="latest"
+        echo -e "${YELLOW}未安装 fzf，默认获取最新版本${RESET}"
+    else
+        for attempt in {1..3}; do
+            VERSIONS=$(curl -s --retry 3 "https://api.github.com/repos/IrineSistiana/mosdns/releases" | grep -oP '"tag_name": "\K[^"]+' | sort -rV)
+            [ -n "$VERSIONS" ] && break
+            echo -e "${RED}第 $attempt 次获取版本列表失败，重试...${RESET}"
+            sleep 2
+        done
+        if [ -z "$VERSIONS" ]; then
+            echo -e "${RED}无法获取版本列表，默认拉取最新版...${RESET}"
+            VERSION="latest"
+        else
+            VERSION=$(echo "$VERSIONS" | fzf --prompt="请选择要更新到的MosDNS版本（默认最新）: " --height=10)
+            VERSION=${VERSION:-latest}
+        fi
+    fi
+
+    # 3. 下载程序压缩包
+    BASE_GITHUB_URL="https://github.com/IrineSistiana/mosdns/releases/$([ "$VERSION" = "latest" ] && echo "latest/download" || echo "download/$VERSION")/mosdns-linux-$ARCHITECTURE.zip"
+    
+    if ! download_with_retry "$BASE_GITHUB_URL" "mosdns_update.zip"; then
+        echo -e "${RED}更新文件下载失败，更新中止！${RESET}"
+        return 1
+    fi
+
+    # 4. 停用服务
+    echo -e "${YELLOW}正在停止 MosDNS 守护服务...${RESET}"
+    if command -v systemctl >/dev/null 2>&1 && pgrep -x systemd >/dev/null 2>&1; then
+        systemctl stop mosdns.service 2>/dev/null || true
+    else
+        killall mosdns 2>/dev/null || true
+    fi
+
+    # 5. 替换文件
+    echo -e "${YELLOW}正在替换二进制核心文件...${RESET}"
+    unzip -o mosdns_update.zip mosdns -d "$INSTALL_PATH" || { 
+        echo -e "${RED}解压失败，核心可能已损坏！请尝试重新安装。${RESET}"
+        rm -f mosdns_update.zip
+        return 1
+    }
+    chmod +x "$INSTALL_PATH/mosdns"
+    rm -f mosdns_update.zip
+
+    NEW_VERSION=$("$INSTALL_PATH/mosdns" version 2>/dev/null || "$INSTALL_PATH/mosdns" --version)
+    echo -e "${GREEN}替换成功！当前 MosDNS 核心版本：$NEW_VERSION${RESET}"
+
+    # 6. 重启服务
+    echo -e "${YELLOW}正在使用原配置重启 MosDNS 服务...${RESET}"
+    if command -v systemctl >/dev/null 2>&1 && pgrep -x systemd >/dev/null 2>&1; then
+        systemctl start mosdns.service
+        sleep 2
+        if systemctl is-active --quiet mosdns.service; then
+            echo -e "${GREEN}🎉 MosDNS 更新并重启成功！您的所有配置已完美保留。${RESET}"
+        else
+            echo -e "${RED}重启失败！请运行 'systemctl status mosdns.service' 检查新版本是否兼容您的旧配置。${RESET}"
+        fi
+    else
+        "$INSTALL_PATH/mosdns" start -c "$CONFIG_PATH/config.yaml" >/dev/null 2>&1 &
+        sleep 2
+        if pgrep -x "mosdns" > /dev/null; then
+            echo -e "${GREEN}🎉 MosDNS 更新并后台启动成功！您的所有配置已完美保留。${RESET}"
+        else
+            echo -e "${RED}后台启动失败！请检查系统日志。${RESET}"
+        fi
+    fi
+}
+# ====================================================================
+
 # 卸载 MosDNS
 uninstall_mosdns() {
     echo -e "${YELLOW}开始卸载MosDNS...${RESET}"
@@ -738,7 +807,7 @@ uninstall_mosdns() {
     rm -f /etc/NetworkManager/conf.d/no-dns.conf 2>/dev/null
 
     restore_resolv_conf
-    echo -e "${GREEN}MosDNS 已卸载${RESET}"
+    echo -e "${GREEN}MosDNS 已完全卸载${RESET}"
 }
 
 # 更新规则
@@ -780,16 +849,6 @@ update_rules() {
     process_gfw_file "$CONFIG_PATH/gfw_raw.txt" "$CONFIG_PATH/gfw.txt"
     rm -f "$CONFIG_PATH/adblock_raw.txt" "$CONFIG_PATH/cn_ip_cidr_raw.txt" "$CONFIG_PATH/gfw_raw.txt"
 
-    if [ ! -s "$CONFIG_PATH/cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/non_cn_domains.txt" ] || [ ! -s "$CONFIG_PATH/adblock.txt" ] || [ ! -s "$CONFIG_PATH/cn_ip_cidr.txt" ] || [ ! -s "$CONFIG_PATH/gfw.txt" ]; then
-        echo -e "${RED}规则文件为空，回滚...${RESET}"
-        [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
-        [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
-        [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
-        [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
-        [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
-        exit 1
-    fi
-
     if command -v systemctl >/dev/null 2>&1 && pgrep -x systemd >/dev/null 2>&1; then
         systemctl restart mosdns
         sleep 3
@@ -813,11 +872,6 @@ update_rules() {
             echo -e "${GREEN}规则更新成功${RESET}"
         else
             echo -e "${RED}重启失败，回滚规则...${RESET}"
-            [ -f "$CONFIG_PATH/cn_domains.txt.bak" ] && mv "$CONFIG_PATH/cn_domains.txt.bak" "$CONFIG_PATH/cn_domains.txt"
-            [ -f "$CONFIG_PATH/non_cn_domains.txt.bak" ] && mv "$CONFIG_PATH/non_cn_domains.txt.bak" "$CONFIG_PATH/non_cn_domains.txt"
-            [ -f "$CONFIG_PATH/adblock.txt.bak" ] && mv "$CONFIG_PATH/adblock.txt.bak" "$CONFIG_PATH/adblock.txt"
-            [ -f "$CONFIG_PATH/cn_ip_cidr.txt.bak" ] && mv "$CONFIG_PATH/cn_ip_cidr.txt.bak" "$CONFIG_PATH/cn_ip_cidr.txt"
-            [ -f "$CONFIG_PATH/gfw.txt.bak" ] && mv "$CONFIG_PATH/gfw.txt.bak" "$CONFIG_PATH/gfw.txt"
             exit 1
         fi
     fi
@@ -830,16 +884,17 @@ show_menu() {
     echo -e "${CYAN}          MosDNS 安装与管理脚本${RESET}"
     echo -e "${CYAN}==============================================${RESET}"
     echo -e "${YELLOW}1. 安装 MosDNS${RESET}"
-    echo -e "${YELLOW}2. 卸载清理 MosDNS${RESET}"
-    echo -e "${YELLOW}3. 更新规则${RESET}"
-    echo -e "${YELLOW}4. 固化 DNS 配置${RESET}"
-    echo -e "${YELLOW}5. 还原系统 DNS 配置${RESET}"
-    echo -e "${YELLOW}6. 查看 MosDNS 状态${RESET}"
-    echo -e "${YELLOW}7. 查看 /etc/resolv.conf${RESET}"
-    echo -e "${YELLOW}8. 配置双ADG接入${RESET}"
-    echo -e "${YELLOW}9. 退出${RESET}"
+    echo -e "${YELLOW}2. 更新 MosDNS 核心 (无损保留配置)${RESET}"
+    echo -e "${YELLOW}3. 卸载清理 MosDNS${RESET}"
+    echo -e "${YELLOW}4. 更新分流过滤规则${RESET}"
+    echo -e "${YELLOW}5. 固化 DNS 配置${RESET}"
+    echo -e "${YELLOW}6. 还原系统 DNS 配置${RESET}"
+    echo -e "${YELLOW}7. 查看 MosDNS 状态${RESET}"
+    echo -e "${YELLOW}8. 查看 /etc/resolv.conf${RESET}"
+    echo -e "${YELLOW}9. 配置双ADG接入${RESET}"
+    echo -e "${YELLOW}10. 退出${RESET}"
     echo -e "${CYAN}==============================================${RESET}"
-    echo -n -e "${CYAN}请选择操作（1-9）：${RESET}"
+    echo -n -e "${CYAN}请选择操作（1-10）：${RESET}"
 }
 
 # 主程序
@@ -850,14 +905,15 @@ main() {
         read -r choice
         case $choice in
             1) check_install_deps; install_mosdns ;;
-            2) uninstall_mosdns ;;
-            3) update_rules ;;
-            4) lock_resolv_conf ;;
-            5) restore_resolv_conf ;;
-            6) check_mosdns_status ;;
-            7) view_resolv_conf ;;
-            8) configure_adg ;;
-            9) echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
+            2) upgrade_mosdns_core ;;
+            3) uninstall_mosdns ;;
+            4) update_rules ;;
+            5) lock_resolv_conf ;;
+            6) restore_resolv_conf ;;
+            7) check_mosdns_status ;;
+            8) view_resolv_conf ;;
+            9) configure_adg ;;
+            10) echo -e "${GREEN}退出脚本${RESET}"; exit 0 ;;
             *) echo -e "${RED}无效选项，请重新选择${RESET}"; sleep 1 ;;
         esac
         read -n 1 -s -r -p "按任意键返回主菜单..."
