@@ -285,7 +285,7 @@ show_menu() {
   while true; do
     echo -e "\n${CYAN}======== QL青龙面板 Docker 管家 =======${NC}"
     echo "1. 部署 QingLong 容器"
-    echo "2. 无损升级 QingLong 面板 ${YELLOW}[保留全部高级配置]${NC}"
+    echo -e "2. 无损升级 QingLong 面板 ${YELLOW}[保留全部高级配置]${NC}"
     echo "3. 查看当前运行的容器"
     echo "4. 卸载 QingLong 容器"
     echo "5. 一键数据备份"
