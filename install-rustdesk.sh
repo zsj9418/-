@@ -643,7 +643,7 @@ main_menu() {
     echo -e "${CYAN}================ RustDesk 终极部署脚本 ================${NC}"
     echo "1) 部署 RustDesk 服务器 (hbbs & hbbr)"
     echo "2) 部署 RustDesk API 管理面板"
-    echo "3) 无损更新 RustDesk 相关组件 ${YELLOW}[保留配置]${NC}"
+    echo -e "3) 无损更新 RustDesk 相关组件 ${YELLOW}[保留配置]${NC}"
     echo "4) 重置 API 管理员密码"
     echo "5) 查看容器状态"
     echo "6) 启动所有容器"
