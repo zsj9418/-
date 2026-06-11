@@ -10,7 +10,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ============== 全局配置 ==============
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.0"
 CONFIG_DIR="/etc/nezha-deploy"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
 LOG_FILE="$CONFIG_DIR/deploy.log"
@@ -38,10 +38,9 @@ check_root() {
 
 # ============== HTTP 穿透级强力对时 (绕过NTP屏蔽与SSL报错) ==============
 sync_time() {
-    info "正在强制同步系统真实时间 (彻底阻断 1033 及 SSL 穿越报错)..."
+    info "正在强制同步系统真实时间 (在公网模式下尤为重要)..."
     
-    # 绝杀：通过 80 端口访问百度获取服务器 Header 时间 (无视SSL错误，无视UDP屏蔽)
-    HTTP_DATE=$(curl -sI http://www.baidu.com | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    HTTP_DATE=$(curl -sI --max-time 5 http://www.baidu.com | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
     
     if [ -n "$HTTP_DATE" ]; then
         date -s "$HTTP_DATE" >/dev/null 2>&1
@@ -137,7 +136,6 @@ install_docker() {
         systemctl enable docker 2>/dev/null || true
     fi
     
-    # 【重要改进】智能配置 Docker IPv6 支持，避免盲目修改导致 Docker 启动失败
     mkdir -p /etc/docker
     if [ ! -f "$DOCKER_CONFIG" ]; then
         if ip -6 addr show scope global | grep -q inet6; then
@@ -156,8 +154,7 @@ EOF
     log "Docker 环境配置完成！"
 }
 
-
-# ============== Cloudflare API 通信模块 ==============
+# ============== Cloudflare API 通信模块 (公网模式专用) ==============
 cf_api() {
     local method=$1 path=$2 data=$3
     if [ -n "$data" ]; then
@@ -210,7 +207,6 @@ cf_update_record() {
     fi
 }
 
-# ============== Cloudflare 交互配置向导 ==============
 configure_cloudflare() {
     init_env
     echo -e "\n${CYAN}═══ Cloudflare 自动配置向导 ═══${NC}"
@@ -368,7 +364,6 @@ setup_firewall() {
     log "✓ 防火墙已尝试放行 (Web:${web_port} Agent:${agent_port})。请注意，这不包括您的云服务商安全组或家庭路由器防火墙。"
 }
 
-
 # ============== 最终配置指南 (核心) ==============
 display_final_instructions() {
     local mode=$1 domain=$2 agent_port=$3 host_ip=$4
@@ -377,12 +372,23 @@ display_final_instructions() {
     echo -e "${CYAN}║                ${BOLD}🎉 部署完成 - 最后配置指南 🎉${NC}${CYAN}               ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 
-    echo -e "1. 浏览器打开你的面板后台: ${BOLD}https://${domain}${NC}"
-    echo -e "   (使用 GitHub 账号登录)"
-    echo -e "\n2. 进入 ${BOLD}[设置]${NC} 页面，找到 ${BOLD}[面板设置]${NC}，进行关键配置："
-
     case $mode in
+        "V3_LAN")
+            echo -e "1. ${BOLD}访问面板:${NC}"
+            echo -e "   在你的浏览器中打开: ${BOLD}http://${host_ip}:8008${NC}  (或 http://localhost:8008)"
+            echo -e "   (首次访问需要设置管理员账号和密码)"
+            echo -e "\n2. ${BOLD}登录后台后，进入 [设置] 页面，进行关键配置：${NC}"
+            echo -e "   - ${GREEN}服务器IP/通讯域名${NC} 必须填写部署哪吒这台机器的【内网IP】: ${BOLD}${host_ip}${NC}"
+            echo -e "   - ${GREEN}Agent 探针端口${NC} 必须填写: ${BOLD}${agent_port}${NC}"
+            echo -e "   - ${RED}必须勾选${NC}: ${BOLD}[未接入 CDN]${NC} 或 ${BOLD}[未开启 TLS]${NC}"
+            echo -e "\n3. ${BOLD}添加 Agent (探针):${NC}"
+            echo -e "   在其他需要被监控的【局域网内】设备上，直接使用后台生成的一键安装命令即可。"
+            echo -e "   (因为上一步已配置好内网IP，生成的命令天生就是为局域网准备的)"
+            ;;
         "V1_DIRECT")
+            echo -e "1. 浏览器打开你的面板后台: ${BOLD}https://${domain}${NC}"
+            echo -e "   (使用 GitHub 账号登录)"
+            echo -e "\n2. 进入 ${BOLD}[设置]${NC} 页面，找到 ${BOLD}[面板设置]${NC}，进行关键配置："
             echo -e "   - ${GREEN}服务器IP/通讯域名${NC} 必须填写你的域名: ${BOLD}${domain}${NC}"
             echo -e "   - ${GREEN}Agent 探针端口${NC} 必须填写: ${BOLD}${agent_port}${NC}"
             echo -e "   - ${RED}无需勾选${NC} [未接入 CDN] 或 [未开启 TLS]。"
@@ -390,6 +396,9 @@ display_final_instructions() {
             echo -e "   在其他需要被监控的机器上，复制后台生成的一键安装命令即可。Agent 会通过公网 (${domain}:${agent_port}) 连接回来。"
             ;;
         "V0_TUNNEL"|"V2_TUNNEL")
+            echo -e "1. 浏览器打开你的面板后台: ${BOLD}https://${domain}${NC}"
+            echo -e "   (使用 GitHub 账号登录)"
+            echo -e "\n2. 进入 ${BOLD}[设置]${NC} 页面，找到 ${BOLD}[面板设置]${NC}，进行关键配置："
             echo -e "   - ${GREEN}服务器IP/通讯域名${NC} 必须填写你的域名: ${BOLD}${domain}${NC}"
             echo -e "   - ${GREEN}Agent 探针端口${NC} 必须填写: ${BOLD}${agent_port}${NC}"
             echo -e "   - ${RED}【非常重要】必须勾选${NC}: ${BOLD}[未接入 CDN]${NC} 或 ${BOLD}[未开启 TLS]${NC}"
@@ -397,7 +406,7 @@ display_final_instructions() {
             
             echo -e "\n3. ${BOLD}Agent 连接方式 (请根据情况选择):${NC}"
             echo -e "   ${PURPLE}场景A: 监控家里或同一局域网内的其他设备 (例如: 另一台电脑, NAS)${NC}"
-            echo -e "     - 在后台复制一键安装命令后，手动修改命令，将 ${domain} 替换为部署哪吒这台机器的【内网IP】(例如: 192.168.x.x)。"
+            echo -e "     - 在后台复制一键安装命令后，手动修改命令，将 ${domain} 替换为部署哪吒这台机器的【内网IP】(例如: ${host_ip})。"
             
             echo -e "\n   ${CYAN}场景B: 监控一个公网的VPS (高级用法)${NC}"
             echo -e "     - ${YELLOW}此模式下，隧道默认不转发 Agent 数据流。${NC}"
@@ -409,7 +418,6 @@ display_final_instructions() {
     
     echo -e "\n4. 保存设置后，你的哪吒监控系统就正式启用了！"
 }
-
 
 # ============== V0: Argo Nezha 全自动部署 ==============
 v0_deploy() {
@@ -569,7 +577,10 @@ v1_verify() {
     
     info "执行本地环回测试..."
     local local_ip="127.0.0.1"
-    [ "$HAS_IPV6_PUBLIC" = "yes" ] && local_ip="::1"
+    if [ -f "$NETWORK_INFO_FILE" ]; then
+        source "$NETWORK_INFO_FILE"
+        [ "$HAS_IPV6_PUBLIC" = "yes" ] && local_ip="::1"
+    fi
     
     LOCAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://${local_ip}:${web_port}" || echo "000")
     if [ "$LOCAL_STATUS" != "000" ] && [ "$LOCAL_STATUS" != "404" ]; then log "✓ 本地连通正常 (HTTP ${LOCAL_STATUS})"; fi
@@ -598,8 +609,7 @@ v1_verify() {
     fi
 }
 
-
-# ============== V2: Cloudflared 官方分离隧道部署 (解决 1033 与 UDP 封锁) ==============
+# ============== V2: Cloudflared 官方分离隧道部署 ==============
 v2_deploy() {
     init_env
     echo -e "\n${PURPLE}══════════════════════════════${NC}"
@@ -675,6 +685,65 @@ v2_deploy() {
     fi
 }
 
+# ============== V3: 纯局域网部署 ==============
+v3_deploy_lan() {
+    init_env
+    echo -e "\n${PURPLE}══════════════════════════════${NC}"
+    echo -e "${PURPLE}  V3: 纯局域网模式部署 (零外部依赖)${NC}"
+    echo -e "${PURPLE}  适用场景: 只想在家里或公司内网使用，不暴露到公网${NC}"
+    echo -e "${PURPLE}══════════════════════════════${NC}"
+    
+    install_docker
+
+    WEB_PORT=8008
+    AGENT_PORT=5555
+    HOST_IP=$(hostname -I | awk '{print $1}')
+    if [ -z "$HOST_IP" ]; then
+        err "无法获取本机内网IP地址，请检查网络配置！"
+        return 1
+    fi
+    log "本机内网IP为: ${HOST_IP}"
+
+    if ! check_port_available "$WEB_PORT"; then
+        warn "端口 ${WEB_PORT} 已被占用。脚本将尝试重用现有面板。"
+    fi
+    if ! check_port_available "$AGENT_PORT"; then
+        warn "端口 ${AGENT_PORT} 已被占用。脚本将尝试重用现有面板。"
+    fi
+
+    info "清理可能存在的旧容器..."
+    docker stop nezha-dashboard 2>/dev/null || true
+    docker rm nezha-dashboard 2>/dev/null || true
+
+    info "拉取 Nezha 官方源镜像..."
+    docker pull ghcr.io/nezhahq/nezha:latest >/dev/null 2>&1
+    
+    DATA_DIR="/opt/nezha/dashboard"
+    mkdir -p "$DATA_DIR"; chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
+
+    info "正式启动 Nezha 核心容器..."
+    docker run -d --name nezha-dashboard --restart unless-stopped \
+        -p "127.0.0.1:${WEB_PORT}:8008" \
+        -p "${HOST_IP}:${WEB_PORT}:8008" \
+        -p "${AGENT_PORT}:5555" \
+        -v "$DATA_DIR:/dashboard/data" \
+        -v /etc/localtime:/etc/localtime:ro \
+        -e TZ="Asia/Shanghai" \
+        ghcr.io/nezhahq/nezha:latest >/dev/null 2>&1
+        
+    sleep 8
+    
+    echo -e "\n${CYAN}═══ V3 部署结果验证 ═══${NC}"
+    if docker ps --filter "name=nezha-dashboard" --format "{{.Names}}" | grep -q "nezha-dashboard"; then
+        log "🎉 恭喜！Nezha 面板容器已成功启动！"
+        docker ps --filter "name=nezha-dashboard" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        display_final_instructions "V3_LAN" "" "$AGENT_PORT" "$HOST_IP"
+    else
+        err "容器启动失败！请检查 Docker 日志以排查问题："
+        echo -e "${RED}docker logs nezha-dashboard${NC}"
+    fi
+}
+
 # ============== 智能推荐雷达 ==============
 smart_recommend() {
     init_env
@@ -685,25 +754,19 @@ smart_recommend() {
     echo -e "${CYAN}║         ${BOLD}智能 AI 部署方案推荐雷达${NC}${CYAN}            ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
     
-    if [ "$HAS_IPV4_PUBLIC" = "yes" ] && [ "$HAS_IPV6_PUBLIC" = "yes" ]; then
-        echo -e "检测到您处于: ${GREEN}极致双栈公网环境${NC}"
-        echo -e "雷达建议方案: ${GREEN}★ 选择 V1 双栈直连部署${NC} (跑满原生带宽，探针数据零延迟)"
-    elif [ "$HAS_IPV4_PUBLIC" = "yes" ]; then
-        echo -e "检测到您处于: ${GREEN}纯 IPv4 公网环境${NC}"
-        echo -e "雷达建议方案: ${GREEN}★ 选择 V1 双栈直连部署${NC} (极其稳定)"
-    elif [ "$HAS_IPV6_PUBLIC" = "yes" ]; then
-        echo -e "检测到您处于: ${GREEN}非对称 IPv6 公网环境 (国内家庭宽带常见)${NC}"
-        echo -e "雷达建议方案:"
-        echo -e "  > ${GREEN}如果你精通路由器配置${NC}: 选择 V1 (记得在路由器里放行 IPv6 端口)"
-        echo -e "  > ${BLUE}如果你不想折腾路由器${NC}: 选择 V2 (利用云端隧道强行穿透内网，免配省心)"
+    if [ "$HAS_IPV4_PUBLIC" = "yes" ] || [ "$HAS_IPV6_PUBLIC" = "yes" ]; then
+        echo -e "检测到您处于: ${GREEN}公网环境${NC}"
+        echo -e "雷达建议方案: ${GREEN}★ 选择 V1 公网直连部署${NC} (跑满原生带宽，探针数据零延迟)"
     else
         echo -e "检测到您处于: ${YELLOW}深层大内网环境 (无任何公网暴露能力)${NC}"
-        echo -e "雷达建议方案: ${GREEN}★ 只能选择 V2 云隧道穿透模式${NC} (这是唯一的出路)"
+        echo -e "雷达建议方案:"
+        echo -e "  > ${GREEN}追求稳定与灵活性?${NC} 选择 V2 云隧道穿透模式 (官方推荐)。"
+        echo -e "  > ${BLUE}想一个容器搞定所有?${NC} 选择 V0 混合隧道模式 (老牌方案)。"
     fi
     echo ""
 }
 
-# ============== 暴力清理 ==============
+# ============== 暴力清理 (增强版) ==============
 uninstall_nezha() {
     init_env
     warn "执行该操作将把哪吒面板系统从当前主机连根拔起！"
@@ -714,6 +777,12 @@ uninstall_nezha() {
             docker stop $c >/dev/null 2>&1 || true
             docker rm $c >/dev/null 2>&1 || true
         done
+        
+        info "正在清理相关的 Docker 镜像..."
+        docker rmi fscarmen/argo-nezha:latest >/dev/null 2>&1 || true
+        docker rmi ghcr.io/nezhahq/nezha:latest >/dev/null 2>&1 || true
+        docker rmi cloudflare/cloudflared:latest >/dev/null 2>&1 || true
+
         info "正在抹除持久化数据与环境变量..."
         rm -rf /opt/nezha "$CONFIG_DIR" >/dev/null 2>&1 || true
         init_env
@@ -726,42 +795,47 @@ uninstall_nezha() {
 # ============== 中枢调度主菜单 ==============
 main_menu() {
     check_root
-    sync_time
+    sync_time # 全局时间校准，确保所有操作时间戳正确
     
     while true; do
         init_env
         echo -e "\n${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║     ${BOLD}哪吒探针全维态·智能融合部署系统 v${SCRIPT_VERSION}${NC}             ║${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
-        echo -e "  ${GREEN}1)${NC} 扫描当前主机的外网暴露面"
-        echo -e "  ${GREEN}2)${NC} V1 原生双栈直连部署 ${YELLOW}(拥有公网环境的神级选择)${NC}"
-        echo -e "  ${GREEN}3)${NC} V0 Argo混合隧道部署 ${YELLOW}(老牌内网穿透方案)${NC}"
-        echo -e "  ${GREEN}4)${NC} V2 Cloudflared官方分离隧道部署 ${YELLOW}(根治UDP阻断与1033报错)${NC}"
-        echo -e "  ${GREEN}5)${NC} ${BOLD}一键无脑自动部署${NC} ${PURPLE}<< 系统测算您的网络并决定最佳方案${NC}"
-        echo -e "  ${GREEN}6)${NC} 观测 Docker 底层运行与日志矩阵"
-        echo -e "  ${GREEN}7)${NC} 执行系统清理 (重装前必点)"
+        echo -e " ${PURPLE}--- 纯局域网 / 内网模式 ---${NC}"
+        echo -e "  ${GREEN}3)${NC} ${BOLD}V3 纯局域网部署${NC} ${YELLOW}(推荐! 无需任何公网/域名，开箱即用)${NC}"
+        echo -e "\n ${CYAN}--- 公网 / 互联网模式 ---${NC}"
+        echo -e "  ${GREEN}1)${NC} 扫描当前主机的外网暴露面 (部署公网模式前必看)"
+        echo -e "  ${GREEN}2)${NC} ${BOLD}V1 公网直连部署${NC} ${YELLOW}(有公网IP，追求性能首选)${NC}"
+        echo -e "  ${GREEN}4)${NC} V2 Cloudflared官方隧道部署 ${YELLOW}(无公网IP，最稳定穿透方案)${NC}"
+        echo -e "  ${GREEN}5)${NC} V0 Argo混合隧道部署 ${YELLOW}(老牌内网穿透方案，适合怀旧)${NC}"
+        echo -e "\n ${BLUE}--- 辅助功能 ---${NC}"
+        echo -e "  ${GREEN}6)${NC} ${BOLD}一键无脑自动部署${NC} ${PURPLE}<< 让系统帮你选公网方案${NC}"
+        echo -e "  ${GREEN}7)${NC} 观测 Docker 底层运行与日志矩阵"
+        echo -e "  ${GREEN}8)${NC} 执行系统清理 (重装前必点)"
         echo -e "  ${RED}0)${NC} 离开系统"
         echo ""
-        read -rp "请输入指令执行序列 [0-7]: " CHOICE
+        read -rp "请输入指令执行序列 [0-8]: " CHOICE
         
         case $CHOICE in
             1) detect_network ;;
             2) [ ! -f "$NETWORK_INFO_FILE" ] && detect_network; v1_deploy ;;
-            3) v0_deploy ;;
+            3) v3_deploy_lan ;;
             4) v2_deploy ;;
-            5)
+            5) v0_deploy ;;
+            6)
                 detect_network
                 smart_recommend
-                read -rp "看完上面的分析，想用高性能 V1 直连请输入 Y，想用无脑 V2 隧道穿透请输入 N。 [Y/n]: " AUTO_CHOICE
-                if [[ "$AUTO_CHOICE" =~ ^([nN][oO]|[nN])$ ]]; then v2_deploy; else v1_deploy; fi
+                read -rp "看完上面的分析，想用高性能 V1 直连请输入 1，想用无脑 V2 隧道穿透请输入 2。 [1/2]: " AUTO_CHOICE
+                if [[ "$AUTO_CHOICE" == "2" ]]; then v2_deploy; else v1_deploy; fi
                 ;;
-            6)
+            7)
                 echo -e "\n${BLUE}【Docker 底层存活矩阵】${NC}"
                 docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
                 echo -e "\n${BLUE}【网卡环境快照缓存】${NC}"
                 [ -f "$NETWORK_INFO_FILE" ] && cat "$NETWORK_INFO_FILE" || echo "缓存为空"
                 ;;
-            7) uninstall_nezha ;;
+            8) uninstall_nezha ;;
             0) log "指令下线，后会有期！"; exit 0 ;;
             *) err "不合法的指令调度，请重新输入" ;;
         esac
