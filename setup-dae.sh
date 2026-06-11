@@ -74,15 +74,85 @@ check_log_size() {
     fi
 }
 
+# ==================== 确定感补强：无痕清理与状态诊断 ====================
+
 clean_network_resources() {
-    printf "${YELLOW}[清理] 正在排查并清理现有网络挂载资源以防冲突...${NC}\n"
-    ip rule del fwmark 114514 2>/dev/null
+    printf "${YELLOW}[清理] 正在排查并深度无痕清理网络挂载资源...${NC}\n"
+    
+    # 清理策略路由与标记表
+    if ip rule show | grep -q "fwmark 0x1bf52"; then # 114514 的十六进制
+        ip rule del fwmark 114514 2>/dev/null
+        printf "  - 已成功解除并注销内核 fwmark 114514 策略路由规则 [${GREEN}OK${NC}]\n"
+    else
+        printf "  - 未发现残留的 fwmark 114514 策略规则 [${cyan}干净${NC}]\n"
+    fi
+
     ip route flush table 114514 2>/dev/null
-    ip link delete dae 2>/dev/null
+    
+    # 清理 dae 虚拟网卡接口
+    if ip link show dae >/dev/null 2>&1; then
+        ip link delete dae 2>/dev/null
+        printf "  - 检测到残留的 eBPF 虚接口 dae，已强行卸载销毁 [${GREEN}OK${NC}]\n"
+    else
+        printf "  - 内核网卡设备中未见 dae 残留接口 [${cyan}干净${NC}]\n"
+    fi
+
+    # 残留后台进程核平清理
     if pgrep dae >/dev/null 2>&1; then
-        printf "${YELLOW}[清理] 检测到残留 dae 后台进程，正在尝试优雅终止...${NC}\n"
+        local pid_list
+        pid_list=$(pgrep dae)
+        printf "${YELLOW}  - 预警：检测到正在运行的 dae 孤儿进程 (PID: %s)，开始优雅终止...${NC}\n" "$pid_list"
         killall dae 2>/dev/null
-        sleep 1
+        sleep 1.5
+        if pgrep dae >/dev/null 2>&1; then
+            printf "${RED}  - 警告：dae 进程拒绝优雅退出，正在触发硬核强杀 (kill -9)...${NC}\n"
+            killall -9 dae 2>/dev/null
+            sleep 0.5
+        fi
+        if pgrep dae >/dev/null 2>&1; then
+            printf "  - 进程清理反馈：${RED}清理失败，进程依旧顽固存在，请检查内核锁！${NC}\n"
+        else
+            printf "  - 进程清理反馈：${GREEN}所有残留大鹅进程已被无痕连根拔起！${NC}\n"
+        fi
+    else
+        printf "  - 进程清理反馈：${GREEN}后台纯净，无任何残留大鹅进程运行${NC}\n"
+    fi
+}
+
+# 实时联动点火状态诊断器
+print_service_live_status() {
+    printf "${YELLOW}[诊断] 正在对点火后的 dae 服务状态进行即时抓取验证...${NC}\n"
+    sleep 2 # 给予 eBPF 内核挂载和节点树加载必要的缓冲时间
+    
+    if pgrep dae >/dev/null 2>&1; then
+        local active_pid
+        active_pid=$(pgrep dae | head -n1)
+        printf "  - 运行状态：${GREEN}● 活跃中 (Running)${NC}\n"
+        printf "  - 主进程 PID：${CYAN}%s${NC}\n" "$active_pid"
+        
+        # 探测端口咬合情况
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -tunlp 2>/dev/null | grep -q "dae"; then
+                printf "  - 端口绑定：${GREEN}成功监听 TProxy 流量导入网关${NC}\n"
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -tunlp 2>/dev/null | grep -q "dae"; then
+                printf "  - 端口绑定：${GREEN}成功监听 TProxy 流量导入网关${NC}\n"
+            fi
+        fi
+        return 0
+    else
+        printf "  - 运行状态：${RED}■ 熄火/启动失败 (Stopped)${NC}\n"
+        printf "  - 错误成因排查：\n"
+        if [ ! -f "$CONFIG_FILE" ]; then
+            printf "    ${RED}[原因] 核心配置文件 /etc/dae/config.dae 不存在！${NC}\n"
+        elif [ ! -f "$GEO_DIR/geoip.dat" ] || [ ! -f "$GEO_DIR/geosite.dat" ]; then
+            printf "    ${RED}[原因] 缺少 GEO 规则依赖库，请执行菜单选项 3 刷新规则库！${NC}\n"
+        else
+            printf "    ${RED}[原因] 疑似订阅链接内的节点协议内核无法解析，或网卡绑定冲突。${NC}\n"
+            printf "    ${YELLOW}💡 建议排查日志：tail -n 20 /var/log/messages 或 logread | grep dae${NC}\n"
+        fi
+        return 1
     fi
 }
 
@@ -248,7 +318,7 @@ validate_subscription() {
 
 cleanup_sing_box() {
     if pgrep sing-box >/dev/null 2>&1; then
-        printf "${YELLOW}检测到冲突项 sing-box 正在运行，正在停止...${NC}\n"
+        printf "${YELLOW}检测到冲突项 sing-box 正在运行，正在停止并解除占用...${NC}\n"
         if [ "$SERVICE_MGR" = "systemd" ]; then 
             systemctl stop sing-box 2>/dev/null
         else 
@@ -271,12 +341,25 @@ manage_service() {
             systemctl $action $svc_name 2>/dev/null
         fi
     else
+        # 兼容 OpenWrt 的 init.d 机制
         if [ "$action" = "status" ]; then
             pgrep $svc_name >/dev/null && printf "${GREEN}${svc_name} 正在活跃运行中${NC}\n" || printf "${RED}${svc_name} 未活跃/已停止${NC}\n"
         elif [ "$action" = "enable" ] || [ "$action" = "disable" ]; then
-            /etc/init.d/$svc_name $action 2>/dev/null
+            [ -f "/etc/init.d/$svc_name" ] && /etc/init.d/$svc_name $action 2>/dev/null
+        elif [ "$action" = "restart" ] || [ "$action" = "start" ]; then
+            if [ -f "/etc/init.d/$svc_name" ]; then
+                /etc/init.d/$svc_name $action 2>/dev/null
+            else
+                # 兜底纯净前台转后台拉起
+                local dae_bin
+                dae_bin=$(command -v dae || echo "/usr/bin/dae")
+                nohup $dae_bin run --config "$CONFIG_FILE" > /var/log/dae_run.log 2>&1 &
+            fi
         else
-            /etc/init.d/$svc_name $action 2>/dev/null || killall $svc_name 2>/dev/null
+            if [ -f "/etc/init.d/$svc_name" ]; then
+                /etc/init.d/$svc_name stop 2>/dev/null
+            fi
+            killall $svc_name 2>/dev/null
         fi
     fi
 }
@@ -411,7 +494,7 @@ EOF
         if dae validate -c "$CONFIG_FILE" >/dev/null 2>&1; then
             printf "${GREEN}[成功] 配置文件完美通过 dae 官方内核语法校验！${NC}\n"
         else
-            printf "${YELLOW}[提醒] 如果大鹅报 GEO 映射错误，请运行选单 3 同步最新本地规则库后再行点火。${NC}\n"
+            printf "${RED}[语法报错] dae 校验器提示配置不合规！请排查接口绑定名。${NC}\n"
         fi
     fi
 }
@@ -482,8 +565,10 @@ upgrade_dae_core() {
     fi
     rm -f /tmp/dae-update.zip
 
-    if [ "$SERVICE_MGR" = "systemd" ] && [ ! -f /etc/systemd/system/dae.service ]; then
-        cat <<EOF > /etc/systemd/system/dae.service
+    # 为 OpenWrt / Proxmox / Linux 智能注入服务管理器配置
+    if [ "$SERVICE_MGR" = "systemd" ]; then
+        if [ ! -f /etc/systemd/system/dae.service ]; then
+            cat <<EOF > /etc/systemd/system/dae.service
 [Unit]
 Description=dae Advanced eBPF Proxy Service
 After=network.target network-online.target
@@ -498,11 +583,32 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
+            systemctl daemon-reload
+        fi
+    else
+        # OpenWrt 专供 Procd 守护进程脚本注入
+        if [ ! -f "/etc/init.d/dae" ]; then
+            cat << 'EOF' > /etc/init.d/dae
+#!/bin/sh /etc/rc.common
+START=95
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/dae run --config /etc/dae/config.dae
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+            chmod +x /etc/init.d/dae
+        fi
     fi
 
     printf "${YELLOW}正在重新点火加载服务...${NC}\n"
     manage_service "start"
+    print_service_live_status
     send_wechat_notification "大鹅底层核心可执行组件成功无损同步更新至 ${latest_version}。"
 }
 
@@ -657,7 +763,7 @@ main_menu() {
         check_log_size
         printf "\n"
         printf "${GREEN}================================================================${NC}\n"
-        printf "${GREEN}   🦢 dae (大鹅) 高性能 eBPF 透明代理全平台融合配置管家 (修复版)${NC}\n"
+        printf "${GREEN}   🦢 dae (大鹅) 高性能 eBPF 透明代理全平台融合配置管家 (高级版)${NC}\n"
         printf "   当前系统环境: ${YELLOW}%s (%s)${NC} | 拓扑检测: ${CYAN}%s路由${NC}\n" "${SERVICE_MGR}" "${PKG_MANAGER:-未知}" "$(detect_router_mode)"
         printf "   内网默认接口: ${GREEN}%s${NC} | 本机IP: ${GREEN}%s${NC}\n" "${LAN_IFACE}" "${LAN_IP}"
         printf "${GREEN}================================================================${NC}\n"
@@ -678,7 +784,7 @@ main_menu() {
                 ;;
             2)
                 printf "${PURPLE}【✨ Sub-Store 操作指引】${NC}\n"
-                printf "${YELLOW}请在 Sub-Store 预览截图中点击第一项「通用订阅」右侧的复制按钮获取链接。${NC}\n"
+                printf "${YELLOW}请在 Sub-Store 复制「通用订阅」链接。${NC}\n"
                 printf "请粘贴复制好的 Sub-Store 通用订阅地址 (http/https): "
                 read -r SUBSCRIPTION_URL
                 if validate_subscription "$SUBSCRIPTION_URL"; then
@@ -691,6 +797,7 @@ main_menu() {
                     manage_service "enable" >/dev/null 2>&1
                     clean_network_resources
                     manage_service "restart"
+                    print_service_live_status
                     send_wechat_notification "大鹅成功同步 Sub-Store 聚合订阅，透明分流矩阵已刷新。"
                 else
                     printf "${RED}[异常] 链入的 URL 格式非法，必须以 http:// 或 https:// 开头！${NC}\n"
@@ -706,10 +813,10 @@ main_menu() {
                 printf "请指派动作 [1-4]: "
                 read -r svc_act
                 case $svc_act in
-                    1) clean_network_resources; manage_service "start"; echo "已触发启动。";;
-                    2) manage_service "stop"; clean_network_resources; echo "已安全撤消。";;
-                    3) clean_network_resources; manage_service "restart"; echo "已全盘重启。";;
-                    4) manage_service "status" ;;
+                    1) clean_network_resources; manage_service "start"; print_service_live_status;;
+                    2) manage_service "stop"; clean_network_resources; printf "${GREEN}已安全完成无痕撤消。${NC}\n";;
+                    3) clean_network_resources; manage_service "restart"; print_service_live_status;;
+                    4) manage_service "status"; pgrep dae >/dev/null 2>&1 && printf "进程快照：${GREEN}活跃${NC}\n" || printf "进程快照：${RED}未运行${NC}\n";;
                 esac
                 ;;
             6) install_dae_docker ;;
