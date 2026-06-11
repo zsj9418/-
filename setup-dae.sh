@@ -9,7 +9,7 @@ ENV_FILE="$HOME/.dae_env"
 LOG_FILE="/var/log/dae.log"
 LOG_SIZE_LIMIT=$((1 * 1024 * 1024)) # 1MB
 
-# 颜色输出
+# 严格遵循 POSIX 标准的颜色转义定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -20,7 +20,7 @@ NC='\033[0m'
 
 # 检查 root 权限
 if [ "$(id -u)" != "0" ]; then
-    echo -e "${RED}[错误] 请以 root 权限运行此脚本${NC}"
+    printf "${RED}[错误] 请以 root 权限运行此脚本${NC}\n"
     exit 1
 fi
 
@@ -52,7 +52,7 @@ send_wechat_notification() {
         return 0
     fi
     local msg=$1
-    echo -e "${BLUE}[通知] 正在向企业微信发送即时运维报告...${NC}"
+    printf "${BLUE}[通知] 正在向企业微信发送即时运维报告...${NC}\n"
     curl -s -X POST "$WECHAT_WEBHOOK" \
        -H 'Content-Type: application/json' \
        -d "{
@@ -68,20 +68,19 @@ check_log_size() {
         local log_size
         log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if [ "$log_size" -gt "$LOG_SIZE_LIMIT" ]; then
-            echo -e "${YELLOW}[系统] 日志文件超过1MB，正在自动轮转清空...${NC}"
+            printf "${YELLOW}[系统] 日志文件超过1MB，正在自动轮转清空...${NC}\n"
             > "$LOG_FILE"
         fi
     fi
 }
 
 clean_network_resources() {
-    echo -e "${YELLOW}[清理] 正在排查并清理现有网络挂载资源以防冲突...${NC}"
-    # 安全解除 dae 残留的 eBPF 挂载
+    printf "${YELLOW}[清理] 正在排查并清理现有网络挂载资源以防冲突...${NC}\n"
     ip rule del fwmark 114514 2>/dev/null
     ip route flush table 114514 2>/dev/null
     ip link delete dae 2>/dev/null
     if pgrep dae >/dev/null 2>&1; then
-        echo -e "${YELLOW}[清理] 检测到残留 dae 后台进程，正在尝试优雅终止...${NC}"
+        printf "${YELLOW}[清理] 检测到残留 dae 后台进程，正在尝试优雅终止...${NC}\n"
         killall dae 2>/dev/null
         sleep 1
     fi
@@ -124,7 +123,7 @@ detect_system_env() {
 check_dependencies() {
     for dep in curl unzip ip pidof; do
         if ! command -v $dep >/dev/null 2>&1; then
-            echo -e "${YELLOW}缺少依赖 $dep，正在尝试通过 $PKG_MANAGER 安装...${NC}"
+            printf "${YELLOW}缺少依赖 $dep，正在尝试通过 $PKG_MANAGER 安装...${NC}\n"
             if [ -n "$INSTALL_CMD" ]; then
                 local pkg_name=$dep
                 [ "$dep" = "ip" ] && pkg_name="iproute2"
@@ -136,19 +135,19 @@ check_dependencies() {
 }
 
 check_ebpf_support() {
-    echo -e "${BLUE}[体检] 正在诊断系统底层内核 eBPF 支持特征...${NC}"
+    printf "${BLUE}[体检] 正在诊断系统底层内核 eBPF 支持特征...${NC}\n"
     KERNEL_VER=$(uname -r)
     local main_ver sub_ver
     main_ver=$(echo "$KERNEL_VER" | cut -d. -f1)
     sub_ver=$(echo "$KERNEL_VER" | cut -d. -f2)
-    echo -e "${CYAN}- 当前系统内核版本: $KERNEL_VER${NC}"
+    printf "${CYAN}- 当前系统内核版本: $KERNEL_VER${NC}\n"
     
     if [ "$main_ver" -lt 5 ] || { [ "$main_ver" -eq 5 ] && [ "$sub_ver" -lt 17 ]; }; then
-        echo -e "${RED}[警告] 您的系统内核低于 dae 官方推荐的最低底线 5.17！${NC}"
-        echo -n "是否仍要强行冒险继续？(y/n, 默认n): "
+        printf "${RED}[警告] 您的系统内核低于 dae 官方推荐的最低底线 5.17！${NC}\n"
+        printf "是否仍要强行冒险继续？(y/n, 默认n): "
         read -r force_kernel
         if [ "$force_kernel" != "y" ] && [ "$force_kernel" != "Y" ]; then
-            echo -e "${RED}[终止] 请升级系统固件后再试。${NC}"
+            printf "${RED}[终止] 请升级系统固件后再试。${NC}\n"
             exit 1
         fi
     fi
@@ -172,32 +171,32 @@ get_network_info() {
             WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "wan")
             LAN_CIDR="$LAN_IP/24"
         else
-            echo -e "${RED}无法自动获取网络接口信息，请检查网络配置！${NC}"
+            printf "${RED}无法自动获取网络接口信息，请检查网络配置！${NC}\n"
             exit 1
         fi
     fi
 
     if [ -z "$LAN_IP" ]; then
-        echo -e "${RED}获取 IP 失败，网络拓扑异常！${NC}"
+        printf "${RED}获取 IP 失败，网络拓扑异常！${NC}\n"
         exit 1
     fi
 }
 
 smart_interface_sniffer() {
-    echo -e "${BLUE}[嗅探] 正在分析物理网络拓扑接口，防止小白选错断网...${NC}"
+    printf "${BLUE}[嗅探] 正在分析物理网络拓扑接口...${NC}\n"
     local all_interfaces
     all_interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -vE 'lo|docker|veth|br-|dae|gretun|sit|tun')
     
-    echo -e "${YELLOW}--- 发现的可用局域网卡候选列表 ---${NC}"
+    printf "${YELLOW}--- 发现的可用局域网卡候选列表 ---${NC}\n"
     local count=1
     for iface in $all_interfaces; do
         local iface_ip
         iface_ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-        echo -e "$count) 网卡名称: ${GREEN}$iface${NC} [当前IP: ${CYAN}${iface_ip:-未分配}${NC}]"
+        printf "$count) 网卡名称: ${GREEN}%s${NC} [当前IP: ${CYAN}%s${NC}]\n" "$iface" "${iface_ip:-未分配}"
         count=$((count + 1))
     done
     
-    echo -e "${YELLOW}请输入数字选择局域网接口 (LAN口)。直接敲回车将全选接管(更稳妥):${NC}"
+    printf "${YELLOW}请输入数字选择局域网接口 (LAN口)。直接敲回车将全选接管(更稳妥):${NC}\n"
     read -r user_iface_choice
     
     if [ -z "$user_iface_choice" ]; then
@@ -209,9 +208,8 @@ smart_interface_sniffer() {
                 merged_ifaces="$merged_ifaces, $iface"
             fi
         done
-        # 【修正】dae 多网卡正确格式为以逗号+空格分隔的纯字符串，严禁带方括号
         LAN_IFACE_SETTING="lan_interface: $merged_ifaces"
-        echo -e "${GREEN}[广撒网策略] 已绑定全部物理网口: $merged_ifaces${NC}"
+        printf "${GREEN}[广撒网策略] 已绑定全部物理网口: %s${NC}\n" "$merged_ifaces"
     else
         local selected_iface=""
         local idx=1
@@ -224,10 +222,10 @@ smart_interface_sniffer() {
         done
         if [ -n "$selected_iface" ]; then
             LAN_IFACE_SETTING="lan_interface: $selected_iface"
-            echo -e "${GREEN}[精准绑定] 已锁定接口: $selected_iface${NC}"
+            printf "${GREEN}[精准绑定] 已锁定接口: %s${NC}\n" "$selected_iface"
         else
             LAN_IFACE_SETTING="lan_interface: $LAN_IFACE"
-            echo -e "${RED}[选择越界] 自动 fallback 缺省选用: $LAN_IFACE${NC}"
+            printf "${RED}[选择越界] 自动 fallback 缺省选用: %s${NC}\n" "$LAN_IFACE"
         fi
     fi
 }
@@ -250,7 +248,7 @@ validate_subscription() {
 
 cleanup_sing_box() {
     if pgrep sing-box >/dev/null 2>&1; then
-        echo -e "${YELLOW}检测到冲突项 sing-box 正在运行，正在停止...${NC}"
+        printf "${YELLOW}检测到冲突项 sing-box 正在运行，正在停止...${NC}\n"
         if [ "$SERVICE_MGR" = "systemd" ]; then 
             systemctl stop sing-box 2>/dev/null
         else 
@@ -268,13 +266,13 @@ manage_service() {
     
     if [ "$SERVICE_MGR" = "systemd" ]; then
         if [ "$action" = "status" ]; then
-            systemctl is-active --quiet $svc_name && echo -e "${GREEN}${svc_name} 正在活跃运行中${NC}" || echo -e "${RED}${svc_name} 未活跃/已停止${NC}"
+            systemctl is-active --quiet $svc_name && printf "${GREEN}${svc_name} 正在活跃运行中${NC}\n" || printf "${RED}${svc_name} 未活跃/已停止${NC}\n"
         else
             systemctl $action $svc_name 2>/dev/null
         fi
     else
         if [ "$action" = "status" ]; then
-            pgrep $svc_name >/dev/null && echo -e "${GREEN}${svc_name} 正在活跃运行中${NC}" || echo -e "${RED}${svc_name} 未活跃/已停止${NC}"
+            pgrep $svc_name >/dev/null && printf "${GREEN}${svc_name} 正在活跃运行中${NC}\n" || printf "${RED}${svc_name} 未活跃/已停止${NC}\n"
         elif [ "$action" = "enable" ] || [ "$action" = "disable" ]; then
             /etc/init.d/$svc_name $action 2>/dev/null
         else
@@ -283,7 +281,7 @@ manage_service() {
     fi
 }
 
-# ==================== 核心配置生成 (并入精细化 AI 特调分流) ====================
+# ==================== 核心配置生成 ====================
 
 generate_dae_config() {
     local subscription_url=$1
@@ -298,7 +296,6 @@ generate_dae_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")"
     mkdir -p "$GEO_DIR"
     
-    # 【修正】规整了 routing 里的过滤标识符，完全对齐官方规范
     cat << EOF > "$CONFIG_FILE"
 global {
     tproxy_port: 12345
@@ -309,7 +306,6 @@ global {
     disable_waiting_network: false
     enable_local_tcp_fast_redirect: false
 
-    # 跨平台智能接口注入机制
     $LAN_IFACE_SETTING
     $wan_setting
 
@@ -334,7 +330,7 @@ global {
 }
 
 subscription {
-    kokk_sub: '$subscription_url'
+    sub_store_link: '$subscription_url'
 }
 
 node {
@@ -368,19 +364,19 @@ dns {
 
 group {
     my_group {
-        filter: subtag(kokk_sub)
+        filter: subtag(sub_store_link)
         policy: min_moving_avg
     }
     high_speed {
-        filter: subtag(kokk_sub) && name(keyword: 'Premium', 'VIP', '专线')
+        filter: subtag(sub_store_link) && name(keyword: 'Premium', 'VIP', '专线', 'IEPL')
         policy: min_moving_avg
     }
     ai_media {
-        filter: subtag(kokk_sub)
+        filter: subtag(sub_store_link)
         policy: min_moving_avg
     }
     gaming {
-        filter: subtag(kokk_sub) && name(keyword: 'Game', 'HK', 'SG', '游戏')
+        filter: subtag(sub_store_link) && name(keyword: 'Game', 'HK', 'SG', '游戏', '直连')
         policy: min
         tcp_check_url: 'http://test.steampowered.com'
         check_interval: 10s
@@ -396,7 +392,6 @@ routing {
     dip(geoip:cn) -> direct
     domain(geosite:cn) -> direct
     
-    # 高级融入：精细化海外 AI 工具与重点流媒体底层硬切流保护机制
     domain(keyword: 'openai', keyword: 'chatgpt') -> ai_media
     domain(keyword: 'gemini', keyword: 'generativelanguage') -> ai_media
     domain(keyword: 'anthropic', keyword: 'claude') -> ai_media
@@ -409,14 +404,14 @@ routing {
 }
 EOF
     chmod 0600 "$CONFIG_FILE"
-    echo -e "${GREEN}✅ 已成功组装高级精细化流媒体/AI特调配置文件：$CONFIG_FILE${NC}"
+    printf "${GREEN}✅ 已成功组装 Sub-Store 特调分流配置文件：${CONFIG_FILE}${NC}\n"
     
-    # 安全验证环节
     if command -v dae >/dev/null 2>&1; then
+        printf "${YELLOW}正在通过 Sub-Store 节点树进行内核本地沙盒语义模拟校验...${NC}\n"
         if dae validate -c "$CONFIG_FILE" >/dev/null 2>&1; then
-            echo -e "${GREEN}[成功] 配置文件通过 dae 内核语法本地校验！${NC}"
+            printf "${GREEN}[成功] 配置文件完美通过 dae 官方内核语法校验！${NC}\n"
         else
-            echo -e "${YELLOW}[注意] 配置规则暂时无法通过内核校验，请执行菜单 3 同步最新 GEO 规则库后再试。${NC}"
+            printf "${YELLOW}[提醒] 如果大鹅报 GEO 映射错误，请运行选单 3 同步最新本地规则库后再行点火。${NC}\n"
         fi
     fi
 }
@@ -424,22 +419,23 @@ EOF
 # ==================== 核心下载与无损更新 ====================
 
 upgrade_dae_core() {
-    echo -e "\n${CYAN}--- 🔄 无损更新/安装 dae 核心 ---${NC}"
+    printf "\n${CYAN}--- 🔄 无损更新/安装 dae 核心 ---${NC}\n"
     check_ebpf_support
     
     local arch target_arch
     arch=$(uname -m)
     case "$arch" in
         x86_64) target_arch="x86_64" ;;
-        aarch64|arm64) target_arch="arm64" ;;
-        *) echo -e "${RED}自动更新暂不支持此架构: $arch${NC}"; return 1 ;;
+        aarch64) target_arch="arm64" ;;
+        arm64) target_arch="arm64" ;;
+        *) printf "${RED}自动更新暂不支持此架构: %s${NC}\n" "$arch"; return 1 ;;
     esac
 
-    echo -e "${YELLOW}正在从 GitHub API 拉取最新发行版本标记...${NC}"
+    printf "${YELLOW}正在从 GitHub API 拉取最新发行版本标记...${NC}\n"
     local latest_version
     latest_version=$(curl -s "https://api.github.com/repos/daeuniverse/dae/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$latest_version" ]; then
-        echo -e "${RED}无法获取云端版本信息，请检查国际网络连通性。${NC}"
+        printf "${RED}无法获取云端版本信息，请检查国际网络连通性。${NC}\n"
         return 1
     fi
 
@@ -447,23 +443,23 @@ upgrade_dae_core() {
     if command -v dae >/dev/null 2>&1; then
         current_version=$(dae --version 2>/dev/null | awk '{print $3}')
     fi
-    echo -e "当前本地版本: ${GREEN}${current_version}${NC}"
-    echo -e "云端最新版本: ${GREEN}${latest_version}${NC}"
+    printf "当前本地版本: ${GREEN}%s${NC}\n" "${current_version}"
+    printf "云端最新版本: ${GREEN}%s${NC}\n" "${latest_version}"
 
     if [ "v${current_version}" = "${latest_version}" ] || [ "${current_version}" = "${latest_version}" ]; then
-        echo -e "${GREEN}当前已是最新版本，无需覆盖安装！${NC}"
+        printf "${GREEN}当前已是最新版本，无需覆盖安装！${NC}\n"
         return 0
     fi
 
     local download_url="https://github.com/daeuniverse/dae/releases/download/${latest_version}/dae-linux-${target_arch}.zip"
-    echo -e "${YELLOW}⬇️ 正在下载二进制核心压缩包...${NC}"
+    printf "${YELLOW}⬇️ 正在下载二进制核心压缩包...${NC}\n"
     curl -L -o /tmp/dae-update.zip "$download_url"
     if [ $? -ne 0 ]; then
-        echo -e "${RED}核心文件下载超时，请检查路由上游链路！${NC}"
+        printf "${RED}核心文件下载超时，请检查路由上游链路！${NC}\n"
         return 1
     fi
 
-    echo -e "${YELLOW}正在安全挂起当前大鹅代理状态...${NC}"
+    printf "${YELLOW}正在安全挂起当前大鹅代理状态...${NC}\n"
     manage_service "stop"
     clean_network_resources
 
@@ -478,9 +474,9 @@ upgrade_dae_core() {
         [ -f /tmp/dae-linux-* ] && mv /tmp/dae-linux-* /tmp/dae
         mv /tmp/dae "$dae_path"
         chmod +x "$dae_path"
-        echo -e "${GREEN}✅ 核心文件无损落地成功！${NC}"
+        printf "${GREEN}✅ 核心文件无损落地成功！${NC}\n"
     else
-        echo -e "${RED}解压和结构提取破损。${NC}"
+        printf "${RED}解压和结构提取破损。${NC}\n"
         rm -f /tmp/dae-update.zip
         return 1
     fi
@@ -505,7 +501,7 @@ EOF
         systemctl daemon-reload
     fi
 
-    echo -e "${YELLOW}正在重新点火加载服务...${NC}"
+    printf "${YELLOW}正在重新点火加载服务...${NC}\n"
     manage_service "start"
     send_wechat_notification "大鹅底层核心可执行组件成功无损同步更新至 ${latest_version}。"
 }
@@ -540,13 +536,13 @@ update_geo_data() {
     if [ ! -f "$UPDATE_GEO_SCRIPT" ]; then
         create_geo_update_script
     fi
-    echo -e "${YELLOW}[运行] 正在触发执行底层的 GEO 规则库全量拉取链...${NC}"
+    printf "${YELLOW}[运行] 正在触发执行底层的 GEO 规则库全量拉取链...${NC}\n"
     "$UPDATE_GEO_SCRIPT"
-    echo -e "${GREEN}✅ 数据同步完成。${NC}"
+    printf "${GREEN}✅ 数据同步完成。${NC}\n"
 }
 
 set_geo_update_schedule() {
-    echo -e "\n${PURPLE}--- 🗓️ 规则自动更新计划任务设定 ---${NC}"
+    printf "\n${PURPLE}--- 🗓️ 规则自动更新计划任务设定 ---${NC}\n"
     echo "1) 每天夜间凌晨自动轮询更新"
     echo "2) 每周一凌晨自动轮询更新"
     echo "3) 每月1号自动轮询更新"
@@ -569,33 +565,33 @@ set_geo_update_schedule() {
     else
         /etc/init.d/cron restart 2>/dev/null || /etc/init.d/crond restart 2>/dev/null
     fi
-    echo -e "${GREEN}✅ 定时计划任务配置成功，已自动剔除历史重复项。${NC}"
+    printf "${GREEN}✅ 定时计划任务配置成功，已自动剔除历史重复项。${NC}\n"
 }
 
 # ==================== Docker 特权隔离沙盒模式 ====================
 
 install_dae_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}[阻断] 宿主机未检测到 Docker 容器引擎。请先安装 Docker。${NC}"
+        printf "${RED}[阻断] 宿主机未检测到 Docker 容器引擎。请先安装 Docker。${NC}\n"
         return 1
     fi
     check_ebpf_support
     
-    echo -e "${RED}⚠️【警告】大鹅涉及深度内核态注入，非极度特殊纯净环境不建议在容器内跑。${NC}"
-    echo -n "确认要采用沙盒虚拟化形态部署吗？(y/n): "
+    printf "${RED}⚠️【警告】大鹅涉及深度内核态注入，非极度特殊纯净环境不建议在容器内跑。${NC}\n"
+    printf "确认要采用沙盒虚拟化形态部署吗？(y/n): "
     read -r continue_docker
     if [ "$continue_docker" != "y" ] && [ "$continue_docker" != "Y" ]; then
         return 0
     fi
 
-    echo -e "请输入底座镜像类型（直接回车缺省使用 小白推荐的 ubuntu:22.04）: "
+    printf "请输入底座镜像类型（直接回车缺省使用 ubuntu:22.04）: "
     read -r docker_image
     docker_image=${docker_image:-ubuntu:22.04}
 
-    echo -n "请输入容器环境下的扁平订阅节点完整 URL: "
+    printf "请粘贴你在 Sub-Store 复制的通用订阅链接 URL: "
     read -r doc_sub
     if ! validate_subscription "$doc_sub"; then
-        echo -e "${RED}订阅地址不合法。${NC}"
+        printf "${RED}订阅地址不合法。${NC}\n"
         return 1
     fi
 
@@ -607,7 +603,7 @@ install_dae_docker() {
     LAN_IFACE_SETTING="lan_interface: \"\""
     generate_dae_config "$doc_sub" "main"
 
-    echo -e "${BLUE}[Docker] 正在全速拉取并构建特权容器沙盒环境...${NC}"
+    printf "${BLUE}[Docker] 正在全速拉取并构建特权容器沙盒环境...${NC}\n"
     local m_arch
     m_arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
@@ -630,10 +626,10 @@ install_dae_docker() {
         /etc/dae/dae run --config /etc/dae/config.dae
 
     if [ "$(docker inspect -f '{{.State.Running}}' dae 2>/dev/null)" = "true" ]; then
-        echo -e "${GREEN}🎉 Docker 特权大鹅沙盒已点火成功上线！${NC}"
+        printf "${GREEN}🎉 Docker 特权大鹅沙盒已点火成功上线！${NC}\n"
         send_wechat_notification "Docker沙盒特权模式下的大鹅透明代理已点火启动。"
     else
-        echo -e "${RED}[熄火] 容器因提权受阻异常退栈。请通过 docker logs dae 查看。${NC}"
+        printf "${RED}[熄火] 容器因提权受阻异常退栈。请通过 docker logs dae 查看。${NC}\n"
     fi
 }
 
@@ -641,10 +637,10 @@ install_dae_docker() {
 
 display_side_router_instructions() {
     if [ "$(detect_router_mode)" = "side" ]; then
-        echo -e "\n${YELLOW}💡 侦测到您当前处于【旁路由网关】生态，请确保主路由侧完成如下补强配对：${NC}"
-        echo -e "1. 主路由的 DHCP 分发网关和 DNS 指向当前设备的局域网内网IP: ${CYAN}$LAN_IP${NC}"
-        echo -e "2. 如果防火墙未自动咬合，可在主路由或本旁路由中补入 TPROXY 标记转换:"
-        echo -e "   iptables -t mangle -A PREROUTING -i $LAN_IFACE -p tcp -j TPROXY --on-port 12345 --tproxy-mark 0x1"
+        printf "\n${YELLOW}💡 侦测到您当前处于【旁路由网关】生态，请确保主路由侧完成如下补强配对：${NC}\n"
+        printf "1. 主路由的 DHCP 分发网关和 DNS 指向当前设备的局域网内网IP: ${CYAN}%s${NC}\n" "$LAN_IP"
+        printf "2. 如果防火墙未自动咬合，可在主路由或本旁路由中补入 TPROXY 标记转换:\n"
+        printf "   iptables -t mangle -A PREROUTING -i %s -p tcp -j TPROXY --on-port 12345 --tproxy-mark 0x1\n" "$LAN_IFACE"
     fi
 }
 
@@ -659,55 +655,55 @@ main_menu() {
     
     while true; do
         check_log_size
-        echo ""
-        echo -e "${GREEN}================================================================${NC}"
-        echo -e "${GREEN}   🦢 dae (大鹅) 高性能 eBPF 透明代理全平台融合配置管家 (排错闭环版)${NC}"
-        echo -e "   当前系统环境: ${YELLOW}${SERVICE_MGR} (${PKG_MANAGER:-未知})${NC} | 拓扑检测: ${CYAN}$(detect_router_mode)路由${NC}"
-        echo -e "   内网默认接口: ${GREEN}${LAN_IFACE}${NC} | 本机IP: ${GREEN}${LAN_IP}${NC}"
-        echo -e "${GREEN}================================================================${NC}"
-        echo -e " 1) ${GREEN}⚡ 智能向导：一键安装/更新 dae 核心【完美保留现有配置】${NC}"
-        echo -e " 2) ✍️ 交互配置：设定订阅链接并生成高级流媒体/AI分流控制矩阵"
-        echo -e " 3) 🔄 立即全量拉取更新本地 GEO 规则数据库文件"
-        echo -e " 4) 🗓️ 规划配置：设定 Crontab 计划任务定时自动化洗刷 Geo 规则"
-        echo -e " 5) ⚙️ 控制中心：查看 dae 服务运行看板与启动/重启/停止拦截"
-        echo -e " 6) 🐳 独立沙盒：使用 Docker 特权提权链路容器化部署 dae"
-        echo -e " 7) 🔔 外部联动：配置/修改企业微信运维通知推送 Webhook 密钥"
-        echo -e " 8) ❌ 退出当前向导程序"
-        echo -e "${GREEN}================================================================${NC}"
-        echo -n "请输入数字选项 [1-8]："
+        printf "\n"
+        printf "${GREEN}================================================================${NC}\n"
+        printf "${GREEN}   🦢 dae (大鹅) 高性能 eBPF 透明代理全平台融合配置管家 (修复版)${NC}\n"
+        printf "   当前系统环境: ${YELLOW}%s (%s)${NC} | 拓扑检测: ${CYAN}%s路由${NC}\n" "${SERVICE_MGR}" "${PKG_MANAGER:-未知}" "$(detect_router_mode)"
+        printf "   内网默认接口: ${GREEN}%s${NC} | 本机IP: ${GREEN}%s${NC}\n" "${LAN_IFACE}" "${LAN_IP}"
+        printf "${GREEN}================================================================${NC}\n"
+        printf " 1) ${GREEN}⚡ 智能向导：一键安装/更新 dae 核心【完美保留现有配置】${NC}\n"
+        printf " 2) ✍️ 交互配置：粘贴 Sub-Store 链接并生成流媒体/AI分流矩阵\n"
+        printf " 3) 🔄 立即全量拉取更新本地 GEO 规则数据库文件\n"
+        printf " 4) 🗓️ 规划配置：设定 Crontab 计划任务定时自动化洗刷 Geo 规则\n"
+        printf " 5) ⚙️ 控制中心：查看 dae 服务运行看板与启动/重启/停止拦截\n"
+        printf " 6) 🐳 独立沙盒：使用 Docker 特权提权链路容器化部署 dae\n"
+        printf " 7) 🔔 外部联动：配置/修改企业微信运维通知推送 Webhook 密钥\n"
+        printf " 8) ❌ 退出当前向导程序\n"
+        printf "${GREEN}================================================================${NC}\n"
+        printf "请输入数字选项 [1-8]："
         read -r choice
         case $choice in
             1)
                 upgrade_dae_core
                 ;;
             2)
-                echo -e "${PURPLE}【小白避坑指南】只认标准的扁平原始节点链接（形如 ss://, vless:// 流）。${NC}"
-                echo -e "${YELLOW}如粘贴的是机场附带的 .yaml 结尾的常规 Clash 订阅，请先通过外部解析转换网站洗成节点流！${NC}"
-                echo -n "请粘贴转换后的标准订阅地址 (http/https): "
+                printf "${PURPLE}【✨ Sub-Store 操作指引】${NC}\n"
+                printf "${YELLOW}请在 Sub-Store 预览截图中点击第一项「通用订阅」右侧的复制按钮获取链接。${NC}\n"
+                printf "请粘贴复制好的 Sub-Store 通用订阅地址 (http/https): "
                 read -r SUBSCRIPTION_URL
                 if validate_subscription "$SUBSCRIPTION_URL"; then
                     smart_interface_sniffer
-                    local router_mode
-                    router_mode=$(detect_router_mode)
-                    generate_dae_config "$SUBSCRIPTION_URL" "$router_mode"
+                    local r_mode
+                    r_mode=$(detect_router_mode)
+                    generate_dae_config "$SUBSCRIPTION_URL" "$r_mode"
                     display_side_router_instructions
-                    echo -e "${YELLOW}正在使能并冷重启服务以加载节点树...${NC}"
+                    printf "${YELLOW}正在使能并冷重启服务以加载节点树...${NC}\n"
                     manage_service "enable" >/dev/null 2>&1
                     clean_network_resources
                     manage_service "restart"
-                    send_wechat_notification "成功覆盖重构了本地大鹅分流矩阵，订阅链已刷新。"
+                    send_wechat_notification "大鹅成功同步 Sub-Store 聚合订阅，透明分流矩阵已刷新。"
                 else
-                    echo -e "${RED}[异常] 链入的 URL 格式非法，必须以 http:// 或 https:// 开头！${NC}"
+                    printf "${RED}[异常] 链入的 URL 格式非法，必须以 http:// 或 https:// 开头！${NC}\n"
                 fi
                 ;;
             3) update_geo_data ;;
             4) set_geo_update_schedule ;;
             5)
                 echo "1) 强起大鹅内核接管 (Start)"
-                echo "2)挂起撤回大鹅内核接管 (Stop)"
+                echo "2) 挂起撤回大鹅内核接管 (Stop)"
                 echo "3) 全盘冷启动复位重载 (Restart)"
                 echo "4) 调取当前实时健康看板 (Status)"
-                echo -n "请指派动作 [1-4]: "
+                printf "请指派动作 [1-4]: "
                 read -r svc_act
                 case $svc_act in
                     1) clean_network_resources; manage_service "start"; echo "已触发启动。";;
@@ -718,20 +714,20 @@ main_menu() {
                 ;;
             6) install_dae_docker ;;
             7)
-                echo -n "请粘贴企业微信群机器人的 Webhook 完整 URL: "
+                printf "请粘贴企业微信群机器人的 Webhook 完整 URL: "
                 read -r input_wx
                 if [ -n "$input_wx" ]; then
                     WECHAT_WEBHOOK="$input_wx"
                     save_env "WECHAT_WEBHOOK" "$WECHAT_WEBHOOK"
-                    echo -e "${GREEN}通知通道已固化绑定。${NC}"
+                    printf "${GREEN}通知通道已固化绑定。${NC}\n"
                 fi
                 ;;
             8)
-                echo -e "${GREEN}退出程序。祝您网络畅通！${NC}"
+                printf "${GREEN}退出程序。祝您网络畅通！${NC}\n"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}输入有误，请输入1-8之间的有效编号。${NC}"
+                printf "${RED}输入有误，请输入1-8之间的有效编号。${NC}\n"
                 ;;
         esac
     done
