@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ==================== 全局配置 ====================
-SCRIPT_VERSION="1.5"
+SCRIPT_VERSION="1.8 (Logic Fixed)"
 
 # 核心路径定义
 CONFIG_FILE="/etc/dae/config.dae"
@@ -239,19 +239,15 @@ check_ebpf_support() {
     return 0
 }
 
-# 【关键修复】重写网络信息获取逻辑，优先适配 OpenWrt
 get_network_info() {
     if command -v uci >/dev/null 2>&1; then
-        # OpenWrt 环境：使用 uci 作为信息源
         LAN_IFACE=$(uci get network.lan.device 2>/dev/null || uci get network.lan.ifname 2>/dev/null || echo "br-lan")
         LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
-        # 如果 uci 拿不到 IP，再用 ip addr 命令作为后备
         if [ -z "$LAN_IP" ]; then
             LAN_IP=$(ip addr show "$LAN_IFACE" 2>/dev/null | grep -o "inet [0-9.]\+" | cut -d' ' -f2 | head -n1)
         fi
-        WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "eth0.2") # 默认一个常见值
+        WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "eth0.2")
     else
-        # 标准 Linux 环境
         DEFAULT_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {print $5}' | head -n1)
         if [ -n "$DEFAULT_IFACE" ]; then
             LAN_IFACE="$DEFAULT_IFACE"
@@ -261,7 +257,6 @@ get_network_info() {
         fi
     fi
 
-    # 如果所有自动方法都失败，则请求用户手动输入
     if [ -z "$LAN_IP" ]; then
         printf "${RED}无法自动获取网络接口信息！${NC}\n"
         printf "请输入您的局域网接口名称 (例如 eth0, br-lan): "
@@ -272,7 +267,7 @@ get_network_info() {
             printf "${RED}信息不足，无法继续。${NC}\n"
             exit 1
         fi
-        WAN_IFACE="$LAN_IFACE" # 在未知情况下，假定为单网卡模式
+        WAN_IFACE="$LAN_IFACE"
     fi
 }
 
@@ -380,6 +375,41 @@ manage_service() {
              killall $svc_name 2>/dev/null
         fi
     fi
+}
+
+create_geo_update_script() {
+    mkdir -p "$(dirname "$UPDATE_GEO_SCRIPT")"
+    cat << 'EOF' > "$UPDATE_GEO_SCRIPT"
+#!/bin/sh
+GEO_DIR="/usr/share/dae"
+mkdir -p "$GEO_DIR"
+echo "正在从社区骨干网同步 geoip.dat..."
+curl -L -o "$GEO_DIR/geoip.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" && mv "$GEO_DIR/geoip.dat.tmp" "$GEO_DIR/geoip.dat"
+echo "正在从社区骨干网同步 geosite.dat..."
+curl -L -o "$GEO_DIR/geosite.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" && mv "$GEO_DIR/geosite.dat.tmp" "$GEO_DIR/geosite.dat"
+chmod 644 "$GEO_DIR/geoip.dat" "$GEO_DIR/geosite.dat"
+mkdir -p /etc/dae
+ln -sf "$GEO_DIR/geoip.dat" /etc/dae/geoip.dat 2>/dev/null
+ln -sf "$GEO_DIR/geosite.dat" /etc/dae/geosite.dat 2>/dev/null
+if pgrep -x dae >/dev/null 2>&1; then
+    echo "检测到 dae 正在运行，将重启以应用新规则..."
+    if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
+        systemctl restart dae >/dev/null 2>&1
+    elif [ -f /etc/init.d/dae ]; then
+        /etc/init.d/dae restart >/dev/null 2>&1
+    fi
+fi
+EOF
+    chmod +x "$UPDATE_GEO_SCRIPT"
+}
+
+update_geo_data() {
+    if [ ! -f "$UPDATE_GEO_SCRIPT" ]; then
+        create_geo_update_script
+    fi
+    printf "${YELLOW}[运行] 正在触发执行底层的 GEO 规则库全量拉取链...${NC}\n"
+    sh "$UPDATE_GEO_SCRIPT"
+    printf "${GREEN}✅ 数据同步完成。${NC}\n"
 }
 
 generate_dae_config() {
@@ -508,11 +538,19 @@ EOF
     printf "${GREEN}✅ 已成功组装 Sub-Store 特调分流配置文件：${CONFIG_FILE}${NC}\n"
     
     if command -v dae >/dev/null 2>&1; then
+        # 【关键修复】自动补齐 GEO 数据库依赖，防止 validate 过程中因缺少文件而抛出语法错误
+        if [ ! -f "$GEO_DIR/geoip.dat" ] || [ ! -f "$GEO_DIR/geosite.dat" ]; then
+            printf "${YELLOW}[自动补救] 检测到尚未同步 GEO 规则库，正在自动拉取 (否则语法校验必报错)...${NC}\n"
+            update_geo_data
+        fi
+
         printf "${YELLOW}正在通过 Sub-Store 节点树进行内核本地沙盒语义模拟校验...${NC}\n"
-        if dae validate -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        if dae validate -c "$CONFIG_FILE" >/tmp/dae_validate.log 2>&1; then
             printf "${GREEN}[成功] 配置文件完美通过 dae 官方内核语法校验！${NC}\n"
         else
-            printf "${RED}[语法报错] dae 校验器提示配置不合规！请排查接口绑定名或日志。${NC}\n"
+            printf "${RED}[语法报错] dae 校验器提示配置不合规！详细报错原因如下：${NC}\n"
+            cat /tmp/dae_validate.log
+            printf "${YELLOW}提示: 请根据上方报错排查接口绑定名是否异常。${NC}\n"
         fi
     fi
 }
@@ -529,32 +567,68 @@ upgrade_dae_core() {
         *) printf "${RED}自动更新暂不支持此架构: %s${NC}\n" "$arch"; return 1 ;;
     esac
 
-    printf "${YELLOW}正在从 GitHub API 拉取最新发行版本标记...${NC}\n"
-    local latest_version
-    latest_version=$(curl -s "https://api.github.com/repos/daeuniverse/dae/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$latest_version" ]; then
+    printf "${YELLOW}正在从 GitHub API 拉取最新发行版本列表...${NC}\n"
+    local release_list
+    release_list=$(curl -s "https://api.github.com/repos/daeuniverse/dae/releases")
+    if [ -z "$release_list" ]; then
         printf "${RED}无法获取云端版本信息，请检查网络连通性。${NC}\n"
         return 1
     fi
 
+    local version_list
+    version_list=$(echo "$release_list" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n 5)
+    
     local current_version="未安装"
     if [ -f "$DAE_BIN_PATH" ] && [ -x "$DAE_BIN_PATH" ]; then
         current_version=$("$DAE_BIN_PATH" --version 2>/dev/null | awk '{print $3}')
     fi
     printf "当前本地版本: ${GREEN}%s${NC}\n" "${current_version}"
-    printf "云端最新版本: ${GREEN}%s${NC}\n" "${latest_version}"
+    
+    printf "${PURPLE}请选择要安装的版本:${NC}\n"
+    local count=1
+    local first_version=""
+    for v in $version_list; do
+        if [ $count -eq 1 ]; then
+            first_version=$v
+            printf " $count) %s ${YELLOW}(最新版)${NC}\n" "$v"
+        else
+            printf " $count) %s\n" "$v"
+        fi
+        count=$((count + 1))
+    done
+    printf " 0) 取消安装\n"
 
-    if [ "v${current_version}" = "${latest_version}" ] || [ "${current_version}" = "${latest_version}" ]; then
-        printf "${GREEN}当前已是最新版本，无需覆盖安装！${NC}\n"
-        return 0
+    if [ "v${current_version}" = "${first_version}" ] || [ "${current_version}" = "${first_version}" ]; then
+        printf "${GREEN}提示：当前已是最新版本。${NC}\n"
     fi
 
-    local download_url="https://github.com/daeuniverse/dae/releases/download/${latest_version}/dae-linux-${target_arch}.zip"
-    local tmp_zip="/tmp/dae-update.zip"
+    printf "请输入数字选项 [0-5]: "
+    read -r choice
+    
+    local selected_version=""
+    case $choice in
+        1|2|3|4|5)
+            selected_version=$(echo "$version_list" | sed -n "${choice}p") ;;
+        0) printf "${GREEN}操作已取消。${NC}\n"; return 0 ;;
+        *) printf "${RED}无效输入。${NC}\n"; return 1 ;;
+    esac
+    
+    if [ -z "$selected_version" ]; then
+        printf "${RED}版本选择失败。${NC}\n"
+        return 1
+    fi
+
+    printf "${YELLOW}已选择版本: %s${NC}\n" "$selected_version"
+    local download_url="https://github.com/daeuniverse/dae/releases/download/${selected_version}/dae-linux-${target_arch}.zip"
+    local tmp_zip="/tmp/dae-update.$$.zip"
     printf "${YELLOW}⬇️ 正在下载二进制核心压缩包...${NC}\n"
-    curl -L -o "$tmp_zip" "$download_url"
-    if [ $? -ne 0 ]; then
-        printf "${RED}核心文件下载超时，请检查路由上游链路！${NC}\n"
+    
+    local http_code
+    http_code=$(curl -L -w "%{http_code}" -o "$tmp_zip" "$download_url")
+    
+    if [ "$http_code" -ne 200 ]; then
+        printf "${RED}下载失败！服务器返回 HTTP 状态码: %s${NC}\n" "$http_code"
+        printf "${RED}这很可能意味着您选择的版本 (%s) 没有提供适用于您系统架构 (%s) 的文件。${NC}\n" "$selected_version" "$target_arch"
         rm -f "$tmp_zip"
         return 1
     fi
@@ -572,15 +646,16 @@ upgrade_dae_core() {
     local tmp_dir="/tmp/dae-unzip-$$"
     mkdir -p "$tmp_dir"
     unzip -o "$tmp_zip" -d "$tmp_dir" >/dev/null 2>&1
+    
     local dae_file
-    dae_file=$(find "$tmp_dir" -type f -name "dae" | head -n1)
+    dae_file=$(find "$tmp_dir" -type f -name "dae-linux-*" | head -n1)
 
     if [ -n "$dae_file" ] && [ -f "$dae_file" ]; then
         mv "$dae_file" "$DAE_BIN_PATH"
         chmod +x "$DAE_BIN_PATH"
-        printf "${GREEN}✅ 核心文件无损落地成功！${NC}\n"
+        printf "${GREEN}✅ 核心文件无损落地成功！新版本: %s${NC}\n" "$selected_version"
     else
-        printf "${RED}解压失败或压缩包内找不到 'dae' 文件。${NC}\n"
+        printf "${RED}解压失败或压缩包内找不到 'dae-linux-*' 文件。${NC}\n"
         rm -rf "$tmp_dir" "$tmp_zip"
         return 1
     fi
@@ -593,7 +668,6 @@ upgrade_dae_core() {
 Description=dae Advanced eBPF Proxy Service
 After=network.target network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 User=root
@@ -601,7 +675,6 @@ ExecStart=$DAE_BIN_PATH run --config $CONFIG_FILE
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -613,7 +686,6 @@ EOF
 #!/bin/sh /etc/rc.common
 START=95
 USE_PROCD=1
-
 start_service() {
     procd_open_instance
     procd_set_param command /usr/bin/dae run --config /etc/dae/config.dae
@@ -627,47 +699,16 @@ EOF
         fi
     fi
 
-    printf "${YELLOW}正在重新点火加载服务...${NC}\n"
-    manage_service "start"
-    print_service_live_status
-    send_wechat_notification "大鹅底层核心可执行组件成功无损同步更新至 ${latest_version}。"
-}
-
-create_geo_update_script() {
-    mkdir -p "$(dirname "$UPDATE_GEO_SCRIPT")"
-    cat << 'EOF' > "$UPDATE_GEO_SCRIPT"
-#!/bin/sh
-GEO_DIR="/usr/share/dae"
-mkdir -p "$GEO_DIR"
-echo "正在从社区骨干网同步 geoip.dat..."
-curl -L -o "$GEO_DIR/geoip.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" && mv "$GEO_DIR/geoip.dat.tmp" "$GEO_DIR/geoip.dat"
-echo "正在从社区骨干网同步 geosite.dat..."
-curl -L -o "$GEO_DIR/geosite.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" && mv "$GEO_DIR/geosite.dat.tmp" "$GEO_DIR/geosite.dat"
-chmod 644 "$GEO_DIR/geoip.dat" "$GEO_DIR/geosite.dat"
-
-mkdir -p /etc/dae
-ln -sf "$GEO_DIR/geoip.dat" /etc/dae/geoip.dat 2>/dev/null
-ln -sf "$GEO_DIR/geosite.dat" /etc/dae/geosite.dat 2>/dev/null
-
-if pgrep -x dae >/dev/null 2>&1; then
-    echo "检测到 dae 正在运行，将重启以应用新规则..."
-    if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
-        systemctl restart dae >/dev/null 2>&1
-    elif [ -f /etc/init.d/dae ]; then
-        /etc/init.d/dae restart >/dev/null 2>&1
+    # 【关键修复】全新安装时阻止强行启动造成的假报错
+    if [ ! -f "$CONFIG_FILE" ]; then
+        printf "${YELLOW}[提示] 检测到这是初次安装，您还未生成 dae 的配置文件。${NC}\n"
+        printf "${CYAN}💡 请在主菜单依次执行【选项 3】(同步规则) 和【选项 2】(生成配置) 后，服务将自动启动。${NC}\n"
+    else
+        printf "${YELLOW}正在重新点火加载服务...${NC}\n"
+        manage_service "start"
+        print_service_live_status
     fi
-fi
-EOF
-    chmod +x "$UPDATE_GEO_SCRIPT"
-}
-
-update_geo_data() {
-    if [ ! -f "$UPDATE_GEO_SCRIPT" ]; then
-        create_geo_update_script
-    fi
-    printf "${YELLOW}[运行] 正在触发执行底层的 GEO 规则库全量拉取链...${NC}\n"
-    sh "$UPDATE_GEO_SCRIPT"
-    printf "${GREEN}✅ 数据同步完成。${NC}\n"
+    send_wechat_notification "大鹅底层核心可执行组件成功无损同步更新至 ${selected_version}。"
 }
 
 set_geo_update_schedule() {
@@ -686,9 +727,7 @@ set_geo_update_schedule() {
         3) cron_schedule="0 3 1 * *" ;;
         *) cron_schedule="0 3 * * 1" ;;
     esac
-    
     (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT"; echo "$cron_schedule $UPDATE_GEO_SCRIPT >/dev/null 2>&1") | crontab -
-
     if [ "$SERVICE_MGR" = "systemd" ]; then
         systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null
     else
@@ -703,40 +742,33 @@ install_dae_docker() {
         return 1
     fi
     check_ebpf_support
-    
     printf "${RED}⚠️【警告】大鹅涉及深度内核态注入，非极度特殊纯净环境不建议在容器内跑。${NC}\n"
     printf "确认要采用沙盒虚拟化形态部署吗？(y/n): "
     read -r continue_docker
     if [ "$continue_docker" != "y" ] && [ "$continue_docker" != "Y" ]; then
         return 0
     fi
-
     printf "请粘贴你在 Sub-Store 复制的通用订阅链接 URL: "
     read -r doc_sub
     if ! validate_subscription "$doc_sub"; then
         printf "${RED}订阅地址不合法。${NC}\n"
         return 1
     fi
-
     if docker ps -a | grep -q dae-container; then
         docker rm -f dae-container >/dev/null 2>&1
     fi
-
     mkdir -p /etc/dae/docker/data
     mkdir -p /etc/dae/persist.d
     LAN_IFACE_SETTING="lan_interface: \"\" # Docker模式下留空"
     generate_dae_config "$doc_sub" "main"
-
     printf "${BLUE}[Docker] 正在全速拉取 dae 官方镜像...${NC}\n"
     if ! docker pull ghcr.io/daeuniverse/dae:latest; then
         printf "${RED}Docker 镜像拉取失败，请检查网络或 Docker Hub 连通性。${NC}\n"
         return 1
     fi
-    
     printf "${BLUE}为 Docker 容器准备最新的 GEO 数据...${NC}\n"
     curl -L -o "/etc/dae/docker/data/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
     curl -L -o "/etc/dae/docker/data/geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-
     printf "${BLUE}正在启动 dae 特权容器...${NC}\n"
     docker run -d \
         --name dae-container \
@@ -747,7 +779,6 @@ install_dae_docker() {
         -v /etc/dae/docker/data:/usr/share/dae \
         -v /etc/dae/persist.d:/etc/dae/persist.d \
         ghcr.io/daeuniverse/dae:latest
-
     sleep 3
     if [ "$(docker inspect -f '{{.State.Running}}' dae-container 2>/dev/null)" = "true" ]; then
         printf "${GREEN}🎉 Docker 特权大鹅沙盒已点火成功上线！${NC}\n"
@@ -767,32 +798,25 @@ uninstall_dae() {
         printf "${GREEN}操作已取消。${NC}\n"
         return
     fi
-    
     printf "${YELLOW}正在停止并禁用 dae 服务...${NC}\n"
     manage_service "stop"
     manage_service "disable"
-    
     printf "${YELLOW}正在执行深度网络资源清理...${NC}\n"
     clean_network_resources
-    
     if docker ps -a --format '{{.Names}}' | grep -q dae-container; then
         printf "${YELLOW}正在清理 Docker 容器...${NC}\n"
         docker rm -f dae-container >/dev/null 2>&1
     fi
-    
     printf "${YELLOW}正在移除相关文件和目录...${NC}\n"
     rm -f "$DAE_BIN_PATH" /etc/systemd/system/dae.service /etc/init.d/dae "$ENV_FILE"
     rm -rf /etc/dae /usr/share/dae
-    
     printf "${YELLOW}正在清理 Crontab 计划任务...${NC}\n"
     if command -v crontab >/dev/null 2>&1; then
         (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT") | crontab -
     fi
-    
     if [ "$SERVICE_MGR" = "systemd" ]; then
         systemctl daemon-reload 2>/dev/null
     fi
-    
     printf "${GREEN}✅ dae 已被彻底从系统中移除。${NC}\n"
     send_wechat_notification "dae 已被从系统中彻底卸载。"
 }
@@ -807,16 +831,14 @@ display_side_router_instructions() {
 }
 
 main_menu() {
-    # 【关键修复】在脚本启动时首先净化网络环境，避免后续网络操作被自身劫持
     detect_system_env
     check_dependencies
-    clean_network_resources 
-
-    # 在干净的网络环境下获取信息
+    if [ "$1" != "--no-clean" ]; then
+        clean_network_resources
+    fi
     get_network_info
     cleanup_sing_box
     load_env
-    
     while true; do
         check_log_size
         printf "\n"
@@ -825,7 +847,7 @@ main_menu() {
         printf "   当前系统: ${YELLOW}%s (%s)${NC} | 拓扑: ${CYAN}%s路由${NC} | 内核: ${PURPLE}%s${NC}\n" "${SERVICE_MGR}" "${PKG_MANAGER:-未知}" "$(detect_router_mode)" "$(uname -r)"
         printf "   内网接口: ${GREEN}%s${NC} | 本机IP: ${GREEN}%s${NC}\n" "${LAN_IFACE}" "${LAN_IP}"
         printf "${GREEN}================================================================${NC}\n"
-        printf " 1) ${GREEN}⚡ 智能向导：一键安装/更新 dae 核心【完美保留现有配置】${NC}\n"
+        printf " 1) ${GREEN}⚡ 智能向导：一键安装/更新 dae 核心 (可选版本)${NC}\n"
         printf " 2) ✍️ 交互配置：粘贴 Sub-Store 链接并生成流媒体/AI分流矩阵\n"
         printf " 3) 🔄 立即全量拉取更新本地 GEO 规则数据库文件\n"
         printf " 4) 🗓️ 规划配置：设定 Crontab 计划任务定时自动化洗刷 Geo 规则\n"
@@ -907,4 +929,4 @@ main_menu() {
 }
 
 # 挂载运行入口
-main_menu
+main_menu "$@"
