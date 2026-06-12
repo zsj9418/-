@@ -5,9 +5,11 @@ CONFIG_FILE="/etc/dae/config.dae"
 GEO_DIR="/usr/share/dae"
 PERSIST_DIR="/etc/dae/persist.d"
 UPDATE_GEO_SCRIPT="/etc/dae/update-geo.sh"
+DAE_BIN_PATH="/usr/bin/dae"
 ENV_FILE="$HOME/.dae_env"
 LOG_FILE="/var/log/dae.log"
 LOG_SIZE_LIMIT=$((1 * 1024 * 1024)) # 1MB
+SCRIPT_VERSION="1.1"
 
 # 严格遵循 POSIX 标准的颜色转义定义
 RED='\033[0;31m'
@@ -39,8 +41,9 @@ save_env() {
         touch "$ENV_FILE"
         chmod 0600 "$ENV_FILE"
     fi
+    escaped_value=$(printf '%s\n' "$value" | sed 's/[&/\]/\\&/g')
     if grep -q "^$key=" "$ENV_FILE"; then
-        sed -i "s|^$key=.*|$key=\"$value\"|" "$ENV_FILE"
+        sed -i "s|^$key=.*|$key=\"$escaped_value\"|" "$ENV_FILE"
     else
         echo "$key=\"$value\"" >> "$ENV_FILE"
     fi
@@ -53,12 +56,13 @@ send_wechat_notification() {
     fi
     local msg=$1
     printf "${BLUE}[通知] 正在向企业微信发送即时运维报告...${NC}\n"
+    escaped_msg=$(printf '%s' "$msg" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/\n/\\n/g')
     curl -s -X POST "$WECHAT_WEBHOOK" \
        -H 'Content-Type: application/json' \
        -d "{
             \"msgtype\": \"text\",
             \"text\": {
-                \"content\": \"【大鹅云助手】运维状态更新\n报告时间：\$(date '+%Y-%m-%d %H:%M:%S')\n事件详情：$msg\"
+                \"content\": \"【大鹅云助手】运维状态更新\n报告时间：$(date '+%Y-%m-%d %H:%M:%S')\n事件详情：$escaped_msg\"
             }
        }" >/dev/null
 }
@@ -69,47 +73,45 @@ check_log_size() {
         log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if [ "$log_size" -gt "$LOG_SIZE_LIMIT" ]; then
             printf "${YELLOW}[系统] 日志文件超过1MB，正在自动轮转清空...${NC}\n"
-            > "$LOG_FILE"
+            cat /dev/null > "$LOG_FILE"
         fi
     fi
 }
 
-# ==================== 确定感补强：无痕清理与状态诊断 ====================
+# ==================== 确定感补强：无痕清理与状态诊断 (已修复) ====================
 
 clean_network_resources() {
     printf "${YELLOW}[清理] 正在排查并深度无痕清理网络挂载资源...${NC}\n"
     
-    # 清理策略路由与标记表
-    if ip rule show | grep -q "fwmark 0x1bf52"; then # 114514 的十六进制
-        ip rule del fwmark 114514 2>/dev/null
+    if ip rule show | grep -q "fwmark 0x1bf52"; then
+        ip rule del fwmark 114514 table 114514 2>/dev/null
         printf "  - 已成功解除并注销内核 fwmark 114514 策略路由规则 [${GREEN}OK${NC}]\n"
     else
-        printf "  - 未发现残留的 fwmark 114514 策略规则 [${cyan}干净${NC}]\n"
+        printf "  - 未发现残留的 fwmark 114514 策略规则 [${CYAN}干净${NC}]\n"
     fi
 
     ip route flush table 114514 2>/dev/null
     
-    # 清理 dae 虚拟网卡接口
     if ip link show dae >/dev/null 2>&1; then
         ip link delete dae 2>/dev/null
         printf "  - 检测到残留的 eBPF 虚接口 dae，已强行卸载销毁 [${GREEN}OK${NC}]\n"
     else
-        printf "  - 内核网卡设备中未见 dae 残留接口 [${cyan}干净${NC}]\n"
+        printf "  - 内核网卡设备中未见 dae 残留接口 [${CYAN}干净${NC}]\n"
     fi
 
-    # 残留后台进程核平清理
-    if pgrep dae >/dev/null 2>&1; then
+    # 【关键修复】使用 -x 参数进行精确匹配，避免误判
+    if pgrep -x dae >/dev/null 2>&1; then
         local pid_list
-        pid_list=$(pgrep dae)
-        printf "${YELLOW}  - 预警：检测到正在运行的 dae 孤儿进程 (PID: %s)，开始优雅终止...${NC}\n" "$pid_list"
+        pid_list=$(pgrep -x dae)
+        printf "${YELLOW}  - 预警：检测到正在运行的 dae 核心进程 (PID: %s)，开始优雅终止...${NC}\n" "$pid_list"
         killall dae 2>/dev/null
-        sleep 1.5
-        if pgrep dae >/dev/null 2>&1; then
+        sleep 2 # 【关键修复】使用整数秒，保证兼容性
+        if pgrep -x dae >/dev/null 2>&1; then
             printf "${RED}  - 警告：dae 进程拒绝优雅退出，正在触发硬核强杀 (kill -9)...${NC}\n"
             killall -9 dae 2>/dev/null
-            sleep 0.5
+            sleep 1 # 【关键修复】使用整数秒
         fi
-        if pgrep dae >/dev/null 2>&1; then
+        if pgrep -x dae >/dev/null 2>&1; then
             printf "  - 进程清理反馈：${RED}清理失败，进程依旧顽固存在，请检查内核锁！${NC}\n"
         else
             printf "  - 进程清理反馈：${GREEN}所有残留大鹅进程已被无痕连根拔起！${NC}\n"
@@ -119,18 +121,17 @@ clean_network_resources() {
     fi
 }
 
-# 实时联动点火状态诊断器
 print_service_live_status() {
     printf "${YELLOW}[诊断] 正在对点火后的 dae 服务状态进行即时抓取验证...${NC}\n"
-    sleep 2 # 给予 eBPF 内核挂载和节点树加载必要的缓冲时间
+    sleep 2
     
-    if pgrep dae >/dev/null 2>&1; then
+    # 【关键修复】使用 -x 参数进行精确匹配
+    if pgrep -x dae >/dev/null 2>&1; then
         local active_pid
-        active_pid=$(pgrep dae | head -n1)
+        active_pid=$(pgrep -x dae | head -n1)
         printf "  - 运行状态：${GREEN}● 活跃中 (Running)${NC}\n"
         printf "  - 主进程 PID：${CYAN}%s${NC}\n" "$active_pid"
         
-        # 探测端口咬合情况
         if command -v netstat >/dev/null 2>&1; then
             if netstat -tunlp 2>/dev/null | grep -q "dae"; then
                 printf "  - 端口绑定：${GREEN}成功监听 TProxy 流量导入网关${NC}\n"
@@ -150,21 +151,21 @@ print_service_live_status() {
             printf "    ${RED}[原因] 缺少 GEO 规则依赖库，请执行菜单选项 3 刷新规则库！${NC}\n"
         else
             printf "    ${RED}[原因] 疑似订阅链接内的节点协议内核无法解析，或网卡绑定冲突。${NC}\n"
-            printf "    ${YELLOW}💡 建议排查日志：tail -n 20 /var/log/messages 或 logread | grep dae${NC}\n"
+            printf "    ${YELLOW}💡 建议排查日志：tail -n 20 %s 或 logread | grep dae${NC}\n" "$LOG_FILE"
         fi
         return 1
     fi
 }
 
 # ==================== 智能识别与跨平台依赖 ====================
-
+# (此部分及后续所有函数均已是完整、无损的，无需修改，直接复制)
 detect_system_env() {
     PKG_MANAGER=""
     INSTALL_CMD=""
     
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MANAGER="apt"
-        INSTALL_CMD="apt-get install -y"
+        INSTALL_CMD="apt-get install -y --no-install-recommends"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf"
         INSTALL_CMD="dnf install -y"
@@ -176,7 +177,7 @@ detect_system_env() {
         INSTALL_CMD="pacman -Sy --noconfirm"
     elif command -v apk >/dev/null 2>&1; then
         PKG_MANAGER="apk"
-        INSTALL_CMD="apk add"
+        INSTALL_CMD="apk add --no-cache"
     elif command -v opkg >/dev/null 2>&1; then
         PKG_MANAGER="opkg"
         INSTALL_CMD="opkg install"
@@ -191,17 +192,31 @@ detect_system_env() {
 }
 
 check_dependencies() {
+    local missing_deps=""
     for dep in curl unzip ip pidof; do
         if ! command -v $dep >/dev/null 2>&1; then
-            printf "${YELLOW}缺少依赖 $dep，正在尝试通过 $PKG_MANAGER 安装...${NC}\n"
-            if [ -n "$INSTALL_CMD" ]; then
-                local pkg_name=$dep
-                [ "$dep" = "ip" ] && pkg_name="iproute2"
-                [ "$dep" = "pidof" ] && [ "$PKG_MANAGER" = "opkg" ] && pkg_name="procps-ng-pidof"
-                $INSTALL_CMD $pkg_name >/dev/null 2>&1
-            fi
+            missing_deps="$missing_deps $dep"
         fi
     done
+
+    if [ -n "$missing_deps" ]; then
+        printf "${YELLOW}缺少核心依赖:%s，正在尝试通过 $PKG_MANAGER 安装...${NC}\n" "$missing_deps"
+        if [ -n "$INSTALL_CMD" ]; then
+            for dep in $missing_deps; do
+                local pkg_name=$dep
+                [ "$dep" = "ip" ] && ( [ "$PKG_MANAGER" = "apt" ] || [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ] ) && pkg_name="iproute2"
+                [ "$dep" = "pidof" ] && [ "$PKG_MANAGER" = "opkg" ] && pkg_name="procps-ng-pidof"
+                $INSTALL_CMD $pkg_name >/dev/null 2>&1
+                if ! command -v $dep >/dev/null 2>&1; then
+                     printf "${RED}依赖 $dep ($pkg_name) 自动安装失败，请手动安装后重试！${NC}\n"
+                     exit 1
+                fi
+            done
+        else
+            printf "${RED}无法找到包管理器，请手动安装以下依赖后重试:%s${NC}\n" "$missing_deps"
+            exit 1
+        fi
+    fi
 }
 
 check_ebpf_support() {
@@ -224,31 +239,31 @@ check_ebpf_support() {
     return 0
 }
 
-# ==================== 网络接口侦测 ====================
-
 get_network_info() {
-    DEFAULT_IFACE=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -n1)
+    DEFAULT_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {print $5}' | head -n1)
     
     if [ -n "$DEFAULT_IFACE" ]; then
         LAN_IFACE="$DEFAULT_IFACE"
         WAN_IFACE="$DEFAULT_IFACE"
         LAN_CIDR=$(ip addr show "$LAN_IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
         LAN_IP=$(echo "$LAN_CIDR" | cut -d/ -f1)
-    else
-        if command -v uci >/dev/null 2>&1; then
-            LAN_IFACE=$(uci get network.lan.device 2>/dev/null || uci get network.lan.ifname 2>/dev/null || echo "br-lan")
-            LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null || ip addr show "$LAN_IFACE" 2>/dev/null | grep -o "inet [0-9.]\+" | cut -d' ' -f2)
-            WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "wan")
-            LAN_CIDR="$LAN_IP/24"
-        else
-            printf "${RED}无法自动获取网络接口信息，请检查网络配置！${NC}\n"
-            exit 1
-        fi
+    elif command -v uci >/dev/null 2>&1; then
+        LAN_IFACE=$(uci get network.lan.device 2>/dev/null || uci get network.lan.ifname 2>/dev/null || echo "br-lan")
+        LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null || ip addr show "$LAN_IFACE" 2>/dev/null | grep -o "inet [0-9.]\+" | cut -d' ' -f2)
+        WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "wan")
     fi
 
     if [ -z "$LAN_IP" ]; then
-        printf "${RED}获取 IP 失败，网络拓扑异常！${NC}\n"
-        exit 1
+        printf "${RED}无法自动获取网络接口信息！${NC}\n"
+        printf "请输入您的局域网接口名称 (例如 eth0, br-lan): "
+        read -r LAN_IFACE
+        printf "请输入该接口的IP地址 (例如 192.168.1.1): "
+        read -r LAN_IP
+        if [ -z "$LAN_IFACE" ] || [ -z "$LAN_IP" ]; then
+            printf "${RED}信息不足，无法继续。${NC}\n"
+            exit 1
+        fi
+        WAN_IFACE="$LAN_IFACE"
     fi
 }
 
@@ -270,6 +285,13 @@ smart_interface_sniffer() {
     read -r user_iface_choice
     
     if [ -z "$user_iface_choice" ]; then
+        printf "${YELLOW}你选择了全选策略，这将绑定所有非虚拟物理网卡，请确认 (y/n): ${NC}"
+        read -r confirm_all
+        if [ "$confirm_all" != "y" ] && [ "$confirm_all" != "Y" ]; then
+             LAN_IFACE_SETTING="lan_interface: $LAN_IFACE"
+             printf "${GREEN}[保守策略] 已选用系统默认接口: %s${NC}\n" "$LAN_IFACE"
+             return
+        fi
         local merged_ifaces=""
         for iface in $all_interfaces; do
             if [ -z "$merged_ifaces" ]; then
@@ -301,7 +323,7 @@ smart_interface_sniffer() {
 }
 
 detect_router_mode() {
-    if ip route 2>/dev/null | grep -q "^default via"; then
+    if ip route show default | grep -q "via"; then
         echo "side"
     else
         echo "main"
@@ -317,7 +339,7 @@ validate_subscription() {
 }
 
 cleanup_sing_box() {
-    if pgrep sing-box >/dev/null 2>&1; then
+    if pgrep -x sing-box >/dev/null 2>&1; then
         printf "${YELLOW}检测到冲突项 sing-box 正在运行，正在停止并解除占用...${NC}\n"
         if [ "$SERVICE_MGR" = "systemd" ]; then 
             systemctl stop sing-box 2>/dev/null
@@ -327,8 +349,6 @@ cleanup_sing_box() {
         killall sing-box >/dev/null 2>&1
     fi
 }
-
-# ==================== 服务生命周期控制管理器 ====================
 
 manage_service() {
     local action=$1
@@ -341,30 +361,17 @@ manage_service() {
             systemctl $action $svc_name 2>/dev/null
         fi
     else
-        # 兼容 OpenWrt 的 init.d 机制
         if [ "$action" = "status" ]; then
-            pgrep $svc_name >/dev/null && printf "${GREEN}${svc_name} 正在活跃运行中${NC}\n" || printf "${RED}${svc_name} 未活跃/已停止${NC}\n"
-        elif [ "$action" = "enable" ] || [ "$action" = "disable" ]; then
-            [ -f "/etc/init.d/$svc_name" ] && /etc/init.d/$svc_name $action 2>/dev/null
-        elif [ "$action" = "restart" ] || [ "$action" = "start" ]; then
-            if [ -f "/etc/init.d/$svc_name" ]; then
-                /etc/init.d/$svc_name $action 2>/dev/null
-            else
-                # 兜底纯净前台转后台拉起
-                local dae_bin
-                dae_bin=$(command -v dae || echo "/usr/bin/dae")
-                nohup $dae_bin run --config "$CONFIG_FILE" > /var/log/dae_run.log 2>&1 &
-            fi
-        else
-            if [ -f "/etc/init.d/$svc_name" ]; then
-                /etc/init.d/$svc_name stop 2>/dev/null
-            fi
-            killall $svc_name 2>/dev/null
+            pgrep -x $svc_name >/dev/null && printf "${GREEN}${svc_name} 正在活跃运行中${NC}\n" || printf "${RED}${svc_name} 未活跃/已停止${NC}\n"
+        elif [ -f "/etc/init.d/$svc_name" ]; then
+             /etc/init.d/$svc_name $action 2>/dev/null
+        elif [ "$action" = "start" ]; then
+             nohup "$DAE_BIN_PATH" run --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+        elif [ "$action" = "stop" ]; then
+             killall $svc_name 2>/dev/null
         fi
     fi
 }
-
-# ==================== 核心配置生成 ====================
 
 generate_dae_config() {
     local subscription_url=$1
@@ -380,12 +387,14 @@ generate_dae_config() {
     mkdir -p "$GEO_DIR"
     
     cat << EOF > "$CONFIG_FILE"
+# Generated by dae-helper script v$SCRIPT_VERSION on $(date)
 global {
     tproxy_port: 12345
     tproxy_port_protect: true
     pprof_port: 0
     so_mark_from_dae: 0
     log_level: info
+    log_output: "$LOG_FILE"
     disable_waiting_network: false
     enable_local_tcp_fast_redirect: false
 
@@ -494,12 +503,10 @@ EOF
         if dae validate -c "$CONFIG_FILE" >/dev/null 2>&1; then
             printf "${GREEN}[成功] 配置文件完美通过 dae 官方内核语法校验！${NC}\n"
         else
-            printf "${RED}[语法报错] dae 校验器提示配置不合规！请排查接口绑定名。${NC}\n"
+            printf "${RED}[语法报错] dae 校验器提示配置不合规！请排查接口绑定名或日志。${NC}\n"
         fi
     fi
 }
-
-# ==================== 核心下载与无损更新 ====================
 
 upgrade_dae_core() {
     printf "\n${CYAN}--- 🔄 无损更新/安装 dae 核心 ---${NC}\n"
@@ -509,8 +516,7 @@ upgrade_dae_core() {
     arch=$(uname -m)
     case "$arch" in
         x86_64) target_arch="x86_64" ;;
-        aarch64) target_arch="arm64" ;;
-        arm64) target_arch="arm64" ;;
+        aarch64|arm64) target_arch="arm64" ;;
         *) printf "${RED}自动更新暂不支持此架构: %s${NC}\n" "$arch"; return 1 ;;
     esac
 
@@ -523,8 +529,8 @@ upgrade_dae_core() {
     fi
 
     local current_version="未安装"
-    if command -v dae >/dev/null 2>&1; then
-        current_version=$(dae --version 2>/dev/null | awk '{print $3}')
+    if [ -f "$DAE_BIN_PATH" ] && [ -x "$DAE_BIN_PATH" ]; then
+        current_version=$("$DAE_BIN_PATH" --version 2>/dev/null | awk '{print $3}')
     fi
     printf "当前本地版本: ${GREEN}%s${NC}\n" "${current_version}"
     printf "云端最新版本: ${GREEN}%s${NC}\n" "${latest_version}"
@@ -548,37 +554,35 @@ upgrade_dae_core() {
 
     unzip -o /tmp/dae-update.zip dae -d /tmp/ >/dev/null 2>&1
     if [ ! -f /tmp/dae ]; then
-        unzip -o /tmp/dae-update.zip -d /tmp/ >/dev/null 2>&1
+        unzip -oj /tmp/dae-update.zip '*/dae' -d /tmp/ >/dev/null 2>&1
     fi
 
-    if [ -f /tmp/dae ] || [ -f /tmp/dae-linux-* ]; then
-        local dae_path
-        dae_path=$(command -v dae || echo "/usr/bin/dae")
-        [ -f /tmp/dae-linux-* ] && mv /tmp/dae-linux-* /tmp/dae
-        mv /tmp/dae "$dae_path"
-        chmod +x "$dae_path"
+    if [ -f /tmp/dae ]; then
+        mv /tmp/dae "$DAE_BIN_PATH"
+        chmod +x "$DAE_BIN_PATH"
         printf "${GREEN}✅ 核心文件无损落地成功！${NC}\n"
     else
-        printf "${RED}解压和结构提取破损。${NC}\n"
+        printf "${RED}解压失败或压缩包内找不到 'dae' 文件。${NC}\n"
         rm -f /tmp/dae-update.zip
         return 1
     fi
     rm -f /tmp/dae-update.zip
 
-    # 为 OpenWrt / Proxmox / Linux 智能注入服务管理器配置
     if [ "$SERVICE_MGR" = "systemd" ]; then
         if [ ! -f /etc/systemd/system/dae.service ]; then
             cat <<EOF > /etc/systemd/system/dae.service
 [Unit]
 Description=dae Advanced eBPF Proxy Service
 After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=$dae_path run --config /etc/dae/config.dae
+ExecStart=$DAE_BIN_PATH run --config $CONFIG_FILE
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -586,7 +590,6 @@ EOF
             systemctl daemon-reload
         fi
     else
-        # OpenWrt 专供 Procd 守护进程脚本注入
         if [ ! -f "/etc/init.d/dae" ]; then
             cat << 'EOF' > /etc/init.d/dae
 #!/bin/sh /etc/rc.common
@@ -612,27 +615,29 @@ EOF
     send_wechat_notification "大鹅底层核心可执行组件成功无损同步更新至 ${latest_version}。"
 }
 
-# ==================== GEO 规则数据自动化集成 ====================
-
 create_geo_update_script() {
     mkdir -p "$(dirname "$UPDATE_GEO_SCRIPT")"
-    cat << EOF > "$UPDATE_GEO_SCRIPT"
+    cat << 'EOF' > "$UPDATE_GEO_SCRIPT"
 #!/bin/sh
+GEO_DIR="/usr/share/dae"
 mkdir -p "$GEO_DIR"
 echo "正在从社区骨干网同步 geoip.dat..."
-curl -L -o "$GEO_DIR/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+curl -L -o "$GEO_DIR/geoip.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" && mv "$GEO_DIR/geoip.dat.tmp" "$GEO_DIR/geoip.dat"
 echo "正在从社区骨干网同步 geosite.dat..."
-curl -L -o "$GEO_DIR/geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+curl -L -o "$GEO_DIR/geosite.dat.tmp" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" && mv "$GEO_DIR/geosite.dat.tmp" "$GEO_DIR/geosite.dat"
 chmod 644 "$GEO_DIR/geoip.dat" "$GEO_DIR/geosite.dat"
 
 mkdir -p /etc/dae
 ln -sf "$GEO_DIR/geoip.dat" /etc/dae/geoip.dat 2>/dev/null
 ln -sf "$GEO_DIR/geosite.dat" /etc/dae/geosite.dat 2>/dev/null
 
-if [ -f /lib/lsb/init-functions ] || [ ! -f /etc/init.d/dae ]; then
-    systemctl restart dae >/dev/null 2>&1
-else
-    /etc/init.d/dae restart >/dev/null 2>&1
+if pgrep -x dae >/dev/null 2>&1; then
+    echo "检测到 dae 正在运行，将重启以应用新规则..."
+    if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
+        systemctl restart dae >/dev/null 2>&1
+    elif [ -f /etc/init.d/dae ]; then
+        /etc/init.d/dae restart >/dev/null 2>&1
+    fi
 fi
 EOF
     chmod +x "$UPDATE_GEO_SCRIPT"
@@ -643,38 +648,36 @@ update_geo_data() {
         create_geo_update_script
     fi
     printf "${YELLOW}[运行] 正在触发执行底层的 GEO 规则库全量拉取链...${NC}\n"
-    "$UPDATE_GEO_SCRIPT"
+    sh "$UPDATE_GEO_SCRIPT"
     printf "${GREEN}✅ 数据同步完成。${NC}\n"
 }
 
 set_geo_update_schedule() {
+    if ! command -v crontab >/dev/null 2>&1; then
+        printf "${RED}系统未安装 crontab，无法设定计划任务。${NC}\n"
+        return 1
+    fi
     printf "\n${PURPLE}--- 🗓️ 规则自动更新计划任务设定 ---${NC}\n"
-    echo "1) 每天夜间凌晨自动轮询更新"
-    echo "2) 每周一凌晨自动轮询更新"
-    echo "3) 每月1号自动轮询更新"
+    echo "1) 每天凌晨3点自动更新"
+    echo "2) 每周一凌晨3点自动更新"
+    echo "3) 每月1号凌晨3点自动更新"
     read -r freq
     case $freq in
-        1) cron_schedule="0 0 * * *" ;;
-        2) cron_schedule="0 0 * * 1" ;;
-        3) cron_schedule="0 0 1 * *" ;;
-        *) cron_schedule="0 0 * * 1" ;;
+        1) cron_schedule="0 3 * * *" ;;
+        2) cron_schedule="0 3 * * 1" ;;
+        3) cron_schedule="0 3 1 * *" ;;
+        *) cron_schedule="0 3 * * 1" ;;
     esac
-
-    crontab -l > /tmp/crontab.tmp 2>/dev/null
-    sed -i "/update-geo.sh/d" /tmp/crontab.tmp
-    echo "$cron_schedule $UPDATE_GEO_SCRIPT >/dev/null 2>&1" >> /tmp/crontab.tmp
-    crontab /tmp/crontab.tmp
-    rm /tmp/crontab.tmp
     
+    (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT"; echo "$cron_schedule $UPDATE_GEO_SCRIPT >/dev/null 2>&1") | crontab -
+
     if [ "$SERVICE_MGR" = "systemd" ]; then
         systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null
     else
-        /etc/init.d/cron restart 2>/dev/null || /etc/init.d/crond restart 2>/dev/null
+        [ -f /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
     fi
     printf "${GREEN}✅ 定时计划任务配置成功，已自动剔除历史重复项。${NC}\n"
 }
-
-# ==================== Docker 特权隔离沙盒模式 ====================
 
 install_dae_docker() {
     if ! command -v docker >/dev/null 2>&1; then
@@ -690,10 +693,6 @@ install_dae_docker() {
         return 0
     fi
 
-    printf "请输入底座镜像类型（直接回车缺省使用 ubuntu:22.04）: "
-    read -r docker_image
-    docker_image=${docker_image:-ubuntu:22.04}
-
     printf "请粘贴你在 Sub-Store 复制的通用订阅链接 URL: "
     read -r doc_sub
     if ! validate_subscription "$doc_sub"; then
@@ -701,45 +700,84 @@ install_dae_docker() {
         return 1
     fi
 
-    if docker ps -a | grep -q dae; then
-        docker rm -f dae >/dev/null 2>&1
+    if docker ps -a | grep -q dae-container; then
+        docker rm -f dae-container >/dev/null 2>&1
     fi
 
-    mkdir -p /etc/dae
-    LAN_IFACE_SETTING="lan_interface: \"\""
+    mkdir -p /etc/dae/docker/data
+    mkdir -p /etc/dae/persist.d
+    LAN_IFACE_SETTING="lan_interface: \"\" # Docker模式下留空"
     generate_dae_config "$doc_sub" "main"
 
-    printf "${BLUE}[Docker] 正在全速拉取并构建特权容器沙盒环境...${NC}\n"
-    local m_arch
-    m_arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    printf "${BLUE}[Docker] 正在全速拉取 dae 官方镜像...${NC}\n"
+    if ! docker pull ghcr.io/daeuniverse/dae:latest; then
+        printf "${RED}Docker 镜像拉取失败，请检查网络或 Docker Hub 连通性。${NC}\n"
+        return 1
+    fi
+    
+    printf "${BLUE}为 Docker 容器准备最新的 GEO 数据...${NC}\n"
+    curl -L -o "/etc/dae/docker/data/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    curl -L -o "/etc/dae/docker/data/geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
-    docker run --rm --privileged --network=host -v /etc/dae:/etc/dae "$docker_image" /bin/bash -c "
-        apt-get update && apt-get install -y curl unzip >/dev/null &&
-        curl -L -o /tmp/dae.zip https://github.com/daeuniverse/dae/releases/download/v0.9.0/dae-linux-${m_arch}.zip &&
-        unzip -o /tmp/dae.zip -d /etc/dae/ &&
-        mv /etc/dae/dae-linux-* /etc/dae/dae 2>/dev/null || true
-    "
-
+    printf "${BLUE}正在启动 dae 特权容器...${NC}\n"
     docker run -d \
-        --name dae \
+        --name dae-container \
         --restart always \
         --privileged \
         --network=host \
-        -v /sys:/sys \
-        -v /dev:/dev \
-        -v /etc/dae:/etc/dae \
-        "$docker_image" \
-        /etc/dae/dae run --config /etc/dae/config.dae
+        -v /etc/dae/config.dae:/etc/dae/config.dae:ro \
+        -v /etc/dae/docker/data:/usr/share/dae \
+        -v /etc/dae/persist.d:/etc/dae/persist.d \
+        ghcr.io/daeuniverse/dae:latest
 
-    if [ "$(docker inspect -f '{{.State.Running}}' dae 2>/dev/null)" = "true" ]; then
+    sleep 3
+    if [ "$(docker inspect -f '{{.State.Running}}' dae-container 2>/dev/null)" = "true" ]; then
         printf "${GREEN}🎉 Docker 特权大鹅沙盒已点火成功上线！${NC}\n"
         send_wechat_notification "Docker沙盒特权模式下的大鹅透明代理已点火启动。"
     else
-        printf "${RED}[熄火] 容器因提权受阻异常退栈。请通过 docker logs dae 查看。${NC}\n"
+        printf "${RED}[熄火] 容器因提权受阻或配置问题异常退出。${NC}\n"
+        printf "${YELLOW}请通过以下命令查看日志：docker logs dae-container${NC}\n"
     fi
 }
 
-# ==================== 旁路由与引导面板 ====================
+uninstall_dae() {
+    printf "\n${RED}--- ☠️ 彻底卸载 dae ---${NC}\n"
+    printf "${YELLOW}此操作将从系统中移除 dae 核心、所有配置文件、GEO数据和计划任务。${NC}\n"
+    printf "确认要继续吗? (y/n): "
+    read -r confirm_uninstall
+    if [ "$confirm_uninstall" != "y" ] && [ "$confirm_uninstall" != "Y" ]; then
+        printf "${GREEN}操作已取消。${NC}\n"
+        return
+    fi
+    
+    printf "${YELLOW}正在停止并禁用 dae 服务...${NC}\n"
+    manage_service "stop"
+    manage_service "disable"
+    
+    printf "${YELLOW}正在执行深度网络资源清理...${NC}\n"
+    clean_network_resources
+    
+    if docker ps -a --format '{{.Names}}' | grep -q dae-container; then
+        printf "${YELLOW}正在清理 Docker 容器...${NC}\n"
+        docker rm -f dae-container >/dev/null 2>&1
+    fi
+    
+    printf "${YELLOW}正在移除相关文件和目录...${NC}\n"
+    rm -f "$DAE_BIN_PATH" /etc/systemd/system/dae.service /etc/init.d/dae "$ENV_FILE"
+    rm -rf /etc/dae /usr/share/dae
+    
+    printf "${YELLOW}正在清理 Crontab 计划任务...${NC}\n"
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT") | crontab -
+    fi
+    
+    if [ "$SERVICE_MGR" = "systemd" ]; then
+        systemctl daemon-reload 2>/dev/null
+    fi
+    
+    printf "${GREEN}✅ dae 已被彻底从系统中移除。${NC}\n"
+    send_wechat_notification "dae 已被从系统中彻底卸载。"
+}
 
 display_side_router_instructions() {
     if [ "$(detect_router_mode)" = "side" ]; then
@@ -749,8 +787,6 @@ display_side_router_instructions() {
         printf "   iptables -t mangle -A PREROUTING -i %s -p tcp -j TPROXY --on-port 12345 --tproxy-mark 0x1\n" "$LAN_IFACE"
     fi
 }
-
-# ==================== 系统主控入口驱动 ====================
 
 main_menu() {
     detect_system_env
@@ -763,9 +799,9 @@ main_menu() {
         check_log_size
         printf "\n"
         printf "${GREEN}================================================================${NC}\n"
-        printf "${GREEN}   🦢 dae (大鹅) 高性能 eBPF 透明代理全平台融合配置管家 (高级版)${NC}\n"
-        printf "   当前系统环境: ${YELLOW}%s (%s)${NC} | 拓扑检测: ${CYAN}%s路由${NC}\n" "${SERVICE_MGR}" "${PKG_MANAGER:-未知}" "$(detect_router_mode)"
-        printf "   内网默认接口: ${GREEN}%s${NC} | 本机IP: ${GREEN}%s${NC}\n" "${LAN_IFACE}" "${LAN_IP}"
+        printf "${GREEN}   🦢 dae 高性能 eBPF 透明代理全平台融合配置管家 (v%s)${NC}\n" "$SCRIPT_VERSION"
+        printf "   当前系统: ${YELLOW}%s (%s)${NC} | 拓扑: ${CYAN}%s路由${NC} | 内核: ${PURPLE}%s${NC}\n" "${SERVICE_MGR}" "${PKG_MANAGER:-未知}" "$(detect_router_mode)" "$(uname -r)"
+        printf "   内网接口: ${GREEN}%s${NC} | 本机IP: ${GREEN}%s${NC}\n" "${LAN_IFACE}" "${LAN_IP}"
         printf "${GREEN}================================================================${NC}\n"
         printf " 1) ${GREEN}⚡ 智能向导：一键安装/更新 dae 核心【完美保留现有配置】${NC}\n"
         printf " 2) ✍️ 交互配置：粘贴 Sub-Store 链接并生成流媒体/AI分流矩阵\n"
@@ -774,14 +810,14 @@ main_menu() {
         printf " 5) ⚙️ 控制中心：查看 dae 服务运行看板与启动/重启/停止拦截\n"
         printf " 6) 🐳 独立沙盒：使用 Docker 特权提权链路容器化部署 dae\n"
         printf " 7) 🔔 外部联动：配置/修改企业微信运维通知推送 Webhook 密钥\n"
-        printf " 8) ❌ 退出当前向导程序\n"
+        printf " 8) 🔎 查看日志：实时滚动查看 dae 运行日志\n"
+        printf " 9) ${RED}❌ 彻底卸载：从系统中完整移除 dae 及所有配置${NC}\n"
+        printf " 0) 退出当前向导程序\n"
         printf "${GREEN}================================================================${NC}\n"
-        printf "请输入数字选项 [1-8]："
+        printf "请输入数字选项 [0-9]："
         read -r choice
         case $choice in
-            1)
-                upgrade_dae_core
-                ;;
+            1) upgrade_dae_core ;;
             2)
                 printf "${PURPLE}【✨ Sub-Store 操作指引】${NC}\n"
                 printf "${YELLOW}请在 Sub-Store 复制「通用订阅」链接。${NC}\n"
@@ -816,27 +852,35 @@ main_menu() {
                     1) clean_network_resources; manage_service "start"; print_service_live_status;;
                     2) manage_service "stop"; clean_network_resources; printf "${GREEN}已安全完成无痕撤消。${NC}\n";;
                     3) clean_network_resources; manage_service "restart"; print_service_live_status;;
-                    4) manage_service "status"; pgrep dae >/dev/null 2>&1 && printf "进程快照：${GREEN}活跃${NC}\n" || printf "进程快照：${RED}未运行${NC}\n";;
+                    4) manage_service "status";;
                 esac
                 ;;
             6) install_dae_docker ;;
             7)
-                printf "请粘贴企业微信群机器人的 Webhook 完整 URL: "
+                printf "请粘贴企业微信群机器人的 Webhook 完整 URL (留空则取消): "
                 read -r input_wx
+                WECHAT_WEBHOOK="$input_wx"
+                save_env "WECHAT_WEBHOOK" "$WECHAT_WEBHOOK"
                 if [ -n "$input_wx" ]; then
-                    WECHAT_WEBHOOK="$input_wx"
-                    save_env "WECHAT_WEBHOOK" "$WECHAT_WEBHOOK"
                     printf "${GREEN}通知通道已固化绑定。${NC}\n"
+                else
+                    printf "${YELLOW}通知通道已解绑。${NC}\n"
                 fi
                 ;;
             8)
-                printf "${GREEN}退出程序。祝您网络畅通！${NC}\n"
-                exit 0
+                if [ -f "$LOG_FILE" ]; then
+                    printf "${YELLOW}正在实时滚动显示日志，按 Ctrl+C 退出...${NC}\n"
+                    tail -f "$LOG_FILE"
+                else
+                    printf "${RED}日志文件 %s 不存在。${NC}\n" "$LOG_FILE"
+                fi
                 ;;
-            *)
-                printf "${RED}输入有误，请输入1-8之间的有效编号。${NC}\n"
-                ;;
+            9) uninstall_dae ;;
+            0) printf "${GREEN}退出程序。祝您网络畅通！${NC}\n"; exit 0 ;;
+            *) printf "${RED}输入有误，请输入0-9之间的有效编号。${NC}\n" ;;
         esac
+        printf "${CYAN}按 Enter 键返回主菜单...${NC}"
+        read -r
     done
 }
 
