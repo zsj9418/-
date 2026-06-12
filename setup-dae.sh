@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# ==================== 全局配置 ====================
+SCRIPT_VERSION="1.5"
+
 # 核心路径定义
 CONFIG_FILE="/etc/dae/config.dae"
 GEO_DIR="/usr/share/dae"
@@ -9,7 +12,6 @@ DAE_BIN_PATH="/usr/bin/dae"
 ENV_FILE="$HOME/.dae_env"
 LOG_FILE="/var/log/dae.log"
 LOG_SIZE_LIMIT=$((1 * 1024 * 1024)) # 1MB
-SCRIPT_VERSION="1.1"
 
 # 严格遵循 POSIX 标准的颜色转义定义
 RED='\033[0;31m'
@@ -78,7 +80,7 @@ check_log_size() {
     fi
 }
 
-# ==================== 确定感补强：无痕清理与状态诊断 (已修复) ====================
+# ==================== 确定感补强：无痕清理与状态诊断 ====================
 
 clean_network_resources() {
     printf "${YELLOW}[清理] 正在排查并深度无痕清理网络挂载资源...${NC}\n"
@@ -99,17 +101,16 @@ clean_network_resources() {
         printf "  - 内核网卡设备中未见 dae 残留接口 [${CYAN}干净${NC}]\n"
     fi
 
-    # 【关键修复】使用 -x 参数进行精确匹配，避免误判
     if pgrep -x dae >/dev/null 2>&1; then
         local pid_list
         pid_list=$(pgrep -x dae)
         printf "${YELLOW}  - 预警：检测到正在运行的 dae 核心进程 (PID: %s)，开始优雅终止...${NC}\n" "$pid_list"
         killall dae 2>/dev/null
-        sleep 2 # 【关键修复】使用整数秒，保证兼容性
+        sleep 2
         if pgrep -x dae >/dev/null 2>&1; then
             printf "${RED}  - 警告：dae 进程拒绝优雅退出，正在触发硬核强杀 (kill -9)...${NC}\n"
             killall -9 dae 2>/dev/null
-            sleep 1 # 【关键修复】使用整数秒
+            sleep 1
         fi
         if pgrep -x dae >/dev/null 2>&1; then
             printf "  - 进程清理反馈：${RED}清理失败，进程依旧顽固存在，请检查内核锁！${NC}\n"
@@ -125,7 +126,6 @@ print_service_live_status() {
     printf "${YELLOW}[诊断] 正在对点火后的 dae 服务状态进行即时抓取验证...${NC}\n"
     sleep 2
     
-    # 【关键修复】使用 -x 参数进行精确匹配
     if pgrep -x dae >/dev/null 2>&1; then
         local active_pid
         active_pid=$(pgrep -x dae | head -n1)
@@ -158,7 +158,7 @@ print_service_live_status() {
 }
 
 # ==================== 智能识别与跨平台依赖 ====================
-# (此部分及后续所有函数均已是完整、无损的，无需修改，直接复制)
+
 detect_system_env() {
     PKG_MANAGER=""
     INSTALL_CMD=""
@@ -239,20 +239,29 @@ check_ebpf_support() {
     return 0
 }
 
+# 【关键修复】重写网络信息获取逻辑，优先适配 OpenWrt
 get_network_info() {
-    DEFAULT_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {print $5}' | head -n1)
-    
-    if [ -n "$DEFAULT_IFACE" ]; then
-        LAN_IFACE="$DEFAULT_IFACE"
-        WAN_IFACE="$DEFAULT_IFACE"
-        LAN_CIDR=$(ip addr show "$LAN_IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
-        LAN_IP=$(echo "$LAN_CIDR" | cut -d/ -f1)
-    elif command -v uci >/dev/null 2>&1; then
+    if command -v uci >/dev/null 2>&1; then
+        # OpenWrt 环境：使用 uci 作为信息源
         LAN_IFACE=$(uci get network.lan.device 2>/dev/null || uci get network.lan.ifname 2>/dev/null || echo "br-lan")
-        LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null || ip addr show "$LAN_IFACE" 2>/dev/null | grep -o "inet [0-9.]\+" | cut -d' ' -f2)
-        WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "wan")
+        LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
+        # 如果 uci 拿不到 IP，再用 ip addr 命令作为后备
+        if [ -z "$LAN_IP" ]; then
+            LAN_IP=$(ip addr show "$LAN_IFACE" 2>/dev/null | grep -o "inet [0-9.]\+" | cut -d' ' -f2 | head -n1)
+        fi
+        WAN_IFACE=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "eth0.2") # 默认一个常见值
+    else
+        # 标准 Linux 环境
+        DEFAULT_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/ {print $5}' | head -n1)
+        if [ -n "$DEFAULT_IFACE" ]; then
+            LAN_IFACE="$DEFAULT_IFACE"
+            WAN_IFACE="$DEFAULT_IFACE"
+            LAN_CIDR=$(ip addr show "$LAN_IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
+            LAN_IP=$(echo "$LAN_CIDR" | cut -d/ -f1)
+        fi
     fi
 
+    # 如果所有自动方法都失败，则请求用户手动输入
     if [ -z "$LAN_IP" ]; then
         printf "${RED}无法自动获取网络接口信息！${NC}\n"
         printf "请输入您的局域网接口名称 (例如 eth0, br-lan): "
@@ -263,7 +272,7 @@ get_network_info() {
             printf "${RED}信息不足，无法继续。${NC}\n"
             exit 1
         fi
-        WAN_IFACE="$LAN_IFACE"
+        WAN_IFACE="$LAN_IFACE" # 在未知情况下，假定为单网卡模式
     fi
 }
 
@@ -524,7 +533,7 @@ upgrade_dae_core() {
     local latest_version
     latest_version=$(curl -s "https://api.github.com/repos/daeuniverse/dae/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$latest_version" ]; then
-        printf "${RED}无法获取云端版本信息，请检查国际网络连通性。${NC}\n"
+        printf "${RED}无法获取云端版本信息，请检查网络连通性。${NC}\n"
         return 1
     fi
 
@@ -541,10 +550,18 @@ upgrade_dae_core() {
     fi
 
     local download_url="https://github.com/daeuniverse/dae/releases/download/${latest_version}/dae-linux-${target_arch}.zip"
+    local tmp_zip="/tmp/dae-update.zip"
     printf "${YELLOW}⬇️ 正在下载二进制核心压缩包...${NC}\n"
-    curl -L -o /tmp/dae-update.zip "$download_url"
+    curl -L -o "$tmp_zip" "$download_url"
     if [ $? -ne 0 ]; then
         printf "${RED}核心文件下载超时，请检查路由上游链路！${NC}\n"
+        rm -f "$tmp_zip"
+        return 1
+    fi
+
+    if ! unzip -t "$tmp_zip" >/dev/null 2>&1; then
+        printf "${RED}下载的文件不是一个有效的 ZIP 压缩包，更新中止。${NC}\n"
+        rm -f "$tmp_zip"
         return 1
     fi
 
@@ -552,21 +569,22 @@ upgrade_dae_core() {
     manage_service "stop"
     clean_network_resources
 
-    unzip -o /tmp/dae-update.zip dae -d /tmp/ >/dev/null 2>&1
-    if [ ! -f /tmp/dae ]; then
-        unzip -oj /tmp/dae-update.zip '*/dae' -d /tmp/ >/dev/null 2>&1
-    fi
+    local tmp_dir="/tmp/dae-unzip-$$"
+    mkdir -p "$tmp_dir"
+    unzip -o "$tmp_zip" -d "$tmp_dir" >/dev/null 2>&1
+    local dae_file
+    dae_file=$(find "$tmp_dir" -type f -name "dae" | head -n1)
 
-    if [ -f /tmp/dae ]; then
-        mv /tmp/dae "$DAE_BIN_PATH"
+    if [ -n "$dae_file" ] && [ -f "$dae_file" ]; then
+        mv "$dae_file" "$DAE_BIN_PATH"
         chmod +x "$DAE_BIN_PATH"
         printf "${GREEN}✅ 核心文件无损落地成功！${NC}\n"
     else
         printf "${RED}解压失败或压缩包内找不到 'dae' 文件。${NC}\n"
-        rm -f /tmp/dae-update.zip
+        rm -rf "$tmp_dir" "$tmp_zip"
         return 1
     fi
-    rm -f /tmp/dae-update.zip
+    rm -rf "$tmp_dir" "$tmp_zip"
 
     if [ "$SERVICE_MGR" = "systemd" ]; then
         if [ ! -f /etc/systemd/system/dae.service ]; then
@@ -789,8 +807,12 @@ display_side_router_instructions() {
 }
 
 main_menu() {
+    # 【关键修复】在脚本启动时首先净化网络环境，避免后续网络操作被自身劫持
     detect_system_env
     check_dependencies
+    clean_network_resources 
+
+    # 在干净的网络环境下获取信息
     get_network_info
     cleanup_sing_box
     load_env
