@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ==================== 全局配置 ====================
-SCRIPT_VERSION="2.3 (Docker Mirror Choice)"
+SCRIPT_VERSION="2.4 (Video Enhanced Edition)"
 
 # 核心路径定义
 CONFIG_FILE="/etc/dae/config.dae"
@@ -440,9 +440,10 @@ global {
 
     auto_config_kernel_parameter: true
 
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    # 【避坑强化】移除 IPv6，使用纯净的国内稳定地址作为 UDP 检测防泄漏，国外检测用于 TCP 连通性
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53,8.8.8.8,2001:4860:4860::8888'
+    udp_check_dns: 'dns.alidns.com:53,223.5.5.5'
     check_interval: 30s
     check_tolerance: 50ms
 
@@ -464,6 +465,7 @@ node {
 }
 
 dns {
+    # 【避坑强化】严格优先使用 IPv4，防止未正确配置的 IPv6 路由导致的 DNS 泄露
     ipversion_prefer: 4
     fixed_domain_ttl {
         ddns.example.org: 10
@@ -492,6 +494,7 @@ dns {
 group {
     my_group {
         filter: subtag(sub_store_link)
+        # 【策略强化】使用 min_moving_avg 固定节点，避免频繁跳变导致 IP 风控
         policy: min_moving_avg
     }
     high_speed {
@@ -519,9 +522,11 @@ routing {
     dip(geoip:cn) -> direct
     domain(geosite:cn) -> direct
     
+    # 【分流强化】整合视频提到的前沿 AI 与社交媒体矩阵，指向专用组
     domain(keyword: 'openai', keyword: 'chatgpt') -> ai_media
     domain(keyword: 'gemini', keyword: 'generativelanguage') -> ai_media
     domain(keyword: 'anthropic', keyword: 'claude') -> ai_media
+    domain(keyword: 'xai', keyword: 'grok', keyword: 'perplexity', keyword: 'huggingface') -> ai_media
     domain(keyword: 'netflix', keyword: 'disney', keyword: 'hbo') -> ai_media
     
     domain(geosite:steam) -> gaming
@@ -730,6 +735,7 @@ set_geo_update_schedule() {
     printf "${GREEN}✅ 定时计划任务配置成功，已自动剔除历史重复项。${NC}\n"
 }
 
+# ==================== REPAIRED DOCKER FUNCTION ====================
 install_dae_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         printf "${RED}[阻断] 宿主机未检测到 Docker 容器引擎。请先安装 Docker。${NC}\n"
@@ -745,8 +751,8 @@ install_dae_docker() {
 
     # 【修复核心】增加镜像源选择菜单
     printf "\n${PURPLE}--- 🐳 请选择 Docker 镜像源 ---${NC}\n"
-    printf "1) ${GREEN}社区镜像 (Docker Hub): 无需登录，一键直达 (推荐新手) ${NC}\n"
-    printf "2) ${CYAN}官方镜像 (ghcr.io): 最安全，但可能需要您手动执行 'docker login ghcr.io'${NC}\n"
+    printf "1) ${GREEN}官方镜像 (Docker Hub): 无需登录，一键直达 (推荐新手) ${NC}\n"
+    printf "2) ${CYAN}官方镜像 (ghcr.io): 最新最安全，但可能需要您手动执行 'docker login ghcr.io'${NC}\n"
     printf "请输入数字选项 [1-2, 默认1]: "
     read -r image_choice
     
@@ -757,11 +763,13 @@ install_dae_docker() {
         DOCKER_IMAGE_URL="ghcr.io/daeuniverse/dae:latest"
         pull_failed_msg="${RED}Docker 镜像拉取失败！错误类型：权限被拒绝 (denied)。${NC}\n${YELLOW}原因：从 GitHub (ghcr.io) 拉取镜像需要认证。${NC}\n${CYAN}解决方案：请先在命令行手动执行 'docker login ghcr.io'，使用GitHub用户名和带 'read:packages' 权限的PAT登录，然后再重试此选项。${NC}"
     else
-        DOCKER_IMAGE_URL="malinkang/dae:latest"
+        DOCKER_IMAGE_URL="daeuniverse/dae:latest"
         pull_failed_msg="${RED}Docker 镜像拉取失败！${NC}\n${YELLOW}请检查您的网络连接以及 Docker Hub 的访问是否正常。${NC}"
     fi
     printf "${BLUE}已选择镜像源: %s${NC}\n" "$DOCKER_IMAGE_URL"
 
+    # 【避坑强化】增加对 Docker 模式下 Clash 格式的预警拦截
+    printf "${RED}⚠️ 注意：大鹅不支持 Clash 格式的订阅，请提供 v2ray/base64 通用订阅！${NC}\n"
     printf "请粘贴你在 Sub-Store 复制的通用订阅链接 URL: "
     read -r doc_sub
     if ! validate_subscription "$doc_sub"; then
@@ -809,6 +817,7 @@ install_dae_docker() {
         printf "${YELLOW}请通过以下命令查看日志以定位具体错误：docker logs dae-container${NC}\n"
     fi
 }
+# =================================================================
 
 uninstall_dae() {
     printf "\n${RED}--- ☠️ 彻底卸载 dae ---${NC}\n"
@@ -885,7 +894,9 @@ main_menu() {
             1) upgrade_dae_core ;;
             2)
                 printf "${PURPLE}【✨ Sub-Store 操作指引】${NC}\n"
-                printf "${YELLOW}请在 Sub-Store 复制「通用订阅」链接。${NC}\n"
+                # 【避坑强化】交互菜单明确警告 Clash 格式不兼容问题
+                printf "${RED}⚠️ 注意：根据社区与实战避坑经验，大鹅不支持 Clash 格式的订阅配置！${NC}\n"
+                printf "${YELLOW}请务必确保粘贴的是「v2ray / base64」格式的通用订阅链接。${NC}\n"
                 printf "请粘贴复制好的 Sub-Store 通用订阅地址 (http/https): "
                 read -r SUBSCRIPTION_URL
                 if validate_subscription "$SUBSCRIPTION_URL"; then
