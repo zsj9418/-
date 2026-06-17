@@ -736,11 +736,34 @@ set_geo_update_schedule() {
 }
 
 # ==================== REPAIRED DOCKER FUNCTION ====================
+# ==================== REPAIRED DOCKER FUNCTION V2 ====================
 install_dae_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         printf "${RED}[阻断] 宿主机未检测到 Docker 容器引擎。请先安装 Docker。${NC}\n"
         return 1
     fi
+    # 【内核兼容性预警】检查 BTF 和 BPF 文件系统
+    if [ ! -d /sys/fs/bpf ]; then
+        printf "${YELLOW}[预检] 检测到 /sys/fs/bpf 目录不存在，正在尝试创建并挂载...${NC}\n"
+        mkdir -p /sys/fs/bpf
+        mount -t bpf bpf /sys/fs/bpf
+        if ! mount | grep -q '/sys/fs/bpf'; then
+            printf "${RED}[致命] 无法挂载 BPF 文件系统！您的内核极有可能不支持 eBPF。无法继续。${NC}\n"
+            return 1
+        fi
+        printf "${GREEN}  - BPF 文件系统挂载成功。${NC}\n"
+    fi
+    if [ ! -f /sys/kernel/btf/vmlinux ]; then
+        printf "${RED}⚠️【内核兼容性警告】${NC}\n"
+        printf "${YELLOW}预检发现您的内核缺少 BTF 信息 (/sys/kernel/btf/vmlinux 不存在)。${NC}\n"
+        printf "${YELLOW}这几乎肯定会导致 dae 启动失败。强烈建议您更换支持 BTF 的固件或系统。${NC}\n"
+        printf "是否仍要无视警告，强行继续尝试？(y/n): "
+        read -r force_btf
+        if [ "$force_btf" != "y" ] && [ "$force_btf" != "Y" ]; then
+            return 0
+        fi
+    fi
+
     check_ebpf_support
     printf "${RED}⚠️【警告】大鹅涉及深度内核态注入，非极度特殊纯净环境不建议在容器内跑。${NC}\n"
     printf "确认要采用沙盒虚拟化形态部署吗？(y/n): "
@@ -749,7 +772,6 @@ install_dae_docker() {
         return 0
     fi
 
-    # 【修复核心】增加镜像源选择菜单
     printf "\n${PURPLE}--- 🐳 请选择 Docker 镜像源 ---${NC}\n"
     printf "1) ${GREEN}官方镜像 (Docker Hub): 无需登录，一键直达 (推荐新手) ${NC}\n"
     printf "2) ${CYAN}官方镜像 (ghcr.io): 最新最安全，但可能需要您手动执行 'docker login ghcr.io'${NC}\n"
@@ -757,18 +779,13 @@ install_dae_docker() {
     read -r image_choice
     
     local DOCKER_IMAGE_URL=""
-    local pull_failed_msg=""
-
     if [ "$image_choice" = "2" ]; then
         DOCKER_IMAGE_URL="ghcr.io/daeuniverse/dae:latest"
-        pull_failed_msg="${RED}Docker 镜像拉取失败！错误类型：权限被拒绝 (denied)。${NC}\n${YELLOW}原因：从 GitHub (ghcr.io) 拉取镜像需要认证。${NC}\n${CYAN}解决方案：请先在命令行手动执行 'docker login ghcr.io'，使用GitHub用户名和带 'read:packages' 权限的PAT登录，然后再重试此选项。${NC}"
     else
         DOCKER_IMAGE_URL="daeuniverse/dae:latest"
-        pull_failed_msg="${RED}Docker 镜像拉取失败！${NC}\n${YELLOW}请检查您的网络连接以及 Docker Hub 的访问是否正常。${NC}"
     fi
     printf "${BLUE}已选择镜像源: %s${NC}\n" "$DOCKER_IMAGE_URL"
 
-    # 【避坑强化】增加对 Docker 模式下 Clash 格式的预警拦截
     printf "${RED}⚠️ 注意：大鹅不支持 Clash 格式的订阅，请提供 v2ray/base64 通用订阅！${NC}\n"
     printf "请粘贴你在 Sub-Store 复制的通用订阅链接 URL: "
     read -r doc_sub
@@ -781,22 +798,20 @@ install_dae_docker() {
     fi
     
     smart_interface_sniffer
-    
     mkdir -p /etc/dae/docker/data
     mkdir -p /etc/dae/persist.d
-    
     generate_dae_config "$doc_sub" ""
     
     printf "${BLUE}[Docker] 正在全速拉取 dae 镜像...${NC}\n"
     if ! docker pull "$DOCKER_IMAGE_URL"; then
-        printf "%b\n" "$pull_failed_msg" # 使用 %b 来解析颜色代码
+        printf "${RED}Docker 镜像拉取失败！请检查网络。${NC}\n"
         return 1
     fi
     printf "${BLUE}为 Docker 容器准备最新的 GEO 数据...${NC}\n"
     curl -L -o "/etc/dae/docker/data/geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
     curl -L -o "/etc/dae/docker/data/geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
     
-    printf "${BLUE}正在启动 dae 特权容器...${NC}\n"
+    printf "${BLUE}正在启动 dae 特权容器 (已加入 bpf 文件系统挂载)...${NC}\n"
     docker run -d \
         --name dae-container \
         --restart always \
@@ -805,6 +820,7 @@ install_dae_docker() {
         -v /etc/dae/config.dae:/etc/dae/config.dae:ro \
         -v /etc/dae/docker/data:/usr/share/dae:ro \
         -v /etc/dae/persist.d:/etc/dae/persist.d \
+        -v /sys/fs/bpf:/sys/fs/bpf \
         "$DOCKER_IMAGE_URL"
         
     sleep 3
