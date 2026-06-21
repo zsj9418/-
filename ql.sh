@@ -2,7 +2,8 @@
 
 DATA_DIR="$HOME/qinglong"
 QL_IMAGE_BASE="whyour/qinglong"
-DEFAULT_IMAGE_VER="latest"
+DEFAULT_IMAGE_VER="latest"        # 升级默认用 latest
+INSTALL_DEFAULT_VER="2.20.2"      # 部署默认用稳定版
 DEFAULT_CONTAINER_NAME="qinglong"
 DEFAULT_PORT=5700
 LOG_FILE="$DATA_DIR/ql_script.log"
@@ -14,6 +15,7 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# ===== 日志 =====
 log() {
   local level=$1 msg=$2 timestamp
   timestamp=$(date "+%Y-%m-%d %H:%M:%S")
@@ -96,23 +98,94 @@ get_container_port() {
   docker inspect --format='{{(index (index .NetworkSettings.Ports "5700/tcp") 0).HostPort}}' "$cname" 2>/dev/null
 }
 
-#===== 部署、备份、恢复 =====#
+# ===== 核心公共函数：版本获取与交互式选择 =====
+# 用法: select_version <默认版本> <显示数量>
+# 通过 stdout 输出用户最终选择的版本字符串
+# 使用更规范的 Docker Hub v2 API + jq 解析，过滤掉 debian/alpine 变体
+select_version() {
+  local default_ver="${1:-latest}"
+  local show_count="${2:-5}"
+
+  echo -e "\n${CYAN}🔄 正在从 Docker Hub 获取青龙版本列表...${NC}" >&2
+
+  local raw_versions=""
+  for i in {1..3}; do
+    # 使用规范的 namespaces API，用 jq 解析，仅取纯数字版本（如 2.20.2），语义化排序取前N个
+    raw_versions=$(
+      curl -s -m 10 \
+        "https://hub.docker.com/v2/namespaces/whyour/repositories/qinglong/tags?page_size=50" \
+        2>/dev/null \
+      | jq -r '.results[].name' 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -rV \
+      | head -n "$show_count"
+    )
+    [[ -n "$raw_versions" ]] && break
+    log WARN "第 $i 次获取版本列表失败，重试中..." >&2
+    sleep 2
+  done
+
+  # 构建版本数组（首位始终为默认版本，去重后合并远端版本）
+  local -a versions=()
+
+  if [[ -n "$raw_versions" ]]; then
+    # 将默认版本置于首位，其余追加（去重：避免默认版本与远端重复）
+    versions+=("$default_ver")
+    while IFS= read -r ver; do
+      [[ "$ver" != "$default_ver" ]] && versions+=("$ver")
+    done <<< "$raw_versions"
+
+    echo -e "${YELLOW}请选择版本（直接回车默认选 1: $default_ver）：${NC}" >&2
+    for i in "${!versions[@]}"; do
+      if [[ "${versions[$i]}" == "$default_ver" ]]; then
+        echo -e "  $((i+1)). ${versions[$i]}  ${GREEN}← 默认推荐${NC}" >&2
+      else
+        echo "  $((i+1)). ${versions[$i]}" >&2
+      fi
+    done
+
+    local choice num_versions=${#versions[@]}
+    while true; do
+      read -p "请输入版本编号 [默认 1]: " choice >&2
+      choice=${choice:-1}
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= num_versions )); then
+        echo "${versions[$((choice-1))]}"  # ← 唯一的 stdout 输出，供调用方捕获
+        return 0
+      else
+        log ERROR "无效选择，请输入 1~$num_versions 之间的数字" >&2
+      fi
+    done
+
+  else
+    # 网络失败降级：手动输入
+    log WARN "无法获取远端版本列表，请手动输入版本号" >&2
+    local manual_ver
+    read -p "请输入版本号 [直接回车默认: $default_ver]: " manual_ver >&2
+    echo "${manual_ver:-$default_ver}"
+  fi
+}
+
+# ===== 部署、备份、恢复 =====
 
 install_ql() {
-  local name port image
+  local name port target_version image
+
   name=$(prompt_container_name "请输入容器名称" "$DEFAULT_CONTAINER_NAME")
   port=$(prompt_port "请输入 WebUI 端口" "$DEFAULT_PORT")
-  image="$QL_IMAGE_BASE:$DEFAULT_IMAGE_VER"
 
   if docker ps -a --format "{{.Names}}" | grep -qw "$name"; then
     log WARN "容器 $name 已存在，不能重复部署"
     return
   fi
 
-  log INFO "正在拉取青龙镜像 $image..."
-  docker pull "$image" || { log ERROR "镜像拉取失败，请检查网络"; exit 1; }
+  # 版本选择：默认 2.20.2，展示最近5个版本
+  target_version=$(select_version "$INSTALL_DEFAULT_VER" 5)
+  image="$QL_IMAGE_BASE:$target_version"
 
-  log INFO "正在启动容器 $name，映射端口 $port..."
+  log INFO "正在拉取青龙镜像 $image ..."
+  docker pull "$image" || { log ERROR "镜像拉取失败，请检查网络"; return 1; }
+
+  log INFO "正在启动容器 $name，端口映射 $port:5700 ..."
   docker run -dit \
     -v "$DATA_DIR/config:/ql/config" \
     -v "$DATA_DIR/log:/ql/log" \
@@ -125,11 +198,11 @@ install_ql() {
     --name "$name" \
     --hostname "$name" \
     --restart unless-stopped \
-    "$image" || { log ERROR "容器启动失败"; exit 1; }
+    "$image" || { log ERROR "容器启动失败"; return 1; }
 
-  log INFO "🎉 青龙容器 $name 部署完成！"
+  log INFO "🎉 青龙容器 $name 部署完成！版本: $target_version"
   echo -e "${CYAN}访问面板: http://$(hostname -I | awk '{print $1}'):$port${NC}"
-  echo -e "${CYAN}默认账号/密码: admin / admin (请在初始配置后及时修改)${NC}"
+  echo -e "${CYAN}默认账号/密码: admin / admin（首次登录后请及时修改）${NC}"
 }
 
 list_containers() {
@@ -181,18 +254,7 @@ restore_ql() {
   fi
 }
 
-#===== 核心：无损升级模块 =====#
-
-get_ql_versions() {
-    local versions=""
-    for i in {1..3}; do
-        # 抓取 Qinglong Docker Hub 的 tag，排除 debian/alpine 变体，仅取纯数字版本
-        versions=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/whyour/qinglong/tags/?page_size=30" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV)
-        if [ -n "$versions" ]; then break; fi
-        sleep 2
-    done
-    if [ -n "$versions" ]; then echo "latest $versions"; else echo ""; fi
-}
+# ===== 核心：无损升级模块 =====
 
 upgrade_ql() {
   local name
@@ -202,84 +264,72 @@ upgrade_ql() {
     return
   fi
 
-  echo -e "\n${CYAN}🔄 正在从 Docker Hub 获取青龙最新版本列表...${NC}"
-  local versions_str=$(get_ql_versions)
-  local versions=($versions_str)
-  local num_versions=${#versions[@]}
-  local target_version="latest"
-
-  if [ $num_versions -eq 0 ]; then
-      log WARN "由于网络问题无法获取版本列表。"
-      read -p "请输入您要升级到的目标版本号 [直接回车默认: latest]: " manual_ver
-      target_version=${manual_ver:-latest}
-  else
-      echo -e "${YELLOW}请选择要升级的目标版本：${NC}"
-      for i in "${!versions[@]}"; do
-          echo "$((i + 1)). ${versions[$i]}"
-      done
-      while true; do
-          read -p "请输入版本编号 [直接回车默认选择 1 (latest)]: " ver_choice
-          ver_choice=${ver_choice:-1}
-          if [[ $ver_choice =~ ^[0-9]+$ ]] && [ "$ver_choice" -ge 1 ] && [ "$ver_choice" -le "$num_versions" ]; then
-              target_version=${versions[$((ver_choice - 1))]}
-              break
-          else
-              log ERROR "无效的选择，请重新输入"
-          fi
-      done
-  fi
-
+  # 版本选择：升级默认 latest，展示最近5个版本
+  local target_version
+  target_version=$(select_version "$DEFAULT_IMAGE_VER" 5)
   local image="$QL_IMAGE_BASE:$target_version"
-  echo -e "\n${YELLOW}ℹ️ 您的旧容器所有配置（端口、所有挂载目录、所有环境变量）将被完美保留。${NC}"
-  log INFO "正在拉取新镜像: $image..."
+
+  echo -e "\n${YELLOW}ℹ️ 旧容器所有配置（端口、挂载目录、环境变量）将被完美保留。${NC}"
+  log INFO "正在拉取新镜像: $image ..."
   docker pull "$image" || { log ERROR "镜像拉取失败，请检查网络！"; return; }
 
-  log INFO "正在提取当前容器 <$name> 的详细配置参数..."
-  local c_info=$(docker inspect "$name")
-  
-  local net_mode=$(echo "$c_info" | jq -r '.[0].HostConfig.NetworkMode')
-  local restart_policy=$(echo "$c_info" | jq -r '.[0].HostConfig.RestartPolicy.Name')
-  
-  # 初始化重建参数 (青龙默认需要 -dit 而不是仅仅 -d)
-  local -a run_args=("-dit" "--name" "$name" "--hostname" "$name")
-  
-  [[ -n "$restart_policy" && "$restart_policy" != "no" && "$restart_policy" != "null" ]] && run_args+=("--restart" "$restart_policy")
-  [[ -n "$net_mode" && "$net_mode" != "default" && "$net_mode" != "null" ]] && run_args+=("--network" "$net_mode")
+  log INFO "正在提取当前容器 <$name> 的配置参数..."
+  local c_info
+  c_info=$(docker inspect "$name")
 
-  # 提取所有映射端口
-  if [ "$net_mode" != "host" ]; then
-      local -a ports
-      mapfile -t ports < <(echo "$c_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key)" else empty end')
-      (( ${#ports[@]} > 0 )) && run_args+=("${ports[@]}")
+  local net_mode restart_policy
+  net_mode=$(echo "$c_info" | jq -r '.[0].HostConfig.NetworkMode')
+  restart_policy=$(echo "$c_info" | jq -r '.[0].HostConfig.RestartPolicy.Name')
+
+  local -a run_args=("-dit" "--name" "$name" "--hostname" "$name")
+
+  [[ -n "$restart_policy" && "$restart_policy" != "no" && "$restart_policy" != "null" ]] \
+    && run_args+=("--restart" "$restart_policy")
+  [[ -n "$net_mode" && "$net_mode" != "default" && "$net_mode" != "null" ]] \
+    && run_args+=("--network" "$net_mode")
+
+  if [[ "$net_mode" != "host" ]]; then
+    local -a ports
+    mapfile -t ports < <(
+      echo "$c_info" | jq -r \
+        'if .[0].HostConfig.PortBindings
+         then .[0].HostConfig.PortBindings | to_entries[]
+              | "-p", "\(.value[0].HostPort):\(.key)"
+         else empty end'
+    )
+    (( ${#ports[@]} > 0 )) && run_args+=("${ports[@]}")
   fi
 
-  # 提取所有挂载卷 (完美兼容用户自行添加的 Ninja、依赖等额外挂载)
   local -a mounts
-  mapfile -t mounts < <(echo "$c_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"')
+  mapfile -t mounts < <(
+    echo "$c_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"'
+  )
   (( ${#mounts[@]} > 0 )) && run_args+=("${mounts[@]}")
 
-  # 提取自定义环境变量 (过滤系统自带变量防止新版本冲突)
   local -a envs
-  mapfile -t envs < <(echo "$c_info" | jq -r '.[0].Config.Env[]? | select(test("^PATH=|^HOSTNAME=|^HOME=|PWD=") | not) | "-e", .')
+  mapfile -t envs < <(
+    echo "$c_info" | jq -r \
+      '.[0].Config.Env[]? | select(test("^PATH=|^HOSTNAME=|^HOME=|^PWD=") | not) | "-e", .'
+  )
   (( ${#envs[@]} > 0 )) && run_args+=("${envs[@]}")
 
   log INFO "🗑️ 正在停止并销毁旧容器..."
   docker stop "$name" >/dev/null 2>&1
-  docker rm "$name" >/dev/null 2>&1
+  docker rm   "$name" >/dev/null 2>&1
 
   log INFO "🚀 正在使用新镜像和旧配置重建容器..."
-  docker run "${run_args[@]}" "$image" >/dev/null 2>&1
-  
-  if [ $? -eq 0 ]; then
-      log INFO "🎉 青龙容器 <$name> 已成功无损升级至 $target_version ！"
-      local old_port=$(get_container_port "$name")
-      [[ -n "$old_port" ]] && echo -e "${CYAN}访问面板: http://$(hostname -I | awk '{print $1}'):$old_port${NC}"
+  if docker run "${run_args[@]}" "$image" >/dev/null 2>&1; then
+    log INFO "🎉 青龙容器 <$name> 已成功无损升级至 $target_version ！"
+    local old_port
+    old_port=$(get_container_port "$name")
+    [[ -n "$old_port" ]] && \
+      echo -e "${CYAN}访问面板: http://$(hostname -I | awk '{print $1}'):$old_port${NC}"
   else
-      log ERROR "❌ 升级后容器启动失败，请运行 'docker logs $name' 检查原因。"
+    log ERROR "❌ 升级后容器启动失败，请运行 'docker logs $name' 检查原因。"
   fi
 }
 
-#===== 主菜单 =====#
+# ===== 主菜单 =====
 
 show_menu() {
   while true; do
