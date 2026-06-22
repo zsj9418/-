@@ -227,6 +227,7 @@ DEFAULT_OPTIONS=(
     "42. 部署监控存盘到局域网服务器01"
     "43. 部署监控存盘到局域网服务器02"
     "44. PVE智能存储迁移脚本"
+    "45. OP系统虚拟内存设置"
     "98. 快捷键管理"
 )
 
@@ -276,6 +277,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["42"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-deploy_frigate.sh"
     ["43"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/Shinobi.sh"
     ["44"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/pve_smart_migration.sh"
+    ["45"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/setup_swap.sh"
 )
 
 # 声明全局变量
