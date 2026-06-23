@@ -247,81 +247,85 @@ download_script() {
     local choice="$1"
     local url="${DEFAULT_SCRIPTS[$choice]:-}"
 
+    # ── 无效选项 ──────────────────────────────────────
     if [[ -z "$url" ]]; then
         echo "此选项没有对应的脚本 URL" >&2
         return 1
     fi
 
-    local script_name
-    script_name="${choice}-$(basename "$url")"
+    local script_name="${choice}-$(basename "$url")"
     local script_path="$SCRIPT_DIR/core_scripts/$script_name"
 
-    # 已存在则检查是否需要更新（24小时内不重复下载）
+    # ── 缓存命中（文件存在且不超过24小时）────────────
+    # 用 find -mmin 兼容 busybox，避免 stat -c%Y 不可用
     if [[ -f "$script_path" ]]; then
-        local file_age
-        file_age=$(( $(date +%s) - $(stat -c%Y "$script_path" 2>/dev/null || echo 0) ))
-        if [[ "$file_age" -lt 86400 ]]; then
-            log "脚本缓存有效（${file_age}秒前下载）: $script_path"
-            echo "$script_path"
+        if ! find "$script_path" -mmin +1440 2>/dev/null | grep -q .; then
+            echo "使用本地缓存: $script_path" >&2   # ✅ 提示 → stderr
+            echo "$script_path"                      # ✅ 路径  → stdout
             return 0
-        else
-            echo "脚本缓存已过期（超过24小时），重新下载..."
-            rm -f "$script_path"
         fi
+        echo "缓存已过期（超过24小时），重新下载..." >&2
+        rm -f "$script_path"
     fi
 
-    # 网络检测（首次）
+    # ── 网络检测（只做一次，结果缓存到 DIRECT_OK）────
     if [[ "$DIRECT_OK" -eq 0 ]]; then
-        echo -n "检测网络连通性... "
+        echo -n "检测网络连通性... " >&2
         if check_network; then
-            echo "直连可用"
+            echo "直连可用" >&2
         else
-            echo "直连不可用，将使用代理"
+            echo "直连不可用，将使用代理" >&2
         fi
     fi
 
-    # ✅ 重组下载 URL 列表（直连 + 多代理）
+    # ── 组装候选 URL 列表 ────────────────────────────
+    # 直连放第一位，代理依次追加
     local urls_to_try=()
-    if [[ "$DIRECT_OK" -eq 1 ]]; then
-        urls_to_try+=("$url")
-    fi
+    [[ "$DIRECT_OK" -eq 1 ]] && urls_to_try+=("$url")
     if [[ "$url" == https://raw.githubusercontent.com/* ]]; then
         for proxy in "${PROXY_PREFIXES[@]}"; do
             urls_to_try+=("${proxy}${url}")
         done
     fi
+    # 如果直连不可用且没有代理匹配，仍保留原 URL 兜底
+    [[ ${#urls_to_try[@]} -eq 0 ]] && urls_to_try+=("$url")
 
-    # 按优先级尝试下载
+    # ── 逐一尝试下载 ─────────────────────────────────
     local attempt=0
     for try_url in "${urls_to_try[@]}"; do
         for ((i=1; i<=RETRY_COUNT; i++)); do
             attempt=$((attempt + 1))
-            echo "下载尝试 $attempt: $try_url" >&2
-            if curl -fsSL --max-time 30 "$try_url" -o "$script_path" 2>/dev/null; then
-                # ✅ 完整性校验：检查文件非空且有 shebang
+            echo "下载尝试 $attempt/$((${#urls_to_try[@]} * RETRY_COUNT)): $try_url" >&2
+
+            if curl -fsSL --connect-timeout 10 --max-time 60 \
+                    "$try_url" -o "$script_path" 2>/dev/null; then
+
+                # ✅ 只检查文件非空，不做 shebang 检查
+                # （某些脚本开头有注释、空行或 BOM，shebang 不一定在第一行）
                 if [[ -s "$script_path" ]]; then
-                    local first_line
-                    first_line=$(head -1 "$script_path" 2>/dev/null)
-                    if [[ "$first_line" =~ ^#! ]]; then
-                        chmod +x "$script_path"
-                        log "下载成功: $script_path (来源: $try_url)"
-                        echo "$script_path"
-                        return 0
-                    else
-                        echo "文件内容异常（无 shebang），放弃此 URL" >&2
-                        rm -f "$script_path"
-                    fi
+                    chmod +x "$script_path"
+                    echo "下载成功 ✅" >&2
+                    log "下载成功: $script_path (来源: $try_url)"
+                    echo "$script_path"   # ✅ 唯一的 stdout 输出，就是路径
+                    return 0
                 else
-                    echo "下载文件为空，重试..." >&2
+                    echo "下载文件为空，删除并重试..." >&2
                     rm -f "$script_path"
                 fi
+
+            else
+                echo "curl 失败，重试 ($i/$RETRY_COUNT)..." >&2
+                rm -f "$script_path" 2>/dev/null
             fi
+
             [[ $i -lt $RETRY_COUNT ]] && sleep 2
         done
+        # 当前 URL 全部重试失败，换下一个
     done
 
-    echo "所有 URL 均下载失败，请检查网络或 URL：$url" >&2
-    log "下载失败: $url"
+    # ── 全部失败 ─────────────────────────────────────
+    echo "❌ 所有下载均失败，URL: $url" >&2
+    log "下载失败: choice=$choice url=$url"
     return 1
 }
 
@@ -789,31 +793,36 @@ main() {
                 continue
                 ;;
             *)
-                if [[ -v SCRIPTS["$choice"] ]]; then
-                    local url="${SCRIPTS[$choice]}"
-                    if [[ -z "$url" ]]; then
-                        echo "该选项是内部功能，请重新选择"
-                        sleep 1
-                        continue
-                    fi
-                    manage_logs
-                    local script_path
-                    # ✅ 不在管道中调用，避免 set -e 误杀
-                    script_path="$(download_script "$choice")"
-                    if [[ $? -eq 0 && -n "$script_path" ]]; then
-                        run_script "$script_path"
-                        echo ""
-                        read -rp "按回车键返回主菜单..."
-                    else
-                        echo "❌ 下载失败，请检查网络"
-                        log "下载失败: choice=$choice"
-                        read -rp "按回车键返回主菜单..."
-                    fi
-                else
-                    echo "无效选项：$choice"
-                    sleep 1
-                fi
-                ;;
+    if [[ -v SCRIPTS["$choice"] ]]; then
+        local url="${SCRIPTS[$choice]}"
+        if [[ -z "$url" ]]; then
+            echo "该选项是内部功能，请重新选择"
+            sleep 1
+            continue
+        fi
+
+        manage_logs
+
+        # ✅ 先用变量接收路径（此时 stdout 只有纯路径）
+        local script_path
+        script_path="$(download_script "$choice")"
+        local dl_ret=$?   # ✅ 立即保存，避免被后续命令覆盖
+
+        if [[ $dl_ret -eq 0 && -f "$script_path" ]]; then
+            run_script "$script_path"
+        else
+            echo ""
+            echo "❌ 下载失败，请检查以上错误信息或网络状态"
+            log "下载失败: choice=$choice"
+        fi
+
+        echo ""
+        read -rp "按回车键返回主菜单..."
+    else
+        echo "无效选项：$choice"
+        sleep 1
+    fi
+    ;;
         esac
     done
 }
