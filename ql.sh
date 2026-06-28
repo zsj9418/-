@@ -58,6 +58,95 @@ check_dependencies() {
     log INFO "jq 安装完成"
   fi
 }
+# ── 存储空间检测（安装依赖前自动调用）──
+check_disk_space() {
+  local min_gb=3  # 最低要求 3GB 可用空间
+  local warn_gb=5 # 建议 5GB 以上
+  local target_dir="${1:-$DATA_DIR}"
+
+  # 获取可用空间（MB）
+  local avail_mb
+  avail_mb=$(df -m "$target_dir" 2>/dev/null | awk 'NR==2{print $4}')
+
+  if [[ -z "$avail_mb" ]]; then
+    log WARN "无法检测磁盘空间，请确保有足够剩余空间"
+    return 0
+  fi
+
+  local avail_gb=$(( avail_mb / 1024 ))
+
+  echo -e "\n${CYAN}${BOLD}════ 磁盘空间检测 ════${NC}"
+  echo -e "  目标路径 : $target_dir"
+  echo -e "  当前可用 : ${avail_gb} GB (${avail_mb} MB)"
+  echo -e "  最低需求 : ${min_gb} GB"
+  echo -e "  推荐需求 : ${warn_gb} GB"
+
+  if (( avail_mb < min_gb * 1024 )); then
+    echo -e "  状态     : ${RED}${BOLD}❌ 空间严重不足！${NC}"
+    echo -e "${RED}═══════════════════════${NC}\n"
+    log ERROR "磁盘可用空间不足 ${min_gb}GB（当前 ${avail_gb}GB），安装可能失败！"
+    read -p "空间不足，是否强制继续？风险自负 (y/N): " force
+    [[ ! "${force:-N}" =~ ^[Yy]$ ]] && return 1
+  elif (( avail_mb < warn_gb * 1024 )); then
+    echo -e "  状态     : ${YELLOW}${BOLD}⚠️  空间偏低，建议清理后再安装${NC}"
+    echo -e "${YELLOW}═══════════════════════${NC}\n"
+    log WARN "磁盘可用空间 ${avail_gb}GB，建议至少 ${warn_gb}GB"
+    read -p "空间偏低，是否继续？(Y/n): " cont
+    [[ "${cont:-Y}" =~ ^[Nn]$ ]] && return 1
+  else
+    echo -e "  状态     : ${GREEN}${BOLD}✅ 空间充足${NC}"
+    echo -e "${GREEN}═══════════════════════${NC}\n"
+  fi
+
+  # 显示各分区使用情况
+  echo -e "${CYAN}── 磁盘使用详情 ──${NC}"
+  df -h "$target_dir" | awk 'NR==1{print "  "$0} NR==2{print "  "$0}'
+
+  # 检测青龙数据目录各子目录大小
+  if [[ -d "$DATA_DIR" ]]; then
+    echo -e "\n${CYAN}── 青龙数据目录占用 ──${NC}"
+    du -sh "$DATA_DIR"/*/  2>/dev/null | \
+      awk '{printf "  %-12s %s\n", $1, $2}'
+    echo -e "  $(du -sh "$DATA_DIR" 2>/dev/null | awk '{print $1}')  合计"
+  fi
+  echo ""
+  return 0
+}
+# ── Docker 镜像存储占用分析 ──
+show_storage_report() {
+  echo -e "\n${CYAN}${BOLD}════════════════════════════════════════════${NC}"
+  echo -e "${CYAN}${BOLD}   💾 青龙面板存储占用分析报告               ${NC}"
+  echo -e "${CYAN}${BOLD}════════════════════════════════════════════${NC}"
+
+  # Docker 镜像占用
+  echo -e "\n${YELLOW}── Docker 镜像 ──${NC}"
+  docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}" \
+    2>/dev/null | grep -E "qinglong|REPO" || echo "  无青龙相关镜像"
+
+  # 容器层占用（运行中容器）
+  echo -e "\n${YELLOW}── 运行中容器 ──${NC}"
+  docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+    2>/dev/null | grep -E "qinglong|NAMES" || echo "  无青龙容器在运行"
+
+  # 宿主机数据目录
+  echo -e "\n${YELLOW}── 宿主机数据目录 ($DATA_DIR) ──${NC}"
+  if [[ -d "$DATA_DIR" ]]; then
+    du -sh "$DATA_DIR"/*/  2>/dev/null | \
+      sort -rh | awk '{printf "  %-10s  %s\n", $1, $2}'
+    echo -e "  ──────────────────────"
+    echo -e "  $(du -sh "$DATA_DIR" 2>/dev/null | awk '{print $1}')  总计"
+  else
+    echo "  数据目录不存在"
+  fi
+
+  # Docker 总体存储
+  echo -e "\n${YELLOW}── Docker 全局存储 ──${NC}"
+  docker system df 2>/dev/null || echo "  无法获取"
+
+  echo -e "\n${CYAN}${BOLD}════════════════════════════════════════════${NC}"
+  echo -e "${GREEN}推荐预留空间: 个人使用 ≥5GB / 多库使用 ≥10GB${NC}"
+  echo -e "${CYAN}${BOLD}════════════════════════════════════════════${NC}\n"
+}
 
 port_is_free() {
   local port=$1
@@ -353,6 +442,7 @@ _progress_bar() {
 #  ★★★ 全依赖一键补全主函数 v3.2 ★★★
 # ================================================================
 install_all_deps() {
+  check_disk_space || return 1
   local name="${1:-}"
   if [[ -z "$name" ]]; then
     name=$(prompt_container_name "请输入青龙容器名" "$DEFAULT_CONTAINER_NAME")
@@ -974,6 +1064,7 @@ show_menu() {
     echo -e "  ${YELLOW}8. 依赖专项修复（pnpm源/pip/canvas/注册）${NC}"
     echo -e "  ${BLUE}9. Linux依赖补充注册到面板（初始化后使用）${NC}"
     echo -e "  ${RED}A. 清除 API 凭证缓存（重新输入凭证）${NC}"
+    echo -e "  ${BLUE}B. 存储占用分析报告${NC}"
     echo "  0. 退出"
     echo -e "${CYAN}${BOLD}═════════════════════════════════════════${NC}"
     read -p "请输入选项编号: " op
@@ -988,6 +1079,7 @@ show_menu() {
       8) repair_deps ;;
       9) register_linux_deps_to_panel ;;
       [Aa]) clear_cred_cache ;;
+      [Bb]) show_storage_report ;;
       0) echo -e "${GREEN}感谢使用，再见！${NC}"; exit 0 ;;
       *) log ERROR "无效输入，请重新输入" ;;
     esac
