@@ -1,212 +1,175 @@
 #!/bin/bash
+# ==============================================================
+#  Docker 服务管理脚本
+#  支持：One-API / New-API / FreeLLMAPI
+#  支持系统：Debian/Ubuntu / CentOS/RHEL/Fedora / Arch / OpenWrt
+#  支持架构：amd64 / arm64 / arm/v7 / 386
+# ==============================================================
 
-# --- 基本设置 ---
 set -euo pipefail
 trap 'echo -e "\n\e[31m操作被用户中断。\e[0m"; exit 1' INT
 
-# --- 全局变量 ---
+# ──────────────────────────────────────────────
+# 全局变量
+# ──────────────────────────────────────────────
 OS=""
 PACKAGE_MANAGER=""
+ARCH=""
 PLATFORM=""
 PORT=""
 NETWORK_MODE=""
 LOG_FILE=""
+SELECTED_IMAGE=""          # 版本选择后写入此全局变量
 DEFAULT_TZ="Asia/Shanghai"
-TEMP_DIR="/tmp/uni_api_deploy_$(date +%s)"
 
-# --- 服务配置常量 ---
-# ⚠️ 维护提示：以下版本号请定期手动核查并更新
-DEFAULT_PORT=1314
+# ──────────────────────────────────────────────
+# 服务镜像基础地址常量
+# ──────────────────────────────────────────────
+ONE_API_IMAGE_BASE="ghcr.io/songquanpeng/one-api"
+NEW_API_IMAGE_BASE="calciumion/new-api"
+FREELLMAPI_IMAGE_BASE="ghcr.io/tashfeenahmed/freellmapi"
 
-# One-API 镜像（定期到 https://github.com/songquanpeng/one-api/releases 检查最新版）
-# ✅ 已更新：原为 v0.6.11-preview.1
-ONE_API_IMAGE_SPECIFIC="justsong/one-api:v0.6.11-preview.1"
-LATEST_ONE_API_IMAGE="ghcr.io/songquanpeng/one-api:latest"
+# FreeLLMAPI compose 工作目录
+FREELLMAPI_COMPOSE_DIR="$HOME/freellmapi"
 
-# Duck2API 镜像
-# ⛔ 警告：Duck2API 项目已于 2025-04-15 被作者归档为只读状态，停止维护。
-# 镜像目前仍可拉取，但随着 DuckDuckGo 接口变动服务可能随时失效且不会修复。
-# 强烈建议迁移至 New-API 或 One-API。
-DUCK2API_IMAGE="ghcr.io/aurora-develop/duck2api:latest"
-
-# Uni-API 镜像（本地构建，依赖克隆 GitHub 仓库）
-# ⚠️ 注意：通过源码构建，网络不通或上游变更可能导致构建失败
-UNI_API_IMAGE="uni-api:latest"
-
-# New-API (calciumion) 镜像
-NEW_API_CALCIUMION_IMAGE="calciumion/new-api:latest"
-
-# Docker Compose 独立版兜底版本（优先动态获取最新版）
-# ✅ 已更新：原为 v2.29.2
+# Docker Compose 兜底版本（优先动态获取）
 COMPOSE_FALLBACK_VERSION="v2.39.1"
 
-# --- 日志设置 ---
-function setup_logging() {
-  local temp_os_check=""
-  if [[ -f /etc/os-release ]]; then
-    temp_os_check=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
-  fi
+# ──────────────────────────────────────────────
+# 颜色输出
+# ──────────────────────────────────────────────
+function green()  { echo -e "\e[32m$1\e[0m"; }
+function red()    { echo -e "\e[31m$1\e[0m"; }
+function yellow() { echo -e "\e[33m$1\e[0m"; }
+function cyan()   { echo -e "\e[36m$1\e[0m"; }
+function bold()   { echo -e "\e[1m$1\e[0m"; }
 
-  if [[ "$temp_os_check" == "openwrt" ]] || [[ "$temp_os_check" == "libwrt" ]]; then
+# ──────────────────────────────────────────────
+# 日志设置
+# ──────────────────────────────────────────────
+function setup_logging() {
+  local tmp_id=""
+  [[ -f /etc/os-release ]] && tmp_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+
+  if [[ "$tmp_id" == "openwrt" || "$tmp_id" == "libwrt" ]]; then
     LOG_FILE="/tmp/deploy_script.log"
-    yellow "提示: OpenWrt/LibWRT 系统日志将写入 /tmp，重启后会丢失。"
+    yellow "提示：OpenWrt 日志写入 /tmp，重启后丢失。"
   else
     LOG_FILE="$HOME/.deploy_script.log"
   fi
 
   local LOG_MAX_SIZE=3145728
-  local current_size=0
-  if [[ -f "$LOG_FILE" ]]; then
-    current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-  fi
-  if [[ "$current_size" -ge "$LOG_MAX_SIZE" ]]; then
-    echo "日志文件 $LOG_FILE 超过 ${LOG_MAX_SIZE} bytes，正在清空..." > "$LOG_FILE"
-  fi
-  touch "$LOG_FILE" || { red "错误：无法创建或访问日志文件 $LOG_FILE"; exit 1; }
+  local cur_size=0
+  [[ -f "$LOG_FILE" ]] && cur_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  [[ "$cur_size" -ge "$LOG_MAX_SIZE" ]] && echo "日志超限，已清空。" > "$LOG_FILE"
+
+  touch "$LOG_FILE" || { red "无法创建日志文件：$LOG_FILE"; exit 1; }
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
-# --- 颜色输出函数 ---
-function green()  { echo -e "\e[32m$1\e[0m"; }
-function red()    { echo -e "\e[31m$1\e[0m"; }
-function yellow() { echo -e "\e[33m$1\e[0m"; }
-
-# --- 系统检测函数 ---
+# ──────────────────────────────────────────────
+# 系统检测
+# ──────────────────────────────────────────────
 function detect_architecture() {
   ARCH=$(uname -m)
   case "$ARCH" in
-    x86_64 | amd64)   PLATFORM="linux/amd64" ;;
-    i386 | i686)      PLATFORM="linux/386" ;;
-    armv7l | armhf)   PLATFORM="linux/arm/v7" ;;
-    aarch64 | arm64)  PLATFORM="linux/arm64" ;;
-    *) yellow "警告：未知的架构 ($ARCH)，将不指定 Docker 平台，可能导致拉取错误。" && PLATFORM="" ;;
+    x86_64|amd64)   PLATFORM="linux/amd64"  ;;
+    i386|i686)      PLATFORM="linux/386"    ;;
+    armv7l|armhf)   PLATFORM="linux/arm/v7" ;;
+    aarch64|arm64)  PLATFORM="linux/arm64"  ;;
+    *)
+      yellow "警告：未知架构 ($ARCH)，将不指定 Docker 平台。"
+      PLATFORM=""
+      ;;
   esac
-  if [[ -n "$PLATFORM" ]]; then
-    green "设备架构：$ARCH，适配平台：$PLATFORM"
-  fi
+  [[ -n "$PLATFORM" ]] && green "架构：$ARCH → 平台：$PLATFORM"
 }
 
 function detect_os() {
   if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
     source /etc/os-release
-    local detected_id="${ID,,}"
-    case "$detected_id" in
-      ubuntu | debian | raspbian)
-        OS="debian"
-        PACKAGE_MANAGER="apt"
-        ;;
-      centos | rhel | fedora | rocky | almalinux)
-        OS="$detected_id"
-        if [[ -f /usr/bin/dnf ]]; then
-          PACKAGE_MANAGER="dnf"
-        elif [[ -f /usr/bin/yum ]]; then
-          PACKAGE_MANAGER="yum"
-        else
-          red "错误：在 $detected_id 系统上未找到 yum 或 dnf。" && exit 1
-        fi
-        ;;
-      arch | manjaro)
-        OS="arch"
-        PACKAGE_MANAGER="pacman"
-        ;;
-      openwrt | libwrt | nwrt | qwrt | hwrt | lede | immortalwrt | x-wrt | istoreos)
-        OS="openwrt"
-        PACKAGE_MANAGER="opkg"
-        ;;
+    local id="${ID,,}"
+    case "$id" in
+      ubuntu|debian|raspbian)
+        OS="debian"; PACKAGE_MANAGER="apt" ;;
+      centos|rhel|rocky|almalinux)
+        OS="$id"
+        [[ -f /usr/bin/dnf ]] && PACKAGE_MANAGER="dnf" || PACKAGE_MANAGER="yum" ;;
+      fedora)
+        OS="fedora"; PACKAGE_MANAGER="dnf" ;;
+      arch|manjaro)
+        OS="arch"; PACKAGE_MANAGER="pacman" ;;
+      openwrt|libwrt|nwrt|qwrt|hwrt|lede|immortalwrt|x-wrt|istoreos)
+        OS="openwrt"; PACKAGE_MANAGER="opkg" ;;
       *)
-        OS="$detected_id"
-        yellow "警告：检测到未明确支持的操作系统 ($OS)，将尝试通用方法。"
+        OS="$id"
+        yellow "未明确支持的系统（$OS），尝试自动检测包管理器..."
         if   command -v apt    &>/dev/null; then PACKAGE_MANAGER="apt"
         elif command -v dnf    &>/dev/null; then PACKAGE_MANAGER="dnf"
         elif command -v yum    &>/dev/null; then PACKAGE_MANAGER="yum"
         elif command -v pacman &>/dev/null; then PACKAGE_MANAGER="pacman"
         elif command -v opkg   &>/dev/null; then PACKAGE_MANAGER="opkg"
-        else red "错误：无法识别的操作系统且未找到已知包管理器。" && exit 1
+        else red "无法找到已知包管理器，退出。"; exit 1
         fi
         ;;
     esac
   elif [[ "$(uname -s)" == "Linux" ]]; then
-    yellow "警告：未找到 /etc/os-release 文件，尝试备用检测。"
+    yellow "未找到 /etc/os-release，尝试备用检测..."
     if   command -v apt    &>/dev/null; then OS="debian";  PACKAGE_MANAGER="apt"
     elif command -v dnf    &>/dev/null; then OS="fedora";  PACKAGE_MANAGER="dnf"
     elif command -v yum    &>/dev/null; then OS="centos";  PACKAGE_MANAGER="yum"
     elif command -v pacman &>/dev/null; then OS="arch";    PACKAGE_MANAGER="pacman"
     elif command -v opkg   &>/dev/null; then OS="openwrt"; PACKAGE_MANAGER="opkg"
-    else red "错误：无法识别操作系统或找到包管理器。" && exit 1
+    else red "无法识别操作系统，退出。"; exit 1
     fi
   else
-    red "错误：不支持的操作系统 ($(uname -s))" && exit 1
+    red "不支持的操作系统：$(uname -s)"; exit 1
   fi
-  green "操作系统识别为：$OS (包管理器: $PACKAGE_MANAGER)"
+  green "操作系统：$OS（包管理器：$PACKAGE_MANAGER）"
 }
 
-# --- 依赖管理函数 ---
-
-# ✅ 修复 Bug A：防止 sudo 被重复添加（原逻辑无论命令是否已含 sudo 均会再次添加）
+# ──────────────────────────────────────────────
+# 依赖安装
+# ──────────────────────────────────────────────
 function install_dependency() {
-  local cmd=$1
-  local package_name=$2
-  local install_cmd=""
-  local update_cmd=""
+  local cmd="$1"
+  local pkg="$2"
+  local update_cmd="" install_cmd=""
 
-  if command -v "$cmd" &>/dev/null; then
-    green "$cmd 已安装。"
-    return 0
-  fi
-
-  yellow "正在准备安装 $package_name (提供 $cmd 命令)..."
+  command -v "$cmd" &>/dev/null && { green "$cmd 已安装。"; return 0; }
+  yellow "准备安装 $pkg（提供 $cmd）..."
 
   case "$PACKAGE_MANAGER" in
-    apt)
-      update_cmd="apt update"
-      install_cmd="apt install -y $package_name"
-      ;;
-    yum)
-      install_cmd="yum install -y $package_name"
-      ;;
-    dnf)
-      install_cmd="dnf install -y $package_name"
-      ;;
-    pacman)
-      update_cmd="pacman -Syu --noconfirm"
-      install_cmd="pacman -S --noconfirm $package_name"
-      ;;
-    opkg)
-      update_cmd="opkg update"
-      install_cmd="opkg install $package_name"
-      ;;
-    *)
-      red "错误：不支持的包管理器：$PACKAGE_MANAGER"
-      exit 1
-      ;;
+    apt)    update_cmd="apt update"; install_cmd="apt install -y $pkg" ;;
+    yum)    install_cmd="yum install -y $pkg" ;;
+    dnf)    install_cmd="dnf install -y $pkg" ;;
+    pacman) update_cmd="pacman -Syu --noconfirm"; install_cmd="pacman -S --noconfirm $pkg" ;;
+    opkg)   update_cmd="opkg update"; install_cmd="opkg install $pkg" ;;
+    *)      red "不支持的包管理器：$PACKAGE_MANAGER"; exit 1 ;;
   esac
 
-  # ✅ 修复核心：仅在非 root、非 openwrt、且命令未以 sudo 开头时才添加 sudo
-  if [[ "$OS" != "openwrt" ]] && [[ "$EUID" -ne 0 ]]; then
+  if [[ "$OS" != "openwrt" && "$EUID" -ne 0 ]]; then
     [[ -n "$update_cmd"  && "$update_cmd"  != sudo* ]] && update_cmd="sudo $update_cmd"
     [[ -n "$install_cmd" && "$install_cmd" != sudo* ]] && install_cmd="sudo $install_cmd"
   fi
 
   if [[ -n "$update_cmd" ]]; then
-    yellow "执行包管理器更新命令: $update_cmd"
-    if ! eval "$update_cmd"; then
-      yellow "警告：包列表更新失败，将继续尝试安装。"
-    fi
+    yellow "执行：$update_cmd"
+    eval "$update_cmd" || yellow "包列表更新失败，继续尝试安装..."
   fi
 
-  yellow "执行安装命令: $install_cmd"
+  yellow "执行：$install_cmd"
   if eval "$install_cmd"; then
-    green "$package_name 安装成功。"
+    green "$pkg 安装成功。"
   else
-    red "$package_name 安装失败，请检查错误信息并尝试手动安装。"
-    exit 1
+    red "$pkg 安装失败，请手动安装后重试。"; exit 1
   fi
 }
 
 function check_base_dependencies() {
   if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-    yellow "curl 和 wget 都未安装，尝试安装 curl..."
+    yellow "curl 和 wget 均未安装，尝试安装 curl..."
     install_dependency "curl" "curl"
   elif command -v curl &>/dev/null; then
     green "curl 已安装。"
@@ -215,20 +178,12 @@ function check_base_dependencies() {
   fi
 
   if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
-    yellow "端口检查工具 ss 和 netstat 都未安装。"
-    local ss_pkg="iproute2"
-    local netstat_pkg="net-tools"
-    if [[ "$PACKAGE_MANAGER" == "opkg" ]]; then
-      ss_pkg="ip-full"
-      netstat_pkg="netstat"
-    elif [[ "$PACKAGE_MANAGER" == "yum" ]] || [[ "$PACKAGE_MANAGER" == "dnf" ]]; then
-      ss_pkg="iproute"
-    fi
-    yellow "尝试安装 $netstat_pkg (提供 netstat)..."
+    local ss_pkg="iproute2" netstat_pkg="net-tools"
+    [[ "$PACKAGE_MANAGER" == "opkg" ]] && ss_pkg="ip-full" && netstat_pkg="netstat"
+    [[ "$PACKAGE_MANAGER" == "yum" || "$PACKAGE_MANAGER" == "dnf" ]] && ss_pkg="iproute"
     install_dependency "netstat" "$netstat_pkg" || true
     if ! command -v netstat &>/dev/null; then
-      yellow "尝试安装 $ss_pkg (提供 ss)..."
-      install_dependency "ss" "$ss_pkg" || yellow "警告: 安装端口检查工具失败，端口检查可能无法工作。"
+      install_dependency "ss" "$ss_pkg" || yellow "警告：端口检查工具安装失败。"
     fi
   elif command -v ss &>/dev/null; then
     green "端口检查工具 ss 已安装。"
@@ -238,856 +193,1030 @@ function check_base_dependencies() {
 }
 
 function check_docker_dependencies() {
-  local docker_package="docker"
+  local docker_pkg="docker"
   local needs_repo=false
 
   case "$PACKAGE_MANAGER" in
-    apt)
-      docker_package="docker.io"
+    apt)    docker_pkg="docker.io" ;;
+    yum|dnf)
+      rpm -q docker-ce &>/dev/null || needs_repo=true
+      docker_pkg="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
       ;;
-    yum | dnf)
-      if ! command -v docker &>/dev/null; then
-        if ! rpm -q docker-ce &>/dev/null; then
-          needs_repo=true
-        fi
-      fi
-      docker_package="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-      ;;
-    pacman)
-      docker_package="docker docker-compose"
-      ;;
-    opkg)
-      docker_package="docker dockerd docker-compose"
-      ;;
+    pacman) docker_pkg="docker docker-compose" ;;
+    opkg)   docker_pkg="docker dockerd docker-compose" ;;
   esac
 
-  if [[ "$needs_repo" == true ]] && [[ "$OS" != "openwrt" ]]; then
-    yellow "为 CentOS/RHEL/Fedora 添加 Docker CE 仓库..."
-    local repo_manager_pkg=""
-    local repo_add_cmd=""
+  if [[ "$needs_repo" == true && "$OS" != "openwrt" ]]; then
+    yellow "为 ${OS} 添加 Docker CE 官方仓库..."
+    local repo_pkg="" repo_cmd=""
     if command -v dnf &>/dev/null; then
-      repo_manager_pkg="dnf-plugins-core"
-      repo_add_cmd="dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo"
-      if [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]] || [[ "$OS" == "rocky" ]] || [[ "$OS" == "almalinux" ]]; then
-        repo_add_cmd="dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+      repo_pkg="dnf-plugins-core"
+      if [[ "$OS" == "fedora" ]]; then
+        repo_cmd="dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo"
+      else
+        repo_cmd="dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
       fi
     elif command -v yum &>/dev/null; then
-      repo_manager_pkg="yum-utils"
-      repo_add_cmd="yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+      repo_pkg="yum-utils"
+      repo_cmd="yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
     fi
-
-    if [[ -n "$repo_manager_pkg" ]]; then
-      install_dependency "config-manager" "$repo_manager_pkg"
-      # 添加 sudo（如果需要）
-      local full_repo_cmd="$repo_add_cmd"
-      if [[ "$EUID" -ne 0 ]] && [[ "$full_repo_cmd" != sudo* ]]; then
-        full_repo_cmd="sudo $full_repo_cmd"
-      fi
-      yellow "执行: $full_repo_cmd"
-      eval "$full_repo_cmd" || red "添加 Docker repo 失败"
-    else
-      yellow "警告：无法确定用于添加仓库的命令。"
+    if [[ -n "$repo_pkg" ]]; then
+      install_dependency "config-manager" "$repo_pkg"
+      local full_cmd="$repo_cmd"
+      [[ "$EUID" -ne 0 && "$full_cmd" != sudo* ]] && full_cmd="sudo $full_cmd"
+      eval "$full_cmd" || yellow "添加 Docker 仓库失败，继续尝试..."
     fi
   fi
 
-  install_dependency "docker" "$docker_package"
+  install_dependency "docker" "$docker_pkg"
 
   if [[ "$OS" == "openwrt" ]]; then
-    if ! /etc/init.d/dockerd status 2>/dev/null | grep -q "running"; then
-      yellow "尝试启动并启用 Docker 服务 (OpenWrt init.d)..."
-      /etc/init.d/dockerd enable || yellow "警告：无法启用 Docker 服务。"
-      /etc/init.d/dockerd start  || yellow "警告：无法启动 Docker 服务，请手动检查：/etc/init.d/dockerd start"
-    else
-      green "Docker 服务已运行 (OpenWrt init.d)。"
-    fi
+    /etc/init.d/dockerd status 2>/dev/null | grep -q "running" || {
+      /etc/init.d/dockerd enable || true
+      /etc/init.d/dockerd start  || yellow "请手动启动 Docker：/etc/init.d/dockerd start"
+    }
   elif command -v systemctl &>/dev/null; then
-    if ! systemctl is-active --quiet docker &>/dev/null; then
-      yellow "尝试启动并启用 Docker 服务 (systemd)..."
-      local systemctl_cmd="systemctl enable --now docker"
-      if [[ "$EUID" -ne 0 ]]; then systemctl_cmd="sudo $systemctl_cmd"; fi
-      eval "$systemctl_cmd" || yellow "警告：无法自动启动或启用 Docker 服务，请手动操作。"
-    else
-      green "Docker 服务已运行 (systemd)。"
-    fi
+    systemctl is-active --quiet docker || {
+      local sc_cmd="systemctl enable --now docker"
+      [[ "$EUID" -ne 0 ]] && sc_cmd="sudo $sc_cmd"
+      eval "$sc_cmd" || yellow "请手动启动 Docker 服务。"
+    }
+    green "Docker 服务已运行（systemd）。"
   else
-    yellow "警告：未知的服务管理器，请确保 Docker 服务已手动启动。"
+    yellow "未知服务管理器，请确保 Docker 已启动。"
   fi
 
-  if ! docker info &>/dev/null; then
-    red "错误：Docker 服务未能成功启动或无法连接。请手动检查 Docker 安装和状态。"
-    exit 1
-  fi
+  docker info &>/dev/null || { red "Docker 无法连接，请检查安装状态。"; exit 1; }
 
-  # 检查 Docker Compose
+  # Docker Compose 检查
   if docker compose version &>/dev/null; then
-    green "Docker Compose 插件已安装: $(docker compose version | head -n 1)"
+    green "Docker Compose 插件：$(docker compose version | head -n1)"
   elif command -v docker-compose &>/dev/null; then
-    green "Docker Compose (独立版) 已安装: $(docker-compose --version)"
+    green "Docker Compose 独立版：$(docker-compose --version)"
   else
-    if [[ "$PACKAGE_MANAGER" == "opkg" ]] && opkg list-installed | grep -q "docker-compose"; then
-      yellow "警告：opkg 显示 docker-compose 已安装，但命令未找到。请检查 PATH 或安装是否完整。"
-    fi
-
     yellow "Docker Compose 未找到，尝试安装独立版..."
-
-    # ✅ 修复：动态获取最新版本，原来硬编码为 v2.29.2，已过旧
-    local compose_version
-    compose_version=$(curl -sSL "https://api.github.com/repos/docker/compose/releases/latest" \
+    local cv
+    cv=$(curl -sSL --connect-timeout 10 \
+      "https://api.github.com/repos/docker/compose/releases/latest" \
       | grep '"tag_name"' | head -n1 | cut -d'"' -f4 2>/dev/null \
       || echo "$COMPOSE_FALLBACK_VERSION")
-    yellow "将安装 Docker Compose 版本: $compose_version"
-
-    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-$(uname -s)-$(uname -m)"
-    local install_path="/usr/local/bin/docker-compose"
-
-    if ! [[ -d "/usr/local/bin" ]] || ! [[ -w "/usr/local/bin" ]]; then
-      if [[ -d "/usr/bin" ]] && [[ -w "/usr/bin" ]]; then
-        install_path="/usr/bin/docker-compose"
-        yellow "将尝试安装到 /usr/bin/docker-compose"
-      else
-        red "错误：无法找到合适的位置安装 docker-compose。请检查权限或手动安装。"
-        exit 1
-      fi
-    fi
-
-    yellow "下载 Docker Compose ${compose_version} 到 $install_path ..."
-    local download_cmd=""
-    if command -v curl &>/dev/null; then
-      download_cmd="curl -sSL \"$compose_url\" -o /tmp/docker-compose"
-    elif command -v wget &>/dev/null; then
-      download_cmd="wget -q \"$compose_url\" -O /tmp/docker-compose"
-    else
-      red "错误：需要 curl 或 wget 来下载 docker-compose。"
-      exit 1
-    fi
-
-    if eval "$download_cmd"; then
-      local mv_cmd="mv /tmp/docker-compose \"$install_path\""
-      local chmod_cmd="chmod +x \"$install_path\""
-      if [[ "$EUID" -ne 0 ]]; then
-        mv_cmd="sudo $mv_cmd"
-        chmod_cmd="sudo $chmod_cmd"
-      fi
-      if eval "$mv_cmd" && eval "$chmod_cmd"; then
-        if command -v docker-compose &>/dev/null; then
-          green "docker-compose $compose_version 安装成功。"
-        else
-          red "docker-compose 文件已移动，但命令仍未找到。请检查 PATH 环境变量。"
-          exit 1
-        fi
-      else
-        red "移动或设置 docker-compose 权限失败。"
-        rm -f /tmp/docker-compose
-        exit 1
-      fi
-    else
-      red "docker-compose 下载失败，请检查网络连接或手动下载安装。"
-      exit 1
-    fi
+    yellow "安装版本：$cv"
+    local url="https://github.com/docker/compose/releases/download/${cv}/docker-compose-$(uname -s)-$(uname -m)"
+    local dst="/usr/local/bin/docker-compose"
+    [[ -w "/usr/local/bin" ]] || dst="/usr/bin/docker-compose"
+    local dl_cmd=""
+    command -v curl &>/dev/null \
+      && dl_cmd="curl -sSL \"$url\" -o /tmp/docker-compose" \
+      || dl_cmd="wget -q \"$url\" -O /tmp/docker-compose"
+    eval "$dl_cmd" || { red "下载 docker-compose 失败。"; exit 1; }
+    local mv_cmd="mv /tmp/docker-compose \"$dst\""
+    local cx_cmd="chmod +x \"$dst\""
+    if [[ "$EUID" -ne 0 ]]; then mv_cmd="sudo $mv_cmd"; cx_cmd="sudo $cx_cmd"; fi
+    eval "$mv_cmd" && eval "$cx_cmd" && green "docker-compose $cv 安装成功。" \
+      || { red "安装 docker-compose 失败。"; rm -f /tmp/docker-compose; exit 1; }
   fi
 }
 
 function check_user_permission() {
-  if [[ "$OS" == "openwrt" ]]; then
-    if [[ "$EUID" -eq 0 ]]; then
-      green "当前用户是 root，拥有 Docker 权限。"
-    else
-      yellow "警告：在 OpenWrt 上但未使用 root 用户 ($USER)。后续 Docker 命令可能需要手动添加 'sudo'。"
-    fi
-    return 0
-  fi
-
-  if [[ "$EUID" -eq 0 ]]; then
-    green "当前用户是 root，拥有 Docker 权限。"
-    return 0
-  fi
+  [[ "$OS" == "openwrt" ]] && return 0
+  [[ "$EUID" -eq 0 ]] && { green "当前为 root 用户。"; return 0; }
 
   if groups "$USER" | grep -q '\bdocker\b'; then
-    green "当前用户 ($USER) 已在 Docker 用户组中。"
+    green "用户 $USER 已在 docker 组中。"
   else
-    yellow "警告：当前用户 ($USER) 未加入 Docker 用户组。"
+    yellow "用户 $USER 不在 docker 组中，尝试自动加入..."
     if command -v sudo &>/dev/null; then
-      yellow "尝试将用户添加到 docker 组..."
-      if sudo usermod -aG docker "$USER"; then
-        green "已将用户 $USER 添加到 docker 组。"
-        red "请完全注销并重新登录，或者运行 'newgrp docker' 命令以使组成员资格生效！"
-        read -n 1 -s -r -p "按任意键继续，或按 Ctrl+C 退出并重新登录..."
-        echo
-      else
-        red "错误：无法将用户添加到 docker 组。请手动添加或使用 sudo 运行 Docker 命令。"
-      fi
+      sudo usermod -aG docker "$USER" \
+        && green "已加入 docker 组，请执行 'newgrp docker' 或重新登录生效。" \
+        || red "自动加入失败，请手动执行：sudo usermod -aG docker $USER"
     else
-      red "错误：缺少 sudo 命令，无法自动将用户添加到 docker 组。请切换到 root 或手动添加。"
+      red "缺少 sudo，请手动执行：usermod -aG docker $USER"
     fi
   fi
 }
 
-# --- 网络和端口函数 ---
+# ──────────────────────────────────────────────
+# 端口与网络
+# ──────────────────────────────────────────────
 function find_available_port() {
-  local start_port=${1:-$DEFAULT_PORT}
-  local check_cmd=""
-
-  if command -v ss &>/dev/null; then
-    check_cmd="ss -tuln"
-  elif command -v netstat &>/dev/null; then
-    check_cmd="netstat -tuln"
-  else
-    yellow "警告：未找到 ss 或 netstat 命令，无法自动检查端口占用。将直接使用建议端口。"
-    echo "$start_port"
-    return
-  fi
-
-  while $check_cmd | grep -Eq "[:.\[]${start_port}[[:space:]]+"; do
-    ((start_port++))
-    if [[ "$start_port" -gt 65535 ]]; then
-      red "错误：无法找到 65535 以下的可用端口。"
-      start_port=${1:-$DEFAULT_PORT}
-      break
-    fi
+  local p=${1:-3000}
+  local ck=""
+  command -v ss      &>/dev/null && ck="ss -tuln"
+  command -v netstat &>/dev/null && ck="${ck:-netstat -tuln}"
+  [[ -z "$ck" ]] && { echo "$p"; return; }
+  while $ck | grep -Eq "[:.\[]${p}[[:space:]]+"; do
+    ((p++))
+    [[ "$p" -gt 65535 ]] && { p=${1:-3000}; break; }
   done
-  echo $start_port
+  echo "$p"
 }
 
 function validate_port() {
-  local initial_suggestion=${1:-$DEFAULT_PORT}
-  local suggested_port
-  suggested_port=$(find_available_port "$initial_suggestion")
-  green "建议使用的端口：$suggested_port"
-  read -p "请输入您希望使用的端口（留空使用 $suggested_port）： " user_port
-  PORT=${user_port:-$suggested_port}
-
-  if ! [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge 1 && "$PORT" -le 65535 ]]; then
-    red "端口号无效，请输入 1 到 65535 范围内的数字。"
-    validate_port "$initial_suggestion"
-    return
+  local hint=${1:-3000}
+  local sug
+  sug=$(find_available_port "$hint")
+  green "建议端口：$sug"
+  read -rp "请输入端口（留空使用 $sug）：" up </dev/tty
+  PORT=${up:-$sug}
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1 || "$PORT" -gt 65535 ]]; then
+    red "无效端口，请重新输入。"; validate_port "$hint"; return
   fi
-
-  local check_cmd=""
-  if command -v ss &>/dev/null; then check_cmd="ss -tuln"
-  elif command -v netstat &>/dev/null; then check_cmd="netstat -tuln"; fi
-
-  if [[ -n "$check_cmd" ]] && $check_cmd | grep -Eq "[:.\[]${PORT}[[:space:]]+"; then
-    red "端口 $PORT 已被占用，请选择其他端口。"
-    validate_port "$initial_suggestion"
-    return
+  local ck=""
+  command -v ss      &>/dev/null && ck="ss -tuln"
+  command -v netstat &>/dev/null && ck="${ck:-netstat -tuln}"
+  if [[ -n "$ck" ]] && $ck | grep -Eq "[:.\[]${PORT}[[:space:]]+"; then
+    red "端口 $PORT 已被占用。"; validate_port "$hint"; return
   fi
-  green "将使用端口: $PORT"
+  green "使用端口：$PORT"
 }
 
 function choose_network_mode() {
   echo "请选择 Docker 网络模式："
-  echo "  1. bridge (推荐, 容器有独立 IP, 通过端口映射访问)"
-  echo "  2. host (容器共享主机网络, 性能稍好, 但端口冲突风险高)"
-  read -p "请输入选项 (1-2, 默认 1): " mode_choice
-  local chosen_mode=${mode_choice:-1}
-  case $chosen_mode in
-    1) NETWORK_MODE="bridge"; green "选择的网络模式：bridge" ;;
-    2) NETWORK_MODE="host";   green "选择的网络模式：host" ;;
-    *) red "无效选项，将使用默认 bridge 模式。" && NETWORK_MODE="bridge" ;;
+  echo "  1. bridge（推荐，容器独立 IP，通过端口映射访问）"
+  echo "  2. host  （共享主机网络，性能略好，端口冲突风险高）"
+  read -rp "选项 (1-2，默认 1)：" mc </dev/tty
+  case "${mc:-1}" in
+    2) NETWORK_MODE="host";   green "网络模式：host" ;;
+    *) NETWORK_MODE="bridge"; green "网络模式：bridge" ;;
   esac
 }
 
-function validate_network_mode() {
-  case "$NETWORK_MODE" in
-    bridge|host) ;;
-    *) red "内部错误：无效的网络模式 '$NETWORK_MODE'" && exit 1 ;;
-  esac
+# ──────────────────────────────────────────────
+# 辅助工具函数
+# ──────────────────────────────────────────────
+function get_local_ip() {
+  local ip="<服务器IP>"
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' \
+    || ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n1 \
+    || hostname -I 2>/dev/null | awk '{print $1}' \
+    || echo "$ip")
+  echo "$ip"
 }
 
-# --- Docker 操作函数 ---
+function ensure_dir_writable() {
+  local d="$1"
+  mkdir -p "$d"
+  if ! touch "$d/.wtest" 2>/dev/null; then
+    red "目录 $d 不可写，尝试修复权限..."
+    local cc="chown $(id -u):$(id -g) \"$d\""
+    local cm="chmod u+rwx \"$d\""
+    [[ "$EUID" -ne 0 ]] && cc="sudo $cc" && cm="sudo $cm"
+    eval "$cc" || true; eval "$cm" || true
+    touch "$d/.wtest" 2>/dev/null || { red "修复失败，请手动检查 $d"; return 1; }
+  fi
+  rm -f "$d/.wtest"
+  green "目录 $d 可写。"
+}
+
 function check_existing_container() {
-  local name="$1"
-  if docker ps -a --format '{{.Names}}' | grep -Eq "^${name}$"; then
-    red "错误：名为 '$name' 的容器已存在。"
-    yellow "请先使用卸载选项移除现有容器，或为新部署选择其他名称。"
+  local n="$1"
+  if docker ps -a --format '{{.Names}}' | grep -Eq "^${n}$"; then
+    red "容器 '$n' 已存在，请先卸载后再部署。"
     return 1
   fi
   return 0
 }
 
 function pull_image_with_retry() {
-  local image=$1
-  local platform_arg=""
-  if [[ -n "${PLATFORM:-}" ]]; then
-    platform_arg="--platform $PLATFORM"
-  fi
-
-  yellow "正在拉取镜像 $image (平台: ${PLATFORM:-自动检测})..."
+  local img="$1"
+  local pa=""
+  [[ -n "${PLATFORM:-}" ]] && pa="--platform $PLATFORM"
+  yellow "拉取镜像：$img（平台：${PLATFORM:-自动}）..."
   # shellcheck disable=SC2086
-  if ! docker pull $platform_arg "$image"; then
-    red "镜像 $image 拉取失败。"
-    read -p "是否重试？(y/n，默认 n): " retry_pull
-    if [[ "${retry_pull:-n}" =~ ^[Yy]$ ]]; then
-      pull_image_with_retry "$image"
-    else
-      red "放弃拉取镜像 $image。"
-      return 1
-    fi
+  if ! docker pull $pa "$img"; then
+    red "拉取失败：$img"
+    read -rp "是否重试？(y/n，默认 n)：" rp </dev/tty
+    [[ "${rp:-n}" =~ ^[Yy]$ ]] && pull_image_with_retry "$img" || { red "放弃拉取。"; return 1; }
   else
-    green "镜像 $image 拉取成功。"
-    return 0
+    green "镜像拉取成功：$img"
   fi
 }
 
-# --- 通用辅助函数：确保目录可写 ---
-function ensure_dir_writable() {
-  local dir="$1"
-  mkdir -p "$dir"
-  if ! touch "$dir/.writable_test" 2>/dev/null; then
-    red "错误：数据目录 $dir 不可写，请检查权限。"
-    if [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null; then
-      yellow "尝试修复目录权限..."
-      local chown_cmd="chown $(id -u):$(id -g) \"$dir\""
-      local chmod_cmd="chmod u+rwx \"$dir\""
-      if [[ "$EUID" -ne 0 ]]; then
-        chown_cmd="sudo $chown_cmd"
-        chmod_cmd="sudo $chmod_cmd"
-      fi
-      eval "$chown_cmd" || true
-      eval "$chmod_cmd" || true
-      if ! touch "$dir/.writable_test" 2>/dev/null; then
-        red "自动修复权限失败，请手动检查 $dir"
-        return 1
-      fi
-      rm -f "$dir/.writable_test"
-      green "目录权限已尝试修复。"
-    else
-      red "请手动检查 $dir 的权限。"
-      return 1
-    fi
-  else
-    rm -f "$dir/.writable_test"
-    green "数据目录 $dir 可写。"
+# ──────────────────────────────────────────────
+# ★ 版本选择核心函数
+# ──────────────────────────────────────────────
+# 从 GitHub Releases API 获取最新 5 个 tag
+function _fetch_versions_github() {
+  local repo="$1"   # 如：songquanpeng/one-api
+  local resp=""
+  if command -v curl &>/dev/null; then
+    resp=$(curl -sSL --connect-timeout 10 \
+      "https://api.github.com/repos/${repo}/releases?per_page=10" 2>/dev/null || true)
+  elif command -v wget &>/dev/null; then
+    resp=$(wget -qO- --timeout=10 \
+      "https://api.github.com/repos/${repo}/releases?per_page=10" 2>/dev/null || true)
   fi
+  [[ -z "$resp" ]] && return 1
+  echo "$resp" | grep '"tag_name"' | cut -d'"' -f4 | head -n5
 }
 
-# --- 通用辅助函数：获取本机 IP ---
-function get_local_ip() {
-  local ip="<您的服务器IP>"
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || \
-       ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n 1 || \
-       hostname -I 2>/dev/null | awk '{print $1}' || \
-       echo "$ip")
-  echo "$ip"
+# 从 Docker Hub API 获取版本 tag（过滤 latest 和 sha256 签名 tag）
+function _fetch_versions_dockerhub() {
+  local repo="$1"   # 如：calciumion/new-api
+  local resp=""
+  if command -v curl &>/dev/null; then
+    resp=$(curl -sSL --connect-timeout 10 \
+      "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=30&ordering=last_updated" 2>/dev/null || true)
+  elif command -v wget &>/dev/null; then
+    resp=$(wget -qO- --timeout=10 \
+      "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=30&ordering=last_updated" 2>/dev/null || true)
+  fi
+  [[ -z "$resp" ]] && return 1
+  # 只保留 v* 开头的语义化版本 tag，过滤 latest 和 sha256 签名
+  echo "$resp" \
+    | grep -o '"name":"[^"]*"' \
+    | cut -d'"' -f4 \
+    | grep -E '^v[0-9]' \
+    | head -n5
 }
 
-# --- 通用部署服务函数 (SQLite 版本) ---
+# 展示版本列表并让用户选择，结果写入全局 SELECTED_IMAGE
+# 用法：select_image_version "服务名" "镜像基础名" "github|dockerhub" "仓库路径"
+function select_image_version() {
+  local svc_name="$1"
+  local img_base="$2"
+  local fetch_type="$3"
+  local fetch_src="$4"
+
+  SELECTED_IMAGE="${img_base}:latest"   # 默认值
+
+  yellow "正在获取 ${svc_name} 版本列表，请稍候..."
+
+  local versions=()
+  local fetch_ok=false
+
+  if [[ "$fetch_type" == "github" ]]; then
+    mapfile -t versions < <(_fetch_versions_github "$fetch_src" 2>/dev/null) && fetch_ok=true
+  elif [[ "$fetch_type" == "dockerhub" ]]; then
+    mapfile -t versions < <(_fetch_versions_dockerhub "$fetch_src" 2>/dev/null) && fetch_ok=true
+  fi
+
+  # 去掉空元素
+  local clean_versions=()
+  for v in "${versions[@]:-}"; do
+    [[ -n "$v" ]] && clean_versions+=("$v")
+  done
+  versions=("${clean_versions[@]:-}")
+
+  echo ""
+  cyan "┌─────────────────────────────────────────────────────┐"
+  cyan "│  请选择 ${svc_name} 版本（推荐使用 latest 自动更新）  │"
+  cyan "└─────────────────────────────────────────────────────┘"
+  echo "  1. latest"
+
+  local i=2
+  if [[ ${#versions[@]} -gt 0 ]]; then
+    for v in "${versions[@]}"; do
+      printf "  %d. %s\n" "$i" "$v"
+      ((i++))
+    done
+  fi
+
+  local manual_idx=$i
+  printf "  %d. 手动输入版本号\n" "$manual_idx"
+  echo ""
+
+  if [[ "$fetch_ok" == false || ${#versions[@]} -eq 0 ]]; then
+    yellow "（网络不可达或无版本数据，仅可选 latest 或手动输入）"
+  fi
+
+  read -rp "请输入版本编号（留空使用 latest）：" vc </dev/tty
+
+  if [[ -z "$vc" || "$vc" == "1" ]]; then
+    SELECTED_IMAGE="${img_base}:latest"
+
+  elif [[ "$vc" =~ ^[0-9]+$ ]] && [[ "$vc" -ge 2 && "$vc" -lt "$manual_idx" ]]; then
+    local idx=$(( vc - 2 ))
+    SELECTED_IMAGE="${img_base}:${versions[$idx]}"
+
+  elif [[ "$vc" == "$manual_idx" ]]; then
+    read -rp "请输入版本号（如 v0.6.11）：" mv </dev/tty
+    if [[ -z "$mv" ]]; then
+      yellow "未输入，使用 latest。"
+      SELECTED_IMAGE="${img_base}:latest"
+    else
+      SELECTED_IMAGE="${img_base}:${mv}"
+    fi
+
+  else
+    yellow "无效选项，使用 latest。"
+    SELECTED_IMAGE="${img_base}:latest"
+  fi
+
+  green "已选择版本：$SELECTED_IMAGE"
+}
+
+# ──────────────────────────────────────────────
+# 通用 SQLite 部署
+# ──────────────────────────────────────────────
 function deploy_service_sqlite() {
-  local name="$1"
+  local cname="$1"
   local image="$2"
-  local internal_port="$3"
-  local data_dir_name="$4"
-  local data_dir="$HOME/$data_dir_name"
+  local int_port="$3"
+  local data_name="$4"
+  local data_dir="$HOME/$data_name"
 
-  if ! check_existing_container "$name"; then return 1; fi
-
-  validate_port "$internal_port"
+  check_existing_container "$cname" || return 1
+  validate_port "$int_port"
   choose_network_mode
-  validate_network_mode
+  pull_image_with_retry "$image" || return 1
 
-  if ! pull_image_with_retry "$image"; then return 1; fi
+  [[ "$OS" == "openwrt" ]] && {
+    yellow "OpenWrt 存储有限，数据存于 $data_dir，建议挂载外部存储。"
+    read -rp "按 Enter 继续，Ctrl+C 退出..." </dev/tty
+  }
+  ensure_dir_writable "$data_dir" || return 1
 
-  if [[ "$OS" == "openwrt" ]]; then
-    yellow "警告：OpenWrt/LibWRT 存储空间有限，数据将存放在 $data_dir。"
-    yellow "强烈建议将数据映射到外部存储！"
-    read -p "按 Enter 继续使用默认路径，或按 Ctrl+C 退出以修改脚本..." </dev/tty
-  fi
-
-  if ! ensure_dir_writable "$data_dir"; then return 1; fi
-
-  green "正在部署 $name (SQLite 模式)..."
-  local docker_run_cmd=()
-  docker_run_cmd+=(docker run -d --name "$name")
-  docker_run_cmd+=(--restart always)
+  green "部署 $cname（SQLite）..."
+  local cmd=()
+  cmd+=(docker run -d --name "$cname" --restart unless-stopped)
 
   if [[ "$NETWORK_MODE" == "host" ]]; then
-    docker_run_cmd+=(--network host)
-    yellow "使用 host 网络模式，容器将尝试监听端口 $internal_port。"
+    cmd+=(--network host)
+    yellow "host 模式，监听端口 $int_port。"
   else
-    docker_run_cmd+=(--network bridge)
-    docker_run_cmd+=(-p "$PORT:$internal_port")
+    cmd+=(--network bridge -p "$PORT:$int_port")
+  fi
+  cmd+=(-v "$data_dir:/data" -e "TZ=$DEFAULT_TZ" "$image")
+
+  yellow "执行：${cmd[*]}"
+  if ! "${cmd[@]}"; then
+    red "启动失败！"; docker rm "$cname" &>/dev/null || true; return 1
   fi
 
-  docker_run_cmd+=(-v "$data_dir:/data")
-  docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
-  docker_run_cmd+=("$image")
-
-  yellow "执行命令: ${docker_run_cmd[*]}"
-  if ! eval "${docker_run_cmd[*]}"; then
-    red "容器 $name 启动失败！"
-    yellow "请检查容器日志获取详细错误信息: docker logs $name"
-    docker rm "$name" &>/dev/null || true
-    return 1
-  fi
-
-  local access_ip
-  access_ip=$(get_local_ip)
-  local access_port=$PORT
-  [[ "$NETWORK_MODE" == "host" ]] && access_port=$internal_port
-
-  green "$name 部署成功！"
-  green "访问地址: http://$access_ip:$access_port"
-  green "数据目录: $data_dir"
-  green "查看日志: docker logs $name"
-  green "停止容器: docker stop $name"
-  green "启动容器: docker start $name"
-  green "卸载服务请使用脚本菜单。"
+  local ip; ip=$(get_local_ip)
+  local ap=$PORT; [[ "$NETWORK_MODE" == "host" ]] && ap=$int_port
+  green "✅ $cname 部署成功！"
+  green "   访问地址：http://$ip:$ap"
+  green "   数据目录：$data_dir"
+  green "   查看日志：docker logs -f $cname"
+  green "   初始账号：root / 123456"
 }
 
-# --- 部署 One-API (MySQL) ---
+# ──────────────────────────────────────────────
+# ★ 部署 One-API（SQLite）
+# ──────────────────────────────────────────────
+function deploy_one_api_sqlite() {
+  local cname="one-api"
+  echo ""
+  bold "══════════════════════════════════════════"
+  bold " 部署 One-API（SQLite）"
+  bold " 仓库：https://github.com/songquanpeng/one-api"
+  bold "══════════════════════════════════════════"
+
+  check_existing_container "$cname" || return 1
+
+  # 版本选择
+  select_image_version \
+    "One-API" \
+    "$ONE_API_IMAGE_BASE" \
+    "github" \
+    "songquanpeng/one-api"
+
+  deploy_service_sqlite "$cname" "$SELECTED_IMAGE" 3000 "one-api-data"
+}
+
+# ──────────────────────────────────────────────
+# ★ 部署 One-API（MySQL）
+# ──────────────────────────────────────────────
 function deploy_one_api_mysql() {
-  local name="one-api-mysql"
-  local image="$LATEST_ONE_API_IMAGE"
-  local internal_port="3000"
-  local data_dir_name="one-api-mysql-logs"
-  local data_dir="$HOME/$data_dir_name"
-  local db_host db_port db_user db_pass db_name sql_dsn
+  local cname="one-api-mysql"
+  local int_port="3000"
+  local data_dir="$HOME/one-api-mysql-logs"
 
-  yellow "--- 部署 One-API (使用 MySQL) ---"
+  echo ""
+  bold "══════════════════════════════════════════"
+  bold " 部署 One-API（MySQL）"
+  bold " 仓库：https://github.com/songquanpeng/one-api"
+  bold "══════════════════════════════════════════"
 
-  if ! check_existing_container "$name"; then return 1; fi
+  check_existing_container "$cname" || return 1
 
-  validate_port "$internal_port"
+  # 版本选择
+  select_image_version \
+    "One-API" \
+    "$ONE_API_IMAGE_BASE" \
+    "github" \
+    "songquanpeng/one-api"
+
+  local sel_image="$SELECTED_IMAGE"
+
+  validate_port "$int_port"
   choose_network_mode
-  validate_network_mode
 
-  yellow "请输入 MySQL 数据库连接信息:"
-  read -p "  数据库主机 (例如: localhost, 192.168.1.10): " db_host </dev/tty
-  read -p "  数据库端口 (默认 3306): " db_port </dev/tty
+  # MySQL 连接信息
+  yellow "请输入 MySQL 连接信息："
+  read -rp "  主机（如 localhost / 192.168.1.10）：" db_host </dev/tty
+  read -rp "  端口（默认 3306）：" db_port </dev/tty
   db_port=${db_port:-3306}
-  read -p "  数据库用户名 (例如: root, oneapi_user): " db_user </dev/tty
-  read -sp "  数据库密码: " db_pass </dev/tty
-  echo
-  read -p "  数据库名称 (例如: oneapi): " db_name </dev/tty
+  read -rp "  用户名：" db_user </dev/tty
+  read -rsp "  密码：" db_pass </dev/tty; echo
+  read -rp "  数据库名：" db_name </dev/tty
 
   if [[ -z "$db_host" || -z "$db_user" || -z "$db_name" ]]; then
-    red "错误：数据库主机、用户名和名称不能为空。"
-    return 1
+    red "主机/用户名/数据库名不能为空。"; return 1
   fi
-  if ! [[ "$db_port" =~ ^[0-9]+$ ]]; then
-    red "错误：数据库端口必须是数字。"
-    return 1
-  fi
+  [[ ! "$db_port" =~ ^[0-9]+$ ]] && { red "端口必须为数字。"; return 1; }
 
-  sql_dsn="${db_user}:${db_pass}@tcp(${db_host}:${db_port})/${db_name}"
-  yellow "将使用的 SQL_DSN: ${db_user}:******@tcp(${db_host}:${db_port})/${db_name}"
+  local dsn="${db_user}:${db_pass}@tcp(${db_host}:${db_port})/${db_name}"
+  yellow "DSN（密码已隐藏）：${db_user}:******@tcp(${db_host}:${db_port})/${db_name}"
 
-  if ! pull_image_with_retry "$image"; then return 1; fi
+  pull_image_with_retry "$sel_image" || return 1
+  ensure_dir_writable "$data_dir" || return 1
 
-  if [[ "$OS" == "openwrt" ]]; then
-    yellow "警告：OpenWrt/LibWRT 存储空间有限，日志等数据将存放在 $data_dir。"
-    read -p "按 Enter 继续，或按 Ctrl+C 退出..." </dev/tty
-  fi
+  local cmd=()
+  cmd+=(docker run -d --name "$cname" --restart unless-stopped)
+  [[ "$NETWORK_MODE" == "host" ]] \
+    && cmd+=(--network host) \
+    || cmd+=(--network bridge -p "$PORT:$int_port")
+  cmd+=(-v "$data_dir:/data" -e "TZ=$DEFAULT_TZ" -e "SQL_DSN=$dsn" "$sel_image")
 
-  if ! ensure_dir_writable "$data_dir"; then return 1; fi
-
-  green "正在部署 $name (MySQL 模式)..."
-  local docker_run_cmd=()
-  docker_run_cmd+=(docker run -d --name "$name")
-  docker_run_cmd+=(--restart always)
-
-  if [[ "$NETWORK_MODE" == "host" ]]; then
-    docker_run_cmd+=(--network host)
-    yellow "使用 host 网络模式，容器将尝试监听端口 $internal_port。"
-  else
-    docker_run_cmd+=(--network bridge)
-    docker_run_cmd+=(-p "$PORT:$internal_port")
+  yellow "执行：${cmd[*]//SQL_DSN=*/SQL_DSN=***}"
+  if ! "${cmd[@]}"; then
+    red "启动失败！"; docker rm "$cname" &>/dev/null || true; return 1
   fi
 
-  docker_run_cmd+=(-v "$data_dir:/data")
-  docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
-  docker_run_cmd+=(-e "SQL_DSN=$sql_dsn")
-  docker_run_cmd+=("$image")
-
-  yellow "执行命令: ${docker_run_cmd[*]}"
-  if ! eval "${docker_run_cmd[*]}"; then
-    red "容器 $name 启动失败！"
-    yellow "请检查数据库连接信息是否正确，以及容器日志: docker logs $name"
-    docker rm "$name" &>/dev/null || true
-    return 1
-  fi
-
-  local access_ip
-  access_ip=$(get_local_ip)
-  local access_port=$PORT
-  [[ "$NETWORK_MODE" == "host" ]] && access_port=$internal_port
-
-  green "$name 部署成功！(使用 MySQL)"
-  green "访问地址: http://$access_ip:$access_port"
-  green "数据库配置: ${db_user}@${db_host}:${db_port}/${db_name}"
-  green "日志/数据目录 (非数据库): $data_dir"
-  green "查看日志: docker logs $name"
+  local ip; ip=$(get_local_ip)
+  local ap=$PORT; [[ "$NETWORK_MODE" == "host" ]] && ap=$int_port
+  green "✅ $cname 部署成功！（MySQL 模式）"
+  green "   访问地址：http://$ip:$ap"
+  green "   数据库：${db_user}@${db_host}:${db_port}/${db_name}"
+  green "   日志目录：$data_dir"
+  green "   初始账号：root / 123456"
 }
 
-# --- 部署 Uni-API ---
-# ⚠️ 注意：Uni-API 通过克隆 GitHub 仓库源码本地构建，以下情况可能导致构建失败：
-#   1. 网络无法访问 GitHub
-#   2. 上游 Dockerfile 或依赖发生变更
-#   3. 构建环境缺少必要工具链
-# 如有预构建镜像可用，建议修改 UNI_API_IMAGE 并跳过 git clone + docker build 步骤。
-# 参考：https://github.com/yym68686/uni-api
-function deploy_uni_api() {
-  local name="uni-api"
-  local image="$UNI_API_IMAGE"
-  local internal_port="8000"
-  local data_dir_name="uni-api-data"
-  local data_dir="$HOME/$data_dir_name"
-  local env_file="$data_dir/.env"
+# ──────────────────────────────────────────────
+# ★ 部署 New-API（calciumion）
+# ──────────────────────────────────────────────
+function deploy_new_api() {
+  local cname="new-api"
+  local int_port="3000"
+  local data_name="new-api-data"
 
-  yellow "--- 部署 Uni-API ---"
-  yellow "⚠️  注意：Uni-API 将通过克隆源码本地构建，需要访问 GitHub 且构建耗时较长。"
+  echo ""
+  bold "══════════════════════════════════════════"
+  bold " 部署 New-API（calciumion/new-api）"
+  bold " 文档：https://docs.newapi.pro"
+  bold "══════════════════════════════════════════"
 
-  if ! check_existing_container "$name"; then return 1; fi
+  check_existing_container "$cname" || return 1
 
-  validate_port "$internal_port"
-  choose_network_mode
-  validate_network_mode
+  # 版本选择（Docker Hub）
+  select_image_version \
+    "New-API" \
+    "$NEW_API_IMAGE_BASE" \
+    "dockerhub" \
+    "calciumion/new-api"
 
-  yellow "检查 git 是否安装..."
-  install_dependency "git" "git"
+  local sel_image="$SELECTED_IMAGE"
 
-  yellow "克隆 uni-api 仓库到临时目录 $TEMP_DIR..."
-  rm -rf "$TEMP_DIR" && mkdir -p "$TEMP_DIR"
-  if ! git clone https://github.com/yym68686/uni-api.git "$TEMP_DIR"; then
-    red "错误：克隆 uni-api 仓库失败，请检查网络或仓库地址。"
-    rm -rf "$TEMP_DIR"
-    return 1
+  # 数据库模式
+  echo ""
+  read -rp "数据库模式：(1) SQLite  (2) MySQL  [默认 1]：" db_mode </dev/tty
+  db_mode=${db_mode:-1}
+
+  if [[ "$db_mode" == "2" ]]; then
+    validate_port "$int_port"
+    choose_network_mode
+    pull_image_with_retry "$sel_image" || return 1
+
+    yellow "请输入 MySQL 连接信息："
+    read -rp "  主机：" db_host </dev/tty
+    read -rp "  端口（默认 3306）：" db_port </dev/tty
+    db_port=${db_port:-3306}
+    read -rp "  用户名：" db_user </dev/tty
+    read -rsp "  密码：" db_pass </dev/tty; echo
+    read -rp "  数据库名：" db_name </dev/tty
+
+    [[ -z "$db_host" || -z "$db_user" || -z "$db_name" ]] && { red "字段不能为空。"; return 1; }
+    [[ ! "$db_port" =~ ^[0-9]+$ ]] && { red "端口必须为数字。"; return 1; }
+
+    local dsn="${db_user}:${db_pass}@tcp(${db_host}:${db_port})/${db_name}"
+    local data_dir="$HOME/$data_name"
+    ensure_dir_writable "$data_dir" || return 1
+
+    local cmd=()
+    cmd+=(docker run -d --name "$cname" --restart unless-stopped)
+    [[ "$NETWORK_MODE" == "host" ]] \
+      && cmd+=(--network host) \
+      || cmd+=(--network bridge -p "$PORT:$int_port")
+    cmd+=(-v "$data_dir:/data" -e "TZ=$DEFAULT_TZ" -e "SQL_DSN=$dsn" "$sel_image")
+
+    yellow "执行：${cmd[*]//SQL_DSN=*/SQL_DSN=***}"
+    if ! "${cmd[@]}"; then
+      red "启动失败！"; docker rm "$cname" &>/dev/null || true; return 1
+    fi
+
+    local ip; ip=$(get_local_ip)
+    local ap=$PORT; [[ "$NETWORK_MODE" == "host" ]] && ap=$int_port
+    green "✅ $cname 部署成功！（MySQL 模式）"
+    green "   访问地址：http://$ip:$ap"
+    green "   初始账号：root / 123456"
+  else
+    # SQLite 模式
+    deploy_service_sqlite "$cname" "$sel_image" "$int_port" "$data_name"
+  fi
+}
+
+# ──────────────────────────────────────────────
+# ★ 部署 FreeLLMAPI
+#   修复：named volume + docker compose + -e 注入
+#   ENCRYPTION_KEY 持久化到 ~/.freellmapi_encryption_key
+# ──────────────────────────────────────────────
+function deploy_freellmapi() {
+  local cname="freellmapi"
+  local int_port="3001"
+  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
+
+  echo ""
+  red    "╔══════════════════════════════════════════════════════════════╗"
+  red    "║  部署 FreeLLMAPI                                               ║"
+  yellow "║  16 家 LLM 平台免费额度聚合，OpenAI 兼容 /v1 端点              ║"
+  yellow "║  仓库：https://github.com/tashfeenahmed/freellmapi             ║"
+  red    "║  ⚠️  仅供个人实验，需出网访问各 LLM 平台，纯内网环境不可用     ║"
+  red    "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  check_existing_container "$cname" || return 1
+
+  # 检查 openssl
+  command -v openssl &>/dev/null || install_dependency "openssl" "openssl"
+
+  # 版本选择（GitHub）
+  select_image_version \
+    "FreeLLMAPI" \
+    "$FREELLMAPI_IMAGE_BASE" \
+    "github" \
+    "tashfeenahmed/freellmapi"
+
+  local sel_image="$SELECTED_IMAGE"
+
+  # 端口
+  validate_port "$int_port"
+  local chosen_port="$PORT"
+
+  # 局域网访问范围
+  local host_bind="127.0.0.1"
+  echo ""
+  echo "请选择网络访问范围："
+  echo "  1. 仅本机访问       (HOST_BIND=127.0.0.1，安全）"
+  echo "  2. 局域网所有设备   (HOST_BIND=0.0.0.0，局域网 Ubuntu 服务器选此项)"
+  read -rp "选项 (1-2，默认 1)：" bc </dev/tty
+  case "${bc:-1}" in
+    2) host_bind="0.0.0.0"; yellow "⚠️  局域网模式，请在受信任网络中使用。" ;;
+    *) host_bind="127.0.0.1" ;;
+  esac
+  green "访问绑定：$host_bind"
+
+  # 频率限制
+  local rpm="120"
+  read -rp "每分钟最大请求数（默认 120，0=禁用）：" ri </dev/tty
+  [[ "$ri" =~ ^[0-9]+$ ]] && rpm="$ri"
+
+  # ENCRYPTION_KEY 持久化管理
+  local key_file="$HOME/.freellmapi_encryption_key"
+  local enc_key=""
+  if [[ -f "$key_file" ]]; then
+    enc_key=$(cat "$key_file")
+    green "复用已有 ENCRYPTION_KEY：$key_file"
+  else
+    enc_key=$(openssl rand -hex 32)
+    echo "$enc_key" > "$key_file"
+    chmod 600 "$key_file"
+    green "已生成新 ENCRYPTION_KEY：$key_file"
+    red   "⚠️  请备份此文件，升级/迁移时必须保留！"
   fi
 
-  yellow "构建 uni-api Docker 镜像 $image..."
-  cd "$TEMP_DIR"
-  local platform_arg=""
-  [[ -n "${PLATFORM:-}" ]] && platform_arg="--platform $PLATFORM"
-  # shellcheck disable=SC2086
-  if ! docker build $platform_arg -t "$image" .; then
-    red "错误：构建 uni-api 镜像失败，请检查 Dockerfile 或构建日志。"
-    cd - >/dev/null
-    rm -rf "$TEMP_DIR"
-    return 1
+  # 已存在 compose 目录提示
+  if [[ -d "$compose_dir" ]]; then
+    yellow "发现已有部署目录：$compose_dir"
+    read -rp "是否覆盖重新部署（保留 ENCRYPTION_KEY）？(y/n，默认 n)：" ow </dev/tty
+    [[ ! "${ow:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
+  fi
+  mkdir -p "$compose_dir"
+
+  # 生成 .env（放 compose 根目录，docker compose 自动读取）
+  cat > "$compose_dir/.env" << EOF
+# FreeLLMAPI 配置 — $(date '+%Y-%m-%d %H:%M:%S')
+# ⚠️  ENCRYPTION_KEY 丢失将导致所有已加密 provider key 永久无法解密
+ENCRYPTION_KEY=${enc_key}
+PORT=${chosen_port}
+HOST_BIND=${host_bind}
+PROXY_RATE_LIMIT_RPM=${rpm}
+REQUEST_ANALYTICS_RETENTION_DAYS=90
+REQUEST_ANALYTICS_MAX_ROWS=100000
+EOF
+  chmod 600 "$compose_dir/.env"
+  green ".env 已写入：$compose_dir/.env"
+
+  # 生成 docker-compose.yml
+  # 使用 named volume 解决 SQLite unable to open database file 权限问题
+  cat > "$compose_dir/docker-compose.yml" << EOF
+# FreeLLMAPI docker-compose.yml — $(date '+%Y-%m-%d %H:%M:%S')
+services:
+  freellmapi:
+    image: ${sel_image}
+    container_name: freellmapi
+    restart: unless-stopped
+    ports:
+      - "${host_bind}:${chosen_port}:${chosen_port}"
+    volumes:
+      # named volume：Docker 自动管理权限，彻底规避 SQLite 权限问题
+      - freellmapi-data:/app/server/data
+    env_file:
+      # .env 与 compose 同目录，dotenvx 正确读取，不再出现 injected env (0)
+      - .env
+    environment:
+      - TZ=${DEFAULT_TZ}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${chosen_port}/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  freellmapi-data:
+    name: freellmapi-data
+EOF
+  green "docker-compose.yml 已写入：$compose_dir/docker-compose.yml"
+
+  # 拉取指定版本镜像
+  pull_image_with_retry "$sel_image" || return 1
+
+  # 启动
+  green "启动 FreeLLMAPI..."
+  cd "$compose_dir"
+  if ! docker compose up -d; then
+    red "docker compose up -d 失败！"
+    yellow "查看日志：docker compose -f $compose_dir/docker-compose.yml logs"
+    cd - >/dev/null; return 1
   fi
   cd - >/dev/null
-  rm -rf "$TEMP_DIR"
-  green "uni-api 镜像 $image 构建成功。"
 
-  if [[ "$OS" == "openwrt" ]]; then
-    yellow "警告：OpenWrt/LibWRT 存储空间有限，数据将存放在 $data_dir。"
-    yellow "强烈建议将数据映射到外部存储！"
-    read -p "按 Enter 继续，或按 Ctrl+C 退出..." </dev/tty
-  fi
+  yellow "等待服务启动（10 秒）..."
+  sleep 10
 
-  if ! ensure_dir_writable "$data_dir"; then return 1; fi
-
-  yellow "uni-api 需要 .env 文件配置 API 密钥（如 OPENAI_API_KEY）。"
-  read -p "是否生成示例 .env 文件？(y/n，默认 y): " env_choice </dev/tty
-  if [[ "${env_choice:-y}" =~ ^[Yy]$ ]]; then
-    cat > "$env_file" << 'EOF'
-DATABASE_URL=sqlite:////app/data/uni_api.db
-OPENAI_API_KEY=your_openai_key
-ANTHROPIC_API_KEY=your_anthropic_key
-GROQ_API_KEY=your_groq_key
-# 添加其他 API 密钥或配置
-EOF
-    green "示例 .env 文件已生成：$env_file"
-    yellow "请编辑 $env_file 添加有效的 API 密钥，否则服务可能无法正常工作。"
-    read -p "按 Enter 继续，或按 Ctrl+C 退出以编辑 .env 文件..." </dev/tty
-  fi
-  if [[ ! -f "$env_file" ]]; then
-    yellow "警告：未找到 .env 文件，容器可能因缺少配置而失败。"
-  fi
-
-  green "正在部署 $name..."
-  local docker_run_cmd=()
-  docker_run_cmd+=(docker run -d --name "$name")
-  docker_run_cmd+=(--restart always)
-
-  if [[ "$NETWORK_MODE" == "host" ]]; then
-    docker_run_cmd+=(--network host)
-    yellow "使用 host 网络模式，容器将监听端口 $internal_port。"
-  else
-    docker_run_cmd+=(--network bridge)
-    docker_run_cmd+=(-p "$PORT:$internal_port")
-  fi
-
-  docker_run_cmd+=(-v "$data_dir:/app/data")
-  [[ -f "$env_file" ]] && docker_run_cmd+=(-v "$env_file:/app/.env")
-  docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
-  docker_run_cmd+=("$image")
-
-  yellow "执行命令: ${docker_run_cmd[*]}"
-  if ! eval "${docker_run_cmd[*]}"; then
-    red "容器 $name 启动失败！"
-    yellow "请检查容器日志：docker logs $name"
-    docker rm "$name" &>/dev/null || true
+  if ! docker ps --format '{{.Names}}' | grep -q "^freellmapi$"; then
+    red "容器已退出，查看日志："
+    docker compose -f "$compose_dir/docker-compose.yml" logs --tail=30 2>/dev/null \
+      || docker logs freellmapi 2>/dev/null | tail -30 || true
     return 1
   fi
 
-  local access_ip
-  access_ip=$(get_local_ip)
-  local access_port=$PORT
-  [[ "$NETWORK_MODE" == "host" ]] && access_port=$internal_port
+  local ip; ip=$(get_local_ip)
+  local url
+  [[ "$host_bind" == "0.0.0.0" ]] && url="http://$ip:$chosen_port" || url="http://localhost:$chosen_port"
 
-  green "$name 部署成功！"
-  green "访问地址: http://$access_ip:$access_port"
-  green "数据目录: $data_dir"
-  green ".env 文件: $env_file"
-  green "查看日志: docker logs $name"
-  yellow "请确保 $env_file 中的 API 密钥正确配置。"
+  echo ""
+  green "╔══════════════════════════════════════════════════════════╗"
+  green "║  ✅  FreeLLMAPI 部署成功！                                  ║"
+  green "╠══════════════════════════════════════════════════════════╣"
+  green "║  Dashboard : $url"
+  green "║  /v1 端点  : $url/v1/chat/completions"
+  green "║  数据卷    : freellmapi-data"
+  green "║  Key 备份  : $key_file"
+  green "╠══════════════════════════════════════════════════════════╣"
+  yellow "║  后续步骤："
+  yellow "║    1. 打开 $url → Keys 页面添加各平台 Key"
+  yellow "║    2. 获取统一 API Key"
+  yellow "║    3. SDK 配置："
+  yellow "║       base_url = \"$url/v1\""
+  yellow "║       api_key  = \"freellmapi-你的统一Key\""
+  green  "╚══════════════════════════════════════════════════════════╝"
 }
 
-# --- 部署 New-API (calciumion) ---
-# ✅ 修复：新增 MySQL/SQLite 模式选择，原版直接调用 deploy_service_sqlite 无任何选项
-function deploy_new_api_calciumion() {
-  local name="new-api-calciumion"
-  local image="$NEW_API_CALCIUMION_IMAGE"
-  local internal_port="3000"
-  local data_dir_name="new-api-calciumion-data"
-  local data_dir="$HOME/$data_dir_name"
+# ──────────────────────────────────────────────
+# ★ FreeLLMAPI 服务管理
+# ──────────────────────────────────────────────
+function manage_freellmapi() {
+  local compose_file="$FREELLMAPI_COMPOSE_DIR/docker-compose.yml"
 
-  yellow "--- 部署 New-API (calciumion/new-api:latest) ---"
-  yellow "参考文档：https://docs.newapi.pro/en/docs"
+  echo ""
+  cyan "╔══════════════════════════════════════════╗"
+  cyan "║       FreeLLMAPI 服务管理                  ║"
+  cyan "╚══════════════════════════════════════════╝"
 
-  if ! check_existing_container "$name"; then return 1; fi
-
-  # 询问数据库模式
-  read -p "请选择数据库模式: (1) SQLite  (2) MySQL  [默认 1]: " db_mode_choice </dev/tty
-  db_mode_choice=${db_mode_choice:-1}
-
-  if [[ "$db_mode_choice" == "2" ]]; then
-    # MySQL 模式
-    validate_port "$internal_port"
-    choose_network_mode
-    validate_network_mode
-
-    local db_host db_port db_user db_pass db_name sql_dsn
-    yellow "请输入 MySQL 数据库连接信息:"
-    read -p "  数据库主机 (例如: localhost): " db_host </dev/tty
-    read -p "  数据库端口 (默认 3306): " db_port </dev/tty
-    db_port=${db_port:-3306}
-    read -p "  数据库用户名: " db_user </dev/tty
-    read -sp "  数据库密码: " db_pass </dev/tty
-    echo
-    read -p "  数据库名称: " db_name </dev/tty
-
-    if [[ -z "$db_host" || -z "$db_user" || -z "$db_name" ]]; then
-      red "错误：数据库主机、用户名和名称不能为空。"
-      return 1
-    fi
-    if ! [[ "$db_port" =~ ^[0-9]+$ ]]; then
-      red "错误：数据库端口必须是数字。"
-      return 1
-    fi
-
-    sql_dsn="${db_user}:${db_pass}@tcp(${db_host}:${db_port})/${db_name}"
-    yellow "将使用的 SQL_DSN: ${db_user}:******@tcp(${db_host}:${db_port})/${db_name}"
-
-    if ! pull_image_with_retry "$image"; then return 1; fi
-
-    if [[ "$OS" == "openwrt" ]]; then
-      yellow "警告：OpenWrt/LibWRT 存储空间有限，日志数据将存放在 $data_dir。"
-      read -p "按 Enter 继续，或按 Ctrl+C 退出..." </dev/tty
-    fi
-
-    if ! ensure_dir_writable "$data_dir"; then return 1; fi
-
-    green "正在部署 $name (MySQL 模式)..."
-    local docker_run_cmd=()
-    docker_run_cmd+=(docker run -d --name "$name")
-    docker_run_cmd+=(--restart always)
-
-    if [[ "$NETWORK_MODE" == "host" ]]; then
-      docker_run_cmd+=(--network host)
-      yellow "使用 host 网络模式，容器将尝试监听端口 $internal_port。"
-    else
-      docker_run_cmd+=(--network bridge)
-      docker_run_cmd+=(-p "$PORT:$internal_port")
-    fi
-
-    docker_run_cmd+=(-v "$data_dir:/data")
-    docker_run_cmd+=(-e "TZ=$DEFAULT_TZ")
-    docker_run_cmd+=(-e "SQL_DSN=$sql_dsn")
-    docker_run_cmd+=("$image")
-
-    yellow "执行命令: ${docker_run_cmd[*]}"
-    if ! eval "${docker_run_cmd[*]}"; then
-      red "容器 $name 启动失败！"
-      yellow "请检查数据库连接信息是否正确，以及容器日志: docker logs $name"
-      docker rm "$name" &>/dev/null || true
-      return 1
-    fi
-
-    local access_ip
-    access_ip=$(get_local_ip)
-    local access_port=$PORT
-    [[ "$NETWORK_MODE" == "host" ]] && access_port=$internal_port
-
-    green "$name 部署成功！(MySQL 模式)"
-    green "访问地址: http://$access_ip:$access_port"
-    green "数据库配置: ${db_user}@${db_host}:${db_port}/${db_name}"
-    green "数据目录: $data_dir"
-    green "查看日志: docker logs $name"
-  else
-    # SQLite 模式（默认）
-    deploy_service_sqlite "$name" "$image" "$internal_port" "$data_dir_name"
-  fi
-}
-
-# --- 卸载服务 (通用) ---
-# ✅ 修复 Bug B：镜像名 grep 正则修复，防止 uni-api:latest 中的 tag 导致二次拼接 ":"
-function uninstall_service() {
-  local name="$1"
-  local data_dir_name="$2"
-  local data_dir="$HOME/$data_dir_name"
-
-  yellow "--- 卸载服务: $name ---"
-
-  local container_exists=false
-  if docker ps -a --format '{{.Names}}' | grep -Eq "^${name}$"; then
-    container_exists=true
-    yellow "正在停止并移除容器 $name..."
-    if docker stop "$name" && docker rm "$name"; then
-      green "容器 $name 已成功停止并移除。"
-    else
-      red "错误：停止或移除容器 $name 失败。请手动检查：docker ps -a"
-    fi
-  else
-    yellow "未发现名为 '$name' 的容器。"
+  # 检查是否已部署
+  if ! docker ps -a --format '{{.Names}}' | grep -q "^freellmapi$"; then
+    yellow "未发现 freellmapi 容器，请先通过选项 4 部署。"
+    return 0
   fi
 
-  # ✅ 修复 Bug B：统一去掉 image_pattern 中可能带有的 :tag 部分，防止 grep 变成 "^name:tag:"
-  local image_pattern=""
-  case "$name" in
-    one-api)              image_pattern="${ONE_API_IMAGE_SPECIFIC%%:*}" ;;
-    one-api-latest | one-api-mysql) image_pattern="${LATEST_ONE_API_IMAGE%%:*}" ;;
-    duck2api)             image_pattern="${DUCK2API_IMAGE%%:*}" ;;
-    uni-api)              image_pattern="${UNI_API_IMAGE%%:*}" ;;
-    new-api-calciumion)   image_pattern="${NEW_API_CALCIUMION_IMAGE%%:*}" ;;
-    *) yellow "警告：无法确定 '$name' 对应的镜像名称模式，跳过镜像移除。" ;;
-  esac
+  echo ""
+  green "── 当前容器状态 ──────────────────────────────"
+  docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" \
+    | grep -E "NAMES|freellmapi" || true
+  echo ""
 
-  if [[ -n "$image_pattern" ]]; then
-    local images_to_remove
-    images_to_remove=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^${image_pattern}:" || true)
-    if [[ -n "$images_to_remove" ]]; then
-      yellow "发现可能相关的镜像:"
-      echo "$images_to_remove"
-      read -p "是否尝试移除这些镜像？(y/n，默认 n): " confirm_rmi </dev/tty
-      if [[ "${confirm_rmi:-n}" =~ ^[Yy]$ ]]; then
-        # shellcheck disable=SC2086
-        if docker rmi $images_to_remove; then
-          green "相关镜像已尝试移除。"
-        else
-          yellow "警告：部分或全部相关镜像移除失败（可能正在被其他容器使用）。"
-        fi
-      else
-        yellow "跳过移除镜像。"
-      fi
-    else
-      yellow "未发现与 '$image_pattern' 相关的镜像。"
-    fi
-  fi
-
-  if [[ -d "$data_dir" ]]; then
-    yellow "发现数据目录: $data_dir"
-    read -p "是否删除此数据目录及其所有内容？警告：此操作不可逆！(y/n，默认 n): " confirm_rm_data </dev/tty
-    if [[ "${confirm_rm_data:-n}" =~ ^[Yy]$ ]]; then
-      read -p "删除前是否备份数据目录 $data_dir？(y/n，默认 n): " backup_choice </dev/tty
-      local do_delete=true
-      if [[ "${backup_choice:-n}" =~ ^[Yy]$ ]]; then
-        local backup_dir="${data_dir}-backup-$(date +%Y%m%d_%H%M%S)"
-        yellow "正在备份数据到 $backup_dir ..."
-        if cp -a "$data_dir" "$backup_dir"; then
-          green "数据目录已备份到 $backup_dir。"
-        else
-          red "错误：备份数据目录失败！请检查权限和磁盘空间。"
-          yellow "数据目录未被删除。"
-          do_delete=false
-        fi
-      fi
-
-      if [[ "$do_delete" == true ]]; then
-        yellow "正在删除数据目录 $data_dir ..."
-        local rm_cmd="rm -rf \"$data_dir\""
-        if [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null; then rm_cmd="sudo $rm_cmd"; fi
-        if eval "$rm_cmd"; then
-          green "数据目录 $data_dir 已删除。"
-        else
-          red "错误：删除数据目录 $data_dir 失败！请检查权限。"
-        fi
-      fi
-    else
-      yellow "数据目录 $data_dir 已保留。"
-    fi
-  elif [[ "$container_exists" == true ]]; then
-    yellow "未找到关联的数据目录 $data_dir（或路径不匹配）。"
-  fi
-
-  green "卸载流程完成。"
-}
-
-# --- 服务部署快捷方式 ---
-function deploy_one_api_specific() {
-  deploy_service_sqlite "one-api" "$ONE_API_IMAGE_SPECIFIC" 3000 "one-api-data"
-}
-
-function deploy_latest_one_api_sqlite() {
-  deploy_service_sqlite "one-api-latest" "$LATEST_ONE_API_IMAGE" 3000 "one-api-latest-data"
-}
-
-function deploy_duck2api() {
-  # ⛔ 警告提示：Duck2API 已停止维护，部署前告知用户
-  red    "╔══════════════════════════════════════════════════════════╗"
-  red    "║  ⛔  警告：Duck2API 已于 2025-04-15 归档，停止维护！      ║"
-  red    "║  镜像目前仍可拉取，但随着 DuckDuckGo 接口变动，           ║"
-  red    "║  服务可能随时失效且不会有任何修复更新。                   ║"
-  red    "║  强烈建议使用 New-API 或 One-API 作为替代方案。           ║"
-  red    "╚══════════════════════════════════════════════════════════╝"
-  read -p "您了解上述风险，是否仍要继续部署？(y/n，默认 n): " duck_confirm </dev/tty
-  if [[ "${duck_confirm:-n}" =~ ^[Yy]$ ]]; then
-    deploy_service_sqlite "duck2api" "$DUCK2API_IMAGE" 8080 "duck2api-data"
-  else
-    yellow "已取消部署 Duck2API。建议选择 New-API (选项 6) 作为替代。"
-  fi
-}
-
-# --- 卸载项目菜单 ---
-function uninstall_project() {
-  echo "请选择要卸载的项目："
-  echo "  1. One-API 特定版本 (SQLite,  容器名: one-api,             数据: $HOME/one-api-data)"
-  echo "  2. One-API 最新版   (SQLite,  容器名: one-api-latest,      数据: $HOME/one-api-latest-data)"
-  echo "  3. One-API 最新版   (MySQL,   容器名: one-api-mysql,       数据: $HOME/one-api-mysql-logs)"
-  echo "  4. Duck2API         (⛔已归档, 容器名: duck2api,           数据: $HOME/duck2api-data)"
-  echo "  5. Uni-API                    (容器名: uni-api,            数据: $HOME/uni-api-data)"
-  echo "  6. New-API (calciumion)       (容器名: new-api-calciumion, 数据: $HOME/new-api-calciumion-data)"
+  echo "请选择操作："
+  echo "  1. 查看实时日志     (Ctrl+C 退出)"
+  echo "  2. 查看最近 100 行日志"
+  echo "  3. 停止服务"
+  echo "  4. 启动服务"
+  echo "  5. 重启服务"
+  echo "  6. 更新到最新镜像   (pull + up -d)"
+  echo "  7. 查看数据卷信息"
   echo "  0. 返回主菜单"
-  read -p "请输入选择（0-6）： " project_choice </dev/tty
-  case $project_choice in
-    1) uninstall_service "one-api"             "one-api-data" ;;
-    2) uninstall_service "one-api-latest"      "one-api-latest-data" ;;
-    3) uninstall_service "one-api-mysql"       "one-api-mysql-logs" ;;
-    4) uninstall_service "duck2api"            "duck2api-data" ;;
-    5) uninstall_service "uni-api"             "uni-api-data" ;;
-    6) uninstall_service "new-api-calciumion"  "new-api-calciumion-data" ;;
-    0) return ;;
-    *) red "无效选项，请重新选择。" && uninstall_project ;;
+  read -rp "选项 (0-7)：" mc </dev/tty
+  echo ""
+
+  local use_compose=false
+  [[ -f "$compose_file" ]] && use_compose=true
+
+  _compose_or_docker() {
+    if $use_compose; then
+      docker compose -f "$compose_file" "$@"
+    else
+      # fallback：直接操作容器
+      local subcmd="$1"; shift
+      case "$subcmd" in
+        logs)    docker logs "$@" freellmapi ;;
+        stop)    docker stop freellmapi ;;
+        start)   docker start freellmapi ;;
+        restart) docker restart freellmapi ;;
+        *)       yellow "fallback 不支持：$subcmd" ;;
+      esac
+    fi
+  }
+
+  case "$mc" in
+    1) green "实时日志（Ctrl+C 退出）..."
+       _compose_or_docker logs -f freellmapi ;;
+    2) green "最近 100 行日志："
+       _compose_or_docker logs --tail=100 freellmapi ;;
+    3) yellow "停止服务..."
+       _compose_or_docker stop freellmapi && green "✅ 已停止。" ;;
+    4) yellow "启动服务..."
+       _compose_or_docker start freellmapi && green "✅ 已启动。" ;;
+    5) yellow "重启服务..."
+       _compose_or_docker restart freellmapi
+       sleep 5
+       green "重启后状态："
+       docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
+         | grep -E "NAMES|freellmapi" || true ;;
+    6) yellow "拉取最新镜像并重启..."
+       if $use_compose; then
+         cd "$FREELLMAPI_COMPOSE_DIR"
+         docker compose pull freellmapi
+         docker compose up -d freellmapi
+         cd - >/dev/null
+       else
+         docker pull "$FREELLMAPI_IMAGE_BASE:latest"
+         yellow "请使用卸载后重新部署以应用新镜像。"
+       fi
+       sleep 5
+       green "更新后状态："
+       docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
+         | grep -E "NAMES|freellmapi" || true ;;
+    7) green "── freellmapi-data 数据卷信息 ──"
+       if docker volume inspect freellmapi-data &>/dev/null; then
+         docker volume inspect freellmapi-data
+       else
+         yellow "未找到 freellmapi-data 卷。"
+       fi ;;
+    0) return 0 ;;
+    *) red "无效选项。" ;;
   esac
 }
 
-# --- 查看容器状态 ---
-# ✅ 修复 Bug C：移除 docker ps 错误使用 --size <数值> 参数（该参数为布尔开关而非数值）
-function view_container_status() {
-  green "--- 当前 Docker 容器状态 ---"
-  if ! docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" &>/dev/null; then
-    yellow "无法获取容器列表，请检查 Docker 是否运行正常。"
-  elif [[ $(docker ps -a --format '{{.Names}}' | wc -l) -eq 0 ]]; then
-    yellow "当前没有 Docker 容器。"
+# ──────────────────────────────────────────────
+# ★ FreeLLMAPI 完整卸载
+# ──────────────────────────────────────────────
+function uninstall_freellmapi() {
+  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
+  local compose_file="$compose_dir/docker-compose.yml"
+  local key_file="$HOME/.freellmapi_encryption_key"
+
+  echo ""
+  red "╔══════════════════════════════════════════════════════════════╗"
+  red "║  完全卸载 FreeLLMAPI                                           ║"
+  red "║  将删除：容器 → 镜像 → 数据卷 → 配置目录 → ENCRYPTION_KEY     ║"
+  red "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+  read -rp "确认完全卸载？(输入 yes 确认，其他取消)：" cf </dev/tty
+  [[ "$cf" != "yes" ]] && { yellow "已取消。"; return 0; }
+
+  # 步骤 1：停止并删除容器
+  echo ""
+  yellow "[1/6] 停止并删除容器..."
+  if docker ps -a --format '{{.Names}}' | grep -q "^freellmapi$"; then
+    if [[ -f "$compose_file" ]]; then
+      cd "$compose_dir"
+      docker compose down freellmapi 2>/dev/null || true
+      cd - >/dev/null
+    fi
+    docker stop freellmapi &>/dev/null || true
+    docker rm   freellmapi &>/dev/null || true
+    green "  ✅ 容器已删除。"
   else
-    # ✅ 修复：直接输出，移除错误的 --size <数值> 用法
+    yellow "  未发现容器，跳过。"
+  fi
+
+  # 步骤 2：删除镜像
+  echo ""
+  yellow "[2/6] 删除 Docker 镜像..."
+  local imgs
+  imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+    | grep "^ghcr.io/tashfeenahmed/freellmapi" || true)
+  if [[ -n "$imgs" ]]; then
+    echo "  发现镜像："; echo "$imgs" | while read -r i; do echo "    - $i"; done
+    read -rp "  是否删除？(y/n，默认 y)：" di </dev/tty
+    if [[ "${di:-y}" =~ ^[Yy]$ ]]; then
+      echo "$imgs" | xargs docker rmi 2>/dev/null \
+        && green "  ✅ 镜像已删除。" \
+        || yellow "  ⚠️  部分镜像删除失败（可能被其他容器引用）。"
+    fi
+  else
+    yellow "  未发现相关镜像，跳过。"
+  fi
+
+  # 步骤 3：删除数据卷（含 SQLite DB）
+  echo ""
+  yellow "[3/6] 删除数据卷 freellmapi-data（含 SQLite 数据库）..."
+  if docker volume inspect freellmapi-data &>/dev/null; then
+    red   "  ⚠️  删除后所有 provider keys 和分析数据将永久丢失！"
+    read -rp "  是否先备份数据卷？(y/n，默认 y)：" bv </dev/tty
+    if [[ "${bv:-y}" =~ ^[Yy]$ ]]; then
+      local bkdir="$HOME/freellmapi-data-backup-$(date +%Y%m%d_%H%M%S)"
+      mkdir -p "$bkdir"
+      yellow "  备份到 $bkdir ..."
+      docker run --rm \
+        -v freellmapi-data:/source:ro \
+        -v "$bkdir":/backup \
+        alpine sh -c "cp -a /source/. /backup/" 2>/dev/null \
+        && green "  ✅ 数据卷已备份：$bkdir" \
+        || yellow "  ⚠️  备份失败，继续删除。"
+    fi
+    docker volume rm freellmapi-data \
+      && green "  ✅ 数据卷已删除。" \
+      || yellow "  ⚠️  请手动：docker volume rm freellmapi-data"
+  else
+    yellow "  未发现数据卷，跳过。"
+  fi
+
+  # 步骤 4：删除 compose 目录
+  echo ""
+  yellow "[4/6] 删除项目目录 $compose_dir ..."
+  if [[ -d "$compose_dir" ]]; then
+    read -rp "  是否删除（含 .env / docker-compose.yml）？(y/n，默认 y)：" dd </dev/tty
+    if [[ "${dd:-y}" =~ ^[Yy]$ ]]; then
+      local rc="rm -rf \"$compose_dir\""
+      [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && rc="sudo $rc"
+      eval "$rc" && green "  ✅ 目录已删除。" || red "  ❌ 请手动：rm -rf $compose_dir"
+    else
+      yellow "  保留目录：$compose_dir"
+    fi
+  else
+    yellow "  目录不存在，跳过。"
+  fi
+
+  # 步骤 5：删除 ENCRYPTION_KEY 文件
+  echo ""
+  yellow "[5/6] 处理 ENCRYPTION_KEY 备份文件 $key_file ..."
+  if [[ -f "$key_file" ]]; then
+    red   "  ⚠️  此文件是加密密钥唯一备份！"
+    read -rp "  是否删除？(y/n，默认 n)：" dk </dev/tty
+    if [[ "${dk:-n}" =~ ^[Yy]$ ]]; then
+      rm -f "$key_file" && green "  ✅ ENCRYPTION_KEY 文件已删除。" || red "  请手动：rm $key_file"
+    else
+      yellow "  保留：$key_file"
+    fi
+  else
+    yellow "  文件不存在，跳过。"
+  fi
+
+  # 步骤 6：清理悬空镜像
+  echo ""
+  yellow "[6/6] 检查悬空镜像（<none>:<none>）..."
+  local dangling
+  dangling=$(docker images -f "dangling=true" -q 2>/dev/null || true)
+  if [[ -n "$dangling" ]]; then
+    local cnt; cnt=$(echo "$dangling" | wc -l)
+    read -rp "  发现 ${cnt} 个悬空镜像，是否清理？(y/n，默认 n)：" cd2 </dev/tty
+    [[ "${cd2:-n}" =~ ^[Yy]$ ]] \
+      && docker image prune -f && green "  ✅ 已清理。" \
+      || yellow "  跳过清理。"
+  else
+    green "  ✅ 无悬空镜像。"
+  fi
+
+  echo ""
+  green "╔══════════════════════════════════════════╗"
+  green "║  ✅  FreeLLMAPI 已完全卸载！               ║"
+  green "╚══════════════════════════════════════════╝"
+  yellow "验证："
+  yellow "  docker ps -a | grep freellmapi"
+  yellow "  docker images | grep freellmapi"
+  yellow "  docker volume ls | grep freellmapi"
+}
+
+# ──────────────────────────────────────────────
+# 卸载 One-API / New-API（通用）
+# ──────────────────────────────────────────────
+function uninstall_general_service() {
+  local cname="$1"
+  local data_name="$2"
+  local img_pat="$3"
+  local data_dir="$HOME/$data_name"
+
+  yellow "── 卸载 $cname ──"
+
+  # 停止并删除容器
+  if docker ps -a --format '{{.Names}}' | grep -Eq "^${cname}$"; then
+    yellow "停止并删除容器 $cname ..."
+    docker stop "$cname" && docker rm "$cname" \
+      && green "  ✅ 容器已删除。" \
+      || red "  ❌ 容器删除失败，请手动：docker rm -f $cname"
+  else
+    yellow "  未发现容器 $cname，跳过。"
+  fi
+
+  # 删除镜像
+  local imgs
+  imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+    | grep "^${img_pat}" || true)
+  if [[ -n "$imgs" ]]; then
+    echo "  发现镜像："; echo "$imgs" | while read -r i; do echo "    - $i"; done
+    read -rp "  是否删除镜像？(y/n，默认 n)：" di </dev/tty
+    if [[ "${di:-n}" =~ ^[Yy]$ ]]; then
+      echo "$imgs" | xargs docker rmi 2>/dev/null \
+        && green "  ✅ 镜像已删除。" \
+        || yellow "  ⚠️  部分镜像删除失败。"
+    fi
+  else
+    yellow "  未发现相关镜像，跳过。"
+  fi
+
+  # 删除数据目录
+  if [[ -d "$data_dir" ]]; then
+    yellow "  数据目录：$data_dir"
+    read -rp "  是否删除（不可逆）？(y/n，默认 n)：" dd </dev/tty
+    if [[ "${dd:-n}" =~ ^[Yy]$ ]]; then
+      read -rp "  是否先备份到 ${data_dir}-backup？(y/n，默认 n)：" bk </dev/tty
+      local do_del=true
+      if [[ "${bk:-n}" =~ ^[Yy]$ ]]; then
+        local bdir="${data_dir}-backup-$(date +%Y%m%d_%H%M%S)"
+        cp -a "$data_dir" "$bdir" \
+          && green "  ✅ 已备份：$bdir" \
+          || { red "  ❌ 备份失败，取消删除。"; do_del=false; }
+      fi
+      if [[ "$do_del" == true ]]; then
+        local rc="rm -rf \"$data_dir\""
+        [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && rc="sudo $rc"
+        eval "$rc" && green "  ✅ 数据目录已删除。" || red "  ❌ 请手动：rm -rf $data_dir"
+      fi
+    else
+      yellow "  保留数据目录：$data_dir"
+    fi
+  else
+    yellow "  数据目录不存在，跳过。"
+  fi
+
+  green "── $cname 卸载完成 ──"
+}
+
+# ──────────────────────────────────────────────
+# 卸载菜单（One-API / New-API）
+# ──────────────────────────────────────────────
+function uninstall_menu() {
+  echo ""
+  cyan "╔══════════════════════════════════════════════════════════╗"
+  cyan "║  卸载服务（One-API / New-API）                            ║"
+  cyan "╚══════════════════════════════════════════════════════════╝"
+  echo "  1. One-API SQLite   (容器：one-api，          数据：~/one-api-data)"
+  echo "  2. One-API MySQL    (容器：one-api-mysql，    数据：~/one-api-mysql-logs)"
+  echo "  3. New-API          (容器：new-api，          数据：~/new-api-data)"
+  echo "  0. 返回主菜单"
+  read -rp "选项 (0-3)：" ch </dev/tty
+  case "$ch" in
+    1) uninstall_general_service "one-api"       "one-api-data"       "ghcr.io/songquanpeng/one-api" ;;
+    2) uninstall_general_service "one-api-mysql" "one-api-mysql-logs" "ghcr.io/songquanpeng/one-api" ;;
+    3) uninstall_general_service "new-api"       "new-api-data"       "calciumion/new-api" ;;
+    0) return ;;
+    *) red "无效选项。"; uninstall_menu ;;
+  esac
+}
+
+# ──────────────────────────────────────────────
+# 查看容器状态
+# ──────────────────────────────────────────────
+function view_container_status() {
+  green "── 当前 Docker 容器状态 ──────────────────────"
+  if [[ $(docker ps -a --format '{{.Names}}' | wc -l) -eq 0 ]]; then
+    yellow "当前无任何 Docker 容器。"
+  else
     docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
   fi
-  echo "-----------------------------"
+  echo ""
+  green "── Docker 磁盘占用 ───────────────────────────"
+  docker system df 2>/dev/null || true
+  echo "──────────────────────────────────────────────"
 }
 
-# --- 主菜单函数 ---
+# ──────────────────────────────────────────────
+# 主菜单
+# ──────────────────────────────────────────────
 function main_menu() {
   detect_architecture
   detect_os
@@ -1098,68 +1227,69 @@ function main_menu() {
 
   if [[ "$OS" == "openwrt" ]]; then
     yellow "==== OpenWrt/LibWRT 环境提示 ===="
-    yellow " - 脚本使用 Bash，如果报错请先安装: opkg install bash"
-    yellow " - 设备存储有限，默认数据目录在 $HOME 下，建议映射到外部存储。"
-    yellow " - Docker 服务管理使用 /etc/init.d/dockerd"
-    yellow "================================"
+    yellow "  - Bash 未安装时请先：opkg install bash"
+    yellow "  - 存储有限，数据目录在 \$HOME，建议挂载外部存储"
+    yellow "  - Docker 服务：/etc/init.d/dockerd"
+    yellow "================================="
     sleep 1
   fi
 
   while true; do
-    local docker_version_info="未运行"
-    if docker --version &>/dev/null; then docker_version_info=$(docker --version); fi
-    local compose_version_info="未安装"
+    local dv="未运行" cv="未安装"
+    docker --version &>/dev/null && dv=$(docker --version)
     if docker compose version &>/dev/null; then
-      compose_version_info=$(docker compose version | head -n 1)
+      cv=$(docker compose version | head -n1)
     elif command -v docker-compose &>/dev/null; then
-      compose_version_info=$(docker-compose --version)
+      cv=$(docker-compose --version)
     fi
 
     echo ""
-    echo "========================================================"
-    echo "             Docker 服务管理脚本"
-    echo "          (支持 Linux & OpenWrt/LibWRT)"
-    echo "========================================================"
-    echo " 系统: $OS ($ARCH)"
-    echo " Docker: $docker_version_info"
-    echo " Compose: $compose_version_info"
-    echo "--------------------------------------------------------"
-    echo "请选择要执行的操作："
-    echo "  1. 部署 One-API 特定版本 (SQLite)"
-    echo "  2. 部署 One-API 最新版   (SQLite)"
-    echo "  3. 部署 One-API 最新版   (MySQL)"
-    echo "  4. 部署 Duck2API         (⛔ 已归档停止维护，不推荐)"
-    echo "  5. 部署 Uni-API"
-    echo "  6. 部署 New-API          (calciumion/new-api, 推荐替代 Duck2API)"
-    echo "--------------------------------------------------------"
-    echo "  7. 卸载服务"
-    echo "  8. 查看所有容器状态"
-    echo "--------------------------------------------------------"
-    echo "  0. 退出脚本"
-    echo "========================================================"
-    read -p "请输入选项编号 (0-8): " choice </dev/tty
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║            Docker 服务管理脚本                             ║"
+    echo "║      支持 Linux / OpenWrt  ·  多架构 amd64/arm64          ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    printf "║  系统：%-20s 架构：%-15s  ║\n" "$OS" "$ARCH"
+    printf "║  Docker：%-50s ║\n" "$dv"
+    printf "║  Compose：%-49s ║\n" "$cv"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  ── 部署服务 ──────────────────────────────────────────  ║"
+    echo "║   1. 部署 One-API  (SQLite)   LLM API 管理分发           ║"
+    echo "║   2. 部署 One-API  (MySQL)    LLM API 管理分发           ║"
+    echo "║   3. 部署 New-API  (calciumion) 新一代 API 管理          ║"
+    echo "║   4. 部署 FreeLLMAPI  16家LLM免费额度聚合 /v1 端点       ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  ── FreeLLMAPI 管理 ────────────────────────────────── ║"
+    echo "║   5. 管理 FreeLLMAPI  (日志/停止/启动/重启/更新)         ║"
+    echo "║   6. 完全卸载 FreeLLMAPI  (含镜像/数据卷/配置/Key)       ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  ── 其他操作 ──────────────────────────────────────────  ║"
+    echo "║   7. 卸载 One-API / New-API                              ║"
+    echo "║   8. 查看所有容器状态                                     ║"
+    echo "║   0. 退出                                                 ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    read -rp "请输入选项 (0-8)：" ch </dev/tty
     echo ""
 
-    case $choice in
-      1) deploy_one_api_specific ;;
-      2) deploy_latest_one_api_sqlite ;;
-      3) deploy_one_api_mysql ;;
-      4) deploy_duck2api ;;
-      5) deploy_uni_api ;;
-      6) deploy_new_api_calciumion ;;
-      7) uninstall_project ;;
+    case "$ch" in
+      1) deploy_one_api_sqlite ;;
+      2) deploy_one_api_mysql ;;
+      3) deploy_new_api ;;
+      4) deploy_freellmapi ;;
+      5) manage_freellmapi ;;
+      6) uninstall_freellmapi ;;
+      7) uninstall_menu ;;
       8) view_container_status ;;
-      0) green "感谢您的使用！脚本退出。" && exit 0 ;;
-      *) red "无效选项 '$choice'，请输入 0 到 8 之间的数字。" ;;
+      0) green "感谢使用，脚本退出。"; exit 0 ;;
+      *) red "无效选项 '$ch'，请输入 0-8。" ;;
     esac
 
-    if [[ "$choice" != "0" ]]; then
+    [[ "$ch" != "0" ]] && {
       echo ""
-      read -n 1 -s -r -p "按任意键返回主菜单..." </dev/tty
+      read -rn 1 -s -p "按任意键返回主菜单..." </dev/tty
       echo ""
-    fi
+    }
   done
 }
 
-# --- 脚本入口 ---
+# ── 入口 ──
 main_menu
