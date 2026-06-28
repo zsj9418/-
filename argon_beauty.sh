@@ -1,10 +1,4 @@
 #!/bin/sh
-# ============================================================
-#  LuCI 主题智能美化工具 v1.1
-#  核心升级：backdrop-filter brightness 自适应暗化
-#           无论背景图深浅，卡片内文字始终可读
-#           用户无需判断色调，全自动适配
-# ============================================================
 
 ESC=$(printf '\033')
 RED="${ESC}[0;31m"
@@ -77,9 +71,6 @@ _count_lines() {
     printf '%s\n' "$cnt"
 }
 
-# ============================================================
-#  图片 API 库
-# ============================================================
 IMG_API_LIST="yppp自适应|https://api.yppp.net/api.php|横竖自适应二次元(推荐)
 yppp横屏PC|https://api.yppp.net/pc.php|横屏壁纸
 yppp竖屏手机|https://api.yppp.net/pe.php|竖屏壁纸
@@ -106,9 +97,6 @@ GRADIENT_LIST="青蓝极光(默认)|#00e5ff,#2979ff,#aa00ff,#00e5ff
 赛博朋克|#00fff7,#ff00ff,#ffff00,#00fff7
 自定义|custom"
 
-# ============================================================
-#  全局变量
-# ============================================================
 ACTIVE_THEME=""
 ACTIVE_CSS=""
 ACTIVE_FONTS_DIR=""
@@ -132,15 +120,10 @@ FONT_WOFF2_URL=""
 FONT_WOFF_URL=""
 GRAD_COLORS="#00e5ff,#2979ff,#aa00ff,#00e5ff"
 GRAD_NAME="青蓝极光"
-# 毛玻璃参数（现在只剩模糊度和边框，亮度由 backdrop-filter 自动处理）
 GLASS_BLUR="12"
 GLASS_BORDER="rgba(255,255,255,0.15)"
-# 背景压暗强度（0.0=全黑 ~ 1.0=不压暗，默认0.35）
 GLASS_DARKEN="0.35"
 
-# ============================================================
-#  加载主题变量
-# ============================================================
 _load_theme_vars() {
     local t="$1"
     case "$t" in
@@ -237,9 +220,6 @@ _load_theme_vars() {
     success "背景图 : $ACTIVE_BG"
 }
 
-# ============================================================
-#  主题探测
-# ============================================================
 detect_themes() {
     title "自动探测已安装 LuCI 主题"
     local tmplist="/tmp/_themes_$$"
@@ -283,9 +263,6 @@ detect_themes() {
     _load_theme_vars "$ACTIVE_THEME"
 }
 
-# ============================================================
-#  路径探测
-# ============================================================
 detect_paths() {
     title "自动探测系统环境"
     HEADER_HTM=$(find /usr/lib/lua /usr/share/ucode \
@@ -335,8 +312,7 @@ step_check_urls() {
         printf "  %-24s " "$name"
         if check_url "$url" 8; then printf "${GREEN}[  OK  ]${NC}  %s\n" "$desc"
         else printf "${RED}[ FAIL ]${NC}  %s\n" "$desc"; fi
-    done < "$tmpf"
-    rm -f "$tmpf"
+    done < "$tmpf"; rm -f "$tmpf"
     printf "\n  ${WHITE}%-28s %s${NC}\n" "字体 CDN" "状态"
     printf "  %s\n" "------------------------------------------"
     local tmpf2="/tmp/_chk_fnt_$$"
@@ -347,8 +323,7 @@ step_check_urls() {
         printf "  %-28s " "$name"
         if check_url "$w2" 10; then printf "${GREEN}[  OK  ]${NC}\n"
         else printf "${RED}[ FAIL ]${NC}\n"; fi
-    done < "$tmpf2"
-    rm -f "$tmpf2"
+    done < "$tmpf2"; rm -f "$tmpf2"
     echo ""; success "检测完成"
 }
 
@@ -370,8 +345,7 @@ show_api_list() {
             printf "  ${CYAN}%2d)${NC} %-24s  %s\n" "$i" "$name" "$desc"
         fi
         i=$((i+1))
-    done < "$tmpf"
-    rm -f "$tmpf"
+    done < "$tmpf"; rm -f "$tmpf"
 }
 
 net_download() {
@@ -393,9 +367,6 @@ net_download() {
     fi
 }
 
-# ============================================================
-#  图片验证（hexdump优先，od次之，大小兜底）
-# ============================================================
 verify_image() {
     local file="$1"
     [ ! -f "$file" ] && return 1
@@ -420,9 +391,6 @@ verify_image() {
     return 1
 }
 
-# ============================================================
-#  CSS 块删除（纯 shell 逐行）
-# ============================================================
 _remove_css_block() {
     local tag="$1" css="$ACTIVE_CSS" tmpout="/tmp/_css_rm_$$"
     grep -q "=== ${tag}" "$css" 2>/dev/null || return 0
@@ -441,9 +409,6 @@ _remove_css_block() {
     fi
 }
 
-# ============================================================
-#  步骤1：背景图片获取（简化色调问题：改用亮度自适应，无需问色调）
-# ============================================================
 step_download_image() {
     title "步骤1：背景图片获取 [$ACTIVE_THEME]"
     echo "  ${CYAN}1)${NC} [网] 从内置API在线下载（直接列出）"
@@ -508,9 +473,6 @@ step_download_image() {
     esac
 }
 
-# ============================================================
-#  步骤2：字体
-# ============================================================
 step_download_font() {
     title "步骤2：品牌字体获取 [$ACTIVE_THEME]"
     local typo_woff2="${ACTIVE_FONTS_DIR}/TypoGraphica.woff2"
@@ -540,7 +502,6 @@ step_download_font() {
         else printf "${YELLOW}[未检测]${NC}\n"; fi
         i=$((i+1))
     done < "$tmpf"; rm -f "$tmpf"
-
     local font_num; font_num=$(ask_num "选择字体编号" 1 1 "$ftotal")
     local tmpf2="/tmp/_fnt_sel_$$"
     printf '%s\n' "$FONT_LIST" > "$tmpf2"
@@ -585,9 +546,6 @@ inject_font_css() {
     success "@font-face 已注入: $FONT_NAME"
 }
 
-# ============================================================
-#  步骤3：Brand 动画
-# ============================================================
 step_brand_animation() {
     title "步骤3：Brand 名称动画效果 [$ACTIVE_THEME]"
     ask "是否启用品牌名动画效果" || return
@@ -680,7 +638,6 @@ _inject_brand_css() {
     esac
     local css="$ACTIVE_CSS"
     printf '\n/* === BRAND_ANIMATION mode=%s filter=%s === */\n' "$mode" "$use_filter" >> "$css"
-    # 侧边栏
     printf '%s {\n' "$SEL_BRAND" >> "$css"
     printf '  display: block; font-family: "%s", sans-serif;\n' "$font" >> "$css"
     printf '  text-decoration: none; text-align: center; cursor: default;\n' >> "$css"
@@ -693,7 +650,6 @@ _inject_brand_css() {
     printf '  -webkit-background-clip: text; background-clip: text;\n' >> "$css"
     printf '  -webkit-text-fill-color: transparent;\n' >> "$css"
     printf '  animation: %s;\n}\n' "$brand_anim" >> "$css"
-    # 登录页
     printf '%s {\n' "$SEL_BRAND_LOGIN" >> "$css"
     printf '  font-weight: 400; word-break: break-word;\n' >> "$css"
     printf '  font-family: "%s", sans-serif;\n' "$font" >> "$css"
@@ -734,26 +690,16 @@ step_switch_animation() {
 }
 
 # ============================================================
-#  步骤4：毛玻璃效果（v1.1核心：backdrop-filter brightness 自适应）
-#
-#  原理：
-#    backdrop-filter: brightness(X) 对卡片背后的图像压暗
-#    X=0.35 → 压暗到35%亮度，无论原图多亮，叠加后都是深色
-#    白色文字在任意背景上始终清晰可读
-#    用户不再需要手动选择"深色/浅色/彩色"方案
-#
-#  对比旧方案：
-#    旧: background: rgba(8,12,20, 0.65) → 深色背景可以，浅色壁纸发灰
-#    新: backdrop-filter: brightness(0.35) → 直接压暗背后图像，任意壁纸均适用
+#  步骤4：毛玻璃效果 v1.1
+#  修复：输入框改为深色背景，确保白字可读且边框清晰
 # ============================================================
 step_glassmorphism() {
     title "步骤4：自适应毛玻璃效果 [$ACTIVE_THEME]"
-    info "v1.1 智能模式：通过 backdrop-filter brightness 自动压暗背景"
-    info "无论壁纸是浅色动漫还是深色星空，文字始终清晰可读"
+    info "v4.5 智能模式：backdrop-filter brightness 自动压暗，任意壁纸可读"
     ask "是否启用毛玻璃效果" || return
 
     echo ""
-    echo "  ${WHITE}压暗强度选择（影响卡片后方图像的暗化程度）：${NC}"
+    echo "  ${WHITE}压暗强度选择：${NC}"
     echo "  ${CYAN}1)${NC} 轻度 (0.50) → 背景图隐约可见，通透感强"
     echo "  ${CYAN}2)${NC} 中度 (0.35) → 背景图适度压暗 ${GREEN}[推荐]${NC}"
     echo "  ${CYAN}3)${NC} 重度 (0.20) → 背景图大幅压暗，文字最清晰"
@@ -765,14 +711,12 @@ step_glassmorphism() {
         3) GLASS_DARKEN="0.20" ;;
         4) GLASS_DARKEN=$(ask_float "压暗值 [0.10最暗 ~ 0.70最亮]" "0.35") ;;
     esac
-
     local blur_choice; blur_choice=$(ask_num "模糊强度 [1=轻 2=中 3=重, 默认2]" 2 1 3)
     case "$blur_choice" in
         1) GLASS_BLUR="6" ;;
         2) GLASS_BLUR="12" ;;
         3) GLASS_BLUR="20" ;;
     esac
-
     info "压暗强度: ${GLASS_DARKEN} | 模糊: ${GLASS_BLUR}px"
 
     if grep -q "=== GLASSMORPHISM ===" "$ACTIVE_CSS" 2>/dev/null; then
@@ -792,19 +736,19 @@ step_glassmorphism() {
     printf '\n/* === GLASSMORPHISM theme=%s darken=%s blur=%s === */\n' \
         "$ACTIVE_THEME" "$DK" "$BL" >> "$css"
 
-    # ---- 背景图 ----
+    # 背景图
     printf 'html, body {\n' >> "$css"
     printf "  background: url('%s') center center / cover fixed no-repeat !important;\n" \
         "$BGPATH" >> "$css"
     printf '  background-color: #0a0f1a !important;\n}\n' >> "$css"
 
-    # ---- 内容主区域：给极淡的暗色打底，防止完全透明 ----
+    # 内容主区域
     printf '%s {\n' "$SEL_CONTENT" >> "$css"
     printf '  background: rgba(0,0,0,0.10) !important;\n' >> "$css"
     printf '  backdrop-filter: none !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: none !important;\n}\n' >> "$css"
 
-    # ---- 侧边栏：backdrop-filter 自适应压暗 ----
+    # 侧边栏
     printf '%s {\n' "$SEL_SIDEBAR" >> "$css"
     printf '  background: rgba(0,0,0,0.20) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(%s) blur(%spx) saturate(160%%) !important;\n' \
@@ -813,7 +757,7 @@ step_glassmorphism() {
         "$DK" "$BL" >> "$css"
     printf '  border-right: 1px solid %s !important;\n}\n' "$BR" >> "$css"
 
-    # ---- 顶部导航栏 ----
+    # 顶部导航栏
     printf '%s {\n' "$SEL_HEADER" >> "$css"
     printf '  background: rgba(0,0,0,0.15) !important;\n' >> "$css"
     printf '  background-color: rgba(0,0,0,0.15) !important;\n' >> "$css"
@@ -824,9 +768,7 @@ step_glassmorphism() {
     printf '  border-bottom: 1px solid %s !important;\n' "$BR" >> "$css"
     printf '  box-shadow: 0 2px 16px rgba(0,0,0,0.40) !important;\n}\n' >> "$css"
 
-    # ---- 内容卡片：核心 ----
-    # backdrop-filter brightness 压暗背后图像 + 轻量黑色底色
-    # 无论壁纸多亮，压暗后配白字始终清晰
+    # 内容卡片
     printf '%s {\n' "$SEL_CARD" >> "$css"
     printf '  background: rgba(0,0,0,0.15) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(%s) blur(%spx) saturate(140%%) !important;\n' \
@@ -837,7 +779,7 @@ step_glassmorphism() {
     printf '  border-radius: 12px !important;\n' >> "$css"
     printf '  box-shadow: 0 4px 24px rgba(0,0,0,0.35) !important;\n}\n' >> "$css"
 
-    # ---- 表格 ----
+    # 表格
     printf 'table, .table { background: transparent !important; }\n' >> "$css"
     printf 'thead {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.30) !important;\n' >> "$css"
@@ -853,19 +795,66 @@ step_glassmorphism() {
     printf '  -webkit-backdrop-filter: brightness(%s) !important;\n' "$DK" >> "$css"
     printf '  border-color: %s !important;\n}\n' "$BR" >> "$css"
 
-    # ---- 输入框 ----
-    printf 'input[type="text"], input[type="password"],\n' >> "$css"
-    printf 'input[type="number"], select, textarea, .form-control {\n' >> "$css"
-    printf '  background: rgba(255,255,255,0.10) !important;\n' >> "$css"
-    printf '  border: 1px solid rgba(255,255,255,0.25) !important;\n' >> "$css"
+    # ----------------------------------------------------------------
+    #  输入框 v1.1 修复：
+    #  问题：rgba(255,255,255,0.10) ≈ 透明 → 叠在白色卡片上 = 白底
+    #       + 白色文字 = 完全不可见
+    #  修复：改为深色半透明背景，配合白字形成足够对比度
+    #        边框加强到 rgba(255,255,255,0.60) 使边框轮廓清晰
+    # ----------------------------------------------------------------
+    printf '/* --- v1.1 输入框修复：深色背景确保白字可见 --- */\n' >> "$css"
+    printf 'input[type="text"], input[type="password"], input[type="number"],\n' >> "$css"
+    printf 'input[type="email"], input[type="url"], input[type="search"],\n' >> "$css"
+    printf 'input[type="tel"], input[type="date"], input[type="time"] {\n' >> "$css"
+    # 深色半透明背景：足够暗使白字可读，又能隐约看到壁纸
+    printf '  background: rgba(0,0,0,0.55) !important;\n' >> "$css"
+    # 加强边框对比度，确保输入框轮廓在任何背景上都清晰
+    printf '  border: 1px solid rgba(255,255,255,0.60) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
     printf '  backdrop-filter: blur(4px) !important;\n' >> "$css"
-    printf '  border-radius: 8px !important; color: #ffffff !important;\n}\n' >> "$css"
-    printf 'input:focus, select:focus, textarea:focus {\n' >> "$css"
-    printf '  border-color: rgba(49,161,161,0.80) !important;\n' >> "$css"
-    printf '  box-shadow: 0 0 0 2px rgba(49,161,161,0.25) !important;\n' >> "$css"
+    # 内发光辅助增强边框感知
+    printf '  box-shadow: inset 0 1px 3px rgba(0,0,0,0.40) !important;\n}\n' >> "$css"
+
+    # 输入框获得焦点时：青色高亮边框
+    printf 'input[type="text"]:focus, input[type="password"]:focus,\n' >> "$css"
+    printf 'input[type="number"]:focus, input[type="email"]:focus,\n' >> "$css"
+    printf 'input[type="url"]:focus, input[type="search"]:focus {\n' >> "$css"
+    printf '  border-color: rgba(0,220,220,0.90) !important;\n' >> "$css"
+    printf '  box-shadow: 0 0 0 2px rgba(0,220,220,0.30),\n' >> "$css"
+    printf '              inset 0 1px 3px rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  outline: none !important;\n}\n' >> "$css"
 
-    # ---- 菜单激活项 ----
+    # select 下拉框
+    printf 'select {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.60) !important;\n' >> "$css"
+    printf '  border: 1px solid rgba(255,255,255,0.60) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '  backdrop-filter: blur(4px) !important;\n}\n' >> "$css"
+    printf 'select:focus {\n' >> "$css"
+    printf '  border-color: rgba(0,220,220,0.90) !important;\n' >> "$css"
+    printf '  outline: none !important;\n}\n' >> "$css"
+
+    # textarea（可编辑）
+    printf 'textarea {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.55) !important;\n' >> "$css"
+    printf '  border: 1px solid rgba(255,255,255,0.60) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '  backdrop-filter: blur(4px) !important;\n}\n' >> "$css"
+    printf 'textarea:focus {\n' >> "$css"
+    printf '  border-color: rgba(0,220,220,0.90) !important;\n' >> "$css"
+    printf '  outline: none !important;\n}\n' >> "$css"
+
+    # .form-control 通用表单控件
+    printf '.form-control {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.55) !important;\n' >> "$css"
+    printf '  border: 1px solid rgba(255,255,255,0.60) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n}\n' >> "$css"
+
+    # 菜单激活项
     printf '.sidenav-menu .nav-item.active > a,\n' >> "$css"
     printf '.nav-pills .nav-link.active, #menu .active > a {\n' >> "$css"
     printf '  background: linear-gradient(90deg,\n' >> "$css"
@@ -873,7 +862,7 @@ step_glassmorphism() {
     printf '  border-left: 3px solid #00fff7 !important;\n' >> "$css"
     printf '  border-radius: 0 8px 8px 0 !important;\n}\n' >> "$css"
 
-    # ---- 登录框 ----
+    # 登录框
     printf '%s {\n' "$SEL_LOGIN" >> "$css"
     printf '  background: rgba(0,0,0,0.20) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(%s) blur(22px) saturate(160%%) !important;\n' \
@@ -884,7 +873,7 @@ step_glassmorphism() {
     printf '  border-radius: 18px !important;\n' >> "$css"
     printf '  box-shadow: 0 8px 40px rgba(0,0,0,0.50) !important;\n}\n' >> "$css"
 
-    # ---- 登录按钮 ----
+    # 登录按钮（只覆盖登录页的）
     printf '%s .cbi-button-apply,\n' "$SEL_LOGIN" >> "$css"
     printf '%s input[type="submit"],\n' "$SEL_LOGIN" >> "$css"
     printf '%s button[type="submit"] {\n' "$SEL_LOGIN" >> "$css"
@@ -903,7 +892,7 @@ step_glassmorphism() {
     printf '  background: rgba(255,255,255,0.18) !important;\n' >> "$css"
     printf '  box-shadow: 0 0 0 2px rgba(255,255,255,0.50) !important;\n}\n' >> "$css"
 
-    # ---- 弹窗/模态框：也用 backdrop-filter brightness 压暗 ----
+    # 弹窗/模态框
     printf '.modal-content, .modal-dialog, .modal .card,\n' >> "$css"
     printf '[role="dialog"], [role="dialog"] .card,\n' >> "$css"
     printf '.dialog, .popup, .luci-popup, .cbi-modal, .cbi-popup {\n' >> "$css"
@@ -915,17 +904,17 @@ step_glassmorphism() {
     printf '  border: 1px solid %s !important;\n' "$BR" >> "$css"
     printf '  border-radius: 14px !important;\n' >> "$css"
     printf '  box-shadow: 0 12px 48px rgba(0,0,0,0.60) !important;\n}\n' >> "$css"
-    # 弹窗内输入框
+    # 弹窗内输入框（继承深色背景样式）
     printf '.modal-content input, .modal-content select, .modal-content textarea,\n' >> "$css"
     printf '[role="dialog"] input, [role="dialog"] select, [role="dialog"] textarea,\n' >> "$css"
     printf '.cbi-modal input, .cbi-modal select, .cbi-modal textarea {\n' >> "$css"
-    printf '  background: rgba(255,255,255,0.12) !important;\n' >> "$css"
-    printf '  border: 1px solid rgba(255,255,255,0.25) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.55) !important;\n' >> "$css"
+    printf '  border: 1px solid rgba(255,255,255,0.60) !important;\n' >> "$css"
     printf '  border-radius: 6px !important;\n}\n' >> "$css"
-    # 遮罩层
+    # 遮罩
     printf '.modal-backdrop { background: rgba(0,0,0,0.65) !important; }\n' >> "$css"
 
-    # ---- 提示框 ----
+    # 提示框
     printf '.alert, .notice, .cbi-map-descr, .warning {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(%s) !important;\n' "$DK" >> "$css"
@@ -934,12 +923,12 @@ step_glassmorphism() {
     printf '  border-radius: 8px !important;\n}\n' >> "$css"
 
     printf '/* === END GLASSMORPHISM === */\n' >> "$css"
-    success "自适应毛玻璃注入完成（压暗: ${DK}，模糊: ${BL}px）"
-    info "提示：浅色壁纸建议压暗0.20~0.35；深色壁纸建议0.40~0.50"
+    success "毛玻璃注入完成（v1.1：输入框已修复，深色背景+白字+亮边框）"
 }
 
 # ============================================================
-#  步骤5：文字颜色（v1.1：白色文字+强阴影，配合 brightness 压暗）
+#  步骤5：文字颜色 v1.1
+#  修复：输入框 placeholder 加半透明白色，可读但不抢眼
 # ============================================================
 step_text() {
     title "步骤5：文字颜色优化 [$ACTIVE_THEME]"
@@ -950,7 +939,6 @@ step_text() {
         else info "跳过"; return; fi
     fi
     local css="$ACTIVE_CSS"
-    # v1.1：文字统一白色 + 强阴影，配合 backdrop brightness 压暗后背景始终深色
     printf '\n/* === TEXT_COLOR theme=%s === */\n' "$ACTIVE_THEME" >> "$css"
     printf 'body, p, li, span, label,\n' >> "$css"
     printf '.cbi-value-title, .cbi-value-field, td, th {\n' >> "$css"
@@ -968,7 +956,7 @@ step_text() {
     printf '%s * {\n' "$SEL_HEADER" >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  text-shadow: 0 1px 4px rgba(0,0,0,0.90) !important;\n}\n' >> "$css"
-    # 弹窗内文字也白色（backdrop-filter 已经压暗背景）
+    # 弹窗内文字
     printf '.modal-content *, [role="dialog"] *,\n' >> "$css"
     printf '.cbi-modal *, .cbi-popup *, .dialog *, .popup * {\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
@@ -976,15 +964,22 @@ step_text() {
     printf 'a { color: #7ecfff !important; }\n' >> "$css"
     printf 'a:hover { color: #00fff7 !important; }\n' >> "$css"
     printf 'a:active { color: #dddddd !important; }\n' >> "$css"
+    # 输入框：白字，无阴影（深色背景已保证可读）
     printf 'input, select, textarea, .form-control {\n' >> "$css"
-    printf '  text-shadow: none !important; color: #ffffff !important;\n}\n' >> "$css"
+    printf '  text-shadow: none !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n}\n' >> "$css"
+    # placeholder：半透明白色（可识别但不抢眼）
+    printf 'input::placeholder, textarea::placeholder {\n' >> "$css"
+    printf '  color: rgba(255,255,255,0.50) !important;\n' >> "$css"
+    printf '  opacity: 1 !important;\n}\n' >> "$css"
+    printf '::-webkit-input-placeholder {\n' >> "$css"
+    printf '  color: rgba(255,255,255,0.50) !important;\n}\n' >> "$css"
+    printf '::-moz-placeholder {\n' >> "$css"
+    printf '  color: rgba(255,255,255,0.50) !important;\n}\n' >> "$css"
     printf '/* === END TEXT_COLOR === */\n' >> "$css"
-    success "文字颜色注入完成（白色 + 强阴影，配合亮度自适应）"
+    success "文字颜色注入完成（v1.1：placeholder 半透明白色）"
 }
 
-# ============================================================
-#  步骤6：登录框位置
-# ============================================================
 step_login_position() {
     title "步骤6：登录框位置 [$ACTIVE_THEME]"
     echo "  ${CYAN}1)${NC} 居中（默认，跳过）"; echo "  ${CYAN}2)${NC} 偏左  5%"
@@ -1021,9 +1016,6 @@ step_login_position() {
     success "登录框位置已设置 (${justify})"
 }
 
-# ============================================================
-#  步骤7：清理
-# ============================================================
 step_clean() {
     title "步骤7：清理页面元素 [$ACTIVE_THEME]"
     [ -n "$SYSAUTH" ] && ask "删除登录页 SVG 图标" && {
@@ -1042,9 +1034,6 @@ step_clean() {
     }
 }
 
-# ============================================================
-#  备份
-# ============================================================
 do_backup() {
     local ts; ts=$(date '+%Y%m%d_%H%M%S' 2>/dev/null || echo "bak")
     if [ ! -f "${ACTIVE_CSS}.bak" ]; then
@@ -1058,9 +1047,6 @@ do_backup() {
         cp "$SYSAUTH" "${SYSAUTH}.bak" && success "sysauth 已备份"
 }
 
-# ============================================================
-#  恢复
-# ============================================================
 do_restore() {
     title "恢复备份 [$ACTIVE_THEME]"
     info "可用备份文件："
@@ -1129,7 +1115,7 @@ show_status() {
         printf "  %-28s ${WHITE}%s${NC}\n" "字体" "系统默认"
     fi
     grep -q "TEXT_COLOR" "$css" 2>/dev/null && \
-        printf "  %-28s ${GREEN}%s${NC}\n" "文字优化" "已启用（白色+强阴影）" || \
+        printf "  %-28s ${GREEN}%s${NC}\n" "文字优化" "已启用" || \
         printf "  %-28s ${YELLOW}%s${NC}\n" "文字优化" "未启用"
     grep -q "LOGIN_POSITION" "$css" 2>/dev/null && \
         printf "  %-28s ${GREEN}%s${NC}\n" "登录框位置" "已自定义" || \
@@ -1137,8 +1123,6 @@ show_status() {
     echo ""
     [ -f "$ACTIVE_BG" ] && info "背景图: 存在 ($(du -sh "$ACTIVE_BG" | cut -f1))" || \
         warn "背景图: 未找到 ($ACTIVE_BG)"
-    [ -f "${ACTIVE_FONTS_DIR}/TypoGraphica.woff2" ] && \
-        info "TypoGraphica.woff2: 存在" || info "TypoGraphica.woff2: 无"
     info "CSS: $(wc -l < "$css") 行 | $(du -sh "$css" | cut -f1)"
     echo ""; info "可用备份:"
     [ -f "${ACTIVE_CSS}.bak" ] && printf "    %s\n" "${ACTIVE_CSS}.bak"
@@ -1147,14 +1131,11 @@ show_status() {
 
 do_flush() { rm -rf /tmp/luci-* 2>/dev/null; success "LuCI 缓存已清除"; }
 
-# ============================================================
-#  主菜单
-# ============================================================
 main_menu() {
     while true; do
         echo ""
         echo "${CYAN}+------------------------------------------------+${NC}"
-        printf "${CYAN}|${NC}  ${WHITE}LuCI Theme Beauty Tool v1.1  [%-14s]${NC}${CYAN}|${NC}\n" \
+        printf "${CYAN}|${NC}  ${WHITE}LuCI Theme Beauty Tool v1.1 [%-12s]${NC}${CYAN}|${NC}\n" \
             "$ACTIVE_THEME"
         echo "${CYAN}+------------------------------------------------+${NC}"
         echo "${CYAN}|${NC} ${WHITE}1${NC}) [全程] 一键智能全流程美化 (推荐新手)       ${CYAN}|${NC}"
@@ -1196,14 +1177,14 @@ main_menu() {
             2)  show_status ;;
             0)  step_check_urls ;;
             T|t) detect_themes; detect_paths; do_backup ;;
-            3)  step_download_image;                    do_flush ;;
-            4)  step_download_font;                     do_flush ;;
-            5)  step_brand_animation;                   do_flush ;;
-            6)  step_switch_animation;                  do_flush ;;
-            7)  step_glassmorphism;                     do_flush ;;
-            8)  step_text;                              do_flush ;;
-            9)  step_login_position;                    do_flush ;;
-            a)  step_clean;                             do_flush ;;
+            3)  step_download_image;   do_flush ;;
+            4)  step_download_font;    do_flush ;;
+            5)  step_brand_animation;  do_flush ;;
+            6)  step_switch_animation; do_flush ;;
+            7)  step_glassmorphism;    do_flush ;;
+            8)  step_text;             do_flush ;;
+            9)  step_login_position;   do_flush ;;
+            a)  step_clean;            do_flush ;;
             r)  do_restore ;;
             f)  do_flush ;;
             q)  echo "${GREEN}  再见！${NC}"; exit 0 ;;
@@ -1212,13 +1193,10 @@ main_menu() {
     done
 }
 
-# ============================================================
-#  程序入口
-# ============================================================
 printf "${CYAN}"
 printf '  +==================================================+\n'
-printf '  |  LuCI Theme Beauty Tool v1.1                    |\n'
-printf '  |  自适应亮度 / 任意壁纸可读 / Busybox兼容        |\n'
+printf '  |  LuCI Theme Beauty Tool v1.1                  |\n'
+printf '  |  修复：输入框深色背景 / 亮边框 / 白字可读       |\n'
 printf '  +==================================================+\n'
 printf "${NC}\n"
 
