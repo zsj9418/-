@@ -1,8 +1,7 @@
 #!/bin/bash
-
 set -euo pipefail
 
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.1"
 
 DAE_CONFIG_FILE="/etc/dae/config.dae"
 DAED_CONFIG_DIR="/etc/daed"
@@ -14,6 +13,14 @@ ENV_FILE="$HOME/.dae_env"
 LOG_FILE="/var/log/dae.log"
 DAED_LOG_FILE="/var/log/daed.log"
 LOG_SIZE_LIMIT=$((1 * 1024 * 1024))
+
+# dae v1.1.0 包含 PR#912 fix: Remove sockmap fast tcp redirect
+# daed 需要基于 dae v1.1.0+ 构建的版本才能在受影响内核上运行
+# 此处记录第一个已知安全的 daed 版本（待官方发布后更新）
+SOCKOPS_SAFE_DAE_VERSION="v1.1.0"
+# daed 版本号与 dae 内核版本的对应关系：v1.27 及以下 = dae v1.0.x = 受影响
+# v1.28.0+ 预计包含 dae v1.1.0，届时更新此值
+SOCKOPS_AFFECTED_DAED_MAX="v1.27.99"
 
 RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
 BLUE='\033[0;34m';   PURPLE='\033[0;35m'; CYAN='\033[0;36m'
@@ -118,6 +125,175 @@ validate_subscription() {
     printf '%s' "$1" | grep -qE '^https?://'
 }
 
+# ==================== 版本号比较 ====================
+# 返回 0=相等 1=v1>v2 2=v1<v2
+ver_compare() {
+    local v1 v2
+    v1=$(printf '%s' "$1" | sed 's/^v//')
+    v2=$(printf '%s' "$2" | sed 's/^v//')
+    if [ "$v1" = "$v2" ]; then echo 0; return; fi
+    local IFS=.
+    local i a b
+    set -- $v1; local p1="$*"
+    set -- $v2; local p2="$*"
+    local max_len
+    max_len=$(printf '%s\n%s\n' "$p1" "$p2" | awk '{print NF}' | sort -rn | head -1)
+    for i in $(seq 1 "${max_len:-3}"); do
+        a=$(printf '%s' "$v1" | cut -d. -f"$i" | tr -cd '0-9')
+        b=$(printf '%s' "$v2" | cut -d. -f"$i" | tr -cd '0-9')
+        a="${a:-0}"; b="${b:-0}"
+        [ "$a" -gt "$b" ] && echo 1 && return
+        [ "$a" -lt "$b" ] && echo 2 && return
+    done
+    echo 0
+}
+
+# ==================== ★ 新增：BPF SOCK_OPS helper 兼容性检测 ====================
+# 检测内核是否支持在 BPF_PROG_TYPE_SOCK_OPS 中使用 bpf_get_current_task helper
+# 返回 0=兼容  1=不兼容（会触发 local_tcp_sockops 崩溃）
+check_sockops_compat() {
+    local result=0
+
+    # ── 方法一：检查内核 SoC 类型（msm/qcom 系列已知不兼容）──
+    local kname
+    kname=$(uname -r)
+    if printf '%s' "$kname" | grep -qiE 'msm|qcom|sdm|sm[0-9]{3,4}'; then
+        printf "${RED}  [BPF] 检测到高通移动 SoC 内核 (%s)${NC}\n" "$kname"
+        printf "${RED}  [BPF] 此类内核不允许 SOCK_OPS 程序使用 bpf_get_current_task helper${NC}\n"
+        result=1
+    fi
+
+    # ── 方法二：检查内核版本是否低于修复基线 ──
+    # 注意：版本号高不代表 helper 可用，魔改内核可能版本号很高但功能受限
+    # 此处仅作补充提示，不单独判定
+    local major minor
+    major=$(printf '%s' "$kname" | cut -d. -f1)
+    minor=$(printf '%s' "$kname" | cut -d. -f2)
+    if [ "${major:-0}" -lt 5 ] || \
+       { [ "${major:-0}" -eq 5 ] && [ "${minor:-0}" -lt 17 ]; }; then
+        result=1
+    fi
+
+    # ── 方法三：检查 /proc/sys/kernel/bpf_stats_enabled 及 helper 白名单 ──
+    # 尝试读取内核 BPF 功能描述（部分内核暴露此信息）
+    if [ -f /proc/sys/kernel/unprivileged_bpf_disabled ]; then
+        local bpf_val
+        bpf_val=$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo 2)
+        # 值为 2 表示完全禁用 BPF（非特权+特权），此时任何 eBPF 都无法加载
+        if [ "${bpf_val:-2}" = "2" ]; then
+            printf "${RED}  [BPF] /proc/sys/kernel/unprivileged_bpf_disabled = 2，BPF 被完全禁用${NC}\n"
+            result=1
+        fi
+    fi
+
+    # ── 方法四：检查已安装 daed 二进制中是否含有 LocalTcpSockops 符号 ──
+    if [ -f "$DAED_BIN_PATH" ] && command -v strings >/dev/null 2>&1; then
+        if strings "$DAED_BIN_PATH" 2>/dev/null | grep -q "LocalTcpSockops"; then
+            printf "${YELLOW}  [BPF] 当前 daed 二进制含有 LocalTcpSockops 程序${NC}\n"
+            printf "${YELLOW}  [BPF] 此版本在不兼容内核上会崩溃${NC}\n"
+            result=1
+        fi
+    fi
+
+    return $result
+}
+
+# ==================== ★ 新增：检查版本是否已知受 sockops bug 影响 ====================
+# 返回 0=受影响  1=安全或未知
+is_daed_version_affected() {
+    local ver="$1"
+    # 清理版本号，只取 vX.Y.Z 部分
+    ver=$(printf '%s' "$ver" | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+    [ -z "$ver" ] && return 1
+
+    local cmp
+    cmp=$(ver_compare "$ver" "$SOCKOPS_AFFECTED_DAED_MAX")
+    # cmp=2 表示 ver < SOCKOPS_AFFECTED_DAED_MAX，即受影响
+    # cmp=0 表示相等，也受影响
+    if [ "$cmp" = "2" ] || [ "$cmp" = "0" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# ==================== ★ 新增：安装后启动探测，检测 sockops 崩溃 ====================
+# 参数1: 服务名（daed 或 dae）
+# 返回 0=启动正常  1=检测到 sockops 崩溃
+verify_daed_sockops_free() {
+    local svc="${1:-daed}"
+    local logf="$DAED_LOG_FILE"
+    [ "$svc" = "dae" ] && logf="$LOG_FILE"
+
+    step "探测启动（5秒）..."
+
+    # 清空旧日志，避免误判历史错误
+    : > "$logf" 2>/dev/null || true
+
+    # 启动服务
+    manage_service_generic "$svc" "start" 2>/dev/null || true
+    sleep 5
+
+    # 检查进程是否还存活
+    if pgrep -x "$svc" >/dev/null 2>&1; then
+        info "探测通过：$svc 进程正常运行"
+        return 0
+    fi
+
+    # 进程已退出，检查日志中的特征错误
+    if [ -f "$logf" ] && grep -q "local_tcp_sockops\|LocalTcpSockops\|bpf_get_current_task" "$logf" 2>/dev/null; then
+        printf "${RED}╔══════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${RED}║  ☠️  检测到 local_tcp_sockops BPF 兼容性崩溃              ║${NC}\n"
+        printf "${RED}║  当前版本的 daed 内嵌 dae v1.0.x 核心                   ║${NC}\n"
+        printf "${RED}║  该核心在此内核上无法加载 SOCK_OPS 类型 BPF 程序         ║${NC}\n"
+        printf "${RED}╠══════════════════════════════════════════════════════════╣${NC}\n"
+        printf "${RED}║  根因: dae PR#912 修复尚未包含在当前版本中               ║${NC}\n"
+        printf "${RED}║  修复: 需要基于 dae ${SOCKOPS_SAFE_DAE_VERSION}+ 构建的 daed 版本         ║${NC}\n"
+        printf "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+        # 立即禁用服务，防止无限重启刷日志
+        manage_service_generic "$svc" "stop"  2>/dev/null || true
+        manage_service_generic "$svc" "disable" 2>/dev/null || true
+        printf "${YELLOW}[保护] 已自动禁用 %s 服务，防止无限重启${NC}\n" "$svc"
+
+        return 1
+    fi
+
+    # 进程退出但日志无特征错误，可能是其他原因
+    warn "$svc 启动后退出，但未检测到 sockops 特征错误"
+    printf "${YELLOW}  最后 10 行日志:${NC}\n"
+    tail -n 10 "$logf" 2>/dev/null || true
+    return 1
+}
+
+# ==================== ★ 新增：sockops 问题修复引导 ====================
+guide_sockops_fix() {
+    printf "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    printf "${YELLOW}  local_tcp_sockops 兼容性问题处理指南${NC}\n"
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    printf "\n"
+    printf "${CYAN}当前状态：${NC}\n"
+    printf "  你的内核 (%s) 不支持 SOCK_OPS 程序使用\n" "$(uname -r)"
+    printf "  bpf_get_current_task helper（dae v1.0.x 需要此 helper）\n"
+    printf "\n"
+    printf "${CYAN}修复方案（按推荐优先级）：${NC}\n"
+    printf "\n"
+    printf "  ${GREEN}方案 A：等待/安装包含 dae v1.1.0+ 的 daed 版本${NC}\n"
+    printf "  ├── dae PR#912 已于 2026-04-23 合并进 dae v1.1.0\n"
+    printf "  ├── PR#912 彻底移除了 local_tcp_sockops BPF 程序\n"
+    printf "  ├── 一旦 daed 发布基于 dae v1.1.0 构建的版本即可使用\n"
+    printf "  └── 检查命令: curl -s https://api.github.com/repos/daeuniverse/daed/releases\n"
+    printf "               | grep tag_name | head -5\n"
+    printf "\n"
+    printf "  ${YELLOW}方案 B：检查本次版本列表中是否有安全版本${NC}\n"
+    printf "  └── 重新执行菜单 A，若列表中出现 v1.28.0+ 则选择该版本\n"
+    printf "\n"
+    printf "  ${RED}方案 C：此设备暂时无法运行 dae/daed（内核限制）${NC}\n"
+    printf "  ├── 替代方案: sing-box（纯用户态，不依赖 eBPF）\n"
+    printf "  └── 替代方案: mihomo/Clash.Meta（同上）\n"
+    printf "\n"
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
+
 # ==================== 内存检测 ====================
 get_free_memory_mb() {
     local mb=0
@@ -154,22 +330,29 @@ check_ebpf_full() {
         printf "  ${GREEN}✓ 内核版本达标${NC}\n"
     fi
 
+    # ── ★ 新增：sockops 兼容性专项检查 ──
+    printf "  ${CYAN}--- BPF SOCK_OPS helper 兼容性 ---${NC}\n"
+    if check_sockops_compat 2>/dev/null; then
+        printf "  ${GREEN}✓ SOCK_OPS bpf_get_current_task helper 可用${NC}\n"
+    else
+        printf "  ${RED}✗ SOCK_OPS bpf_get_current_task helper 不可用${NC}\n"
+        printf "  ${RED}  daed v1.0.x~v1.27.x 将在此内核上崩溃${NC}\n"
+        printf "  ${YELLOW}  需要基于 dae %s+ 构建的 daed 版本${NC}\n" "$SOCKOPS_SAFE_DAE_VERSION"
+        warn_count=$((warn_count+1))
+    fi
+
     if [ -f /sys/kernel/btf/vmlinux ]; then
         printf "  ${GREEN}✓ BTF (/sys/kernel/btf/vmlinux) 存在${NC}\n"
     else
         printf "  ${RED}✗ 缺少 BTF！eBPF 加载将失败${NC}\n"
         warn_count=$((warn_count+1))
-        local kname
-        kname=$(uname -r)
-        printf "\n  ${YELLOW}━━ BTF 缺失解决方案 ━━${NC}\n"
-        if printf '%s' "$kname" | grep -qiE 'msm|qcom|sdm|sm[0-9]'; then
-            printf "  高通平台: 方案1【推荐】Docker 部署 → 菜单 B\n"
+        if printf '%s' "$(uname -r)" | grep -qiE 'msm|qcom|sdm|sm[0-9]'; then
+            printf "  ${CYAN}高通平台: 方案1【推荐】Docker 部署 → 菜单 B${NC}\n"
             printf "           方案2  刷入支持 BTF 的主线内核\n"
         else
             printf "  方案1  重新编译内核: CONFIG_DEBUG_INFO_BTF=y\n"
             printf "  方案2  Docker 部署 → 菜单 B\n"
         fi
-        printf "\n"
     fi
 
     if mount | grep -q 'type bpf'; then
@@ -357,7 +540,7 @@ detect_system_env() {
     elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/runlevels ]; then
         SERVICE_MGR="openrc"
     elif command -v procd >/dev/null 2>&1 || \
-         { [ -f /etc/openwrt_release ] && command -v /etc/init.d/boot >/dev/null 2>&1; }; then
+         [ -f /etc/openwrt_release ]; then
         SERVICE_MGR="procd"
     else
         SERVICE_MGR="initd"
@@ -498,7 +681,7 @@ check_mode_conflict() {
 collect_subscriptions() {
     printf "\n${CYAN}══ 订阅链接配置 ══${NC}\n"
     printf "${YELLOW}请逐一输入订阅链接（v2ray/base64 格式，不支持 Clash）${NC}\n"
-    printf "${YELLOW}输入完成后直接回车继续下一步，不输入直接回车则结束输入${NC}\n\n"
+    printf "${YELLOW}每条输入完成后按回车继续，不输入直接回车则结束${NC}\n\n"
 
     local idx=1
     SUB_NAMES=""
@@ -630,7 +813,9 @@ generate_dae_config() {
         first_name=$(printf '%s' "$SUB_NAMES" | cut -d',' -f1)
         filter_expr="subtag(${first_name})"
         if printf '%s' "$SUB_NAMES" | grep -q ','; then
-            filter_expr="subtag(${SUB_NAMES//,/, })"
+            local names_spaced
+            names_spaced=$(printf '%s' "$SUB_NAMES" | sed 's/,/, /g')
+            filter_expr="subtag(${names_spaced})"
         fi
     fi
 
@@ -827,17 +1012,17 @@ manage_service_generic() {
     local svc="$1"
     local action="$2"
 
-    local bin_path desc cfg_or_dir log_path
+    local bin_path cfg_or_dir log_path exec_start
     if [ "$svc" = "daed" ]; then
         bin_path="$DAED_BIN_PATH"
         cfg_or_dir="$DAED_CONFIG_DIR"
-        desc="daed eBPF Proxy with Web Dashboard"
         log_path="$DAED_LOG_FILE"
+        exec_start="${bin_path} run"
     else
         bin_path="$DAE_BIN_PATH"
         cfg_or_dir="$DAE_CONFIG_FILE"
-        desc="dae eBPF Transparent Proxy"
         log_path="$LOG_FILE"
+        exec_start="${bin_path} run -c ${cfg_or_dir}"
     fi
 
     case "${SERVICE_MGR:-initd}" in
@@ -872,21 +1057,13 @@ manage_service_generic() {
             else
                 case "$action" in
                     start)
-                        if [ "$svc" = "daed" ]; then
-                            nohup "$bin_path" run > "$log_path" 2>&1 &
-                        else
-                            nohup "$bin_path" run -c "$cfg_or_dir" > "$log_path" 2>&1 &
-                        fi
+                        nohup $exec_start > "$log_path" 2>&1 &
                         printf "${GREEN}%s 已后台启动${NC}\n" "$svc" ;;
                     stop)
                         killall "$svc" 2>/dev/null || true ;;
                     restart)
                         killall "$svc" 2>/dev/null || true; sleep 1
-                        if [ "$svc" = "daed" ]; then
-                            nohup "$bin_path" run > "$log_path" 2>&1 &
-                        else
-                            nohup "$bin_path" run -c "$cfg_or_dir" > "$log_path" 2>&1 &
-                        fi
+                        nohup $exec_start > "$log_path" 2>&1 &
                         printf "${GREEN}%s 已重启${NC}\n" "$svc" ;;
                     enable|disable)
                         printf "${YELLOW}[提示] %s 下 %s 开机自启需手动配置${NC}\n" \
@@ -929,23 +1106,18 @@ print_service_live_status() {
 install_service_unit() {
     local svc="${1:-dae}"
 
-    local bin_path desc cfg_or_dir log_path
+    local bin_path desc cfg_or_dir log_path exec_start
     if [ "$svc" = "daed" ]; then
         bin_path="$DAED_BIN_PATH"
         cfg_or_dir="$DAED_CONFIG_DIR"
         desc="daed eBPF Proxy with Web Dashboard"
         log_path="$DAED_LOG_FILE"
+        exec_start="${bin_path} run"
     else
         bin_path="$DAE_BIN_PATH"
         cfg_or_dir="$DAE_CONFIG_FILE"
         desc="dae eBPF Transparent Proxy"
         log_path="$LOG_FILE"
-    fi
-
-    local exec_start
-    if [ "$svc" = "daed" ]; then
-        exec_start="${bin_path} run"
-    else
         exec_start="${bin_path} run -c ${cfg_or_dir}"
     fi
 
@@ -967,6 +1139,8 @@ ExecStart=${exec_start}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
 LimitNOFILE=1048576
 
 [Install]
@@ -982,7 +1156,7 @@ EOF
 #!/sbin/openrc-run
 description="${desc}"
 command="${bin_path}"
-command_args="run${svc:+ }$([ "$svc" = "dae" ] && echo "-c ${cfg_or_dir}" || echo "")"
+command_args="run$([ "$svc" = "dae" ] && echo " -c ${cfg_or_dir}" || echo "")"
 command_background=true
 pidfile="/run/${svc}.pid"
 depend() { need net; }
@@ -1004,7 +1178,7 @@ start_service() {
     procd_set_param command ${exec_start}
     procd_set_param stdout 1
     procd_set_param stderr 1
-    procd_set_param respawn 3600 5 5
+    procd_set_param respawn 3600 5 3
     procd_close_instance
 }
 EOF
@@ -1027,8 +1201,9 @@ EOF
 ### END INIT INFO
 BIN="${bin_path}"
 LOG="${log_path}"
+ARGS="$([ "$svc" = "dae" ] && echo "run -c ${cfg_or_dir}" || echo "run")"
 case "\$1" in
-    start)   nohup "\$BIN" ${exec_start#${bin_path} } > "\$LOG" 2>&1 & ;;
+    start)   nohup "\$BIN" \$ARGS > "\$LOG" 2>&1 & ;;
     stop)    killall ${svc} 2>/dev/null || true ;;
     restart) \$0 stop; sleep 1; \$0 start ;;
     status)  pgrep -x ${svc} >/dev/null && echo "running" || echo "stopped" ;;
@@ -1044,11 +1219,30 @@ EOF
 
 # ==================== daed 面板安装/更新 ====================
 install_daed_panel() {
-    printf "\n${CYAN}═══════════════════════════════════════${NC}\n"
-    printf "${CYAN}   🖥️  daed Web 面板安装/更新          ${NC}\n"
-    printf "${CYAN}═══════════════════════════════════════${NC}\n"
+    printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "${CYAN}   🖥️  daed Web 面板安装/更新                               ${NC}\n"
+    printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
 
     check_mode_conflict "daed" || return 1
+
+    # ── ★ 安装前 sockops 兼容性预警 ──
+    local sockops_risky=0
+    printf "\n${CYAN}[兼容性] 检测 BPF SOCK_OPS helper 兼容性...${NC}\n"
+    if ! check_sockops_compat 2>/dev/null; then
+        sockops_risky=1
+        printf "${RED}╔══════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${RED}║  ⚠️  检测到 local_tcp_sockops 潜在兼容性问题            ║${NC}\n"
+        printf "${RED}║  daed v1.27.x 及以下版本在此内核上会崩溃               ║${NC}\n"
+        printf "${RED}║  需要选择基于 dae v1.1.0+ 构建的 daed 版本             ║${NC}\n"
+        printf "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
+        printf "\n${YELLOW}继续安装（将在版本列表中标注受影响版本）？(y/n): ${NC}"
+        read -r go_on
+        [ "${go_on:-n}" != "y" ] && [ "${go_on:-n}" != "Y" ] && {
+            guide_sockops_fix; return 0; }
+    else
+        printf "${GREEN}  ✓ 内核兼容性检测通过${NC}\n"
+    fi
+
     check_ebpf_full || warn "预检有问题，但您选择继续。"
 
     local target_arch
@@ -1061,10 +1255,12 @@ install_daed_panel() {
         "https://api.github.com/repos/daeuniverse/daed/releases" 2>/dev/null || true)
     [ -z "${release_list:-}" ] && { err "无法获取版本列表，请检查网络。"; return 1; }
 
+    # 只取正式版本（过滤掉 dae-lang-core / dae-editor 等非主版本 tag）
     local version_list
     version_list=$(printf '%s' "$release_list" \
         | grep '"tag_name":' \
         | sed -E 's/.*"([^"]+)".*/\1/' \
+        | grep -E '^v[0-9]+\.[0-9]+' \
         | head -n 5)
     [ -z "${version_list:-}" ] && { err "版本列表解析失败。"; return 1; }
 
@@ -1076,17 +1272,37 @@ install_daed_panel() {
 
     printf "当前版本: ${GREEN}%s${NC}\n" "$current_version"
     printf "${PURPLE}可选版本:${NC}\n"
+
+    # ── ★ 版本列表中对受影响版本标注警告 ──
     local count=1
     while IFS= read -r v; do
         [ -z "$v" ] && continue
-        [ $count -eq 1 ] \
-            && printf " %d) %s ${YELLOW}(最新)${NC}\n" "$count" "$v" \
-            || printf " %d) %s\n" "$count" "$v"
+        local tag_suffix=""
+        [ $count -eq 1 ] && tag_suffix="${YELLOW}(最新)${NC}"
+
+        # ★ 检测此版本是否已知受 sockops bug 影响
+        local compat_mark=""
+        if [ "$sockops_risky" = "1" ]; then
+            if is_daed_version_affected "$v"; then
+                compat_mark=" ${RED}⚠️  此版本在你的内核上会崩溃${NC}"
+            else
+                compat_mark=" ${GREEN}✅ 预计包含 dae v1.1.0 修复${NC}"
+            fi
+        fi
+
+        printf " %d) %s %b%b\n" "$count" "$v" "$tag_suffix" "$compat_mark"
         count=$((count+1))
     done << VEREOF
 $version_list
 VEREOF
     printf " 0) 取消\n"
+
+    # ── ★ 如果内核有风险，额外提示如何判断安全版本 ──
+    if [ "$sockops_risky" = "1" ]; then
+        printf "\n${YELLOW}[提示] 标注 ⚠️ 的版本基于 dae v1.0.x，在你的内核上会崩溃${NC}\n"
+        printf "${YELLOW}[提示] 标注 ✅ 的版本基于 dae v1.1.0+（PR#912 已修复）${NC}\n"
+        printf "${YELLOW}[提示] 若所有版本均标注 ⚠️，说明官方尚未发布修复版本${NC}\n\n"
+    fi
 
     printf "输入序号 [0-%d]: " "$((count-1))"
     read -r choice
@@ -1097,6 +1313,18 @@ VEREOF
         *) err "无效输入。"; return 1 ;;
     esac
     [ -z "${selected_version:-}" ] && { err "版本选择失败。"; return 1; }
+
+    # ── ★ 选择了受影响版本时二次确认 ──
+    if [ "$sockops_risky" = "1" ] && is_daed_version_affected "$selected_version"; then
+        printf "\n${RED}[警告] 你选择的 %s 已知会在此内核上崩溃！${NC}\n" "$selected_version"
+        printf "${RED}仍然继续安装？(y/n): ${NC}"
+        read -r force_install
+        if [ "${force_install:-n}" != "y" ] && [ "${force_install:-n}" != "Y" ]; then
+            guide_sockops_fix
+            return 0
+        fi
+        warn "已确认强行安装，将在安装后进行崩溃探测..."
+    fi
 
     local installed=0
     local base_url="https://github.com/daeuniverse/daed/releases/download/${selected_version}"
@@ -1111,8 +1339,7 @@ VEREOF
         if [ "$hc" = "200" ] && dpkg-deb -I "$tmp_deb" >/dev/null 2>&1; then
             dpkg -i "$tmp_deb" 2>/dev/null || true
             apt-get --fix-broken install -y >/dev/null 2>&1 || true
-            command -v daed >/dev/null 2>&1 && installed=1 \
-                && info ".deb 包安装成功"
+            command -v daed >/dev/null 2>&1 && installed=1 && info ".deb 安装成功"
             rm -f "$tmp_deb"
         else
             rm -f "$tmp_deb"
@@ -1120,7 +1347,8 @@ VEREOF
         fi
     fi
 
-    if [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
+    if { [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ] \
+         || [ "$PKG_MANAGER" = "zypper" ]; } && [ "$installed" -eq 0 ]; then
         local rpm_url="${base_url}/installer-daed-linux-${target_arch}.rpm"
         local tmp_rpm="/tmp/daed-installer.$$.rpm"
         step "尝试 .rpm 包..."
@@ -1128,31 +1356,15 @@ VEREOF
         hc=$(curl -fsSL -w "%{http_code}" --connect-timeout 60 \
             -o "$tmp_rpm" "$rpm_url" 2>/dev/null || echo "000")
         if [ "$hc" = "200" ]; then
-            rpm -ivh "$tmp_rpm" 2>/dev/null || true
-            command -v daed >/dev/null 2>&1 && installed=1 \
-                && info ".rpm 包安装成功"
+            case "$PKG_MANAGER" in
+                zypper) zypper install -y "$tmp_rpm" 2>/dev/null || true ;;
+                *)      rpm -ivh "$tmp_rpm" 2>/dev/null || true ;;
+            esac
+            command -v daed >/dev/null 2>&1 && installed=1 && info ".rpm 安装成功"
             rm -f "$tmp_rpm"
         else
             rm -f "$tmp_rpm"
             warn ".rpm 下载失败 (HTTP $hc)，尝试裸二进制..."
-        fi
-    fi
-
-    if [ "$PKG_MANAGER" = "zypper" ] && [ "$installed" -eq 0 ]; then
-        local rpm_url="${base_url}/installer-daed-linux-${target_arch}.rpm"
-        local tmp_rpm="/tmp/daed-installer.$$.rpm"
-        step "尝试 openSUSE .rpm 包..."
-        local hc
-        hc=$(curl -fsSL -w "%{http_code}" --connect-timeout 60 \
-            -o "$tmp_rpm" "$rpm_url" 2>/dev/null || echo "000")
-        if [ "$hc" = "200" ]; then
-            zypper install -y "$tmp_rpm" 2>/dev/null || true
-            command -v daed >/dev/null 2>&1 && installed=1 \
-                && info ".rpm(zypper) 安装成功"
-            rm -f "$tmp_rpm"
-        else
-            rm -f "$tmp_rpm"
-            warn "zypper .rpm 失败，尝试裸二进制..."
         fi
     fi
 
@@ -1206,21 +1418,33 @@ VEREOF
     chmod 0700 "$DAED_CONFIG_DIR"
     [ ! -f "$GEO_DIR/geoip.dat" ] || [ ! -f "$GEO_DIR/geosite.dat" ] && update_geo_data
     install_service_unit "daed"
-    open_firewall_ports "2023"
+    open_firewall_ports "2023,12345"
     fix_resolv_conf
 
-    printf "\n${GREEN}╔══════════════════════════════════════════════╗${NC}\n"
-    printf "${GREEN}║  ✅ daed 安装完成！版本: %-20s║${NC}\n" "$selected_version"
-    printf "${GREEN}║  🌐 面板: http://%-27s║${NC}\n" "${LAN_IP:-localhost}:2023"
-    printf "${GREEN}╚══════════════════════════════════════════════╝${NC}\n"
+    printf "\n${GREEN}╔══════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${GREEN}║  ✅ daed 安装完成！版本: %-30s║${NC}\n" "$selected_version"
+    printf "${GREEN}║  🌐 面板: http://%-37s║${NC}\n" "${LAN_IP:-localhost}:2023"
+    printf "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
 
     printf "\n立即启动 daed 服务？(y/n): "; read -r start_now
     if [ "${start_now:-n}" = "y" ] || [ "${start_now:-n}" = "Y" ]; then
         manage_service_generic "daed" "enable" 2>/dev/null || true
-        manage_service_generic "daed" "start"
+
+        # ── ★ 启动后探测 sockops 崩溃 ──
+        if ! verify_daed_sockops_free "daed"; then
+            # 崩溃已被捕获，服务已被自动禁用
+            guide_sockops_fix
+            send_wechat_notification "daed ${selected_version} 安装失败: local_tcp_sockops 内核不兼容"
+            return 1
+        fi
+
         print_service_live_status "daed"
     else
         printf "${YELLOW}手动启动: %s run${NC}\n" "$DAED_BIN_PATH"
+        if [ "$sockops_risky" = "1" ] && is_daed_version_affected "$selected_version"; then
+            warn "提醒: 此版本在你的内核上启动后会立即崩溃并循环重启"
+            warn "建议等待官方发布基于 dae v1.1.0+ 的新版本"
+        fi
     fi
     send_wechat_notification "daed ${selected_version} 已安装"
 }
@@ -1237,6 +1461,19 @@ install_daed_docker_compose() {
         return 1
     }
     printf "${CYAN}[Docker] 使用: %s${NC}\n" "$DC_CMD"
+
+    # ── ★ Docker 模式也做 sockops 预检 ──
+    printf "\n${CYAN}[兼容性] 检测 BPF SOCK_OPS helper 兼容性...${NC}\n"
+    if ! check_sockops_compat 2>/dev/null; then
+        printf "${RED}⚠️  检测到 local_tcp_sockops 兼容性问题！${NC}\n"
+        printf "${RED}   Docker 容器内的 daed 使用宿主机内核，同样会崩溃${NC}\n"
+        printf "${RED}   需要基于 dae v1.1.0+ 的镜像版本${NC}\n"
+        printf "强行继续？(y/n): "; read -r f
+        [ "${f:-n}" != "y" ] && [ "${f:-n}" != "Y" ] && {
+            guide_sockops_fix; return 0; }
+    else
+        printf "${GREEN}  ✓ 内核兼容性检测通过${NC}\n"
+    fi
 
     if [ ! -f /sys/kernel/btf/vmlinux ]; then
         err "缺少 BTF，daed 容器启动将失败！"
@@ -1280,7 +1517,7 @@ EOF
 
     info "Compose 文件: $compose_file"
     update_geo_data
-    open_firewall_ports "2023"
+    open_firewall_ports "2023,12345"
 
     step "拉取 $daed_image..."
     docker pull "$daed_image" || { err "镜像拉取失败。"; return 1; }
@@ -1288,16 +1525,29 @@ EOF
     step "启动容器..."
     $DC_CMD -f "$compose_file" up -d
 
-    sleep 3
+    sleep 5
+
+    # ── ★ Docker 容器启动后也检测 sockops 崩溃 ──
     if [ "$(docker inspect -f '{{.State.Running}}' daed 2>/dev/null)" = "true" ]; then
-        printf "\n${GREEN}╔══════════════════════════════════════════╗${NC}\n"
-        printf "${GREEN}║  🎉 daed Docker 容器启动成功！           ║${NC}\n"
-        printf "${GREEN}║  面板: http://%-27s║${NC}\n" "${LAN_IP:-localhost}:2023"
-        printf "${GREEN}╚══════════════════════════════════════════╝${NC}\n"
+        # 检查容器日志中是否有崩溃特征
+        if docker logs --tail=20 daed 2>/dev/null \
+            | grep -q "local_tcp_sockops\|LocalTcpSockops\|bpf_get_current_task"; then
+            printf "${RED}╔══════════════════════════════════════════════════════╗${NC}\n"
+            printf "${RED}║  ☠️  Docker 容器内检测到 local_tcp_sockops 崩溃     ║${NC}\n"
+            printf "${RED}╚══════════════════════════════════════════════════════╝${NC}\n"
+            docker stop daed 2>/dev/null || true
+            guide_sockops_fix
+            return 1
+        fi
+        printf "\n${GREEN}╔══════════════════════════════════════════════════════╗${NC}\n"
+        printf "${GREEN}║  🎉 daed Docker 容器启动成功！                       ║${NC}\n"
+        printf "${GREEN}║  面板: http://%-37s║${NC}\n" "${LAN_IP:-localhost}:2023"
+        printf "${GREEN}╚══════════════════════════════════════════════════════╝${NC}\n"
         send_wechat_notification "daed Docker 已启动 http://${LAN_IP:-localhost}:2023"
     else
         err "容器异常退出："
         docker logs --tail=20 daed 2>/dev/null || true
+        guide_sockops_fix
     fi
 }
 
@@ -1320,6 +1570,7 @@ upgrade_dae_core() {
     version_list=$(printf '%s' "$release_list" \
         | grep '"tag_name":' \
         | sed -E 's/.*"([^"]+)".*/\1/' \
+        | grep -E '^v[0-9]+\.[0-9]+' \
         | head -n 5)
     [ -z "${version_list:-}" ] && { err "版本列表解析失败。"; return 1; }
 
@@ -1334,9 +1585,17 @@ upgrade_dae_core() {
     local count=1
     while IFS= read -r v; do
         [ -z "$v" ] && continue
+        local safe_mark=""
+        local cmp
+        cmp=$(ver_compare "$v" "$SOCKOPS_SAFE_DAE_VERSION")
+        if [ "$cmp" = "0" ] || [ "$cmp" = "1" ]; then
+            safe_mark="${GREEN} ✅ PR#912 已修复${NC}"
+        else
+            safe_mark="${RED} ⚠️  含 local_tcp_sockops bug${NC}"
+        fi
         [ $count -eq 1 ] \
-            && printf " %d) %s ${YELLOW}(最新)${NC}\n" "$count" "$v" \
-            || printf " %d) %s\n" "$count" "$v"
+            && printf " %d) %s ${YELLOW}(最新)${NC}%b\n" "$count" "$v" "$safe_mark" \
+            || printf " %d) %s%b\n" "$count" "$v" "$safe_mark"
         count=$((count+1))
     done << VEREOF
 $version_list
@@ -1396,6 +1655,11 @@ VEREOF
         warn "首次安装：请执行菜单 3 同步规则，再执行菜单 2 生成配置。"
     else
         manage_service_generic "dae" "start"
+        # ── ★ dae CLI 也做启动后探测 ──
+        if ! verify_daed_sockops_free "dae"; then
+            guide_sockops_fix
+            return 1
+        fi
         print_service_live_status "dae"
     fi
     send_wechat_notification "dae 更新至 ${selected_version} (${target_arch})"
@@ -1477,6 +1741,12 @@ main_menu() {
             *)    mode_display="${YELLOW}? 未知${NC}"           ;;
         esac
 
+        # ── ★ 主菜单也显示 sockops 兼容性警告 ──
+        local sockops_warn=""
+        if ! check_sockops_compat >/dev/null 2>&1; then
+            sockops_warn="${RED}   ⚠️  当前内核存在 local_tcp_sockops 兼容性问题${NC}\n   ${RED}需要 dae v1.1.0+ 方可正常运行${NC}"
+        fi
+
         local free_mb
         free_mb=$(get_free_memory_mb)
 
@@ -1490,6 +1760,7 @@ main_menu() {
         printf "   接口: ${GREEN}%s${NC} | IP: ${GREEN}%s${NC} | 拓扑: ${CYAN}%s路由${NC}\n" \
             "${LAN_IFACE:-?}" "${LAN_IP:-?}" "$(detect_router_mode)"
         printf "   状态: "; printf "$mode_display\n"
+        [ -n "$sockops_warn" ] && printf "%b\n" "$sockops_warn"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
         printf "\n  ${CYAN}── 面板模式（daed）──${NC}\n"
         printf "  A) 🖥️  安装/更新 daed Web 面板\n"
@@ -1506,6 +1777,7 @@ main_menu() {
         printf "\n  ${CYAN}── 系统工具 ──${NC}\n"
         printf "  7) 🔬  eBPF & 内核兼容性完整预检\n"
         printf "  8) 🔔  配置企业微信 Webhook 通知\n"
+        printf "  9) 📋  查看 local_tcp_sockops 修复指南\n"
         printf "  ${RED}U) ☠️  彻底卸载 dae + daed 全部组件${NC}\n"
         printf "  0) 退出\n"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
@@ -1523,13 +1795,23 @@ main_menu() {
                 case "${sact:-}" in
                     1) clean_network_resources
                        manage_service_generic "daed" "start"
-                       print_service_live_status "daed" ;;
+                       sleep 3
+                       if ! verify_daed_sockops_free "daed" 2>/dev/null; then
+                           guide_sockops_fix
+                       else
+                           print_service_live_status "daed"
+                       fi ;;
                     2) manage_service_generic "daed" "stop"
                        clean_network_resources
                        info "daed 已停止。" ;;
                     3) clean_network_resources
                        manage_service_generic "daed" "restart"
-                       print_service_live_status "daed" ;;
+                       sleep 3
+                       if ! verify_daed_sockops_free "daed" 2>/dev/null; then
+                           guide_sockops_fix
+                       else
+                           print_service_live_status "daed"
+                       fi ;;
                     4) manage_service_generic "daed" "status" ;;
                     *) err "无效选项。" ;;
                 esac ;;
@@ -1557,8 +1839,13 @@ main_menu() {
                 manage_service_generic "dae" "enable" 2>/dev/null || true
                 clean_network_resources
                 manage_service_generic "dae" "restart"
-                print_service_live_status "dae"
-                send_wechat_notification "dae 配置已更新" ;;
+                sleep 3
+                if ! verify_daed_sockops_free "dae" 2>/dev/null; then
+                    guide_sockops_fix
+                else
+                    print_service_live_status "dae"
+                    send_wechat_notification "dae 配置已更新"
+                fi ;;
 
             3) update_geo_data ;;
             4) set_geo_update_schedule ;;
@@ -1569,12 +1856,22 @@ main_menu() {
                 case "${sact:-}" in
                     1) clean_network_resources
                        manage_service_generic "dae" "start"
-                       print_service_live_status "dae" ;;
+                       sleep 3
+                       if ! verify_daed_sockops_free "dae" 2>/dev/null; then
+                           guide_sockops_fix
+                       else
+                           print_service_live_status "dae"
+                       fi ;;
                     2) manage_service_generic "dae" "stop"
                        clean_network_resources ;;
                     3) clean_network_resources
                        manage_service_generic "dae" "restart"
-                       print_service_live_status "dae" ;;
+                       sleep 3
+                       if ! verify_daed_sockops_free "dae" 2>/dev/null; then
+                           guide_sockops_fix
+                       else
+                           print_service_live_status "dae"
+                       fi ;;
                     4) manage_service_generic "dae" "status" ;;
                     *) err "无效选项。" ;;
                 esac ;;
@@ -1599,6 +1896,8 @@ main_menu() {
                 [ -n "${wx_url:-}" ] \
                     && info "Webhook 已绑定。" \
                     || warn "Webhook 已清除。" ;;
+
+            9) guide_sockops_fix ;;
 
             [Uu]) uninstall_all ;;
 
