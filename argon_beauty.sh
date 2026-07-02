@@ -88,7 +88,7 @@ yppp竖屏手机|https://api.yppp.net/pe.php|竖屏壁纸
 樱花ACG|https://www.dmoe.cc/random.php|随机二次元
 随机图片|https://api.elaina.cat/random|二次元动漫
 二次元|https://api.yppp.net/api.php|高清壁纸
-游戏|https://wp.upx8.com/api.php?category=game|随机游戏壁纸
+梓宸の随机图片|https://app.zichen.zone/api/acg/api.php|随机壁纸
 UAPIs|https://uapis.cn/api/v1/random/image|免费随机动漫(国内CDN)
 南风自适应|https://api.sretna.cn/api/anime/auto|自动横竖适配
 必应每日|https://bing.img.run/1920x1080.php|必应每日壁纸
