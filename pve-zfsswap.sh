@@ -22,6 +22,8 @@ MEM_TOTAL_MB=0
 HAS_ZFS="no"
 ZFS_DATASET="rpool/swap"
 ZFS_ZVOL="/dev/zvol/rpool/swap"
+TEMP_SWAP_FILE=""
+TEMP_SWAP_MARKER="/var/run/swap_temp_active"
 
 # ---------- 工具函数 ----------
 print_line() {
@@ -281,7 +283,6 @@ collect_all_swap_paths() {
         proc_swaps=$(awk 'NR>1 {print $1}' /proc/swaps)
         for p in $proc_swaps; do
             ALL_SWAP_PATHS="${ALL_SWAP_PATHS} ${p}"
-            # 判断类型
             case "$p" in
                 /dev/zram*)   ALL_SWAP_TYPES="${ALL_SWAP_TYPES} zram" ;;
                 /dev/zvol/*)  ALL_SWAP_TYPES="${ALL_SWAP_TYPES} zvol" ;;
@@ -328,8 +329,10 @@ collect_all_swap_paths() {
         done
     fi
 
-    # 来源4: 搜索常见 swapfile
-    for sf in /swapfile /swap /mnt/*/swapfile /opt/swapfile; do
+    # 来源4: 搜索常见 swapfile（含临时文件）
+    for sf in /swapfile /swap /swapfile.temp \
+              /mnt/*/swapfile /mnt/*/swapfile.temp \
+              /opt/swapfile /opt/swapfile.temp; do
         if [ -f "$sf" ]; then
             case " $ALL_SWAP_PATHS " in
                 *" $sf "*) ;;
@@ -339,8 +342,8 @@ collect_all_swap_paths() {
         fi
     done
 
-    # 来源5: find 搜索
-    found_files=$(find / -maxdepth 3 -name "swapfile" -type f 2>/dev/null)
+    # 来源5: find 搜索（含 .temp 后缀）
+    found_files=$(find / -maxdepth 3 \( -name "swapfile" -o -name "swapfile.temp" \) -type f 2>/dev/null)
     for sf in $found_files; do
         case " $ALL_SWAP_PATHS " in
             *" $sf "*) ;;
@@ -367,9 +370,11 @@ get_swap_type_desc() {
             printf "swap 分区（磁盘分区）" ;;
         *)
             if [ -f "$path" ]; then
-                # 检测文件所在文件系统
                 local fs_type=$(df -T "$path" 2>/dev/null | awk 'NR==2 {print $2}')
-                printf "swap 文件（%s 文件系统）" "$fs_type"
+                case "$path" in
+                    *.temp) printf "临时 swap 文件（%s 文件系统）" "$fs_type" ;;
+                    *)      printf "swap 文件（%s 文件系统）" "$fs_type" ;;
+                esac
             else
                 printf "配置残留（文件不存在）"
             fi
@@ -409,15 +414,33 @@ show_swap_status() {
         printf "  ── Swap 类型分析 ──\n"
         for sp in $ALL_SWAP_PATHS; do
             type_desc=$(get_swap_type_desc "$sp")
+            # 临时 swap 标记
+            temp_tag=""
+            case "$sp" in *.temp) temp_tag=" ${YELLOW}[临时]${PLAIN}" ;; esac
             if grep -q "$sp" /proc/swaps 2>/dev/null; then
-                printf "    ${GREEN}●${PLAIN} %s\n" "$sp"
+                printf "    ${GREEN}●${PLAIN} %s%b\n" "$sp" "$temp_tag"
                 printf "      类型: %s  状态: ${GREEN}使用中${PLAIN}\n" "$type_desc"
             else
-                printf "    ${YELLOW}○${PLAIN} %s\n" "$sp"
+                printf "    ${YELLOW}○${PLAIN} %s%b\n" "$sp" "$temp_tag"
                 printf "      类型: %s  状态: ${YELLOW}未激活${PLAIN}\n" "$type_desc"
             fi
         done
         printf "\n"
+    fi
+
+    # 临时 swap 状态
+    if [ -f "$TEMP_SWAP_MARKER" ]; then
+        _tf=$(cat "$TEMP_SWAP_MARKER" 2>/dev/null)
+        if [ -n "$_tf" ]; then
+            printf "  ── 临时 Swap 状态 ──\n"
+            if grep -q "$_tf" /proc/swaps 2>/dev/null; then
+                _sz=$(awk -v p="$_tf" '$1==p {print int($3/1024)}' /proc/swaps)
+                printf "    文件: ${GREEN}%s${PLAIN}  大小: ${GREEN}%s MB${PLAIN}  ${YELLOW}重启后自动清理${PLAIN}\n" "$_tf" "$_sz"
+            else
+                printf "    文件: ${YELLOW}%s${PLAIN}  ${RED}（已停用但文件残留）${PLAIN}\n" "$_tf"
+            fi
+            printf "\n"
+        fi
     fi
 
     # zram 服务信息
@@ -473,7 +496,6 @@ scan_storage() {
         eval "STOR_${STORAGE_COUNT}_AVAIL_KB='${ROOT_AVAIL_KB}'"
         eval "STOR_${STORAGE_COUNT}_FSTYPE='${ROOT_FS_TYPE}'"
 
-        # 更准确地识别存储类型
         case "$ROOT_DEV" in
             /dev/mmcblk*)
                 eval "STOR_${STORAGE_COUNT}_TYPE='eMMC/TF内部存储'"
@@ -494,7 +516,6 @@ scan_storage() {
                 ;;
         esac
 
-        # btrfs 特别标注
         if [ "$ROOT_FS_TYPE" = "btrfs" ]; then
             eval "STOR_${STORAGE_COUNT}_WARN='btrfs: 将使用专用方式创建'"
         fi
@@ -507,7 +528,6 @@ scan_storage() {
         EXT_MOUNT=$(printf "%s" "$mnt_line" | cut -d: -f2)
         EXT_FSTYPE=$(printf "%s" "$mnt_line" | cut -d: -f3)
 
-        # 跳过已经作为根分区的
         [ "$EXT_DEV" = "$ROOT_DEV" ] && continue
 
         EXT_AVAIL_KB=$(df "$EXT_MOUNT" 2>/dev/null | tail -1 | awk '{print $4}')
@@ -724,7 +744,6 @@ choose_swappiness() {
     printf "    [4] 60  — 系统默认\n"
     printf "\n"
 
-    # 根据设备和文件系统类型给建议
     case "$CHOSEN_DEV" in
         /dev/mmcblk*|/dev/mtd*)
             printf "  ${YELLOW}eMMC/闪存设备，建议 [1] 或 [2]${PLAIN}\n" ;;
@@ -797,7 +816,6 @@ create_btrfs_swap() {
         SWAP_FILE="${CHOSEN_MOUNT}/swapfile"
     fi
 
-    # 检查已存在
     if [ -f "$SWAP_FILE" ]; then
         print_warn "文件 ${SWAP_FILE} 已存在"
         printf "\n"
@@ -827,7 +845,6 @@ create_btrfs_swap() {
         esac
     fi
 
-    # 检测 btrfs 内核版本支持
     BTRFS_VER=$(btrfs --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
@@ -835,7 +852,6 @@ create_btrfs_swap() {
     printf "  btrfs-progs: %s  内核: %s.%s\n" "${BTRFS_VER:-未知}" "$KERNEL_MAJOR" "$KERNEL_MINOR"
     printf "\n"
 
-    # 方法1: 新版 btrfs（6.1+ 内核 + btrfs-progs 6.1+）有 mkswapfile
     if command -v btrfs >/dev/null 2>&1 && btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
         printf "  ${GREEN}检测到 btrfs mkswapfile 命令，使用原生方式${PLAIN}\n\n"
 
@@ -850,10 +866,8 @@ create_btrfs_swap() {
         printf "${GREEN}完成${PLAIN}\n"
 
     else
-        # 方法2: 手动方式（内核 5.0+）
         printf "  ${YELLOW}使用手动方式创建 btrfs swapfile${PLAIN}\n\n"
 
-        # 2a: 创建空文件（必须用 truncate，不能用 fallocate）
         printf "  [1/5] 创建空文件... "
         truncate -s 0 "$SWAP_FILE"
         if [ $? -ne 0 ]; then
@@ -862,7 +876,6 @@ create_btrfs_swap() {
         fi
         printf "${GREEN}完成${PLAIN}\n"
 
-        # 2b: 禁用 COW
         printf "  [2/5] 禁用 COW (chattr +C)... "
         chattr +C "$SWAP_FILE" 2>/dev/null
         if [ $? -ne 0 ]; then
@@ -871,12 +884,10 @@ create_btrfs_swap() {
             printf "${GREEN}完成${PLAIN}\n"
         fi
 
-        # 2c: 禁用压缩
         printf "  [3/5] 禁用压缩... "
         btrfs property set "$SWAP_FILE" compression none 2>/dev/null
         printf "${GREEN}完成${PLAIN}\n"
 
-        # 2d: 用 dd 填充（btrfs 不能用 fallocate）
         printf "  [4/5] 用 dd 填充 %sMB... " "$SWAP_SIZE_MB"
         dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$SWAP_SIZE_MB status=none 2>/dev/null
         if [ $? -ne 0 ]; then
@@ -886,13 +897,11 @@ create_btrfs_swap() {
         fi
         printf "${GREEN}完成${PLAIN}\n"
 
-        # 2e: 设置权限
         printf "  [5/5] 设置权限... "
         chmod 600 "$SWAP_FILE"
         printf "${GREEN}完成${PLAIN}\n"
     fi
 
-    # 格式化
     printf "  格式化为 swap... "
     mkswap "$SWAP_FILE" >/dev/null 2>&1
     if [ $? -ne 0 ]; then
@@ -902,7 +911,6 @@ create_btrfs_swap() {
     fi
     printf "${GREEN}完成${PLAIN}\n"
 
-    # 启用
     printf "  启用 swap... "
     swapon "$SWAP_FILE" 2>&1
     if [ $? -ne 0 ]; then
@@ -916,13 +924,11 @@ create_btrfs_swap() {
         printf "  你的内核: %s\n" "$(uname -r)"
         printf "\n"
 
-        # 检查内核版本
         if [ "$KERNEL_MAJOR" -lt 5 ]; then
             print_error "内核版本 < 5.0，不支持 btrfs swapfile"
             printf "  建议：升级内核或使用 swap 分区\n"
         fi
 
-        # 检查子卷快照
         MOUNT_SUBVOL=$(mount | grep " / " | grep -o 'subvol=[^ ,]*' | head -1)
         if [ -n "$MOUNT_SUBVOL" ]; then
             printf "  当前子卷: %s\n" "$MOUNT_SUBVOL"
@@ -934,12 +940,10 @@ create_btrfs_swap() {
     fi
     printf "${GREEN}完成${PLAIN}\n"
 
-    # swappiness
     printf "  设置 swappiness=%s... " "$SWAPPINESS"
     apply_swappiness
     printf "${GREEN}完成${PLAIN}\n"
 
-    # 自启
     printf "  配置开机自启... "
     setup_autostart
     printf "${GREEN}完成${PLAIN}\n"
@@ -1154,7 +1158,6 @@ disable_all_swap() {
     fi
 
     printf "  当前 Swap：\n\n"
-    # 逐条显示类型
     awk 'NR>1 {print $1}' /proc/swaps | while read sp; do
         type_desc=$(get_swap_type_desc "$sp")
         sp_size=$(awk -v p="$sp" '$1==p {print int($3/1024)}' /proc/swaps)
@@ -1162,7 +1165,6 @@ disable_all_swap() {
         printf "    类型: %s\n\n" "$type_desc"
     done
 
-    # 检查 zram
     has_zram_in_swap=$(awk 'NR>1 && /zram/ {print $1}' /proc/swaps)
     if [ -n "$has_zram_in_swap" ]; then
         print_warn "包含 zram swap，卸载后不会释放磁盘空间（这是正常的）"
@@ -1236,7 +1238,6 @@ delete_swap() {
         printf "\n"
     done
 
-    # 特别提示
     if [ "$has_zram" = "1" ]; then
         print_line
         printf "  ${YELLOW}⚠ 关于 zram swap：${PLAIN}\n"
@@ -1261,7 +1262,6 @@ delete_swap() {
 
     printf "\n"
 
-    # 步骤1: 关闭所有 swap
     printf "  [1/6] 关闭所有 swap... "
     sync
     swapoff -a 2>/dev/null
@@ -1270,7 +1270,6 @@ delete_swap() {
     done
     printf "${GREEN}完成${PLAIN}\n"
 
-    # 步骤2: 删除 swap 文件
     printf "  [2/6] 删除 swap 文件... "
     file_del=0
     for sp in $ALL_SWAP_PATHS; do
@@ -1290,7 +1289,11 @@ delete_swap() {
         printf "\n"
     fi
 
-    # 步骤3: 处理 ZFS
+    # 清理临时 swap 标记
+    if [ -f "$TEMP_SWAP_MARKER" ]; then
+        rm -f "$TEMP_SWAP_MARKER"
+    fi
+
     printf "  [3/6] 检查 ZFS zvol... "
     if [ "$HAS_ZFS" = "yes" ] && zfs list "$ZFS_DATASET" >/dev/null 2>&1; then
         printf "\n"
@@ -1299,7 +1302,6 @@ delete_swap() {
         printf "无\n"
     fi
 
-    # 步骤4: 处理 zram 服务
     printf "  [4/6] 处理 zram 服务... "
     if [ "$has_zram" = "1" ] && [ -n "$ZRAM_SERVICE" ]; then
         printf "\n"
@@ -1318,7 +1320,6 @@ delete_swap() {
                 systemctl stop "$ZRAM_SERVICE" 2>/dev/null
                 systemctl disable "$ZRAM_SERVICE" 2>/dev/null
 
-                # Armbian 特殊处理
                 if [ "$ZRAM_SERVICE" = "armbian-zram-config" ]; then
                     if [ -f /etc/default/armbian-zram-config ]; then
                         sed -i 's/^ENABLED=.*/ENABLED=false/' /etc/default/armbian-zram-config 2>/dev/null
@@ -1328,7 +1329,6 @@ delete_swap() {
                     fi
                 fi
 
-                # zramswap
                 if [ "$ZRAM_SERVICE" = "zramswap" ]; then
                     if [ -f /etc/default/zramswap ]; then
                         sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/zramswap 2>/dev/null
@@ -1338,7 +1338,6 @@ delete_swap() {
                 printf "${GREEN}完成${PLAIN}\n"
                 print_info "zram 服务已禁用，重启后不会自动创建 zram swap"
 
-                # 其他 zram 不受影响提示
                 other_zram=$(zramctl 2>/dev/null | grep -v "SWAP" | tail -n +2)
                 if [ -n "$other_zram" ]; then
                     printf "\n"
@@ -1355,7 +1354,6 @@ delete_swap() {
         printf "无 zram 服务\n"
     fi
 
-    # 步骤5: 清理启动配置
     printf "  [5/6] 清理启动配置... "
     config_cleaned=0
 
@@ -1369,18 +1367,27 @@ delete_swap() {
 
     if [ -f /etc/fstab ]; then
         fstab_before=$(wc -l < /etc/fstab)
-        # 按路径逐个清理
         for sp in $ALL_SWAP_PATHS; do
             case "$sp" in
-                /dev/zram*) continue ;;  # zram 不在 fstab 里
+                /dev/zram*) continue ;;
             esac
             escaped_sp=$(printf "%s" "$sp" | sed 's/[\/&]/\\&/g')
             sed -i "/${escaped_sp}/d" /etc/fstab 2>/dev/null
         done
-        # 通用清理 swap 行（排除注释）
         sed -i '/^[^#].*[[:space:]]swap[[:space:]]/d' /etc/fstab 2>/dev/null
         fstab_after=$(wc -l < /etc/fstab)
         [ "$fstab_before" != "$fstab_after" ] && config_cleaned=1
+    fi
+
+    # 清理临时 swap 自启服务
+    if [ -f /etc/systemd/system/swap-temp-cleanup.service ]; then
+        systemctl disable swap-temp-cleanup.service >/dev/null 2>&1
+        rm -f /etc/systemd/system/swap-temp-cleanup.service
+        systemctl daemon-reload >/dev/null 2>&1
+        config_cleaned=1
+    fi
+    if [ -f /etc/rc.local ]; then
+        sed -i '/# swap-temp-cleanup-start/,/# swap-temp-cleanup-end/d' /etc/rc.local 2>/dev/null
     fi
 
     if [ "$config_cleaned" = "1" ]; then
@@ -1389,7 +1396,6 @@ delete_swap() {
         printf "无需清理\n"
     fi
 
-    # 步骤6: 清理 sysctl
     printf "  [6/6] 清理 swappiness 配置... "
     if [ -f /etc/sysctl.conf ] && grep -q '^vm.swappiness' /etc/sysctl.conf; then
         sed -i '/^vm.swappiness/d' /etc/sysctl.conf
@@ -1398,7 +1404,6 @@ delete_swap() {
         printf "无需清理\n"
     fi
 
-    # 验证
     printf "\n"
     print_line
     printf "  ${CYAN}删除结果验证${PLAIN}\n"
@@ -1432,12 +1437,404 @@ delete_swap() {
 }
 
 # ============================================================
-#  创建流程
+#  临时 Swap - 普通文件（ext4/xfs 等）
+# ============================================================
+create_temp_file_swap() {
+    printf "\n"
+
+    printf "  [1/4] 创建 %sMB 临时文件... " "$SWAP_SIZE_MB"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l ${SWAP_SIZE_MB}M "$TEMP_SWAP_FILE" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            dd if=/dev/zero of="$TEMP_SWAP_FILE" bs=1M count=$SWAP_SIZE_MB status=none 2>/dev/null
+        fi
+    else
+        dd if=/dev/zero of="$TEMP_SWAP_FILE" bs=1M count=$SWAP_SIZE_MB status=none 2>/dev/null
+    fi
+    if [ $? -ne 0 ]; then
+        printf "${RED}失败${PLAIN}\n"
+        return 1
+    fi
+    printf "${GREEN}完成${PLAIN}\n"
+
+    printf "  [2/4] 设置权限... "
+    chmod 600 "$TEMP_SWAP_FILE"
+    printf "${GREEN}完成${PLAIN}\n"
+
+    printf "  [3/4] 格式化... "
+    mkswap "$TEMP_SWAP_FILE" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        printf "${RED}失败${PLAIN}\n"
+        rm -f "$TEMP_SWAP_FILE"
+        return 1
+    fi
+    printf "${GREEN}完成${PLAIN}\n"
+
+    printf "  [4/4] 启用... "
+    swapon "$TEMP_SWAP_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        printf "${RED}失败${PLAIN}\n"
+        rm -f "$TEMP_SWAP_FILE"
+        return 1
+    fi
+    printf "${GREEN}完成${PLAIN}\n"
+    return 0
+}
+
+# ============================================================
+#  临时 Swap - btrfs 专用
+# ============================================================
+create_temp_btrfs_swap() {
+    printf "\n"
+
+    if command -v btrfs >/dev/null 2>&1 && btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+        printf "  ${GREEN}检测到 btrfs mkswapfile，使用原生方式${PLAIN}\n\n"
+
+        printf "  [1/2] 创建 btrfs swapfile (%sMB)... " "$SWAP_SIZE_MB"
+        btrfs filesystem mkswapfile --size ${SWAP_SIZE_MB}M "$TEMP_SWAP_FILE" >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            rm -f "$TEMP_SWAP_FILE" 2>/dev/null
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [2/2] 启用... "
+        swapon "$TEMP_SWAP_FILE" 2>&1
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            rm -f "$TEMP_SWAP_FILE"
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+
+    else
+        printf "  ${YELLOW}使用手动方式创建 btrfs swapfile${PLAIN}\n\n"
+
+        printf "  [1/6] 创建空文件... "
+        truncate -s 0 "$TEMP_SWAP_FILE"
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [2/6] 禁用 COW (chattr +C)... "
+        chattr +C "$TEMP_SWAP_FILE" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            printf "${YELLOW}跳过${PLAIN}\n"
+        else
+            printf "${GREEN}完成${PLAIN}\n"
+        fi
+
+        printf "  [3/6] 禁用压缩... "
+        btrfs property set "$TEMP_SWAP_FILE" compression none 2>/dev/null
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [4/6] 用 dd 填充 %sMB... " "$SWAP_SIZE_MB"
+        dd if=/dev/zero of="$TEMP_SWAP_FILE" bs=1M count=$SWAP_SIZE_MB status=none 2>/dev/null
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            rm -f "$TEMP_SWAP_FILE"
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [5/6] 格式化... "
+        chmod 600 "$TEMP_SWAP_FILE"
+        mkswap "$TEMP_SWAP_FILE" >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            rm -f "$TEMP_SWAP_FILE"
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [6/6] 启用... "
+        swapon "$TEMP_SWAP_FILE" 2>&1
+        if [ $? -ne 0 ]; then
+            printf "${RED}失败${PLAIN}\n"
+            print_error "swapon 失败！可能原因：内核<5.0 / 子卷有快照 / RAID"
+            rm -f "$TEMP_SWAP_FILE"
+            return 1
+        fi
+        printf "${GREEN}完成${PLAIN}\n"
+    fi
+    return 0
+}
+
+# ============================================================
+#  注册重启后自动清理临时 swap
+# ============================================================
+setup_temp_swap_cleanup() {
+    if [ "$SYSTEM_TYPE" = "openwrt" ]; then
+        if [ -f /etc/rc.local ]; then
+            sed -i '/# swap-temp-cleanup-start/,/# swap-temp-cleanup-end/d' /etc/rc.local
+            sed -i "/^exit 0/i\\
+# swap-temp-cleanup-start\\
+if [ -f \"${TEMP_SWAP_MARKER}\" ]; then\\
+    _tf=\$(cat \"${TEMP_SWAP_MARKER}\")\\
+    [ -n \"\$_tf\" ] && { swapoff \"\$_tf\" 2>/dev/null; rm -f \"\$_tf\"; }\\
+    rm -f \"${TEMP_SWAP_MARKER}\"\\
+fi\\
+# swap-temp-cleanup-end" /etc/rc.local
+        fi
+    else
+        cat > /etc/systemd/system/swap-temp-cleanup.service << UNIT_EOF
+[Unit]
+Description=Clean up temporary swap file on boot
+DefaultDependencies=no
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ -f "${TEMP_SWAP_MARKER}" ] && { _tf=\$(cat "${TEMP_SWAP_MARKER}"); [ -n "\$_tf" ] && [ -f "\$_tf" ] && { swapoff "\$_tf" 2>/dev/null; rm -f "\$_tf"; }; rm -f "${TEMP_SWAP_MARKER}"; } || true'
+RemainAfterExit=no
+
+[Install]
+WantedBy=sysinit.target
+UNIT_EOF
+        systemctl daemon-reload 2>/dev/null
+        systemctl enable swap-temp-cleanup.service >/dev/null 2>&1
+    fi
+}
+
+# ============================================================
+#  手动移除临时 swap
+# ============================================================
+remove_temp_swap() {
+    print_title "移除临时 Swap"
+
+    if [ ! -f "$TEMP_SWAP_MARKER" ]; then
+        print_warn "当前没有活跃的临时 Swap（标记文件不存在）"
+        # 兜底：检查是否有残留 .temp 文件
+        for sf in /swapfile.temp /mnt/*/swapfile.temp /opt/swapfile.temp; do
+            if [ -f "$sf" ]; then
+                print_warn "发现残留文件: $sf"
+                if confirm_yes_no "是否清理此残留文件？"; then
+                    swapoff "$sf" 2>/dev/null
+                    rm -f "$sf"
+                    print_info "已清理: $sf"
+                fi
+            fi
+        done
+        return 0
+    fi
+
+    EXISTING_TEMP=$(cat "$TEMP_SWAP_MARKER" 2>/dev/null)
+    if [ -z "$EXISTING_TEMP" ]; then
+        rm -f "$TEMP_SWAP_MARKER"
+        print_warn "标记文件异常，已清理"
+        return 0
+    fi
+
+    printf "\n"
+    if grep -q "$EXISTING_TEMP" /proc/swaps 2>/dev/null; then
+        temp_size=$(awk -v p="$EXISTING_TEMP" '$1==p {print int($3/1024)}' /proc/swaps)
+        printf "  临时 Swap：${GREEN}%s${PLAIN}  大小: ${GREEN}%s MB${PLAIN}  状态: ${GREEN}使用中${PLAIN}\n" \
+            "$EXISTING_TEMP" "$temp_size"
+    else
+        printf "  临时 Swap：${YELLOW}%s${PLAIN}  状态: ${YELLOW}已停用（文件可能残留）${PLAIN}\n" \
+            "$EXISTING_TEMP"
+    fi
+
+    printf "\n"
+    if confirm_yes_no "确认立即移除临时 Swap？"; then
+        printf "\n"
+        printf "  [1/4] 关闭 swap... "
+        swapoff "$EXISTING_TEMP" 2>/dev/null
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [2/4] 删除文件... "
+        rm -f "$EXISTING_TEMP"
+        if [ $? -eq 0 ]; then
+            printf "${GREEN}完成${PLAIN}\n"
+        else
+            printf "${YELLOW}文件不存在或已删除${PLAIN}\n"
+        fi
+
+        printf "  [3/4] 清理标记... "
+        rm -f "$TEMP_SWAP_MARKER"
+        printf "${GREEN}完成${PLAIN}\n"
+
+        printf "  [4/4] 清理自启服务... "
+        if [ -f /etc/systemd/system/swap-temp-cleanup.service ]; then
+            systemctl disable swap-temp-cleanup.service >/dev/null 2>&1
+            rm -f /etc/systemd/system/swap-temp-cleanup.service
+            systemctl daemon-reload >/dev/null 2>&1
+            printf "${GREEN}完成${PLAIN}\n"
+        elif [ -f /etc/rc.local ]; then
+            sed -i '/# swap-temp-cleanup-start/,/# swap-temp-cleanup-end/d' /etc/rc.local 2>/dev/null
+            printf "${GREEN}完成${PLAIN}\n"
+        else
+            printf "无需清理\n"
+        fi
+
+        printf "\n"
+        print_info "临时 Swap 已完全移除"
+        printf "\n"
+        printf "  当前内存状态：\n"
+        free -h 2>/dev/null || free
+        printf "\n"
+        printf "  当前 Swap 状态：\n"
+        cat /proc/swaps
+    else
+        printf "  已取消。\n"
+    fi
+}
+
+# ============================================================
+#  临时 Swap 主流程
+# ============================================================
+create_temp_swap_flow() {
+    print_title "创建临时 Swap（仅本次开机有效）"
+
+    printf "  ${CYAN}功能说明：${PLAIN}\n"
+    printf "    • 立即增加虚拟内存，应对当前内存不足\n"
+    printf "    • ${YELLOW}不写入 fstab，重启后自动失效并清理文件${PLAIN}\n"
+    printf "    • 适合临时编译、运行大程序等短期场景\n"
+    printf "    • 与现有 zram / 永久 swap 共存叠加使用\n"
+    printf "\n"
+
+    # 显示当前内存状态
+    printf "  当前内存状态：\n"
+    free -h 2>/dev/null || free
+    printf "\n"
+
+    # 检查是否已有临时 swap
+    if [ -f "$TEMP_SWAP_MARKER" ]; then
+        EXISTING_TEMP=$(cat "$TEMP_SWAP_MARKER" 2>/dev/null)
+        if [ -n "$EXISTING_TEMP" ] && grep -q "$EXISTING_TEMP" /proc/swaps 2>/dev/null; then
+            existing_size=$(awk -v p="$EXISTING_TEMP" '$1==p {print int($3/1024)}' /proc/swaps)
+            print_warn "已存在临时 Swap: ${EXISTING_TEMP} (${existing_size} MB)"
+            printf "\n"
+            printf "  [1] 替换（先删除旧的再创建）\n"
+            printf "  [2] 取消\n"
+            printf "  请选择 [1-2]: "
+            read temp_exist_choice
+            case "$temp_exist_choice" in
+                1)
+                    swapoff "$EXISTING_TEMP" 2>/dev/null
+                    rm -f "$EXISTING_TEMP"
+                    rm -f "$TEMP_SWAP_MARKER"
+                    print_info "已删除旧临时 Swap"
+                    ;;
+                *)
+                    printf "  已取消。\n"
+                    return 0
+                    ;;
+            esac
+        else
+            [ -n "$EXISTING_TEMP" ] && [ -f "$EXISTING_TEMP" ] && rm -f "$EXISTING_TEMP"
+            rm -f "$TEMP_SWAP_MARKER"
+        fi
+    fi
+
+    scan_storage || return
+    choose_storage || return
+    choose_size || return
+
+    # 确定临时文件路径
+    if [ "$CHOSEN_MOUNT" = "/" ]; then
+        TEMP_SWAP_FILE="/swapfile.temp"
+    else
+        TEMP_SWAP_FILE="${CHOSEN_MOUNT}/swapfile.temp"
+    fi
+
+    # 清理同路径残留
+    if [ -f "$TEMP_SWAP_FILE" ]; then
+        swapoff "$TEMP_SWAP_FILE" 2>/dev/null
+        rm -f "$TEMP_SWAP_FILE"
+    fi
+
+    print_title "临时 Swap 配置确认"
+    printf "  存储设备：    ${GREEN}%s (%s)${PLAIN}\n" "$CHOSEN_DEV" "$CHOSEN_TYPE"
+    printf "  文件系统：    ${GREEN}%s${PLAIN}\n" "$CHOSEN_FSTYPE"
+    printf "  Swap 大小：   ${GREEN}%s MB${PLAIN}\n" "$SWAP_SIZE_MB"
+    printf "  临时文件：    ${GREEN}%s${PLAIN}\n" "$TEMP_SWAP_FILE"
+    printf "  写入 fstab：  ${YELLOW}否（不持久化）${PLAIN}\n"
+    printf "  重启行为：    ${YELLOW}自动清理文件，恢复重启前状态${PLAIN}\n"
+
+    if ! confirm_yes_no "确认创建临时 Swap？"; then
+        printf "  已取消。\n"
+        return
+    fi
+
+    # 临时设置 swappiness（仅写 /proc，不持久化）
+    printf "\n"
+    printf "  临时设置 swappiness=60（不写入 sysctl.conf）... "
+    printf "60" > /proc/sys/vm/swappiness 2>/dev/null
+    printf "${GREEN}完成${PLAIN}\n"
+
+    # 根据文件系统选择创建方式
+    create_result=1
+    case "$CHOSEN_FSTYPE" in
+        zfs)
+            print_error "ZFS 不支持临时 swap（zvol 本身是持久化对象）"
+            printf "  请使用菜单 [1] 创建永久 Swap\n"
+            return 1
+            ;;
+        btrfs)
+            create_temp_btrfs_swap
+            create_result=$?
+            ;;
+        *)
+            create_temp_file_swap
+            create_result=$?
+            ;;
+    esac
+
+    if [ "$create_result" -eq 0 ]; then
+        # 写入标记文件
+        printf "%s" "$TEMP_SWAP_FILE" > "$TEMP_SWAP_MARKER"
+
+        # 注册重启清理服务
+        setup_temp_swap_cleanup
+
+        printf "\n"
+        print_line
+        printf "  ${GREEN}✅ 临时 Swap 已创建并启用${PLAIN}\n"
+        printf "  ${GREEN}   大小: %s MB  文件: %s${PLAIN}\n" "$SWAP_SIZE_MB" "$TEMP_SWAP_FILE"
+        printf "  ${YELLOW}⏰ 重启后自动清理，无需手动操作${PLAIN}\n"
+        printf "  ${CYAN}💡 如需提前移除，使用主菜单 [6]${PLAIN}\n"
+        print_line
+        printf "\n"
+
+        printf "  当前内存状态：\n"
+        free -h 2>/dev/null || free
+        printf "\n"
+
+        printf "  当前所有 Swap：\n"
+        cat /proc/swaps
+    else
+        printf "\n"
+        print_line
+        printf "  ${RED}❌ 临时 Swap 创建失败，已自动清理${PLAIN}\n"
+        print_line
+        printf "\n"
+        printf "  可能的解决方案：\n"
+        case "$CHOSEN_FSTYPE" in
+            btrfs)
+                printf "    1. 确保内核版本 >= 5.0（当前: %s）\n" "$(uname -r)"
+                printf "    2. 确保 swapfile 所在子卷没有快照\n"
+                printf "    3. 可继续使用现有 zram swap\n"
+                ;;
+            *)
+                printf "    1. 检查磁盘空间是否充足\n"
+                printf "    2. 检查文件系统是否只读\n"
+                printf "    3. 尝试较小的 swap 大小\n"
+                ;;
+        esac
+    fi
+}
+
+# ============================================================
+#  创建流程（永久）
 # ============================================================
 create_swap_flow() {
     scan_storage || return
 
-    # 如果已有 zram swap，提示
     if [ "$HAS_ZRAM_SWAP" = "yes" ]; then
         printf "\n"
         print_warn "当前已有 zram swap（${ZRAM_SWAP_DEV}，${ZRAM_SWAP_SIZE}MB）"
@@ -1460,7 +1857,6 @@ create_swap_flow() {
     printf "  swappiness：  ${GREEN}%s${PLAIN}\n" "$SWAPPINESS"
     printf "  开机自启：    ${GREEN}是${PLAIN}\n"
 
-    # btrfs 提示
     if [ "$CHOSEN_FSTYPE" = "btrfs" ]; then
         printf "  创建方式：    ${YELLOW}btrfs 专用（禁用COW+压缩）${PLAIN}\n"
     fi
@@ -1470,7 +1866,6 @@ create_swap_flow() {
         return
     fi
 
-    # 根据文件系统类型选择创建方式
     create_result=1
     case "$CHOSEN_FSTYPE" in
         zfs)
@@ -1487,9 +1882,7 @@ create_swap_flow() {
             ;;
     esac
 
-    # 只在成功时显示完成信息
     if [ "$create_result" -eq 0 ]; then
-        # 验证
         if grep -q "$SWAP_FILE" /proc/swaps 2>/dev/null; then
             printf "\n"
             show_swap_status
@@ -1533,13 +1926,28 @@ main_menu() {
         printf "  ${CYAN}Swap 管理主菜单${PLAIN}\n"
         print_line
         printf "\n"
-        printf "    [1] 创建并启用 Swap\n"
+        printf "    [1] 创建并启用 Swap（永久，写入 fstab）\n"
         printf "    [2] 查看当前 Swap 状态\n"
-        printf "    [3] 卸载 Swap（临时关闭）\n"
+        printf "    [3] 卸载 Swap（临时关闭，不删文件）\n"
         printf "    [4] 彻底删除 Swap（含文件和配置）\n"
+        print_line
+        printf "    [5] 创建临时 Swap ${YELLOW}（仅本次开机有效，重启自动清理）${PLAIN}\n"
+        printf "    [6] 移除临时 Swap\n"
+        print_line
         printf "    [0] 退出\n"
         printf "\n"
-        printf "  请选择 [0-4]: "
+
+        # 若有活跃临时 swap，在菜单中提示
+        if [ -f "$TEMP_SWAP_MARKER" ]; then
+            _tf=$(cat "$TEMP_SWAP_MARKER" 2>/dev/null)
+            if [ -n "$_tf" ] && grep -q "$_tf" /proc/swaps 2>/dev/null; then
+                _tsz=$(awk -v p="$_tf" '$1==p {print int($3/1024)}' /proc/swaps)
+                printf "  ${YELLOW}[临时Swap运行中] %s (%s MB) — 重启后自动清理${PLAIN}\n" "$_tf" "$_tsz"
+                printf "\n"
+            fi
+        fi
+
+        printf "  请选择 [0-6]: "
         read menu_choice
 
         case "$menu_choice" in
@@ -1547,6 +1955,8 @@ main_menu() {
             2) show_swap_status ;;
             3) disable_all_swap ;;
             4) delete_swap ;;
+            5) create_temp_swap_flow ;;
+            6) remove_temp_swap ;;
             0) printf "\n  再见！\n\n"; exit 0 ;;
             *) print_error "无效选择，请重新输入" ;;
         esac
@@ -1560,7 +1970,7 @@ main() {
     clear
     printf "\n"
     printf "${CYAN}╔══════════════════════════════════════════════════════╗${PLAIN}\n"
-    printf "${CYAN}║   全平台一键交互式 Swap 管理工具  v3.0             ║${PLAIN}\n"
+    printf "${CYAN}║   全平台一键交互式 Swap 管理工具  v3.1             ║${PLAIN}\n"
     printf "${CYAN}║   OpenWrt / Armbian / Debian / Ubuntu / PVE(ZFS)   ║${PLAIN}\n"
     printf "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}\n"
     printf "\n"
