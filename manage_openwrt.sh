@@ -8,7 +8,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 全局变量（跨函数共享）
+# 全局变量
 ARCH=""
 ARCH_DESC=""
 DOCKER_IMAGE=""
@@ -47,35 +47,88 @@ check_environment() {
         error "脚本需要 bash 运行，请使用：bash $0"
         exit 1
     fi
-
-    # [BUG6修复] 检查 bash 版本是否支持 mapfile
     local bash_major
     bash_major=$(echo "$BASH_VERSION" | cut -d. -f1)
     if [[ "$bash_major" -lt 4 ]]; then
-        warn "Bash 版本 $BASH_VERSION 较旧，部分升级功能需要 bash 4.0+。当前版本可正常使用安装功能。"
+        warn "Bash $BASH_VERSION 较旧，建议升级到 4.0+"
     fi
-
     if ! command -v jq &>/dev/null; then
-        warn "未安装 jq，无损升级功能依赖它。建议：apt install jq / yum install jq"
+        warn "未安装 jq，无损升级功能依赖它。建议：apt install jq"
     fi
     log "Bash 版本：$BASH_VERSION"
 }
 
 # ==============================================================================
-# [NEW3] 检测 macvlan 内核模块支持
+# [FIX1] 检测 Cgroup 版本 - 核心修复点
 # ==============================================================================
-check_macvlan_support() {
-    log "检测 macvlan 内核模块支持..."
-    if modprobe macvlan 2>/dev/null; then
-        success "macvlan 模块已加载"
-        return 0
-    elif lsmod | grep -q macvlan; then
-        success "macvlan 模块已在内核中"
-        return 0
+detect_cgroup_version() {
+    if mount | grep -q "cgroup2"; then
+        echo "v2"
     else
-        warn "无法加载 macvlan 模块（可能内核不支持，如部分 NAS 设备）"
-        warn "在此类设备上 macvlan 模式将失败，建议改用 bridge 模式"
-        return 1
+        echo "v1"
+    fi
+}
+
+# [FIX1] 根据 Cgroup 版本决定是否需要 --cgroupns=host
+get_cgroupns_arg() {
+    local cgroup_ver
+    cgroup_ver=$(detect_cgroup_version)
+    if [[ "$cgroup_ver" == "v2" ]]; then
+        log "检测到 Cgroup v2，将自动添加 --cgroupns=host 参数以兼容 OpenWrt procd"
+        echo "--cgroupns=host"
+    else
+        echo ""
+    fi
+}
+
+# ==============================================================================
+# [FIX6] 容器真实状态检测
+# 区分：正常运行 / 反复崩溃重启 / 未运行
+# ==============================================================================
+check_container_real_status() {
+    local container_name="${1:-openwrt}"
+
+    # 容器不存在
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+        echo "not_found"
+        return
+    fi
+
+    local status
+    status=$(docker inspect "$container_name" \
+        --format '{{.State.Status}}' 2>/dev/null)
+
+    if [[ "$status" != "running" ]]; then
+        echo "stopped"
+        return
+    fi
+
+    # 检测是否在反复重启（重启次数 > 3 且运行时间 < 10秒）
+    local restart_count
+    restart_count=$(docker inspect "$container_name" \
+        --format '{{.RestartCount}}' 2>/dev/null || echo "0")
+
+    local started_at
+    started_at=$(docker inspect "$container_name" \
+        --format '{{.State.StartedAt}}' 2>/dev/null)
+
+    # 转换启动时间为秒数差
+    local now_ts started_ts uptime_sec
+    now_ts=$(date +%s)
+    started_ts=$(date -d "$started_at" +%s 2>/dev/null || echo "$now_ts")
+    uptime_sec=$(( now_ts - started_ts ))
+
+    if [[ "$restart_count" -gt 3 && "$uptime_sec" -lt 10 ]]; then
+        echo "crash_loop"
+        return
+    fi
+
+    # 验证容器是否真正完成启动（检查 uhttpd 或 procd 进程）
+    if docker exec "$container_name" \
+        /bin/sh -c "ps 2>/dev/null | grep -q 'uhttpd\|procd'" 2>/dev/null; then
+        echo "healthy"
+    else
+        echo "starting"
     fi
 }
 
@@ -104,10 +157,10 @@ set_architecture_and_images() {
             ALIYUN_IMAGE="registry.cn-shanghai.aliyuncs.com/suling/openwrt:armv7"
             FALLBACK_IMAGE=""
             ARCH_DESC="ARMv7 设备"
-
             if [ -f "/proc/cpuinfo" ]; then
                 local cpu_model
-                cpu_model=$(grep -m1 'Hardware' /proc/cpuinfo 2>/dev/null | awk '{print $NF}' || true)
+                cpu_model=$(grep -m1 'Hardware' /proc/cpuinfo 2>/dev/null \
+                    | awk '{print $NF}' || true)
                 case "$cpu_model" in
                     BCM2835)
                         DOCKER_IMAGE="sulinggg/openwrt:rpi1"
@@ -157,28 +210,6 @@ get_default_interface() {
     ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1
 }
 
-calculate_network_address() {
-    local ip_cidr="$1"
-    local ip_addr cidr_mask
-    ip_addr=$(echo "$ip_cidr" | cut -d'/' -f1)
-    cidr_mask=$(echo "$ip_cidr" | cut -d'/' -f2)
-
-    if ! [[ "$cidr_mask" =~ ^[0-9]+$ ]] || [ "$cidr_mask" -lt 0 ] || [ "$cidr_mask" -gt 32 ]; then
-        error "无效的 CIDR 掩码: $cidr_mask"
-        return 1
-    fi
-
-    # 优先使用 ipcalc
-    if command -v ipcalc &>/dev/null; then
-        ipcalc -n "$ip_cidr" 2>/dev/null | awk '/Network:/ {print $2}' || {
-            # ipcalc 输出格式因版本不同而异，备用纯 bash 计算
-            _calc_network_bash "$ip_addr" "$cidr_mask"
-        }
-    else
-        _calc_network_bash "$ip_addr" "$cidr_mask"
-    fi
-}
-
 _calc_network_bash() {
     local ip_addr="$1" cidr_mask="$2"
     local o1 o2 o3 o4
@@ -194,14 +225,33 @@ _calc_network_bash() {
         "$cidr_mask"
 }
 
-# [BUG2修复] 子网冲突检查 - 改用进程替换避免子shell
+calculate_network_address() {
+    local ip_cidr="$1"
+    local ip_addr cidr_mask
+    ip_addr=$(echo "$ip_cidr" | cut -d'/' -f1)
+    cidr_mask=$(echo "$ip_cidr" | cut -d'/' -f2)
+
+    if ! [[ "$cidr_mask" =~ ^[0-9]+$ ]] || \
+       [ "$cidr_mask" -lt 0 ] || [ "$cidr_mask" -gt 32 ]; then
+        error "无效的 CIDR 掩码: $cidr_mask"
+        return 1
+    fi
+
+    if command -v ipcalc &>/dev/null; then
+        local result
+        result=$(ipcalc -n "$ip_cidr" 2>/dev/null | awk '/Network:/ {print $2}')
+        if [[ -n "$result" ]]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+    _calc_network_bash "$ip_addr" "$cidr_mask"
+}
+
 check_network_conflict() {
     local subnet="$1"
-    log "检查子网 $subnet 是否与现有 Docker 网络冲突..."
+    log "检查子网 $subnet 冲突..."
     local conflict_found=0
-    local net
-
-    # 使用进程替换代替管道，避免子shell变量丢失
     while IFS= read -r net; do
         [[ -z "$net" ]] && continue
         local net_subnet
@@ -212,23 +262,16 @@ check_network_conflict() {
             conflict_found=1
         fi
     done < <(docker network ls --format '{{.Name}}' 2>/dev/null)
-
-    if [[ $conflict_found -eq 1 ]]; then
-        return 1
-    fi
-    log "子网 $subnet 未发现冲突"
-    return 0
+    return $conflict_found
 }
 
-# [BUG5修复] IP 格式验证改进 - 先验证格式再解析
 validate_ip_in_subnet() {
     local ip="$1"
     local subnet="$2"
 
-    # 严格的 IP 格式验证（4个0-255的十进制数）
     if ! echo "$ip" | grep -Eq \
         '^([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$'; then
-        error "无效的 IP 地址格式: $ip（必须为 0-255 范围内的 4 段数字）"
+        error "无效 IP 格式: $ip"
         return 1
     fi
 
@@ -236,28 +279,15 @@ validate_ip_in_subnet() {
     network=$(echo "$subnet" | cut -d'/' -f1)
     cidr=$(echo "$subnet" | cut -d'/' -f2)
 
-    if ! [[ "$cidr" =~ ^[0-9]+$ ]] || [ "$cidr" -lt 0 ] || [ "$cidr" -gt 32 ]; then
-        error "无效的子网掩码: $cidr"
+    local ip1 ip2 ip3 ip4 net1 net2 net3 net4
+    IFS='.' read -r ip1 ip2 ip3 ip4 <<< "$ip"
+    IFS='.' read -r net1 net2 net3 net4 <<< "$network"
+    local ip_int=$(( (ip1<<24)+(ip2<<16)+(ip3<<8)+ip4 ))
+    local net_int=$(( (net1<<24)+(net2<<16)+(net3<<8)+net4 ))
+    local mask=$(( 0xFFFFFFFF << (32 - cidr) ))
+    if (( (ip_int & mask) != (net_int & mask) )); then
+        error "IP $ip 不在子网 $subnet 内"
         return 1
-    fi
-
-    if command -v ipcalc &>/dev/null; then
-        if ! ipcalc -c "$ip" "$subnet" &>/dev/null; then
-            error "IP $ip 不在子网 $subnet 内"
-            return 1
-        fi
-    else
-        # 纯 bash 计算
-        local ip1 ip2 ip3 ip4 net1 net2 net3 net4
-        IFS='.' read -r ip1 ip2 ip3 ip4 <<< "$ip"
-        IFS='.' read -r net1 net2 net3 net4 <<< "$network"
-        local ip_int=$(( (ip1 << 24) + (ip2 << 16) + (ip3 << 8) + ip4 ))
-        local net_int=$(( (net1 << 24) + (net2 << 16) + (net3 << 8) + net4 ))
-        local mask=$(( 0xFFFFFFFF << (32 - cidr) ))
-        if (( (ip_int & mask) != (net_int & mask) )); then
-            error "IP $ip 不在子网 $subnet 内"
-            return 1
-        fi
     fi
     return 0
 }
@@ -266,7 +296,7 @@ check_ip_occupied() {
     local ip="$1"
     log "检查 IP $ip 是否被占用..."
     if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
-        error "IP $ip 已被占用，请选择其他 IP"
+        error "IP $ip 已被占用"
         return 1
     fi
     log "IP $ip 可用"
@@ -275,81 +305,49 @@ check_ip_occupied() {
 
 check_port_usage() {
     local port="$1"
-    log "检查端口 $port..."
     if command -v ss &>/dev/null; then
         if ss -tuln 2>/dev/null | grep -q ":${port} "; then
             error "端口 $port 已被占用"
             return 1
         fi
-    elif command -v netstat &>/dev/null; then
-        if netstat -tuln 2>/dev/null | grep -q ":${port} "; then
-            error "端口 $port 已被占用"
-            return 1
-        fi
-    else
-        warn "缺少 ss/netstat，无法检查端口占用，请手动确认"
-        return 0
     fi
-    log "端口 $port 可用"
     return 0
 }
 
-# [P2修复] 宿主机 IP 获取 - 修正 Docker 网段过滤逻辑
 get_host_ip() {
     local ip_addr
-    # 过滤 loopback 和 Docker 默认 bridge（172.17.0.0/16），保留真实网卡 IP
     ip_addr=$(ip -o -4 addr show 2>/dev/null | \
-        awk '!/lo|docker[0-9]+|br-/ {print $4}' | \
-        cut -d'/' -f1 | \
+        awk '!/lo|docker[0-9]+|br-/' | \
+        awk '{print $4}' | cut -d'/' -f1 | \
         grep -v '^172\.1[6-9]\.' | \
         grep -v '^172\.2[0-9]\.' | \
         grep -v '^172\.3[01]\.' | \
         head -n1)
-
-    if [[ -z "$ip_addr" ]]; then
-        # 最后备用：hostname -I
-        ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-    fi
-
     echo "${ip_addr:-<无法获取>}"
 }
 
-# ==============================================================================
-# 检测局域网参数
-# ==============================================================================
 detect_lan_subnet_gateway() {
     log "自动检测局域网参数..."
     local default_iface
     default_iface=$(get_default_interface)
+    [[ -z "$default_iface" ]] && { error "无法检测默认接口"; return 1; }
 
-    if [[ -z "$default_iface" ]]; then
-        error "无法检测默认网络接口"
-        return 1
-    fi
-
-    # 检查接口类型（WiFi 不支持 macvlan）
     if [[ -d "/sys/class/net/$default_iface/wireless" ]]; then
-        warn "检测到 $default_iface 是 WiFi 接口，macvlan 可能不支持"
-        warn "建议使用有线网卡或切换到 bridge 模式"
+        warn "$default_iface 是 WiFi 接口，macvlan 可能不支持"
     fi
 
     local ip_cidr
-    ip_cidr=$(ip addr show dev "$default_iface" 2>/dev/null | awk '/inet / {print $2}' | head -n1)
-    if [[ -z "$ip_cidr" ]]; then
-        error "无法获取接口 $default_iface 的 IP 信息"
-        return 1
-    fi
+    ip_cidr=$(ip addr show dev "$default_iface" 2>/dev/null \
+        | awk '/inet / {print $2}' | head -n1)
+    [[ -z "$ip_cidr" ]] && { error "无法获取接口 IP"; return 1; }
 
     local subnet gateway
     subnet=$(calculate_network_address "$ip_cidr") || return 1
-    gateway=$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1)
+    gateway=$(ip route show default 2>/dev/null \
+        | awk '/default/ {print $3}' | head -n1)
+    [[ -z "$subnet" || -z "$gateway" ]] && { error "自动检测失败"; return 1; }
 
-    if [[ -z "$subnet" || -z "$gateway" ]]; then
-        error "自动检测失败"
-        return 1
-    fi
-
-    success "检测到子网: $subnet | 网关: $gateway | 接口: $default_iface"
+    success "子网: $subnet | 网关: $gateway | 接口: $default_iface"
     DETECTED_SUBNET="$subnet"
     DETECTED_GATEWAY="$gateway"
     DETECTED_INTERFACE="$default_iface"
@@ -357,23 +355,17 @@ detect_lan_subnet_gateway() {
 }
 
 # ==============================================================================
-# [P4修复] 混杂模式持久化
+# 混杂模式持久化
 # ==============================================================================
 enable_persistent_promisc() {
     local iface="$1"
-
-    # 立即开启
-    ip link set "$iface" promisc on || {
-        error "无法开启 $iface 的混杂模式"
-        return 1
-    }
+    ip link set "$iface" promisc on || { error "无法开启 $iface 混杂模式"; return 1; }
     success "混杂模式已开启: $iface"
 
-    # 持久化
     if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
-        local svc_file="/etc/systemd/system/promisc-${iface}.service"
-        if [[ ! -f "$svc_file" ]]; then
-            cat > "$svc_file" << EOF
+        local svc="/etc/systemd/system/promisc-${iface}.service"
+        if [[ ! -f "$svc" ]]; then
+            cat > "$svc" << EOF
 [Unit]
 Description=Enable promiscuous mode for ${iface}
 After=network.target
@@ -388,120 +380,89 @@ WantedBy=multi-user.target
 EOF
             systemctl enable "promisc-${iface}.service" >/dev/null 2>&1
             systemctl start "promisc-${iface}.service" >/dev/null 2>&1
-            success "已创建混杂模式持久化服务: promisc-${iface}.service"
-        fi
-    else
-        # fallback: /etc/rc.local
-        local rc_local="/etc/rc.local"
-        if [[ -f "$rc_local" ]] && ! grep -q "promisc.*$iface" "$rc_local"; then
-            sed -i "s/^exit 0/ip link set $iface promisc on\nexit 0/" "$rc_local"
-            success "已将混杂模式命令写入 /etc/rc.local"
-        else
-            warn "请手动配置混杂模式持久化: ip link set $iface promisc on"
+            success "混杂模式持久化服务已创建"
         fi
     fi
     return 0
 }
 
 # ==============================================================================
-# [NEW1] macvlan-shim 配置（允许宿主机访问容器）
+# macvlan-shim（解决宿主机无法访问容器）
 # ==============================================================================
 setup_macvlan_shim() {
     local parent_iface="$1"
     local container_ip="$2"
     local subnet="$3"
-    local shim_name="macvlan-shim"
 
-    log "配置 macvlan-shim 以允许宿主机访问容器..."
+    log "配置 macvlan-shim..."
 
-    # 计算 shim IP（取子网中倒数第二个可用 IP）
-    local net_addr cidr
+    local net_addr cidr o1 o2 o3 o4
     net_addr=$(echo "$subnet" | cut -d'/' -f1)
     cidr=$(echo "$subnet" | cut -d'/' -f2)
-
-    local o1 o2 o3 o4
     IFS='.' read -r o1 o2 o3 o4 <<< "$net_addr"
-    local net_int=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+
+    local net_int=$(( (o1<<24)+(o2<<16)+(o3<<8)+o4 ))
     local host_bits=$((32 - cidr))
-    local shim_ip_int=$(( net_int + (1 << host_bits) - 2 ))
+    local shim_ip_int=$(( net_int + (1 << host_bits) - 3 ))
     local shim_ip
     shim_ip=$(printf "%d.%d.%d.%d" \
-        $(( (shim_ip_int >> 24) & 255 )) \
-        $(( (shim_ip_int >> 16) & 255 )) \
-        $(( (shim_ip_int >> 8) & 255 )) \
-        $(( shim_ip_int & 255 )))
+        $(( (shim_ip_int>>24)&255 )) \
+        $(( (shim_ip_int>>16)&255 )) \
+        $(( (shim_ip_int>>8)&255 )) \
+        $(( shim_ip_int&255 )))
 
     # 避免与容器 IP 冲突
     if [[ "$shim_ip" == "$container_ip" ]]; then
         shim_ip_int=$((shim_ip_int - 1))
         shim_ip=$(printf "%d.%d.%d.%d" \
-            $(( (shim_ip_int >> 24) & 255 )) \
-            $(( (shim_ip_int >> 16) & 255 )) \
-            $(( (shim_ip_int >> 8) & 255 )) \
-            $(( shim_ip_int & 255 )))
+            $(( (shim_ip_int>>24)&255 )) \
+            $(( (shim_ip_int>>16)&255 )) \
+            $(( (shim_ip_int>>8)&255 )) \
+            $(( shim_ip_int&255 )))
     fi
 
-    # 创建 shim
-    ip link del "$shim_name" >/dev/null 2>&1 || true
-    if ip link add link "$parent_iface" name "$shim_name" type macvlan mode bridge 2>/dev/null; then
-        ip addr add "${shim_ip}/32" dev "$shim_name"
-        ip link set "$shim_name" up
-        ip route add "${container_ip}/32" dev "$shim_name" 2>/dev/null || true
-        success "macvlan-shim 已创建: 宿主机 IP $shim_ip → 容器 $container_ip"
+    ip link del macvlan-shim >/dev/null 2>&1 || true
 
-        # 持久化 shim
+    if ip link add link "$parent_iface" name macvlan-shim \
+        type macvlan mode bridge 2>/dev/null; then
+        ip addr add "${shim_ip}/32" dev macvlan-shim
+        ip link set macvlan-shim up
+        ip route add "${container_ip}/32" dev macvlan-shim 2>/dev/null || true
+        success "macvlan-shim 已创建: 宿主机可通过 shim($shim_ip) 访问容器($container_ip)"
+
+        # 持久化
         if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
             cat > /etc/systemd/system/macvlan-shim.service << EOF
 [Unit]
-Description=macvlan shim for OpenWrt Docker container
+Description=macvlan shim for OpenWrt Docker
 After=network.target docker.service
+Wants=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c "ip link del $shim_name 2>/dev/null || true; \
-    ip link add link $parent_iface name $shim_name type macvlan mode bridge && \
-    ip addr add ${shim_ip}/32 dev $shim_name && \
-    ip link set $shim_name up && \
-    ip route add ${container_ip}/32 dev $shim_name 2>/dev/null || true"
-ExecStop=/bin/bash -c "ip link del $shim_name 2>/dev/null || true"
+ExecStart=/bin/bash -c "\
+    ip link del macvlan-shim 2>/dev/null || true; \
+    ip link add link ${parent_iface} name macvlan-shim type macvlan mode bridge && \
+    ip addr add ${shim_ip}/32 dev macvlan-shim && \
+    ip link set macvlan-shim up && \
+    ip route add ${container_ip}/32 dev macvlan-shim 2>/dev/null || true"
+ExecStop=/bin/bash -c "ip link del macvlan-shim 2>/dev/null || true"
 
 [Install]
 WantedBy=multi-user.target
 EOF
             systemctl enable macvlan-shim.service >/dev/null 2>&1
-            success "macvlan-shim systemd 服务已创建并启用"
+            success "macvlan-shim 持久化服务已启用"
         fi
     else
-        warn "macvlan-shim 创建失败（某些内核不支持），宿主机可能无法直接访问容器"
-        warn "如需从宿主机访问容器，请通过其他局域网设备访问 http://$container_ip:80"
+        warn "macvlan-shim 创建失败（内核不支持），宿主机无法直接访问容器"
+        warn "请从局域网其他设备访问 http://$container_ip"
     fi
 }
 
 # ==============================================================================
-# [P3修复] 镜像拉取 - 加超时控制
-# ==============================================================================
-pull_image() {
-    local image="$1"
-    local timeout_sec=300  # 5分钟超时
-    log "正在拉取镜像: $image（超时: ${timeout_sec}s）..."
-
-    if timeout "$timeout_sec" docker pull "$image" 2>&1 | tee /tmp/docker-pull.log; then
-        success "镜像拉取成功: $image"
-        return 0
-    else
-        local exit_code=$?
-        error "镜像拉取失败: $image (退出码: $exit_code)"
-        if [[ $exit_code -eq 124 ]]; then
-            error "拉取超时（>${timeout_sec}s），请检查网络或使用阿里云镜像源"
-        fi
-        cat /tmp/docker-pull.log
-        return 1
-    fi
-}
-
-# ==============================================================================
-# [BUG3修复] OpenWrt 网络修正 - 精准防火墙配置
+# [FIX5] OpenWrt 网络配置对齐（确保内部 IP = macvlan 分配 IP）
 # ==============================================================================
 fix_openwrt_network() {
     local net_mode="$1"
@@ -509,31 +470,31 @@ fix_openwrt_network() {
     local gateway="${3:-}"
     local cidr="${4:-}"
 
-    log "正在修正 OpenWrt 网络配置..."
+    log "修正 OpenWrt 内部网络配置..."
 
-    if [[ "$net_mode" -eq 2 ]] && [[ -n "$ip" ]] && [[ -n "$gateway" ]]; then
-        # Macvlan 模式：静态 IP 配置
+    if [[ "$net_mode" -eq 2 ]] && [[ -n "$ip" && -n "$gateway" ]]; then
+        # 计算子网掩码
         local prefix mask
         prefix=$(echo "$cidr" | cut -d'/' -f2)
         if [[ "$prefix" =~ ^[0-9]+$ ]]; then
             local val=$(( 0xffffffff ^ ((1 << (32 - prefix)) - 1) ))
-            mask="$(( (val >> 24) & 0xff )).$(( (val >> 16) & 0xff )).$(( (val >> 8) & 0xff )).$(( val & 0xff ))"
+            mask="$(( (val>>24)&0xff )).$(( (val>>16)&0xff )).\
+$(( (val>>8)&0xff )).$(( val&0xff ))"
         else
             mask="255.255.255.0"
         fi
 
-        log "配置容器静态 IP: $ip, 网关: $gateway, 掩码: $mask"
+        log "设置静态 IP: $ip 掩码: $mask 网关: $gateway"
         docker exec openwrt /bin/sh -c "
             uci set network.lan.proto='static'
-            uci set network.lan.ipaddr='$ip'
-            uci set network.lan.netmask='$mask'
-            uci set network.lan.gateway='$gateway'
-            uci set network.lan.dns='$gateway 8.8.8.8'
+            uci set network.lan.ipaddr='${ip}'
+            uci set network.lan.netmask='${mask}'
+            uci set network.lan.gateway='${gateway}'
+            uci set network.lan.dns='${gateway} 8.8.8.8'
             uci commit network
             /etc/init.d/network restart
         " >/dev/null 2>&1
     else
-        # Bridge 模式：DHCP
         docker exec openwrt /bin/sh -c "
             uci set network.lan.proto='dhcp'
             uci commit network
@@ -541,86 +502,267 @@ fix_openwrt_network() {
         " >/dev/null 2>&1
     fi
 
-    # [BUG3修复] 精准防火墙配置：只放开 LAN zone（index 不固定，需按名查找）
-    log "配置防火墙规则..."
-    docker exec openwrt /bin/sh -c "
-        # 查找 LAN zone 的实际 index
-        local lan_idx=0
-        local zone_count=0
-        while uci get firewall.@zone[\$zone_count] >/dev/null 2>&1; do
-            zone_name=\$(uci get firewall.@zone[\$zone_count].name 2>/dev/null)
-            if [ \"\$zone_name\" = 'lan' ]; then
-                lan_idx=\$zone_count
+    sleep 3
+
+    # 精准防火墙（按名查找 LAN zone）
+    docker exec openwrt /bin/sh -c '
+        i=0
+        while uci get firewall.@zone[$i] >/dev/null 2>&1; do
+            name=$(uci get firewall.@zone[$i].name 2>/dev/null)
+            if [ "$name" = "lan" ]; then
+                uci set firewall.@zone[$i].input="ACCEPT"
+                uci set firewall.@zone[$i].output="ACCEPT"
+                uci set firewall.@zone[$i].forward="ACCEPT"
+                uci commit firewall
+                /etc/init.d/firewall restart
                 break
             fi
-            zone_count=\$((zone_count + 1))
+            i=$((i+1))
         done
+    ' >/dev/null 2>&1
 
-        # 仅对 LAN zone 放开 INPUT（允许访问管理界面），保持 WAN 防火墙不变
-        uci set firewall.@zone[\$lan_idx].input='ACCEPT'
-        uci set firewall.@zone[\$lan_idx].output='ACCEPT'
-        # forward 保持 ACCEPT 以支持旁路由转发
-        uci set firewall.@zone[\$lan_idx].forward='ACCEPT'
-        uci commit firewall
-        /etc/init.d/firewall restart
-    " >/dev/null 2>&1
+    docker exec openwrt /bin/sh -c \
+        "/etc/init.d/uhttpd restart" >/dev/null 2>&1
 
-    # 重启 uhttpd
-    docker exec openwrt /bin/sh -c "/etc/init.d/uhttpd restart" >/dev/null 2>&1
-    sleep 2
-    success "OpenWrt 网络配置已修正"
+    success "OpenWrt 网络配置已对齐"
 }
 
 # ==============================================================================
-# [P1修复] LuCI 状态检查 - 兼容 OpenWrt ps 格式
+# 镜像拉取（带超时）
+# ==============================================================================
+pull_image() {
+    local image="$1"
+    local timeout_sec="${2:-300}"
+    log "拉取镜像: $image (超时 ${timeout_sec}s)..."
+    if timeout "$timeout_sec" docker pull "$image" 2>&1 | tee /tmp/docker-pull.log; then
+        success "镜像拉取成功: $image"
+        return 0
+    else
+        local code=$?
+        [[ $code -eq 124 ]] && error "拉取超时，请检查网络或使用阿里云镜像源"
+        error "拉取失败: $image"
+        return 1
+    fi
+}
+
+# ==============================================================================
+# [FIX1][FIX2] 核心：构建并运行容器
+# 自动注入 --cgroupns=host，并在崩溃时尝试备用启动方式
+# ==============================================================================
+build_and_run_container() {
+    local container_name="$1"
+    local image="$2"
+    local net_name="$3"
+    local net_mode="$4"         # 1=bridge 2=macvlan
+    local macvlan_ip="${5:-}"
+    local web_port="${6:-8080}"
+    local ssh_port="${7:-2222}"
+    local volume_src="${8:-}"   # 宿主机路径，为空则不挂载
+
+    # [FIX1] 自动获取 cgroup 参数
+    local cgroupns_arg
+    cgroupns_arg=$(get_cgroupns_arg)
+
+    # 构建命令数组（不使用 eval）
+    local cmd=(
+        docker run -d
+        --name "$container_name"
+        --restart unless-stopped
+        --privileged
+    )
+
+    # 注入 cgroupns 参数
+    [[ -n "$cgroupns_arg" ]] && cmd+=($cgroupns_arg)
+
+    cmd+=(
+        -p "${web_port}:80"
+        -p "${ssh_port}:22"
+    )
+
+    [[ -n "$volume_src" ]] && cmd+=(-v "${volume_src}:/etc/config")
+
+    if [[ "$net_mode" -eq 2 && -n "$macvlan_ip" ]]; then
+        cmd+=(--network "$net_name" --ip "$macvlan_ip")
+    else
+        cmd+=(--network "$net_name")
+    fi
+
+    cmd+=("$image" /sbin/init)
+
+    log "启动命令: ${cmd[*]}"
+    "${cmd[@]}" >/dev/null 2>&1 || return 1
+
+    # [FIX2][FIX3] 等待容器真正启动（最多等60秒）
+    log "等待容器初始化..."
+    local wait=0
+    local real_status=""
+    while [[ $wait -lt 60 ]]; do
+        sleep 3
+        wait=$((wait + 3))
+
+        real_status=$(check_container_real_status "$container_name")
+
+        case "$real_status" in
+            healthy)
+                success "容器启动成功（${wait}s）"
+                return 0
+                ;;
+            crash_loop)
+                warn "检测到容器反复崩溃（已等待 ${wait}s）"
+                _handle_crash_loop "$container_name" "$image" \
+                    "$net_name" "$net_mode" "$macvlan_ip" \
+                    "$web_port" "$ssh_port" "$volume_src" "$cgroupns_arg"
+                return $?
+                ;;
+            starting)
+                log "容器启动中... (${wait}s)"
+                ;;
+            stopped|not_found)
+                warn "容器已停止，尝试查看日志..."
+                docker logs "$container_name" 2>&1 | tail -20
+                return 1
+                ;;
+        esac
+    done
+
+    # 60秒后仍在 starting 状态，检查是否是 preinit 卡住
+    warn "容器超过60秒未完成初始化，检查是否为 preinit 卡死..."
+    local log_content
+    log_content=$(docker logs "$container_name" 2>&1 | tail -5)
+
+    if echo "$log_content" | grep -q "Press the \[f\] key"; then
+        warn "检测到 preinit failsafe 卡死，尝试绕过方案..."
+        _handle_crash_loop "$container_name" "$image" \
+            "$net_name" "$net_mode" "$macvlan_ip" \
+            "$web_port" "$ssh_port" "$volume_src" "$cgroupns_arg"
+        return $?
+    fi
+
+    # 虽然超时但容器仍在运行，认为基本成功
+    if docker ps -q --filter "name=^${container_name}$" | grep -q .; then
+        warn "容器运行中但服务可能未完全就绪，继续后续步骤..."
+        return 0
+    fi
+
+    return 1
+}
+
+# ==============================================================================
+# [FIX2] 崩溃循环处理：尝试绕过 preinit 直接启动服务
+# ==============================================================================
+_handle_crash_loop() {
+    local container_name="$1"
+    local image="$2"
+    local net_name="$3"
+    local net_mode="$4"
+    local macvlan_ip="$5"
+    local web_port="$6"
+    local ssh_port="$7"
+    local volume_src="$8"
+    local cgroupns_arg="$9"
+
+    warn "==================================================="
+    warn "检测到启动失败，尝试备用启动方式（绕过 preinit）..."
+    warn "==================================================="
+
+    # 停止旧容器
+    docker stop "$container_name" >/dev/null 2>&1 || true
+    docker rm "$container_name" >/dev/null 2>&1 || true
+
+    # 备用启动命令：绕过 /sbin/init，手动启动关键服务
+    local cmd=(
+        docker run -d
+        --name "$container_name"
+        --restart unless-stopped
+        --privileged
+    )
+    [[ -n "$cgroupns_arg" ]] && cmd+=($cgroupns_arg)
+    cmd+=(
+        -p "${web_port}:80"
+        -p "${ssh_port}:22"
+    )
+    [[ -n "$volume_src" ]] && cmd+=(-v "${volume_src}:/etc/config")
+
+    if [[ "$net_mode" -eq 2 && -n "$macvlan_ip" ]]; then
+        cmd+=(--network "$net_name" --ip "$macvlan_ip")
+    else
+        cmd+=(--network "$net_name")
+    fi
+
+    # 绕过 preinit，直接执行必要的初始化步骤
+    cmd+=("$image" /bin/sh -c "
+        mkdir -p /var/lock /var/run /var/log /tmp/run /tmp/state
+        mount -t proc proc /proc 2>/dev/null || true
+        mount -t sysfs sysfs /sys 2>/dev/null || true
+        mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+        mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+        /sbin/ubusd &
+        sleep 2
+        /etc/init.d/network start 2>/dev/null || true
+        sleep 3
+        /etc/init.d/firewall start 2>/dev/null || true
+        /etc/init.d/uhttpd start 2>/dev/null || true
+        /etc/init.d/dropbear start 2>/dev/null || true
+        echo 'OpenWrt services started (bypass mode)'
+        tail -f /dev/null
+    ")
+
+    log "执行备用启动: ${cmd[*]}"
+    if "${cmd[@]}" >/dev/null 2>&1; then
+        sleep 8
+        if docker ps -q --filter "name=^${container_name}$" | grep -q .; then
+            success "备用启动成功！（注意：此模式下部分 OpenWrt 功能可能受限）"
+            warn "建议：尝试升级宿主机内核或更换 OpenWrt 镜像版本"
+            return 0
+        fi
+    fi
+
+    error "备用启动也失败了"
+    error "可能原因："
+    error "  1. 宿主机内核 $(uname -r) 与 OpenWrt 镜像不兼容"
+    error "  2. 尝试更换镜像版本（当前: $image）"
+    error "  3. 尝试升级宿主机内核"
+    echo ""
+    echo -e "${YELLOW}调试命令：${NC}"
+    echo "  docker logs $container_name"
+    echo "  docker run --rm --privileged $cgroupns_arg $image /bin/sh"
+    return 1
+}
+
+# ==============================================================================
+# LuCI 状态检查（兼容 OpenWrt busybox ps）
 # ==============================================================================
 check_luci_status() {
-    log "检查 OpenWrt 容器内 LuCI 和 uhttpd 状态..."
+    log "检查 LuCI 和 uhttpd..."
 
-    # 检查 LuCI 是否安装（opkg）
-    if ! docker exec openwrt /bin/sh -c "opkg list-installed 2>/dev/null | grep -q '^luci'"; then
-        log "LuCI 未安装，正在尝试安装..."
-        if docker exec openwrt /bin/sh -c \
-            "opkg update && opkg install luci-ssl luci-app-opkg luci-base 2>/dev/null"; then
-            success "LuCI 安装成功"
-        else
-            error "LuCI 安装失败，请手动进入容器安装"
+    if ! docker exec openwrt /bin/sh -c \
+        "opkg list-installed 2>/dev/null | grep -q '^luci'" 2>/dev/null; then
+        log "LuCI 未安装，尝试安装..."
+        docker exec openwrt /bin/sh -c \
+            "opkg update && opkg install luci-ssl luci-app-opkg luci-base 2>/dev/null" \
+            && success "LuCI 安装成功" || {
+            error "LuCI 安装失败，请手动安装"
             return 1
-        fi
-    else
-        log "LuCI 已安装"
+        }
     fi
 
-    # [P1修复] 检查 uhttpd - 使用多种方式兼容 OpenWrt ps
-    local uhttpd_running=false
-    # 方式1：ps（OpenWrt busybox ps 格式简化）
-    if docker exec openwrt /bin/sh -c "ps 2>/dev/null | grep -q 'uhttpd'"; then
-        uhttpd_running=true
-    fi
-    # 方式2：init.d status
-    if ! $uhttpd_running; then
-        if docker exec openwrt /bin/sh -c \
-            "/etc/init.d/uhttpd status 2>/dev/null | grep -q 'running'"; then
-            uhttpd_running=true
-        fi
-    fi
-    # 方式3：检查 PID 文件
-    if ! $uhttpd_running; then
-        if docker exec openwrt /bin/sh -c \
-            "[ -f /var/run/uhttpd.pid ] && kill -0 \$(cat /var/run/uhttpd.pid) 2>/dev/null"; then
-            uhttpd_running=true
-        fi
+    # 多方式检测 uhttpd
+    local uhttpd_ok=false
+    docker exec openwrt /bin/sh -c \
+        "ps 2>/dev/null | grep -v grep | grep -q uhttpd" 2>/dev/null \
+        && uhttpd_ok=true
+    if ! $uhttpd_ok; then
+        docker exec openwrt /bin/sh -c \
+            "[ -f /var/run/uhttpd.pid ] && \
+             kill -0 \$(cat /var/run/uhttpd.pid) 2>/dev/null" 2>/dev/null \
+            && uhttpd_ok=true
     fi
 
-    if ! $uhttpd_running; then
-        log "uhttpd 未运行，正在启动..."
-        if docker exec openwrt /bin/sh -c \
-            "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable"; then
-            success "uhttpd 已启动"
-        else
-            error "uhttpd 启动失败"
-            return 1
-        fi
+    if ! $uhttpd_ok; then
+        log "uhttpd 未运行，尝试启动..."
+        docker exec openwrt /bin/sh -c \
+            "/etc/init.d/uhttpd start && /etc/init.d/uhttpd enable" >/dev/null 2>&1 \
+            && success "uhttpd 已启动" || { error "uhttpd 启动失败"; return 1; }
     else
         log "uhttpd 运行正常"
     fi
@@ -634,26 +776,24 @@ verify_web_access() {
     local ip="$1"
     local port="$2"
     log "验证 Web 界面: http://$ip:$port ..."
-
     local retry=0
-    while [[ $retry -lt 3 ]]; do
+    while [[ $retry -lt 5 ]]; do
         if curl -sf -m 5 "http://$ip:$port" >/dev/null 2>&1; then
-            success "Web 界面可访问: http://$ip:$port"
+            success "✅ Web 界面可访问: http://$ip:$port"
             return 0
         fi
         retry=$((retry + 1))
-        [[ $retry -lt 3 ]] && sleep 2
+        [[ $retry -lt 5 ]] && sleep 3
     done
-
-    warn "Web 界面暂不可访问: http://$ip:$port（可能容器仍在初始化）"
+    warn "⚠ Web 暂不可访问（可能仍在初始化），请稍后手动访问 http://$ip:$port"
     return 1
 }
 
 # ==============================================================================
-# 清理残留资源
+# 清理
 # ==============================================================================
 cleanup_residual() {
-    log "清理残留 Docker 资源..."
+    log "清理残留资源..."
     docker stop openwrt >/dev/null 2>&1 || true
     docker rm openwrt >/dev/null 2>&1 || true
     docker network rm openwrt_net >/dev/null 2>&1 || true
@@ -662,113 +802,50 @@ cleanup_residual() {
 }
 
 # ==============================================================================
-# [BUG1修复] 使用数组构建 Docker run 命令，不使用 eval
-# ==============================================================================
-build_and_run_container() {
-    local container_name="$1"
-    local image="$2"
-    local net_name="$3"
-    local net_mode="$4"
-    local macvlan_ip="${5:-}"
-    local web_port="${6:-8080}"
-    local ssh_port="${7:-2222}"
-    local volume_map="${8:-}"
-
-    local cmd=(
-        docker run -d
-        --name "$container_name"
-        --restart unless-stopped
-        --privileged
-        -p "${web_port}:80"
-        -p "${ssh_port}:22"
-    )
-
-    if [[ -n "$volume_map" ]]; then
-        cmd+=(-v "$volume_map:/etc/config")
-    fi
-
-    if [[ "$net_mode" -eq 2 ]] && [[ -n "$macvlan_ip" ]]; then
-        cmd+=(--network "$net_name" --ip "$macvlan_ip")
-    else
-        cmd+=(--network "$net_name")
-    fi
-
-    cmd+=("$image" /sbin/init)
-
-    log "执行命令: ${cmd[*]}"
-    "${cmd[@]}"
-    return $?
-}
-
-# ==============================================================================
-# 系统信息显示
-# ==============================================================================
-show_system_info() {
-    clear
-    echo -e "${BLUE}====================================${NC}"
-    echo -e "      ${CYAN}OpenWrt Docker 管理工具 v2.0${NC}"
-    echo -e "${BLUE}====================================${NC}"
-    echo -e "系统架构：${GREEN}$ARCH_DESC ($ARCH)${NC}"
-    echo -e "默认镜像：${YELLOW}$DOCKER_IMAGE${NC}"
-    [[ -n "$ALIYUN_IMAGE" ]] && echo -e "阿里云镜像：${YELLOW}$ALIYUN_IMAGE${NC}"
-    [[ -n "$FALLBACK_IMAGE" ]] && echo -e "备选镜像：${YELLOW}$FALLBACK_IMAGE${NC}"
-    echo -e "宿主机内核：${GREEN}$(uname -r)${NC}"
-    echo -e "Docker 版本：${GREEN}$(docker --version 2>/dev/null | head -n1)${NC}"
-
-    # 内核版本警告
-    local kmajor kminor
-    kmajor=$(uname -r | cut -d. -f1)
-    kminor=$(uname -r | cut -d. -f2)
-    if (( kmajor < 5 || (kmajor == 5 && kminor < 4) )); then
-        warn "内核 $(uname -r) 较旧，建议升级到 5.4+ 以提升兼容性"
-    fi
-    echo -e "${BLUE}====================================${NC}"
-}
-
-# ==============================================================================
-# 显示登录信息（提取为独立函数，[BUG4修复]）
+# 显示登录信息
 # ==============================================================================
 show_login_info() {
-    echo -e "\n${CYAN}正在查询 OpenWrt 容器登录信息...${NC}"
+    echo -e "\n${CYAN}查询容器登录信息...${NC}"
 
     local container_id
     container_id=$(docker ps -q --filter name=openwrt 2>/dev/null)
     if [[ -z "$container_id" ]]; then
-        error "未找到正在运行的 openwrt 容器，请先安装或启动容器"
+        error "未找到运行中的 openwrt 容器"
         return 1
     fi
 
     local inspect_json
     inspect_json=$(docker inspect "$container_id" 2>/dev/null)
 
-    local network_name container_ip web_host_port ssh_host_port
+    local network_name container_ip web_port ssh_port
 
     if command -v jq &>/dev/null; then
-        network_name=$(echo "$inspect_json" | jq -r \
-            '.[0].NetworkSettings.Networks | keys[0]' 2>/dev/null || true)
-        container_ip=$(echo "$inspect_json" | jq -r \
-            ".[0].NetworkSettings.Networks[\"$network_name\"].IPAddress" 2>/dev/null || true)
-        web_host_port=$(echo "$inspect_json" | jq -r \
-            '.[0].HostConfig.PortBindings."80/tcp"[0].HostPort // empty' 2>/dev/null || true)
-        ssh_host_port=$(echo "$inspect_json" | jq -r \
-            '.[0].HostConfig.PortBindings."22/tcp"[0].HostPort // empty' 2>/dev/null || true)
-    else
-        warn "未安装 jq，使用 grep 解析（结果可能不精确）"
-        container_ip=$(echo "$inspect_json" | \
-            grep -A5 '"Networks"' | grep '"IPAddress"' | \
-            head -n1 | sed 's/.*"IPAddress": "\(.*\)".*/\1/')
         network_name=$(echo "$inspect_json" | \
-            grep -E '"openwrt_net|openwrt_bridge"' | \
-            head -n1 | sed 's/.*"\(openwrt_[^"]*\)".*/\1/')
-        web_host_port=$(echo "$inspect_json" | \
-            grep -A2 '"80/tcp"' | grep '"HostPort"' | \
-            head -n1 | sed 's/.*"HostPort": "\(.*\)".*/\1/')
-        ssh_host_port=$(echo "$inspect_json" | \
-            grep -A2 '"22/tcp"' | grep '"HostPort"' | \
-            head -n1 | sed 's/.*"HostPort": "\(.*\)".*/\1/')
+            jq -r '.[0].NetworkSettings.Networks | keys[0]' 2>/dev/null || true)
+        container_ip=$(echo "$inspect_json" | \
+            jq -r ".[0].NetworkSettings.Networks[\"$network_name\"].IPAddress" \
+            2>/dev/null || true)
+        web_port=$(echo "$inspect_json" | \
+            jq -r '.[0].HostConfig.PortBindings."80/tcp"[0].HostPort // empty' \
+            2>/dev/null || true)
+        ssh_port=$(echo "$inspect_json" | \
+            jq -r '.[0].HostConfig.PortBindings."22/tcp"[0].HostPort // empty' \
+            2>/dev/null || true)
+    else
+        container_ip=$(docker inspect openwrt 2>/dev/null | \
+            grep '"IPAddress"' | grep -v '""' | head -n1 | \
+            sed 's/.*"IPAddress": "\(.*\)".*/\1/')
+        network_name=$(docker inspect openwrt 2>/dev/null | \
+            grep -E '"openwrt_net|openwrt_bridge"' | head -n1 | \
+            sed 's/.*"\(openwrt_[^"]*\)".*/\1/')
+        web_port=$(docker inspect openwrt 2>/dev/null | \
+            grep -A2 '"80/tcp"' | grep '"HostPort"' | head -n1 | \
+            sed 's/.*"HostPort": "\(.*\)".*/\1/')
+        ssh_port=$(docker inspect openwrt 2>/dev/null | \
+            grep -A2 '"22/tcp"' | grep '"HostPort"' | head -n1 | \
+            sed 's/.*"HostPort": "\(.*\)".*/\1/')
     fi
 
-    # 根据网络模式确定访问 IP
     local access_ip access_mode
     if [[ "$network_name" == "openwrt_net" ]]; then
         access_ip="$container_ip"
@@ -778,40 +855,65 @@ show_login_info() {
         access_mode="Bridge（通过宿主机 IP）"
     fi
 
-    echo -e "\n${BLUE}--- OpenWrt 登录信息 ---${NC}"
-    echo -e "网络模式 : ${YELLOW}$access_mode${NC}"
-    echo -e "容器 IP  : ${GREEN}$container_ip${NC}"
+    # 检测容器实际状态
+    local real_status
+    real_status=$(check_container_real_status "openwrt")
 
-    if [[ -n "$web_host_port" ]]; then
-        echo -e "Web 管理 : ${GREEN}http://$access_ip:$web_host_port${NC}"
-    else
-        echo -e "Web 管理 : ${YELLOW}未映射端口，Macvlan 模式直接访问 http://$container_ip${NC}"
-    fi
-    echo -e "Web 账号 : ${GREEN}root${NC} / 密码: ${YELLOW}(通常为空，首次登录后设置)${NC}"
+    echo -e "\n${BLUE}─────────────────────────────────${NC}"
+    echo -e " ${CYAN}OpenWrt 登录信息${NC}"
+    echo -e "${BLUE}─────────────────────────────────${NC}"
 
-    if [[ -n "$ssh_host_port" ]]; then
-        echo -e "SSH 连接 : ${GREEN}ssh root@$access_ip -p $ssh_host_port${NC}"
+    # 状态显示
+    case "$real_status" in
+        healthy)   echo -e " 容器状态: ${GREEN}✅ 运行正常${NC}" ;;
+        starting)  echo -e " 容器状态: ${YELLOW}⏳ 启动中...${NC}" ;;
+        crash_loop)echo -e " 容器状态: ${RED}❌ 反复崩溃（建议重装）${NC}" ;;
+        stopped)   echo -e " 容器状态: ${RED}⏹ 已停止${NC}" ;;
+        *)         echo -e " 容器状态: ${YELLOW}未知${NC}" ;;
+    esac
+
+    echo -e " Cgroup 版本: ${YELLOW}$(detect_cgroup_version)${NC}"
+    echo -e " 网络模式: ${YELLOW}$access_mode${NC}"
+    echo -e " 容器 IP: ${GREEN}$container_ip${NC}"
+
+    if [[ -n "$web_port" ]]; then
+        echo -e " Web 管理: ${GREEN}http://$access_ip:$web_port${NC}"
     else
-        echo -e "SSH 连接 : ${YELLOW}未映射端口，Macvlan 模式: ssh root@$container_ip${NC}"
+        echo -e " Web 管理: ${GREEN}http://$container_ip${NC} (macvlan 直连)"
     fi
-    echo -e "${BLUE}------------------------${NC}"
-    echo -e "${YELLOW}提示：如无法访问 Web，请尝试：${NC}"
-    echo -e "  docker exec -it openwrt /bin/sh"
-    echo -e "  /etc/init.d/uhttpd start"
+    echo -e " 账号/密码: ${GREEN}root${NC} / ${YELLOW}(空，首次登录后设置)${NC}"
+
+    if [[ -n "$ssh_port" ]]; then
+        echo -e " SSH 连接: ${GREEN}ssh root@$access_ip -p $ssh_port${NC}"
+    else
+        echo -e " SSH 连接: ${GREEN}ssh root@$container_ip${NC}"
+    fi
+
+    echo -e "${BLUE}─────────────────────────────────${NC}"
+
+    if [[ "$network_name" == "openwrt_net" ]]; then
+        echo -e "${YELLOW}提示：macvlan 模式下宿主机本身无法直接访问容器${NC}"
+        echo -e "${YELLOW}请用局域网内其他设备（手机/电脑）访问上述地址${NC}"
+    fi
+
+    if [[ "$real_status" == "crash_loop" ]]; then
+        echo ""
+        echo -e "${RED}容器正在反复崩溃，请执行以下诊断：${NC}"
+        echo "  docker logs openwrt | tail -30"
+        echo "  建议：选择菜单 [1] 重新安装（已自动添加 cgroup 兼容参数）"
+    fi
 }
 
 # ==============================================================================
-# 无损升级函数
-# [BUG6修复] mapfile 兼容性处理
+# 无损升级
 # ==============================================================================
 upgrade_openwrt() {
-    echo -e "\n${CYAN}--- 一键无损升级 OpenWrt 容器 ---${NC}"
+    echo -e "\n${CYAN}─── 无损升级 OpenWrt 容器 ───${NC}"
 
     if ! command -v jq &>/dev/null; then
-        error "无损升级需要 jq，请先安装：apt install jq"
+        error "无损升级需要 jq：apt install jq"
         return 1
     fi
-
     if ! docker ps -a --format '{{.Names}}' | grep -q "^openwrt$"; then
         error "未找到 openwrt 容器，请先安装"
         return 1
@@ -822,15 +924,20 @@ upgrade_openwrt() {
     container_info=$(docker inspect openwrt 2>/dev/null)
 
     local net_mode_name macvlan_ip
-    net_mode_name=$(echo "$container_info" | jq -r '.[0].HostConfig.NetworkMode' 2>/dev/null || true)
-
+    net_mode_name=$(echo "$container_info" | \
+        jq -r '.[0].HostConfig.NetworkMode' 2>/dev/null || true)
     if [[ "$net_mode_name" != "bridge" && "$net_mode_name" != "host" ]]; then
         macvlan_ip=$(echo "$container_info" | \
-            jq -r ".[0].NetworkSettings.Networks[\"$net_mode_name\"].IPAddress" 2>/dev/null || true)
+            jq -r ".[0].NetworkSettings.Networks[\"$net_mode_name\"].IPAddress" \
+            2>/dev/null || true)
     fi
 
-    # [BUG6修复] 兼容 bash < 4 的 mapfile 替代方案
     local run_args=("-d" "--name" "openwrt" "--restart" "unless-stopped" "--privileged")
+
+    # [FIX1] 自动补充 cgroupns 参数
+    local cgroupns_arg
+    cgroupns_arg=$(get_cgroupns_arg)
+    [[ -n "$cgroupns_arg" ]] && run_args+=($cgroupns_arg)
 
     # 提取端口映射
     local ports_json
@@ -839,48 +946,37 @@ upgrade_openwrt() {
             .[0].HostConfig.PortBindings | to_entries[] |
             "-p \(.value[0].HostPort):\(.key | split("/")[0])"
         else empty end' 2>/dev/null || true)
-
-    if [[ -n "$ports_json" ]]; then
-        while IFS= read -r port_arg; do
-            [[ -n "$port_arg" ]] && run_args+=($port_arg)
-        done <<< "$ports_json"
-    fi
+    while IFS= read -r port_arg; do
+        [[ -n "$port_arg" ]] && run_args+=($port_arg)
+    done <<< "$ports_json"
 
     # 提取挂载卷
     local mounts_json
     mounts_json=$(echo "$container_info" | jq -r \
         '.[0].Mounts[]? | "-v \(.Source):\(.Destination)"' 2>/dev/null || true)
-
-    if [[ -n "$mounts_json" ]]; then
-        while IFS= read -r mount_arg; do
-            [[ -n "$mount_arg" ]] && run_args+=($mount_arg)
-        done <<< "$mounts_json"
-    fi
+    while IFS= read -r mount_arg; do
+        [[ -n "$mount_arg" ]] && run_args+=($mount_arg)
+    done <<< "$mounts_json"
 
     if [[ -n "$net_mode_name" && "$net_mode_name" != "null" ]]; then
         run_args+=(--network "$net_mode_name")
-        if [[ -n "$macvlan_ip" ]]; then
-            run_args+=(--ip "$macvlan_ip")
-        fi
+        [[ -n "$macvlan_ip" ]] && run_args+=(--ip "$macvlan_ip")
     fi
 
-    # 选择升级镜像
-    echo -e "\n${YELLOW}请选择升级镜像源：${NC}"
+    # 选择镜像
+    echo -e "\n${YELLOW}选择升级镜像源：${NC}"
     echo "1) 默认镜像 ($DOCKER_IMAGE)"
     [[ -n "$ALIYUN_IMAGE" ]] && echo "2) 阿里云镜像 ($ALIYUN_IMAGE)"
     [[ -n "$FALLBACK_IMAGE" ]] && echo "3) 备选镜像 ($FALLBACK_IMAGE)"
     read -rp "请选择 [默认1]: " img_choice
 
     local target_image="$DOCKER_IMAGE"
-    case "$img_choice" in
+    case "${img_choice:-1}" in
         2) [[ -n "$ALIYUN_IMAGE" ]] && target_image="$ALIYUN_IMAGE" ;;
         3) [[ -n "$FALLBACK_IMAGE" ]] && target_image="$FALLBACK_IMAGE" ;;
     esac
 
-    if ! pull_image "$target_image"; then
-        error "镜像拉取失败，升级终止"
-        return 1
-    fi
+    pull_image "$target_image" || { error "镜像拉取失败"; return 1; }
 
     log "停止并删除旧容器..."
     docker stop openwrt >/dev/null 2>&1 || true
@@ -894,10 +990,21 @@ upgrade_openwrt() {
         return 1
     fi
 
-    success "容器已重建，等待启动（约10秒）..."
-    sleep 10
+    log "等待启动（约15秒）..."
+    sleep 15
 
-    # 重新应用网络补丁
+    # 检测是否崩溃
+    local status
+    status=$(check_container_real_status "openwrt")
+    if [[ "$status" == "crash_loop" ]]; then
+        warn "检测到崩溃循环，尝试备用启动方式..."
+        _handle_crash_loop "openwrt" "$target_image" \
+            "$net_mode_name" \
+            "$([[ "$net_mode_name" == "openwrt_net" ]] && echo 2 || echo 1)" \
+            "$macvlan_ip" "8080" "2222" "" "$cgroupns_arg"
+    fi
+
+    # 重新注入网络配置
     if [[ "$net_mode_name" == "openwrt_net" ]] && [[ -n "$macvlan_ip" ]]; then
         local gw subnet_val
         gw=$(docker network inspect "$net_mode_name" 2>/dev/null | \
@@ -910,44 +1017,91 @@ upgrade_openwrt() {
     fi
 
     check_luci_status
-    success "无损升级完成！"
+    success "升级完成！"
+}
+
+# ==============================================================================
+# 系统信息显示
+# ==============================================================================
+show_system_info() {
+    clear
+    local cgroup_ver
+    cgroup_ver=$(detect_cgroup_version)
+
+    echo -e "${BLUE}════════════════════════════════════${NC}"
+    echo -e "    ${CYAN}OpenWrt Docker 管理工具 v2.1${NC}"
+    echo -e "${BLUE}════════════════════════════════════${NC}"
+    echo -e " 架构: ${GREEN}$ARCH_DESC ($ARCH)${NC}"
+    echo -e " 内核: ${GREEN}$(uname -r)${NC}"
+    echo -e " Cgroup: ${YELLOW}$cgroup_ver${NC}\
+$([ "$cgroup_ver" = "v2" ] && echo " ${GREEN}(已自动兼容)${NC}")"
+    echo -e " Docker: ${GREEN}$(docker --version 2>/dev/null | head -n1)${NC}"
+    echo -e " 默认镜像: ${YELLOW}$DOCKER_IMAGE${NC}"
+    [[ -n "$ALIYUN_IMAGE" ]] && \
+        echo -e " 阿里云: ${YELLOW}$ALIYUN_IMAGE${NC}"
+    [[ -n "$FALLBACK_IMAGE" ]] && \
+        echo -e " 备选: ${YELLOW}$FALLBACK_IMAGE${NC}"
+
+    # 内核版本警告
+    local kmajor kminor
+    kmajor=$(uname -r | cut -d. -f1)
+    kminor=$(uname -r | cut -d. -f2)
+    if (( kmajor < 5 || (kmajor == 5 && kminor < 4) )); then
+        warn "内核 $(uname -r) 较旧，建议升级到 5.4+"
+    fi
+
+    # 容器当前状态预览
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^openwrt$"; then
+        local status
+        status=$(check_container_real_status "openwrt")
+        case "$status" in
+            healthy)    echo -e " 容器状态: ${GREEN}✅ 运行正常${NC}" ;;
+            crash_loop) echo -e " 容器状态: ${RED}❌ 反复崩溃${NC}" ;;
+            starting)   echo -e " 容器状态: ${YELLOW}⏳ 启动中${NC}" ;;
+            stopped)    echo -e " 容器状态: ${YELLOW}⏹ 已停止${NC}" ;;
+        esac
+    fi
+    echo -e "${BLUE}════════════════════════════════════${NC}"
 }
 
 # ==============================================================================
 # 主安装流程
 # ==============================================================================
 do_install() {
+    # 预检 Cgroup 版本并提示
+    local cgroup_ver
+    cgroup_ver=$(detect_cgroup_version)
+    if [[ "$cgroup_ver" == "v2" ]]; then
+        log "检测到 Cgroup v2，将自动添加 --cgroupns=host 确保 OpenWrt 兼容性"
+    fi
+
     # 镜像源选择
     echo -e "\n${YELLOW}» 镜像源选择 «${NC}"
     echo "1) Docker Hub（默认）"
-    [[ -n "$ALIYUN_IMAGE" ]] && echo "2) 阿里云镜像仓库（国内推荐）"
-    read -rp "请选择镜像源 [默认2]: " image_source
+    [[ -n "$ALIYUN_IMAGE" ]] && echo "2) 阿里云镜像（国内推荐）"
+    read -rp "请选择 [默认2]: " image_source
     image_source=${image_source:-2}
 
     local selected_image="$DOCKER_IMAGE"
-    if [[ "$image_source" -eq 2 && -n "$ALIYUN_IMAGE" ]]; then
+    [[ "$image_source" -eq 2 && -n "$ALIYUN_IMAGE" ]] && \
         selected_image="$ALIYUN_IMAGE"
-    fi
-    log "已选择镜像: $selected_image"
 
     # 网络模式选择
     echo -e "\n${YELLOW}» 网络模式选择 «${NC}"
-    echo "1) Bridge 模式（宿主机端口映射，适合测试）"
-    echo "2) Macvlan 模式（容器获得独立 IP，推荐旁路由）"
-    read -rp "请选择网络类型 [默认2]: " net_mode
+    echo "1) Bridge 模式（端口映射，适合测试）"
+    echo "2) Macvlan 模式（容器独立 IP，推荐旁路由）"
+    read -rp "请选择 [默认2]: " net_mode
     net_mode=${net_mode:-2}
 
-    # 获取默认网卡
     local default_nic
     default_nic=$(get_default_interface)
     if [[ -z "$default_nic" ]]; then
-        error "无法自动检测网卡"
+        error "无法检测默认网卡"
         ip link show
         read -rp "请输入网卡名称: " default_nic
-        if [[ -z "$default_nic" ]] || ! ip link show "$default_nic" >/dev/null 2>&1; then
-            error "无效的网卡名称，安装中止"
-            return 1
-        fi
+        ip link show "$default_nic" >/dev/null 2>&1 || {
+            error "无效网卡名称"; return 1
+        }
     fi
 
     local macvlan_ip="" subnet="" gateway="" target_nic=""
@@ -955,21 +1109,11 @@ do_install() {
     local net_name=""
 
     if [[ "$net_mode" -eq 2 ]]; then
-        # --- Macvlan 配置 ---
-
-        # [NEW3] 检测 macvlan 内核支持
-        if ! check_macvlan_support; then
-            warn "macvlan 内核支持不确定，是否继续？"
-            read -rp "继续尝试 macvlan？(y/N): " try_macvlan
-            if [[ ! "$try_macvlan" =~ ^[Yy]$ ]]; then
-                error "安装中止，请改用 bridge 模式"
-                return 1
-            fi
-        fi
-
+        # Macvlan 配置
         echo -e "\n${YELLOW}» Macvlan 参数配置 «${NC}"
+
         if detect_lan_subnet_gateway; then
-            read -rp "使用自动检测的参数？[Y/n]: " use_detected
+            read -rp "使用自动检测参数？[Y/n]: " use_detected
             if [[ ! "$use_detected" =~ ^[Nn]$ ]]; then
                 subnet="$DETECTED_SUBNET"
                 gateway="$DETECTED_GATEWAY"
@@ -980,26 +1124,19 @@ do_install() {
         if [[ -z "$subnet" ]]; then
             read -rp "子网 (如 192.168.3.0/24): " subnet
             read -rp "网关 (如 192.168.3.1): " gateway
-            read -rp "网卡 (如 eth0) [默认: $default_nic]: " target_nic
+            read -rp "网卡 [默认: $default_nic]: " target_nic
             target_nic=${target_nic:-$default_nic}
         fi
 
-        if ! ip link show "$target_nic" >/dev/null 2>&1; then
+        ip link show "$target_nic" >/dev/null 2>&1 || {
             error "网卡 $target_nic 不存在"
-            ip link show
             return 1
-        fi
+        }
 
-        # 容器 IP
-        read -rp "容器静态 IP（在 $subnet 网段内，未被占用）: " macvlan_ip
-        if ! validate_ip_in_subnet "$macvlan_ip" "$subnet"; then
-            return 1
-        fi
-        if ! check_ip_occupied "$macvlan_ip"; then
-            return 1
-        fi
+        read -rp "容器静态 IP（在 $subnet 网段内）: " macvlan_ip
+        validate_ip_in_subnet "$macvlan_ip" "$subnet" || return 1
+        check_ip_occupied "$macvlan_ip" || return 1
 
-        # 冲突检查
         if ! check_network_conflict "$subnet"; then
             read -rp "是否删除冲突网络 openwrt_net？(y/N): " del_net
             if [[ "$del_net" =~ ^[Yy]$ ]]; then
@@ -1009,87 +1146,64 @@ do_install() {
             fi
         fi
 
-        # 开启混杂模式（持久化）
         enable_persistent_promisc "$target_nic" || return 1
 
-        # 创建 macvlan 网络
         if ! docker network inspect openwrt_net >/dev/null 2>&1; then
-            log "创建 macvlan 网络 openwrt_net..."
-
-            # [NEW2] 使用 --ip-range 限制 Docker 可分配 IP
-            # 取子网中段作为 Docker 可分配范围，避免与 LAN 设备冲突
-            local cidr_bits
-            cidr_bits=$(echo "$subnet" | cut -d'/' -f2)
-            local ip_range="${subnet%/*}"
-            # 将最后一段改为 192-250 范围（简单策略）
-            local ip_range_base
-            ip_range_base=$(echo "$ip_range" | cut -d. -f1-3)
-            local ip_range_str="${ip_range_base}.192/$((cidr_bits < 27 ? 27 : cidr_bits))"
-
-            if ! docker network create -d macvlan \
+            log "创建 macvlan 网络..."
+            docker network create -d macvlan \
                 --subnet="$subnet" \
                 --gateway="$gateway" \
-                --ip-range="$ip_range_str" \
-                --aux-address="host_shim=$(echo "$ip_range_base").253" \
                 -o parent="$target_nic" \
-                openwrt_net 2>/dev/null; then
-                # 不带 ip-range 重试（某些老版本 Docker 不支持 aux-address）
-                docker network create -d macvlan \
-                    --subnet="$subnet" \
-                    --gateway="$gateway" \
-                    -o parent="$target_nic" \
-                    openwrt_net || { error "macvlan 网络创建失败"; return 1; }
-            fi
-            success "macvlan 网络 openwrt_net 创建成功"
+                openwrt_net || { error "macvlan 网络创建失败"; return 1; }
+            success "macvlan 网络创建成功"
         else
-            log "macvlan 网络 openwrt_net 已存在，复用"
+            log "macvlan 网络已存在，复用"
         fi
         net_name="openwrt_net"
 
     else
-        # --- Bridge 配置 ---
+        # Bridge 配置
         if ! docker network inspect openwrt_bridge >/dev/null 2>&1; then
-            docker network create openwrt_bridge || { error "bridge 网络创建失败"; return 1; }
-            success "bridge 网络 openwrt_bridge 创建成功"
+            docker network create openwrt_bridge || {
+                error "bridge 网络创建失败"
+                return 1
+            }
         fi
         net_name="openwrt_bridge"
     fi
 
     # 端口配置
-    echo -e "\n${YELLOW}» 端口映射配置 «${NC}"
-    read -rp "Web 管理端口映射到宿主机 [默认: $web_port]: " user_web_port
-    web_port=${user_web_port:-$web_port}
+    echo -e "\n${YELLOW}» 端口映射 «${NC}"
+    read -rp "Web 管理端口 [默认: $web_port]: " user_web
+    web_port=${user_web:-$web_port}
     check_port_usage "$web_port" || return 1
 
-    read -rp "SSH 端口映射到宿主机 [默认: $ssh_port]: " user_ssh_port
-    ssh_port=${user_ssh_port:-$ssh_port}
+    read -rp "SSH 端口 [默认: $ssh_port]: " user_ssh
+    ssh_port=${user_ssh:-$ssh_port}
     check_port_usage "$ssh_port" || return 1
 
     # 数据持久化
     echo -e "\n${YELLOW}» 数据持久化 «${NC}"
-    read -rp "是否挂载配置目录到宿主机？[y/N]: " need_volume
-    local volume_map=""
-    if [[ "$need_volume" =~ ^[Yy]$ ]]; then
-        read -rp "宿主机存储路径 [默认: /opt/openwrt/config]: " config_path
+    read -rp "是否挂载配置目录到宿主机？[y/N]: " need_vol
+    local volume_src=""
+    if [[ "$need_vol" =~ ^[Yy]$ ]]; then
+        read -rp "宿主机路径 [默认: /opt/openwrt/config]: " config_path
         config_path=${config_path:-/opt/openwrt/config}
         mkdir -p "$config_path" && chmod 755 "$config_path" || {
             error "无法创建目录 $config_path"
             return 1
         }
-        volume_map="$config_path"
-        log "配置将持久化到: $config_path"
+        volume_src="$config_path"
     fi
 
     # 清理旧容器
     if docker ps -a --format '{{.Names}}' | grep -q "^openwrt$"; then
-        warn "已存在名为 openwrt 的容器"
-        read -rp "是否停止并删除？[y/N]: " remove_old
-        if [[ "$remove_old" =~ ^[Yy]$ ]]; then
+        warn "已存在 openwrt 容器"
+        read -rp "是否停止并删除？[y/N]: " rm_old
+        if [[ "$rm_old" =~ ^[Yy]$ ]]; then
             docker stop openwrt >/dev/null 2>&1 || true
             docker rm openwrt >/dev/null 2>&1 || true
-            success "旧容器已删除"
         else
-            error "安装中止"
             return 1
         fi
     fi
@@ -1098,58 +1212,36 @@ do_install() {
     if ! pull_image "$selected_image"; then
         if [[ -n "$FALLBACK_IMAGE" ]]; then
             warn "尝试备选镜像: $FALLBACK_IMAGE"
-            if pull_image "$FALLBACK_IMAGE"; then
-                selected_image="$FALLBACK_IMAGE"
-            else
-                error "所有镜像拉取失败，请检查网络"
+            pull_image "$FALLBACK_IMAGE" && selected_image="$FALLBACK_IMAGE" || {
+                error "所有镜像拉取失败"
                 return 1
-            fi
+            }
         else
-            error "无可用备选镜像，安装中止"
             return 1
         fi
     fi
 
-    # [BUG1修复] 启动容器（不使用 eval）
-    log "启动 OpenWrt 容器..."
+    # [FIX1][FIX2][FIX3] 启动容器（含 cgroup 兼容 + 崩溃检测 + 备用方案）
     if ! build_and_run_container \
         "openwrt" "$selected_image" "$net_name" "$net_mode" \
-        "$macvlan_ip" "$web_port" "$ssh_port" "$volume_map"; then
-
-        error "容器启动失败"
-        echo -e "${YELLOW}排查建议：${NC}"
-        echo "  1. 查看日志：docker logs openwrt"
-        echo "  2. 检查内核兼容性：uname -r（建议 5.4+）"
-        [[ "$net_mode" -eq 2 ]] && echo "  3. 确认网卡 $target_nic 支持 macvlan"
+        "$macvlan_ip" "$web_port" "$ssh_port" "$volume_src"; then
+        error "容器启动失败，请检查上方错误信息"
         cleanup_residual
         return 1
     fi
-    success "OpenWrt 容器已启动！"
 
-    log "等待容器初始化（约10秒）..."
-    sleep 10
-
-    # 注入网络补丁
+    # [FIX5] 网络配置对齐
     if [[ "$net_mode" -eq 2 ]]; then
         fix_openwrt_network 2 "$macvlan_ip" "$gateway" "$subnet"
-        # [NEW1] 配置 macvlan-shim
+        # [FIX4] macvlan-shim
         setup_macvlan_shim "$target_nic" "$macvlan_ip" "$subnet"
     else
         fix_openwrt_network 1
     fi
 
-    # 检查容器状态
-    if ! docker ps -q --filter name=openwrt | grep -q .; then
-        error "容器未保持运行"
-        docker logs openwrt | tail -20
-        cleanup_residual
-        return 1
-    fi
-
     # 配置 LuCI
     log "配置 OpenWrt 环境..."
-    # [P7修复] 移除危险的 preinit sed 命令
-    check_luci_status || warn "LuCI 配置未完成，请手动进入容器安装"
+    check_luci_status || warn "LuCI 未完全配置，可手动进入容器安装"
 
     # 验证部署
     echo ""
@@ -1157,21 +1249,18 @@ do_install() {
         --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
 
     if [[ "$net_mode" -eq 2 ]]; then
-        ping -c 1 -W 2 "$macvlan_ip" >/dev/null 2>&1 && \
-            success "容器 IP $macvlan_ip 可 ping 通" || \
-            warn "无法 ping 通 $macvlan_ip（macvlan 宿主机限制，其他设备可访问）"
+        ping -c 2 "$macvlan_ip" >/dev/null 2>&1 \
+            && success "✅ 容器 IP $macvlan_ip 可 ping 通" \
+            || warn "宿主机无法 ping 通容器（macvlan 正常限制），请用其他设备测试"
         verify_web_access "$macvlan_ip" "80"
     else
-        local host_ip
-        host_ip=$(get_host_ip)
-        verify_web_access "$host_ip" "$web_port"
+        verify_web_access "$(get_host_ip)" "$web_port"
     fi
 
     echo ""
-    success "=========================================="
+    success "══════════════════════════════"
     success "  OpenWrt Docker 部署完成！"
-    success "=========================================="
-    # [BUG4修复] 直接调用函数，不递归调用脚本
+    success "══════════════════════════════"
     show_login_info
 }
 
@@ -1190,8 +1279,9 @@ main_menu() {
         echo "4) 查看容器状态"
         echo "5) 查看容器实时日志"
         echo "6) 显示 Web/SSH 登录地址"
-        echo "7) 退出"
-        read -rp "请输入操作编号 (1-7): " action
+        echo "7) 修复网络配置（容器运行但无法访问时使用）"
+        echo "8) 退出"
+        read -rp "请输入操作编号 (1-8): " action
 
         case "$action" in
             1) do_install ;;
@@ -1201,33 +1291,74 @@ main_menu() {
                 read -rp "确认卸载？[y/N]: " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     cleanup_residual
-                    # 清理 shim 服务
                     systemctl disable macvlan-shim.service >/dev/null 2>&1 || true
                     rm -f /etc/systemd/system/macvlan-shim.service
                     systemctl daemon-reload >/dev/null 2>&1 || true
                     success "卸载完成"
-                else
-                    log "卸载已取消"
                 fi
                 ;;
             4)
-                echo -e "\n${CYAN}--- 容器状态 ---${NC}"
+                echo -e "\n${CYAN}─── 容器状态 ───${NC}"
                 docker ps -a --filter name=openwrt \
-                    --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" || \
-                    error "未找到 openwrt 容器"
+                    --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" \
+                    || error "未找到 openwrt 容器"
+                local rs
+                rs=$(check_container_real_status "openwrt")
+                echo -e "实际状态: ${YELLOW}$rs${NC}"
                 ;;
             5)
-                echo -e "\n${CYAN}--- 实时日志 (Ctrl+C 退出) ---${NC}"
+                echo -e "\n${CYAN}─── 实时日志 (Ctrl+C 退出) ───${NC}"
+                echo -e "${YELLOW}提示：'Press the [f] key' 是正常 preinit 输出，约3秒后自动跳过${NC}"
+                echo -e "${YELLOW}若持续停留超过30秒，说明容器已崩溃，请选择 [1] 重新安装${NC}"
+                echo ""
                 docker logs -f openwrt 2>/dev/null || error "无法获取日志"
-                echo -e "${YELLOW}提示：若日志停滞，请进入容器执行 /etc/init.d/uhttpd start${NC}"
                 ;;
             6) show_login_info ;;
             7)
-                echo -e "\n${YELLOW}感谢使用，再见！${NC}"
+                # 手动触发网络修复
+                echo -e "\n${CYAN}─── 修复网络配置 ───${NC}"
+                local rs
+                rs=$(check_container_real_status "openwrt")
+                if [[ "$rs" != "healthy" && "$rs" != "starting" ]]; then
+                    error "容器未正常运行（状态: $rs），请先启动容器"
+                else
+                    # 从容器读取当前配置
+                    local cur_ip cur_gw cur_subnet
+                    cur_ip=$(docker inspect openwrt 2>/dev/null | \
+                        grep '"IPAddress"' | grep -v '""' | head -n1 | \
+                        sed 's/.*"IPAddress": "\(.*\)".*/\1/')
+                    local net_name
+                    net_name=$(docker inspect openwrt 2>/dev/null | \
+                        jq -r '.[0].HostConfig.NetworkMode' 2>/dev/null || \
+                        echo "openwrt_net")
+
+                    if [[ "$net_name" == "openwrt_net" ]]; then
+                        cur_gw=$(docker network inspect openwrt_net 2>/dev/null | \
+                            grep '"Gateway"' | head -n1 | \
+                            sed 's/.*"Gateway": "\(.*\)".*/\1/')
+                        cur_subnet=$(docker network inspect openwrt_net 2>/dev/null | \
+                            grep '"Subnet"' | head -n1 | \
+                            sed 's/.*"Subnet": "\(.*\)".*/\1/')
+                        log "当前配置: IP=$cur_ip 网关=$cur_gw 子网=$cur_subnet"
+                        fix_openwrt_network 2 "$cur_ip" "$cur_gw" "$cur_subnet"
+                        # 重建 shim
+                        local parent_iface
+                        parent_iface=$(docker network inspect openwrt_net 2>/dev/null | \
+                            grep '"parent"' | head -n1 | \
+                            sed 's/.*"parent": "\(.*\)".*/\1/')
+                        [[ -n "$parent_iface" && -n "$cur_ip" && -n "$cur_subnet" ]] && \
+                            setup_macvlan_shim "$parent_iface" "$cur_ip" "$cur_subnet"
+                    else
+                        fix_openwrt_network 1
+                    fi
+                fi
+                ;;
+            8)
+                echo -e "\n${YELLOW}再见！${NC}"
                 exit 0
                 ;;
             *)
-                error "无效选项，请输入 1-7"
+                error "无效选项，请输入 1-8"
                 ;;
         esac
 
