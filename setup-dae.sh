@@ -2187,11 +2187,21 @@ install_daed_panel() {
         err "无法获取版本列表。"; return 1; }
 
     local version_list
+    # 只保留正式 release（vX.Y.Z），排除 rc/alpha/beta/nightly
     version_list=$(printf '%s' "$release_list" \
         | grep '"tag_name":' \
         | sed -E 's/.*"([^"]+)".*/\1/' \
-        | grep -E '^v[0-9]+\.[0-9]+' \
-        | head -n 5)
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | head -n 5 || true)
+
+    # 若无正式版本则放宽到包含 rc
+    if [ -z "$version_list" ]; then
+        version_list=$(printf '%s' "$release_list" \
+            | grep '"tag_name":' \
+            | sed -E 's/.*"([^"]+)".*/\1/' \
+            | grep -E '^v[0-9]+\.[0-9]+' \
+            | head -n 5 || true)
+    fi
     [ -z "${version_list:-}" ] && {
         err "版本列表解析失败。"; return 1; }
 
@@ -2202,6 +2212,56 @@ install_daed_panel() {
     fi
 
     printf "当前版本: ${GREEN}%s${NC}\n" "$current_version"
+            # ── 版本选择：优先 fzf ──
+        local selected_version=""
+        if command -v fzf >/dev/null 2>&1; then
+            printf "\n${CYAN}[fzf] 方向键选择版本，Enter 确认：${NC}\n"
+            local ver_input="/tmp/daed_ver_input_$$"
+            local ver_output="/tmp/daed_ver_output_$$"
+            printf '%s\n' "$version_list" > "$ver_input"
+            : > "$ver_output"
+
+            # ★ 修复：fzf 直接运行，不在 $() 内
+            fzf \
+                --height=40% \
+                --border=rounded \
+                --prompt="请选择 daed 版本 > " \
+                --header="当前已安装: ${current_version}" \
+                --no-mouse \
+                < "$ver_input" > "$ver_output"
+
+            selected_version=$(cat "$ver_output" 2>/dev/null \
+                | tr -d '\n' || true)
+            rm -f "$ver_input" "$ver_output"
+            [ -z "$selected_version" ] && {
+                info "已取消。"; return 0; }
+        else
+            # 原有数字列表逻辑保持不变
+            printf "当前版本: ${GREEN}%s${NC}\n" "$current_version"
+            printf "${PURPLE}可选版本:${NC}\n"
+            local count=1
+            while IFS= read -r v; do
+                [ -z "$v" ] && continue
+                [ $count -eq 1 ] \
+                    && printf " %d) %s ${YELLOW}(最新)${NC}\n" "$count" "$v" \
+                    || printf " %d) %s\n" "$count" "$v"
+                count=$((count+1))
+            done << VEREOF
+$version_list
+VEREOF
+            printf " 0) 取消\n"
+            printf "输入序号 [0-%d]: " "$((count-1))"
+            read -r choice
+            case "${choice:-0}" in
+                [1-5])
+                    selected_version=$(printf '%s\n' "$version_list" \
+                        | sed -n "${choice}p") ;;
+                0) info "已取消。"; return 0 ;;
+                *) err "无效输入。"; return 1 ;;
+            esac
+        fi
+        [ -z "${selected_version:-}" ] && {
+            err "版本选择失败。"; return 1; }
     printf "${PURPLE}可选版本:${NC}\n"
     local count=1
     while IFS= read -r v; do
@@ -2363,17 +2423,176 @@ install_daed_docker_compose() {
             || { err "BPF FS 挂载失败。"; return 1; }
     fi
 
+    # ── 镜像源选择 ──
     printf "\n${PURPLE}选择镜像源:${NC}\n"
-    printf " 1) Docker Hub  : daeuniverse/daed:latest\n"
-    printf " 2) GHCR        : ghcr.io/daeuniverse/daed:latest\n"
-    printf " 3) Quay.io     : quay.io/daeuniverse/daed:latest\n"
+    printf " 1) Docker Hub  (daeuniverse/daed)\n"
+    printf " 2) GHCR        (ghcr.io/daeuniverse/daed)\n"
+    printf " 3) Quay.io     (quay.io/daeuniverse/daed)\n"
     printf "选择 [1-3, 默认2]: "; read -r img_choice
-    local daed_image
+
+    local registry_prefix
     case "${img_choice:-2}" in
-        1) daed_image="daeuniverse/daed:latest" ;;
-        3) daed_image="quay.io/daeuniverse/daed:latest" ;;
-        *) daed_image="ghcr.io/daeuniverse/daed:latest" ;;
+        1) registry_prefix="daeuniverse/daed" ;;
+        3) registry_prefix="quay.io/daeuniverse/daed" ;;
+        *) registry_prefix="ghcr.io/daeuniverse/daed" ;;
     esac
+
+    # ── ★ 修复：使用正确的 API 端点拉取 tag 列表 ──
+    step "拉取 daeuniverse/daed 镜像标签列表..."
+    local raw_tags=""
+
+    # 先诊断 API 是否可达
+    local api_url="https://registry.hub.docker.com/v2/repositories/daeuniverse/daed/tags?page_size=100&ordering=last_updated"
+    local http_status
+    http_status=$(curl -fsSL --connect-timeout 15 \
+        -w "%{http_code}" \
+        -o /tmp/daed_tags_$$.json \
+        "$api_url" 2>/dev/null || echo "000")
+
+    if [ "$http_status" != "200" ]; then
+        warn "API 返回 HTTP $http_status，尝试备用端点..."
+        api_url="https://hub.docker.com/v2/repositories/daeuniverse/daed/tags/?page_size=20"
+        http_status=$(curl -fsSL --connect-timeout 15 \
+            -w "%{http_code}" \
+            -o /tmp/daed_tags_$$.json \
+            "$api_url" 2>/dev/null || echo "000")
+    fi
+
+    local tag_list=""
+    if [ "$http_status" = "200" ] && [ -s /tmp/daed_tags_$$.json ]; then
+        raw_tags=$(cat /tmp/daed_tags_$$.json)
+        # ★ 精确提取 results 数组中每个对象的 name 字段
+        # 方法：找到 "name": "xxx" 后的值，排除 sha256 格式
+        # ★ 修复：分三层过滤，确保有效版本足够
+        # 第一层：只排除明确的噪音（sha256、纯日期格式、-test后缀）
+        local all_clean_tags
+        all_clean_tags=$(printf '%s' "$raw_tags" \
+            | grep -o '"name":"[^"]*"' \
+            | sed 's/"name":"//;s/"//' \
+            | grep -vE '^sha256-|^[0-9a-f]{40,}' \
+            | grep -vE '^[0-9]{8}$|^[0-9]{8}-' \
+            | grep -vE '\-test$|\-dev$|\-dirty$' \
+            || true)
+
+        # 第二层：优先提取稳定版（latest/nightly + 纯语义版本号）
+        local stable_tags
+        stable_tags=$(printf '%s\n' "$all_clean_tags" \
+            | grep -E '^latest$|^nightly$|^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+            || true)
+
+        # 第三层：若稳定版不足 5 个，补充 rc/预发布版本
+        local stable_count
+        stable_count=$(printf '%s\n' "$stable_tags" | grep -c . 2>/dev/null \
+            || echo 0)
+
+        if [ "${stable_count:-0}" -ge 3 ]; then
+            tag_list=$(printf '%s\n' "$stable_tags" | head -n 20)
+        else
+            # 放宽：接受所有非 test/日期格式的版本
+            tag_list=$(printf '%s\n' "$all_clean_tags" | head -n 20)
+        fi
+
+        # 确保 latest 排在最前面
+        if printf '%s\n' "$tag_list" | grep -q '^latest$'; then
+            tag_list=$(printf 'latest\n%s\n' \
+                "$(printf '%s\n' "$tag_list" | grep -v '^latest$')" \
+                | grep -v '^$')
+        fi
+    fi
+    rm -f /tmp/daed_tags_$$.json
+
+    # ── 调试输出（确认拉取结果）──
+    if [ -n "$tag_list" ]; then
+        local tag_count
+        tag_count=$(printf '%s\n' "$tag_list" | grep -c . || echo 0)
+        info "成功获取 $tag_count 个标签"
+    else
+        warn "无法获取标签列表（HTTP $http_status），将使用 latest"
+    fi
+
+    local daed_image=""
+
+    if [ -z "$tag_list" ]; then
+        daed_image="${registry_prefix}:latest"
+        info "使用默认版本: $daed_image"
+    else
+        # ── fzf 模式 ──
+        if command -v fzf >/dev/null 2>&1; then
+            printf "\n${CYAN}[fzf] 方向键选择，Enter 确认，Ctrl+C 取消:${NC}\n"
+
+            # ★ 修复：写入临时文件传给 fzf，与 Docker 安装脚本保持一致
+            local fzf_input="/tmp/daed_tags_input_$$"
+            local fzf_output="/tmp/daed_tags_output_$$"
+            printf '%s\n' "$tag_list" > "$fzf_input"
+            : > "$fzf_output"
+
+            # ★ 修复：fzf 直接运行（不在 $() 内），输出重定向到文件
+            fzf \
+                --height=50% \
+                --border=rounded \
+                --prompt="请选择版本 > " \
+                --header="镜像源: ${registry_prefix}" \
+                --no-mouse \
+                < "$fzf_input" > "$fzf_output"
+
+            local selected_tag
+            selected_tag=$(cat "$fzf_output" 2>/dev/null | tr -d '\n' || true)
+            rm -f "$fzf_input" "$fzf_output"
+
+            if [ -n "$selected_tag" ]; then
+                daed_image="${registry_prefix}:${selected_tag}"
+                printf "${GREEN}已选择: %s${NC}\n" "$daed_image"
+            else
+                warn "未选择版本，使用 latest"
+                daed_image="${registry_prefix}:latest"
+            fi
+
+        else
+            # ── 无 fzf：数字列表模式 ──
+            local tag_count
+            tag_count=$(printf '%s\n' "$tag_list" | grep -c . || echo 0)
+            printf "\n${PURPLE}可用标签（共 %d 个）:${NC}\n" "$tag_count"
+
+            local idx=1
+            while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                local mark=""
+                [ "$tag" = "latest" ]  && mark="${GREEN} ← 推荐${NC}"
+                [ "$tag" = "nightly" ] && mark="${YELLOW} ← 每日构建（不稳定）${NC}"
+                printf ' %2d) %-25s%b\n' "$idx" "$tag" "$mark"
+                idx=$((idx+1))
+            done <<< "$tag_list"
+            printf "   0) 手动输入 tag\n"
+
+            printf "\n输入序号 [0-%d, 默认1]: " "$((idx-1))"
+            read -r tag_choice
+
+            if [ "${tag_choice:-}" = "0" ]; then
+                printf "输入自定义 tag: "
+                read -r custom_tag
+                custom_tag=$(printf '%s' "${custom_tag:-latest}" \
+                    | tr -cd 'a-zA-Z0-9._-')
+                daed_image="${registry_prefix}:${custom_tag:-latest}"
+            elif [ -n "${tag_choice:-}" ] \
+                && printf '%s' "$tag_choice" | grep -qE '^[0-9]+$' \
+                && [ "$tag_choice" -ge 1 ] 2>/dev/null \
+                && [ "$tag_choice" -lt "$idx" ] 2>/dev/null; then
+                local chosen
+                chosen=$(printf '%s\n' "$tag_list" | sed -n "${tag_choice}p")
+                daed_image="${registry_prefix}:${chosen}"
+            else
+                local first_tag
+                first_tag=$(printf '%s\n' "$tag_list" | head -n1)
+                daed_image="${registry_prefix}:${first_tag:-latest}"
+            fi
+
+            printf "${GREEN}已选择: %s${NC}\n" "$daed_image"
+        fi
+    fi
+
+    if ! command -v fzf >/dev/null 2>&1; then
+        printf "${YELLOW}[提示] 安装 fzf 可获得交互式搜索: apt-get install fzf${NC}\n"
+    fi
 
     mkdir -p "$DAED_CONFIG_DIR"
     local compose_file="$DAED_CONFIG_DIR/docker-compose.yml"
@@ -2431,8 +2650,16 @@ upgrade_dae_core() {
     version_list=$(printf '%s' "$release_list" \
         | grep '"tag_name":' \
         | sed -E 's/.*"([^"]+)".*/\1/' \
-        | grep -E '^v[0-9]+\.[0-9]+' \
-        | head -n 5)
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | head -n 5 || true)
+
+    if [ -z "$version_list" ]; then
+        version_list=$(printf '%s' "$release_list" \
+            | grep '"tag_name":' \
+            | sed -E 's/.*"([^"]+)".*/\1/' \
+            | grep -E '^v[0-9]+\.[0-9]+' \
+            | head -n 5 || true)
+    fi
     [ -z "${version_list:-}" ] && {
         err "版本列表解析失败。"; return 1; }
 
@@ -2443,6 +2670,56 @@ upgrade_dae_core() {
     fi
 
     printf "当前版本: ${GREEN}%s${NC}\n" "$current_version"
+            # ── 版本选择：优先 fzf ──
+        local selected_version=""
+        if command -v fzf >/dev/null 2>&1; then
+            printf "\n${CYAN}[fzf] 方向键选择版本，Enter 确认：${NC}\n"
+            local ver_input="/tmp/dae_ver_input_$$"
+            local ver_output="/tmp/dae_ver_output_$$"
+            printf '%s\n' "$version_list" > "$ver_input"
+            : > "$ver_output"
+
+            # ★ fzf 直接运行，不在 $() 内
+            fzf \
+                --height=40% \
+                --border=rounded \
+                --prompt="请选择 dae 版本 > " \
+                --header="当前已安装: ${current_version}" \
+                --no-mouse \
+                < "$ver_input" > "$ver_output"
+
+            selected_version=$(cat "$ver_output" 2>/dev/null \
+                | tr -d '\n' || true)
+            rm -f "$ver_input" "$ver_output"
+            [ -z "$selected_version" ] && {
+                info "已取消。"; return 0; }
+        else
+            # 原有数字列表逻辑保持不变
+            printf "当前版本: ${GREEN}%s${NC}\n" "$current_version"
+            printf "${PURPLE}可选版本:${NC}\n"
+            local count=1
+            while IFS= read -r v; do
+                [ -z "$v" ] && continue
+                [ $count -eq 1 ] \
+                    && printf " %d) %s ${YELLOW}(最新)${NC}\n" "$count" "$v" \
+                    || printf " %d) %s\n" "$count" "$v"
+                count=$((count+1))
+            done << VEREOF
+$version_list
+VEREOF
+            printf " 0) 取消\n"
+            printf "输入序号 [0-%d]: " "$((count-1))"
+            read -r choice
+            case "${choice:-0}" in
+                [1-5])
+                    selected_version=$(printf '%s\n' "$version_list" \
+                        | sed -n "${choice}p") ;;
+                0) info "已取消。"; return 0 ;;
+                *) err "无效输入。"; return 1 ;;
+            esac
+        fi
+        [ -z "${selected_version:-}" ] && {
+            err "版本选择失败。"; return 1; }
     printf "${PURPLE}可选版本:${NC}\n"
     local count=1
     while IFS= read -r v; do
