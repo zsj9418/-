@@ -15,6 +15,10 @@ LOG_FILE="/var/log/dae.log"
 DAED_LOG_FILE="/var/log/daed.log"
 LOG_SIZE_LIMIT=$((1 * 1024 * 1024))
 
+# dae 启动所需最低可用内存（MB）
+# 加载 eBPF 程序 + GEO 规则约需 120-150MB 内核内存
+DAE_MIN_MEMORY_MB=150
+
 RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
 BLUE='\033[0;34m';   PURPLE='\033[0;35m'; CYAN='\033[0;36m'
 NC='\033[0m'
@@ -93,8 +97,9 @@ save_env() {
     local key="$1" value="$2"
     [ ! -f "$ENV_FILE" ] && touch "$ENV_FILE" && chmod 0600 "$ENV_FILE"
     local escaped_val escaped_key
-    escaped_val=$(printf '%s' "$value" | sed 's/[\&\/|]/\\&/g; s/\[/\\[/g; s/\]/\\]/g')
-    escaped_key=$(printf '%s' "$key"   | sed 's/[\&\/|]/\\&/g')
+    escaped_val=$(printf '%s' "$value" \
+        | sed 's/[\&\/|]/\\&/g; s/\[/\\[/g; s/\]/\\]/g')
+    escaped_key=$(printf '%s' "$key" | sed 's/[\&\/|]/\\&/g')
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         sed -i "s|^${escaped_key}=.*|${key}=\"${escaped_val}\"|" "$ENV_FILE"
     else
@@ -110,7 +115,8 @@ send_wechat_notification() {
     esc=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
     curl -s -X POST "${WECHAT_WEBHOOK}" \
         -H 'Content-Type: application/json' \
-        -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"[dae] $(date '+%Y-%m-%d %H:%M:%S')\n${esc}\"}}" \
+        -d "{\"msgtype\":\"text\",\"text\":{\"content\":\
+\"[dae] $(date '+%Y-%m-%d %H:%M:%S')\n${esc}\"}}" \
         >/dev/null 2>&1 || true
 }
 
@@ -127,32 +133,276 @@ get_free_memory_mb() {
             mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $4}')
     fi
     [ -z "$mb" ] || [ "$mb" = "0" ] && \
-        mb=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || true)
+        mb=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' \
+            /proc/meminfo 2>/dev/null || true)
     [ -z "$mb" ] || [ "$mb" = "0" ] && \
-        mb=$(awk '/^MemFree:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || true)
+        mb=$(awk '/^MemFree:/{printf "%d", $2/1024}' \
+            /proc/meminfo 2>/dev/null || true)
     mb=$(printf '%s' "${mb:-0}" | tr -cd '0-9')
     printf '%d' "${mb:-0}"
 }
 
-# ==================== ★ 修复：运行时 eBPF 能力检测 ====================
-# 返回 0=运行时已验证 eBPF 可用  1=无法验证
-ebpf_runtime_verified() {
-    local btf_ok=0 bpf_fs_ok=0 svc_ok=0
+# 检测日志中是否存在 LPM Map 内存分配失败特征
+# 返回 0=发现内存错误  1=未发现
+check_lpm_oom_in_log() {
+    local svc="${1:-dae}"
+    local logf="$LOG_FILE"
+    [ "$svc" = "daed" ] && logf="$DAED_LOG_FILE"
 
-    [ -f /sys/kernel/btf/vmlinux ]       && btf_ok=1
-    mount | grep -q 'type bpf'           && bpf_fs_ok=1
-    { pgrep -x dae >/dev/null 2>&1 || \
-      pgrep -x daed >/dev/null 2>&1; }  && svc_ok=1
+    local log_lines=""
+    if [ -f "$logf" ] && [ -s "$logf" ]; then
+        log_lines=$(tail -n 50 "$logf" 2>/dev/null || true)
+    elif command -v journalctl >/dev/null 2>&1 \
+        && [ "${SERVICE_MGR:-}" = "systemd" ]; then
+        log_lines=$(journalctl -u "$svc" --no-pager -n 50 \
+            2>/dev/null || true)
+    fi
 
-    # BTF 存在 + BPF FS 已挂载 = 内核 eBPF 子系统实际可用
-    # 无需配置文件的静态 CONFIG 来验证
-    if [ "$btf_ok" = "1" ] && [ "$bpf_fs_ok" = "1" ]; then
+    # 检测两类已知崩溃：内存不足 + sockops 不兼容
+    if printf '%s' "$log_lines" \
+        | grep -qE 'cannot allocate memory|newLpmMap|batch update.*memory|allocate.*bpf|local_tcp_sockops|LocalTcpSockops|bpf_get_current_task'; then
         return 0
     fi
     return 1
 }
 
-# ==================== ★ 修复：eBPF 预检 ====================
+# 尝试缓解内存不足问题
+# 返回 0=缓解操作已执行  1=内存仍不足
+try_mitigate_memory() {
+    local free_mb
+    free_mb=$(get_free_memory_mb)
+
+    printf "${YELLOW}╔══════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${YELLOW}║  ⚠️  内存不足检测到 BPF LPM Map 分配失败                ║${NC}\n"
+    printf "${YELLOW}╠══════════════════════════════════════════════════════════╣${NC}\n"
+    printf "${YELLOW}║  错误: cannot allocate memory (newLpmMap)                ║${NC}\n"
+    printf "${YELLOW}║  原因: dae 在内核态创建路由规则表时内存不足              ║${NC}\n"
+    printf "${YELLOW}║  当前可用内存: %-10s MB                             ║${NC}\n" \
+        "$free_mb"
+    printf "${YELLOW}║  dae 建议最低可用内存: %-6s MB                         ║${NC}\n" \
+        "$DAE_MIN_MEMORY_MB"
+    printf "${YELLOW}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+    printf "\n${CYAN}── 自动缓解方案（按顺序尝试）──────────────────────────────${NC}\n"
+
+    # 方案一：释放 Page Cache
+    printf "  ${CYAN}[1/3] 释放 Page Cache...${NC}\n"
+    sync
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 1
+    local free_after
+    free_after=$(get_free_memory_mb)
+    printf "  释放后可用内存: ${GREEN}%d MB${NC}（释放了 %d MB）\n" \
+        "$free_after" "$((free_after - free_mb))"
+
+    # 方案二：释放 Slab Cache
+    printf "  ${CYAN}[2/3] 释放 Slab Cache...${NC}\n"
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 1
+    free_after=$(get_free_memory_mb)
+    printf "  释放后可用内存: ${GREEN}%d MB${NC}\n" "$free_after"
+
+    # 方案三：调整 BPF JIT 内存上限
+    printf "  ${CYAN}[3/3] 调整 BPF JIT 内存上限...${NC}\n"
+    local current_jit
+    current_jit=$(cat /proc/sys/net/core/bpf_jit_limit 2>/dev/null || echo 0)
+    local new_jit=$((512 * 1024 * 1024))
+    if [ "${current_jit:-0}" -lt "$new_jit" ]; then
+        echo "$new_jit" > /proc/sys/net/core/bpf_jit_limit 2>/dev/null || true
+        printf "  BPF JIT limit: %d MB → %d MB\n" \
+            "$((current_jit/1024/1024))" "$((new_jit/1024/1024))"
+    else
+        printf "  BPF JIT limit 已足够: %d MB\n" \
+            "$((current_jit/1024/1024))"
+    fi
+
+    free_after=$(get_free_memory_mb)
+    printf "\n  ${CYAN}缓解后可用内存: ${GREEN}%d MB${NC}\n" "$free_after"
+
+    if [ "$free_after" -ge "$DAE_MIN_MEMORY_MB" ]; then
+        info "内存已释放至安全水位，可以重试启动"
+        return 0
+    else
+        printf "\n${RED}  内存仍不足（%d MB < %d MB），缓解失败${NC}\n" \
+            "$free_after" "$DAE_MIN_MEMORY_MB"
+        return 1
+    fi
+}
+
+# 显示内存不足的进阶建议
+guide_memory_fix() {
+    local free_mb
+    free_mb=$(get_free_memory_mb)
+
+    printf "\n${CYAN}── 内存不足进阶解决方案 ───────────────────────────────────${NC}\n"
+    printf "\n"
+    printf "  ${GREEN}方案 A：降级到 dae v1.x（更省内存）${NC}\n"
+    printf "  ├── dae v2.0.0rc1 是 Release Candidate 版本\n"
+    printf "  ├── RC 版本可能引入了更大的 BPF Map 结构\n"
+    printf "  ├── v1.1.0 稳定版内存占用更低\n"
+    printf "  └── 操作: 菜单 1 → 选择 v1.1.0\n"
+    printf "\n"
+    printf "  ${GREEN}方案 B：精简 GEO 规则（减少 LPM Map 条目）${NC}\n"
+    printf "  ├── 当前 geoip.dat 大小: "
+    du -sh "$GEO_DIR/geoip.dat" 2>/dev/null | cut -f1 || printf "未知"
+    printf "\n"
+    printf "  ├── 考虑使用精简版 GEO 数据库\n"
+    printf "  └── 仅保留必要的国家/地区规则\n"
+    printf "\n"
+    printf "  ${GREEN}方案 C：启用 ZRAM 增加可用内存${NC}\n"
+    printf "  ├── 当前可用内存: %d MB\n" "$free_mb"
+    if ! command -v zramctl >/dev/null 2>&1 \
+        && ! [ -d /sys/block/zram0 ]; then
+        printf "  ├── 安装: apt-get install zram-tools\n"
+    fi
+    printf "  └── 操作: 菜单选项 M → ZRAM 管理\n"
+    printf "\n"
+    printf "  ${GREEN}方案 D：减少配置中的规则数量${NC}\n"
+    printf "  ├── 在 routing 段减少 domain(geosite:*) 规则数\n"
+    printf "  ├── 特别是 geosite:category-ads-all 条目极多\n"
+    printf "  └── 操作: 菜单 2 → 重新生成配置（精简版）\n"
+    printf "\n"
+    printf "${CYAN}────────────────────────────────────────────────────────────${NC}\n"
+}
+
+# ★ 启动前内存预检
+check_memory_before_start() {
+    local free_mb
+    free_mb=$(get_free_memory_mb)
+
+    if [ "$free_mb" -lt "$DAE_MIN_MEMORY_MB" ]; then
+        printf "${RED}╔══════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${RED}║  ⚠️  启动前内存预警                                     ║${NC}\n"
+        printf "${RED}║  当前可用: %-8s MB  建议最低: %-8s MB            ║${NC}\n" \
+            "$free_mb" "$DAE_MIN_MEMORY_MB"
+        printf "${RED}║  内存不足可能导致 BPF LPM Map 分配失败后崩溃           ║${NC}\n"
+        printf "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
+        printf "尝试自动释放内存后启动？(y/n 默认y): "
+        read -r do_mitigate
+        if [ "${do_mitigate:-y}" = "y" ] || [ "${do_mitigate:-y}" = "Y" ]; then
+            if ! try_mitigate_memory; then
+                guide_memory_fix
+                printf "内存不足，仍然强行启动？(y/n 默认n): "
+                read -r force_start
+                [ "${force_start:-n}" != "y" ] && \
+                [ "${force_start:-n}" != "Y" ] && return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+# ★ 启动后检测 LPM OOM 并处理
+verify_start_no_lpm_oom() {
+    local svc="${1:-dae}"
+    local logf="$LOG_FILE"
+    [ "$svc" = "daed" ] && logf="$DAED_LOG_FILE"
+
+    step "启动后错误检测（5秒）..."
+
+    : > "$logf" 2>/dev/null || true
+    sleep 5
+
+    if pgrep -x "$svc" >/dev/null 2>&1; then
+        info "$svc 进程正常运行，无启动错误"
+        return 0
+    fi
+
+    # ── 读取日志内容 ──
+    local log_lines=""
+    if [ -f "$logf" ] && [ -s "$logf" ]; then
+        log_lines=$(tail -n 30 "$logf" 2>/dev/null || true)
+    elif command -v journalctl >/dev/null 2>&1 \
+        && [ "${SERVICE_MGR:-}" = "systemd" ]; then
+        log_lines=$(journalctl -u "$svc" --no-pager -n 30 \
+            --since "1 minute ago" 2>/dev/null || true)
+    fi
+
+    # ── 检测类型一：local_tcp_sockops BPF helper 不兼容 ──
+    if printf '%s' "$log_lines" \
+        | grep -qE 'local_tcp_sockops|LocalTcpSockops|bpf_get_current_task'; then
+        printf "${RED}╔══════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${RED}║  ☠️  检测到 local_tcp_sockops BPF 兼容性崩溃            ║${NC}\n"
+        printf "${RED}╠══════════════════════════════════════════════════════════╣${NC}\n"
+        printf "${RED}║  错误: program local_tcp_sockops: load program:          ║${NC}\n"
+        printf "${RED}║        cannot use helper bpf_get_current_task#35         ║${NC}\n"
+        printf "${RED}╠══════════════════════════════════════════════════════════╣${NC}\n"
+        printf "${RED}║  根因: 当前 %s 版本包含 local_tcp_sockops BPF 程序   ║${NC}\n" \
+            "$svc"
+        printf "${RED}║  该程序在此内核（%s）上被禁止 ║${NC}\n" \
+            "$(uname -r | cut -c1-28)"
+        printf "${RED}╠══════════════════════════════════════════════════════════╣${NC}\n"
+        printf "${RED}║  修复: dae v1.1.0+ 已通过 PR#912 彻底移除此程序         ║${NC}\n"
+        printf "${RED}║  操作: 菜单 1 → 选择 v1.1.0 或更高版本                 ║${NC}\n"
+        printf "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+        # 自动禁用服务防止无限重启
+        manage_service_generic "$svc" "stop"    2>/dev/null || true
+        manage_service_generic "$svc" "disable" 2>/dev/null || true
+        printf "${YELLOW}[保护] 已自动禁用 %s 服务，防止无限重启${NC}\n" "$svc"
+        printf "${YELLOW}[提示] 重新启用命令: systemctl enable %s${NC}\n" "$svc"
+
+        # 打印快速修复命令
+        local arch
+        arch=$(resolve_arch 2>/dev/null || uname -m)
+        printf "\n${CYAN}── 快速修复命令 ────────────────────────────────────────────${NC}\n"
+        printf "  systemctl stop %s\n" "$svc"
+        printf "  curl -L -o /tmp/dae-v1.1.0.zip \\\n"
+        printf "    'https://github.com/daeuniverse/dae/releases/download/v1.1.0/dae-linux-%s.zip'\n" \
+            "$arch"
+        printf "  unzip -o /tmp/dae-v1.1.0.zip -d /tmp/dae-v110/\n"
+        printf "  install -Dm755 /tmp/dae-v110/dae-linux-%s /usr/bin/dae\n" \
+            "$arch"
+        printf "  systemctl enable dae && systemctl start dae\n"
+        printf "${CYAN}────────────────────────────────────────────────────────────${NC}\n"
+        return 1
+    fi
+
+    # ── 检测类型二：BPF LPM Map 内存分配失败 ──
+    if printf '%s' "$log_lines" \
+        | grep -qE 'cannot allocate memory|newLpmMap|batch update.*memory'; then
+        printf "${RED}╔══════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${RED}║  ☠️  检测到 BPF LPM Map 内存分配失败导致崩溃            ║${NC}\n"
+        printf "${RED}║  错误: routing kernspace snapshot: newLpmMap             ║${NC}\n"
+        printf "${RED}║        batch update: cannot allocate memory              ║${NC}\n"
+        printf "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+        if try_mitigate_memory; then
+            printf "\n${YELLOW}内存已释放，尝试重新启动 %s...${NC}\n" "$svc"
+            manage_service_generic "$svc" "start" 2>/dev/null || true
+            sleep 5
+            if pgrep -x "$svc" >/dev/null 2>&1; then
+                info "重启成功！$svc 现在正常运行"
+                return 0
+            else
+                err "重启后仍然失败"
+                guide_memory_fix
+                return 1
+            fi
+        else
+            guide_memory_fix
+            return 1
+        fi
+    fi
+
+    # ── 进程退出但无特征错误 ──
+    warn "$svc 启动后退出，未识别到已知错误类型"
+    printf "${YELLOW}最后 15 行日志:${NC}\n"
+    if [ -n "$log_lines" ]; then
+        printf '%s\n' "$log_lines" | tail -n 15
+    else
+        printf "  ${YELLOW}△ 无法读取日志${NC}\n"
+    fi
+    return 1
+}
+
+# ==================== 运行时 eBPF 能力检测 ====================
+ebpf_runtime_verified() {
+    [ -f /sys/kernel/btf/vmlinux ] && mount | grep -q 'type bpf' && return 0
+    return 1
+}
+
+# ==================== eBPF 预检 ====================
 check_ebpf_full() {
     [ -z "$SERVICE_MGR" ] && detect_system_env
 
@@ -178,11 +428,7 @@ check_ebpf_full() {
         printf "  ${RED}✗ 缺少 BTF！eBPF 加载将失败${NC}\n"
         warn_count=$((warn_count+1))
         if printf '%s' "$(uname -r)" | grep -qiE 'msm|qcom|sdm|sm[0-9]'; then
-            printf "  ${CYAN}高通平台: 方案1【推荐】Docker 部署 → 菜单 B${NC}\n"
-            printf "           方案2  刷入支持 BTF 的主线内核\n"
-        else
-            printf "  方案1  重新编译内核: CONFIG_DEBUG_INFO_BTF=y\n"
-            printf "  方案2  Docker 部署 → 菜单 B\n"
+            printf "  ${CYAN}高通平台: 方案1 Docker 部署 → 菜单 B${NC}\n"
         fi
     fi
 
@@ -204,11 +450,13 @@ check_ebpf_full() {
     local free_mb
     free_mb=$(get_free_memory_mb)
     printf "  内存  : ${CYAN}%d MB 可用${NC}\n" "$free_mb"
-    if [ "$free_mb" -lt 128 ]; then
-        printf "  ${RED}✗ 可用内存不足 128MB！${NC}\n"
+    if [ "$free_mb" -lt "$DAE_MIN_MEMORY_MB" ]; then
+        printf "  ${RED}✗ 可用内存 %d MB < 建议最低 %d MB！${NC}\n" \
+            "$free_mb" "$DAE_MIN_MEMORY_MB"
+        printf "  ${RED}  内存不足可能导致 BPF LPM Map 分配失败崩溃${NC}\n"
         warn_count=$((warn_count+1))
     else
-        printf "  ${GREEN}✓ 内存充足${NC}\n"
+        printf "  ${GREEN}✓ 内存充足 (%d MB)${NC}\n" "$free_mb"
     fi
 
     local ipfwd
@@ -223,32 +471,26 @@ check_ebpf_full() {
         printf "  ${GREEN}✓ ip_forward 已启用${NC}\n"
     fi
 
-    # ── ★ 修复：CONFIG 检测先做运行时验证 ──
     local cfg_path=""
     for p in /proc/config.gz "/boot/config-$(uname -r)" /boot/config; do
         [ -f "$p" ] && cfg_path="$p" && break
     done
 
-    # 运行时已验证 eBPF 可用（BTF+BPF FS 均通过）
     local runtime_ok=0
     ebpf_runtime_verified && runtime_ok=1
 
     if [ -n "$cfg_path" ]; then
         printf "  ${CYAN}内核配置: %s${NC}\n" "$cfg_path"
-
         if [ "$runtime_ok" = "1" ]; then
-            # 运行时验证通过：CONFIG 检测仅作参考，不计入警告
             printf "  ${GREEN}✓ 运行时验证通过（BTF+BPF FS 均可用）${NC}\n"
-            printf "  ${YELLOW}  以下 CONFIG 检测仅供参考，不影响实际使用：${NC}\n"
+            printf "  ${YELLOW}  以下 CONFIG 检测仅供参考：${NC}\n"
         fi
-
         local cfg_content
         if printf '%s' "$cfg_path" | grep -q '\.gz$'; then
             cfg_content=$(zcat "$cfg_path" 2>/dev/null || true)
         else
             cfg_content=$(cat "$cfg_path" 2>/dev/null || true)
         fi
-
         for kopt in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
                     CONFIG_CGROUPS CONFIG_CGROUP_BPF \
                     CONFIG_NET_CLS_BPF CONFIG_NET_CLS_ACT \
@@ -259,25 +501,21 @@ check_ebpf_full() {
                 printf "  ${YELLOW}△ %-32s = m (模块，需已加载)${NC}\n" "$kopt"
             else
                 if [ "$runtime_ok" = "1" ]; then
-                    # 运行时已验证可用，CONFIG 未显示只是配置文件不完整
-                    # 对于移动平台魔改内核此属正常现象，不计入警告
-                    printf "  ${YELLOW}△ %-32s 配置文件未显示（运行时已验证）${NC}\n" "$kopt"
+                    printf "  ${YELLOW}△ %-32s 配置文件未显示（运行时已验证）${NC}\n" \
+                        "$kopt"
                 else
                     printf "  ${RED}✗ %-32s 未启用${NC}\n" "$kopt"
-                    # 只有 BTF 未通过运行时验证时才将此计入警告
                     [ "$kopt" = "CONFIG_DEBUG_INFO_BTF" ] && \
                         warn_count=$((warn_count+1))
                 fi
             fi
         done
-
         if [ "$runtime_ok" = "1" ]; then
-            printf "  ${CYAN}说明: 移动平台/定制内核常将选项编译进内核而不写入${NC}\n"
-            printf "  ${CYAN}       config 文件，BTF 和 BPF FS 运行时可用即代表支持。${NC}\n"
+            printf "  ${CYAN}说明: 定制内核常将选项编译进内核而不写入 config 文件${NC}\n"
         fi
     else
         if [ "$runtime_ok" = "1" ]; then
-            printf "  ${GREEN}✓ 未找到内核配置文件，但运行时验证通过（BTF+BPF FS 可用）${NC}\n"
+            printf "  ${GREEN}✓ 未找到内核配置文件，但运行时验证通过${NC}\n"
         else
             printf "  ${YELLOW}△ 未找到内核配置文件，跳过 CONFIG 检测${NC}\n"
         fi
@@ -285,7 +523,8 @@ check_ebpf_full() {
 
     printf "\n"
     if [ "$warn_count" -gt 0 ]; then
-        printf "${RED}[预检] 发现 %d 个问题，强行继续？(y/n 默认n): ${NC}" "$warn_count"
+        printf "${RED}[预检] 发现 %d 个问题，强行继续？(y/n 默认n): ${NC}" \
+            "$warn_count"
         read -r fc
         if [ "${fc:-n}" != "y" ] && [ "${fc:-n}" != "Y" ]; then
             warn "已中止。"; return 1
@@ -308,11 +547,12 @@ fix_resolv_conf() {
     if command -v systemctl >/dev/null 2>&1 \
         && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local stub
-        stub=$(grep -E '^DNSStubListener' /etc/systemd/resolved.conf 2>/dev/null \
-               | tail -1 || true)
+        stub=$(grep -E '^DNSStubListener' /etc/systemd/resolved.conf \
+               2>/dev/null | tail -1 || true)
         if [ "$stub" != "DNSStubListener=no" ]; then
             warn "systemd-resolved 占用 53 端口，修复中..."
-            sed -i '/^DNSStubListener/d' /etc/systemd/resolved.conf 2>/dev/null || true
+            sed -i '/^DNSStubListener/d' /etc/systemd/resolved.conf \
+                2>/dev/null || true
             echo "DNSStubListener=no" >> /etc/systemd/resolved.conf
             systemctl restart systemd-resolved 2>/dev/null || true
             info "stub 监听已关闭"
@@ -332,44 +572,44 @@ open_firewall_ports() {
         fi
         if command -v firewall-cmd >/dev/null 2>&1 \
             && systemctl is-active --quiet firewalld 2>/dev/null; then
-            firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+            firewall-cmd --permanent --add-port="${port}/tcp" \
+                >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
             printf "  ${GREEN}✓ firewalld: %s/tcp${NC}\n" "$port"; continue
         fi
         if command -v nft >/dev/null 2>&1; then
-            nft add rule inet filter input tcp dport "$port" accept 2>/dev/null \
-                || nft insert rule ip filter INPUT tcp dport "$port" accept 2>/dev/null \
-                || true
+            nft add rule inet filter input tcp dport "$port" accept \
+                2>/dev/null || true
             printf "  ${GREEN}✓ nftables: %s/tcp${NC}\n" "$port"; continue
         fi
         if command -v iptables >/dev/null 2>&1; then
-            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
-                || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT \
+                2>/dev/null \
+                || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT \
+                2>/dev/null || true
             printf "  ${GREEN}✓ iptables: %s/tcp${NC}\n" "$port"; continue
         fi
-        printf "  ${YELLOW}△ 未检测到防火墙工具，请手动放行 TCP %s${NC}\n" "$port"
+        printf "  ${YELLOW}△ 未检测到防火墙工具，请手动放行 TCP %s${NC}\n" \
+            "$port"
     done
 }
 
-# ==================== ★ 修复：智能网络资源清理 ====================
-# 原来无条件清理改为：检测到服务运行中则跳过，仅在确认无服务时才清理
+# ==================== 智能网络资源清理 ====================
 clean_network_resources() {
     local force="${1:-}"
-
-    # 检测是否有服务正在运行
     local running_svc=""
     pgrep -x dae  >/dev/null 2>&1 && running_svc="dae"
     pgrep -x daed >/dev/null 2>&1 && running_svc="daed"
 
     if [ -n "$running_svc" ] && [ "$force" != "force" ]; then
-        printf "${CYAN}[清理] 检测到 %s 正在运行，跳过网络资源清理（保护运行中服务）${NC}\n" \
+        printf "${CYAN}[清理] %s 运行中，跳过网络资源清理（保护服务）${NC}\n" \
             "$running_svc"
         return 0
     fi
 
     printf "${YELLOW}[清理] 清理 eBPF 网络挂载资源...${NC}\n"
-
-    if ip rule show 2>/dev/null | grep -qE "fwmark 0x1bf52|fwmark 114514"; then
+    if ip rule show 2>/dev/null \
+        | grep -qE "fwmark 0x1bf52|fwmark 114514"; then
         ip rule del fwmark 114514 table 114514 2>/dev/null || true
         printf "  - fwmark 114514 [${GREEN}OK${NC}]\n"
     fi
@@ -378,14 +618,11 @@ clean_network_resources() {
         ip link delete dae 2>/dev/null || true
         printf "  - eBPF 虚接口 dae [${GREEN}OK${NC}]\n"
     fi
-
     for proc in dae daed; do
         if pgrep -x "$proc" >/dev/null 2>&1; then
-            killall "$proc" 2>/dev/null || true
-            sleep 2
+            killall "$proc" 2>/dev/null || true; sleep 2
             pgrep -x "$proc" >/dev/null 2>&1 && \
-                killall -9 "$proc" 2>/dev/null || true
-            sleep 1
+                killall -9 "$proc" 2>/dev/null || true; sleep 1
             pgrep -x "$proc" >/dev/null 2>&1 \
                 && printf "  ${RED}%s 清理失败${NC}\n" "$proc" \
                 || printf "  ${GREEN}%s 已清除${NC}\n" "$proc"
@@ -397,7 +634,8 @@ clean_network_resources() {
 detect_system_env() {
     PKG_MANAGER=""; INSTALL_CMD=""
     if command -v apt-get >/dev/null 2>&1; then
-        PKG_MANAGER="apt";    INSTALL_CMD="apt-get install -y --no-install-recommends"
+        PKG_MANAGER="apt"
+        INSTALL_CMD="apt-get install -y --no-install-recommends"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf";    INSTALL_CMD="dnf install -y"
     elif command -v yum >/dev/null 2>&1; then
@@ -413,11 +651,14 @@ detect_system_env() {
         PKG_MANAGER="zypper"; INSTALL_CMD="zypper install -y"
     fi
 
-    if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 \
+        && pidof systemd >/dev/null 2>&1; then
         SERVICE_MGR="systemd"
-    elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/runlevels ]; then
+    elif command -v rc-service >/dev/null 2>&1 \
+        && [ -d /etc/runlevels ]; then
         SERVICE_MGR="openrc"
-    elif command -v procd >/dev/null 2>&1 || [ -f /etc/openwrt_release ]; then
+    elif command -v procd >/dev/null 2>&1 \
+        || [ -f /etc/openwrt_release ]; then
         SERVICE_MGR="procd"
     else
         SERVICE_MGR="initd"
@@ -436,8 +677,10 @@ check_dependencies() {
     for dep in $missing; do
         pkg="$dep"
         case "$dep" in
-            ip)    [ "$PKG_MANAGER" = "opkg" ] && pkg="ip-full"   || pkg="iproute2" ;;
-            pgrep) [ "$PKG_MANAGER" = "opkg" ] && pkg="procps-ng" || pkg="procps"   ;;
+            ip)    [ "$PKG_MANAGER" = "opkg" ] \
+                       && pkg="ip-full" || pkg="iproute2" ;;
+            pgrep) [ "$PKG_MANAGER" = "opkg" ] \
+                       && pkg="procps-ng" || pkg="procps" ;;
         esac
         $INSTALL_CMD "$pkg" >/dev/null 2>&1 || true
         command -v "$dep" >/dev/null 2>&1 || {
@@ -450,20 +693,22 @@ get_network_info() {
         LAN_IFACE=$(uci get network.lan.device 2>/dev/null \
             || uci get network.lan.ifname 2>/dev/null || echo "br-lan")
         LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null || true)
-        [ -z "${LAN_IP:-}" ] && LAN_IP=$(ip -4 addr show "$LAN_IFACE" 2>/dev/null \
-            | awk '/inet /{split($2,a,"/");print a[1]}' | head -n1 || true)
+        [ -z "${LAN_IP:-}" ] && \
+            LAN_IP=$(ip -4 addr show "$LAN_IFACE" 2>/dev/null \
+                | awk '/inet /{split($2,a,"/");print a[1]}' \
+                | head -n1 || true)
         WAN_IFACE=$(uci get network.wan.device 2>/dev/null \
             || uci get network.wan.ifname 2>/dev/null || echo "eth0")
     else
         local def_iface
         def_iface=$(ip route get 8.8.8.8 2>/dev/null \
-            | awk '/dev/{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1);exit}}}' \
-            || true)
+            | awk '/dev/{for(i=1;i<=NF;i++){
+                if($i=="dev"){print $(i+1);exit}}}' || true)
         if [ -n "${def_iface:-}" ]; then
-            LAN_IFACE="$def_iface"
-            WAN_IFACE="$def_iface"
+            LAN_IFACE="$def_iface"; WAN_IFACE="$def_iface"
             LAN_IP=$(ip -4 addr show "$LAN_IFACE" 2>/dev/null \
-                | awk '/inet /{split($2,a,"/");print a[1]}' | head -n1 || true)
+                | awk '/inet /{split($2,a,"/");print a[1]}' \
+                | head -n1 || true)
         fi
     fi
     if [ -z "${LAN_IP:-}" ]; then
@@ -481,7 +726,8 @@ smart_interface_sniffer() {
     local all_ifaces
     all_ifaces=$(ip -o link show 2>/dev/null \
         | awk -F': ' '{print $2}' \
-        | grep -vE '^(lo|docker|veth|dae|gretun|sit|tun|bond|dummy)' || true)
+        | grep -vE '^(lo|docker|veth|dae|gretun|sit|tun|bond|dummy)' \
+        || true)
     if [ -z "${all_ifaces:-}" ]; then
         LAN_IFACE_SETTING="lan_interface: ${LAN_IFACE:-auto}"; return
     fi
@@ -490,7 +736,8 @@ smart_interface_sniffer() {
     for iface in $all_ifaces; do
         local iface_ip
         iface_ip=$(ip -4 addr show "$iface" 2>/dev/null \
-            | awk '/inet /{split($2,a,"/");print a[1]}' | head -n1 || true)
+            | awk '/inet /{split($2,a,"/");print a[1]}' \
+            | head -n1 || true)
         printf " %d) ${GREEN}%s${NC} [IP: ${CYAN}%s${NC}]\n" \
             "$count" "$iface" "${iface_ip:-未分配}"
         count=$((count+1))
@@ -499,13 +746,16 @@ smart_interface_sniffer() {
     read -r user_choice
     if [ -z "${user_choice:-}" ]; then
         local merged=""
-        for iface in $all_ifaces; do merged="${merged:+$merged, }$iface"; done
+        for iface in $all_ifaces; do
+            merged="${merged:+$merged, }$iface"
+        done
         LAN_IFACE_SETTING="lan_interface: $merged"
         printf "${GREEN}[全选] %s${NC}\n" "$merged"
     else
         local idx=1 sel=""
         for iface in $all_ifaces; do
-            [ "$idx" -eq "${user_choice:-0}" ] 2>/dev/null && sel="$iface" && break
+            [ "$idx" -eq "${user_choice:-0}" ] 2>/dev/null \
+                && sel="$iface" && break
             idx=$((idx+1))
         done
         if [ -n "${sel:-}" ]; then
@@ -519,7 +769,8 @@ smart_interface_sniffer() {
 }
 
 detect_router_mode() {
-    ip route show default 2>/dev/null | grep -q "via" && echo "side" || echo "main"
+    ip route show default 2>/dev/null | grep -q "via" \
+        && echo "side" || echo "main"
 }
 
 cleanup_sing_box() {
@@ -577,7 +828,8 @@ collect_subscriptions() {
         fi
 
         local sub_name="sub${idx}"
-        printf "${CYAN}为此订阅命名（直接回车使用默认名 '%s'）: ${NC}" "$sub_name"
+        printf "${CYAN}为此订阅命名（直接回车使用默认名 '%s'）: ${NC}" \
+            "$sub_name"
         read -r custom_name
         [ -n "${custom_name:-}" ] && sub_name="$custom_name"
 
@@ -600,7 +852,7 @@ collect_subscriptions() {
     printf "${GREEN}订阅配置完成，共 %d 条${NC}\n" "$((idx-1))"
 }
 
-# ==================== 节点与订阅信息查看 ====================
+# ==================== ★ 修复：节点与订阅信息查看 ====================
 show_node_info() {
     local cur_mode
     cur_mode=$(detect_current_mode)
@@ -609,35 +861,67 @@ show_node_info() {
     printf "${CYAN}   📊 订阅与节点信息                                        ${NC}\n"
     printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n\n"
 
+    # ── 服务状态 ──
     printf "${BLUE}── 服务状态 ──────────────────────────────────────────────${NC}\n"
     case "$cur_mode" in
         dae)
             local pid
             pid=$(pgrep -x dae | head -n1)
-            printf "  运行模式: ${GREEN}● dae CLI${NC} | PID: ${CYAN}%s${NC}\n" "$pid"
+            printf "  运行模式: ${GREEN}● dae CLI${NC} | PID: ${CYAN}%s${NC}\n" \
+                "$pid"
             local uptime_str=""
             command -v ps >/dev/null 2>&1 && \
-                uptime_str=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+                uptime_str=$(ps -o etime= -p "$pid" 2>/dev/null \
+                    | tr -d ' ' || true)
             [ -n "$uptime_str" ] && \
                 printf "  运行时长: ${CYAN}%s${NC}\n" "$uptime_str"
             ;;
         daed)
             local pid
             pid=$(pgrep -x daed | head -n1)
-            printf "  运行模式: ${GREEN}● daed 面板${NC} | PID: ${CYAN}%s${NC}\n" "$pid"
-            printf "  面板地址: ${GREEN}http://%s:2023${NC}\n" "${LAN_IP:-localhost}"
+            printf "  运行模式: ${GREEN}● daed 面板${NC} | PID: ${CYAN}%s${NC}\n" \
+                "$pid"
+            printf "  面板地址: ${GREEN}http://%s:2023${NC}\n" \
+                "${LAN_IP:-localhost}"
             ;;
         none)
             printf "  运行模式: ${RED}■ 未运行${NC}\n"
             ;;
     esac
 
+    # ── 内存状态 ──
+    printf "\n${BLUE}── 内存状态 ──────────────────────────────────────────────${NC}\n"
+    local free_mb
+    free_mb=$(get_free_memory_mb)
+    if [ "$free_mb" -lt "$DAE_MIN_MEMORY_MB" ]; then
+        printf "  可用内存: ${RED}%d MB（低于建议最低 %d MB）⚠️${NC}\n" \
+            "$free_mb" "$DAE_MIN_MEMORY_MB"
+        printf "  ${RED}  存在 BPF LPM Map 分配失败崩溃风险${NC}\n"
+    else
+        printf "  可用内存: ${GREEN}%d MB${NC}\n" "$free_mb"
+    fi
+
+    # 检测历史日志中是否有 LPM OOM 记录
+    local svc_for_log
+    svc_for_log=$([ "$cur_mode" = "daed" ] && echo "daed" || echo "dae")
+    if check_lpm_oom_in_log "$svc_for_log" 2>/dev/null; then
+        printf "  ${RED}⚠️  日志中发现已知崩溃记录（内存不足或 BPF 兼容性问题）${NC}\n"
+        printf "  ${YELLOW}  执行菜单选项 M → 内存诊断与缓解${NC}\n"
+        printf "  ${YELLOW}  执行菜单选项 6 → 查看完整日志确认具体原因${NC}\n"
+    fi
+
+    # ── 版本信息 ──
     printf "\n${BLUE}── 版本信息 ──────────────────────────────────────────────${NC}\n"
     if [ -f "$DAE_BIN_PATH" ] && [ -x "$DAE_BIN_PATH" ]; then
         local dae_ver
         dae_ver=$("$DAE_BIN_PATH" --version 2>/dev/null \
             | awk 'NR==1{print $3}' | head -n1 || echo "未知")
-        printf "  dae  版本: ${GREEN}%s${NC}\n" "$dae_ver"
+        printf "  dae  版本: ${GREEN}%s${NC}" "$dae_ver"
+        # 标注 RC 版本警告
+        if printf '%s' "$dae_ver" | grep -qiE 'rc|alpha|beta'; then
+            printf " ${YELLOW}(预发布版本，内存占用可能较高)${NC}"
+        fi
+        printf "\n"
     else
         printf "  dae  版本: ${RED}未安装${NC}\n"
     fi
@@ -650,40 +934,97 @@ show_node_info() {
         printf "  daed 版本: ${RED}未安装${NC}\n"
     fi
 
+    # ── ★ 修复：订阅信息（精确解析 subscription {} 块）──
     printf "\n${BLUE}── 订阅信息（来自配置文件）────────────────────────────────${NC}\n"
     if [ ! -f "$DAE_CONFIG_FILE" ]; then
         printf "  ${RED}配置文件不存在: %s${NC}\n" "$DAE_CONFIG_FILE"
     else
-        local in_sub=0 sub_count=0 sub_idx=0
+        local in_sub=0 sub_count=0 sub_idx=0 brace_depth=0
+
         while IFS= read -r line; do
-            printf '%s' "$line" | grep -q '^subscription[[:space:]]*{' && \
-                in_sub=1 && continue
+            # 精确匹配 subscription 块开始（必须是行首级别）
+            if [ "$in_sub" = "0" ] && \
+               printf '%s' "$line" | grep -qE '^[[:space:]]*subscription[[:space:]]*\{'; then
+                in_sub=1
+                brace_depth=1
+                continue
+            fi
+
             if [ "$in_sub" = "1" ]; then
-                printf '%s' "$line" | grep -q '^}' && break
+                # 追踪花括号深度，确保在 subscription{} 内
+                local open_count close_count
+                open_count=$(printf '%s' "$line" | tr -cd '{' | wc -c)
+                close_count=$(printf '%s' "$line" | tr -cd '}' | wc -c)
+                brace_depth=$((brace_depth + open_count - close_count))
+
+                # 花括号归零，subscription 块结束
+                [ "$brace_depth" -le 0 ] && break
+
+                # 跳过注释和空行
                 printf '%s' "$line" | grep -qE '^\s*(#|$)' && continue
+
+                # ★ 修复：严格匹配 name: 'url' 格式
+                # 要求 url 必须以 http/https/vmess/vless/trojan/ss 开头
+                # 排除 dns upstream（udp://、tcp://、tcp+udp://）
                 local sub_name sub_url
                 sub_name=$(printf '%s' "$line" \
-                    | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*:\
-[[:space:]]*'([^']+)'.*/\1/p")
+                    | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)\
+[[:space:]]*:[[:space:]]*'(https?:\/\/[^']+)'.*/\1/p")
                 sub_url=$(printf '%s' "$line" \
-                    | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*:\
-[[:space:]]*'([^']+)'.*/\2/p")
+                    | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)\
+[[:space:]]*:[[:space:]]*'(https?:\/\/[^']+)'.*/\2/p")
+
                 if [ -n "$sub_name" ] && [ -n "$sub_url" ]; then
                     sub_idx=$((sub_idx+1))
                     local url_display
-                    url_display=$(printf '%s' "$sub_url" | cut -c1-55)
-                    [ ${#sub_url} -gt 55 ] && url_display="${url_display}..."
+                    url_display=$(printf '%s' "$sub_url" | cut -c1-52)
+                    [ ${#sub_url} -gt 52 ] && \
+                        url_display="${url_display}..."
                     printf "  %d) ${GREEN}%-12s${NC} %s\n" \
                         "$sub_idx" "$sub_name" "$url_display"
                     sub_count=$((sub_count+1))
                 fi
             fi
         done < "$DAE_CONFIG_FILE"
-        [ "$sub_count" -eq 0 ] && \
-            printf "  ${YELLOW}△ 未找到订阅配置${NC}\n" || \
-            printf "  ${CYAN}共 %d 条订阅${NC}\n" "$sub_count"
 
-        printf "\n${BLUE}── 全局配置摘要 ───────────────────────────────────────────${NC}\n"
+        if [ "$sub_count" -eq 0 ]; then
+            printf "  ${YELLOW}△ 未找到有效订阅（需 http/https 开头的 URL）${NC}\n"
+            printf "  ${YELLOW}  以下为配置文件中 subscription {} 块的原始内容：${NC}\n"
+
+            # 打印原始内容供用户核查
+            local raw_in_sub=0 raw_depth=0 raw_printed=0
+            while IFS= read -r raw_line; do
+                if [ "$raw_in_sub" = "0" ] && \
+                   printf '%s' "$raw_line" \
+                       | grep -qE '^[[:space:]]*subscription[[:space:]]*\{'; then
+                    raw_in_sub=1; raw_depth=1; continue
+                fi
+                if [ "$raw_in_sub" = "1" ]; then
+                    local oc cc
+                    oc=$(printf '%s' "$raw_line" | tr -cd '{' | wc -c)
+                    cc=$(printf '%s' "$raw_line" | tr -cd '}' | wc -c)
+                    raw_depth=$((raw_depth + oc - cc))
+                    [ "$raw_depth" -le 0 ] && break
+                    # 跳过纯注释和空行
+                    printf '%s' "$raw_line" \
+                        | grep -qE '^\s*$' && continue
+                    printf "  ${CYAN}│ %s${NC}\n" "$raw_line"
+                    raw_printed=$((raw_printed+1))
+                fi
+            done < "$DAE_CONFIG_FILE"
+
+            if [ "$raw_printed" -eq 0 ]; then
+                printf "  ${RED}  subscription {} 块为空或不存在${NC}\n"
+                printf "  ${RED}  请执行菜单 2 重新生成配置并填入订阅链接${NC}\n"
+            else
+                printf "  ${YELLOW}  若上方 URL 非 http/https 开头则无法被识别为订阅${NC}\n"
+                printf "  ${YELLOW}  请执行菜单 2 重新生成配置确认订阅格式正确${NC}\n"
+            fi
+        else
+            printf "  ${CYAN}共 %d 条订阅${NC}\n" "$sub_count"
+        fi
+        # ── 全局配置摘要 ──
+        printf "\n${BLUE}── 全局配置摘要 ──────────────────────────────────────────${NC}\n"
         for field in tproxy_port dial_mode log_level check_interval \
                      lan_interface wan_interface fallback_resolver \
                      enable_local_tcp_fast_redirect; do
@@ -691,17 +1032,20 @@ show_node_info() {
             val=$(grep -E "^[[:space:]]*${field}[[:space:]]*:" \
                 "$DAE_CONFIG_FILE" 2>/dev/null \
                 | head -n1 \
-                | sed -E "s/^[[:space:]]*${field}[[:space:]]*:[[:space:]]*//" \
+                | sed -E "s/^[[:space:]]*${field}\
+[[:space:]]*:[[:space:]]*//" \
                 | tr -d "'")
             [ -n "$val" ] && \
                 printf "  ${YELLOW}%-35s${NC} %s\n" "${field}:" "$val"
         done
     fi
 
+    # ── 节点健康检查日志 ──
     printf "\n${BLUE}── 节点健康检查记录（最近 20 条）──────────────────────────${NC}\n"
     local log_src=""
     if [ "$cur_mode" = "dae" ]; then
-        [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ] && log_src="$LOG_FILE" \
+        [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ] \
+            && log_src="$LOG_FILE" \
             || { command -v journalctl >/dev/null 2>&1 \
                 && [ "${SERVICE_MGR:-}" = "systemd" ] \
                 && log_src="journal_dae"; }
@@ -718,22 +1062,35 @@ show_node_info() {
     else
         local log_lines=""
         case "$log_src" in
-            journal_dae)  log_lines=$(journalctl -u dae  --no-pager -n 200 2>/dev/null || true) ;;
-            journal_daed) log_lines=$(journalctl -u daed --no-pager -n 200 2>/dev/null || true) ;;
-            *)            log_lines=$(tail -n 200 "$log_src" 2>/dev/null || true) ;;
+            journal_dae)
+                log_lines=$(journalctl -u dae --no-pager -n 200 \
+                    2>/dev/null || true) ;;
+            journal_daed)
+                log_lines=$(journalctl -u daed --no-pager -n 200 \
+                    2>/dev/null || true) ;;
+            *)
+                log_lines=$(tail -n 200 "$log_src" 2>/dev/null || true) ;;
         esac
+
         local check_lines
         check_lines=$(printf '%s' "$log_lines" \
-            | grep -iE 'latency|check|alive|dead|subscript|update|reload|node|select|policy|switch|timeout|connect|fail|error' \
+            | grep -iE 'latency|check|alive|dead|subscript|update|reload|node|select|policy|switch|timeout|connect|fail|error|allocate|memory|lpm|bpf|sockops' \
             | tail -n 20 || true)
+
         if [ -z "$check_lines" ]; then
             printf "  ${YELLOW}△ 未找到节点检查记录${NC}\n"
             printf "  ${YELLOW}  dae 使用 policy: min_moving_avg 自动选择最优节点${NC}\n"
         else
             printf '%s\n' "$check_lines" | while IFS= read -r lline; do
-                if printf '%s' "$lline" | grep -qiE 'error|fail|dead|timeout'; then
+                # LPM/内存错误特别标红
+                if printf '%s' "$lline" \
+                    | grep -qiE 'allocate memory|newLpmMap|batch update'; then
+                    printf "  ${RED}🔴 %s${NC}\n" "$lline"
+                elif printf '%s' "$lline" \
+                    | grep -qiE 'error|fail|dead|timeout'; then
                     printf "  ${RED}%s${NC}\n" "$lline"
-                elif printf '%s' "$lline" | grep -qiE 'alive|select|switch|update|reload'; then
+                elif printf '%s' "$lline" \
+                    | grep -qiE 'alive|select|switch|update|reload'; then
                     printf "  ${GREEN}%s${NC}\n" "$lline"
                 else
                     printf "  ${CYAN}%s${NC}\n" "$lline"
@@ -742,31 +1099,40 @@ show_node_info() {
         fi
     fi
 
+    # ── 实时连通性测试 ──
     printf "\n${BLUE}── 实时连通性测试 ─────────────────────────────────────────${NC}\n"
     printf "  ${YELLOW}正在测试...${NC}\n"
-    for entry in "223.5.5.5:国内DNS" "cp.cloudflare.com:Cloudflare" "8.8.8.8:谷歌DNS"; do
+    for entry in "223.5.5.5:国内DNS" \
+                 "cp.cloudflare.com:Cloudflare" \
+                 "8.8.8.8:谷歌DNS"; do
         local host label rtt status_color
         host=$(printf '%s' "$entry" | cut -d: -f1)
         label=$(printf '%s' "$entry" | cut -d: -f2)
         rtt="超时"; status_color="$RED"
         if command -v ping >/dev/null 2>&1; then
             local ping_out
-            ping_out=$(ping -c 1 -W 2 "$host" 2>/dev/null | grep 'time=' || true)
+            ping_out=$(ping -c 1 -W 2 "$host" 2>/dev/null \
+                | grep 'time=' || true)
             if [ -n "$ping_out" ]; then
                 rtt=$(printf '%s' "$ping_out" \
-                    | grep -oE 'time=[0-9.]+ ms' | head -n1 | sed 's/time=//')
+                    | grep -oE 'time=[0-9.]+ ms' \
+                    | head -n1 | sed 's/time=//')
                 status_color="$GREEN"
             fi
         fi
-        printf "  ${CYAN}%-20s${NC} %b%s${NC}\n" "${label}(${host})" \
-            "$status_color" "${rtt}"
+        printf "  ${CYAN}%-22s${NC} %b%s${NC}\n" \
+            "${label}(${host})" "$status_color" "${rtt}"
     done
 
+    # ── 流量统计 ──
     printf "\n${BLUE}── 网络接口流量（当前）────────────────────────────────────${NC}\n"
-    if [ -n "${LAN_IFACE:-}" ] && [ -d "/sys/class/net/${LAN_IFACE}" ]; then
+    if [ -n "${LAN_IFACE:-}" ] \
+        && [ -d "/sys/class/net/${LAN_IFACE}" ]; then
         local rx_bytes tx_bytes rx_mb tx_mb
-        rx_bytes=$(cat "/sys/class/net/${LAN_IFACE}/statistics/rx_bytes" 2>/dev/null || echo 0)
-        tx_bytes=$(cat "/sys/class/net/${LAN_IFACE}/statistics/tx_bytes" 2>/dev/null || echo 0)
+        rx_bytes=$(cat "/sys/class/net/${LAN_IFACE}/statistics/rx_bytes" \
+            2>/dev/null || echo 0)
+        tx_bytes=$(cat "/sys/class/net/${LAN_IFACE}/statistics/tx_bytes" \
+            2>/dev/null || echo 0)
         rx_mb=$(awk "BEGIN{printf \"%.1f\", ${rx_bytes}/1048576}")
         tx_mb=$(awk "BEGIN{printf \"%.1f\", ${tx_bytes}/1048576}")
         printf "  接口 ${GREEN}%s${NC}: ${CYAN}↓ %s MB${NC}  ${YELLOW}↑ %s MB${NC}\n" \
@@ -775,6 +1141,7 @@ show_node_info() {
         printf "  ${YELLOW}△ 无法读取接口流量${NC}\n"
     fi
 
+    # ── GEO 状态 ──
     printf "\n${BLUE}── GEO 规则库状态 ─────────────────────────────────────────${NC}\n"
     for gf in geoip.dat geosite.dat; do
         local gpath="$GEO_DIR/$gf"
@@ -782,7 +1149,8 @@ show_node_info() {
             local gsize gmtime
             gsize=$(du -sh "$gpath" 2>/dev/null | cut -f1 || echo "?")
             gmtime=$(stat -c '%y' "$gpath" 2>/dev/null \
-                || stat -f '%Sm' "$gpath" 2>/dev/null || echo "未知")
+                || stat -f '%Sm' "$gpath" 2>/dev/null \
+                || echo "未知")
             gmtime=$(printf '%s' "$gmtime" | cut -d'.' -f1)
             printf "  ${GREEN}✓ %-15s${NC} 大小: ${CYAN}%s${NC}  更新: %s\n" \
                 "$gf" "$gsize" "$gmtime"
@@ -795,6 +1163,127 @@ show_node_info() {
     printf "${YELLOW}dae CLI 模式下节点由 policy: min_moving_avg 自动选择${NC}\n"
     printf "${YELLOW}安装 daed 面板后可可视化查看和切换节点${NC}\n"
     printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+}
+
+# ==================== ★ 新增：内存诊断菜单 ====================
+memory_diagnostic_menu() {
+    printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "${CYAN}   🧠 内存诊断与 BPF LPM Map 缓解                          ${NC}\n"
+    printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n\n"
+
+    local free_mb total_mb
+    free_mb=$(get_free_memory_mb)
+    total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' \
+        /proc/meminfo 2>/dev/null || echo 0)
+
+    printf "${BLUE}── 当前内存状态 ───────────────────────────────────────────${NC}\n"
+    printf "  总内存  : ${CYAN}%d MB${NC}\n" "$total_mb"
+    printf "  可用内存: "
+    if [ "$free_mb" -lt "$DAE_MIN_MEMORY_MB" ]; then
+        printf "${RED}%d MB ⚠️ 低于建议最低 %d MB${NC}\n" \
+            "$free_mb" "$DAE_MIN_MEMORY_MB"
+    else
+        printf "${GREEN}%d MB ✓${NC}\n" "$free_mb"
+    fi
+
+    local bpf_jit_limit
+    bpf_jit_limit=$(cat /proc/sys/net/core/bpf_jit_limit 2>/dev/null \
+        || echo 0)
+    printf "  BPF JIT limit: ${CYAN}%d MB${NC}\n" \
+        "$((bpf_jit_limit/1024/1024))"
+
+    printf "\n${BLUE}── 历史错误检测 ───────────────────────────────────────────${NC}\n"
+    local cur_mode
+    cur_mode=$(detect_current_mode)
+    local svc_log
+    svc_log=$([ "$cur_mode" = "daed" ] && echo "daed" || echo "dae")
+    if check_lpm_oom_in_log "$svc_log" 2>/dev/null; then
+        printf "  ${RED}⚠️  发现 BPF LPM Map 内存分配失败记录${NC}\n"
+        printf "  ${YELLOW}错误: cannot allocate memory (newLpmMap)${NC}\n"
+    else
+        printf "  ${GREEN}✓ 未发现 LPM Map 内存错误记录${NC}\n"
+    fi
+
+    printf "\n${BLUE}── 操作选项 ───────────────────────────────────────────────${NC}\n"
+    printf "  1) 🧹  立即释放系统缓存（Page Cache + Slab）\n"
+    printf "  2) ⬆️   调整 BPF JIT 内存上限（当前 %d MB → 512 MB）\n" \
+        "$((bpf_jit_limit/1024/1024))"
+    printf "  3) 🔄  释放内存后重启 dae 服务\n"
+    printf "  4) 📋  查看进阶解决方案（降级/精简规则/ZRAM）\n"
+    printf "  5) 📊  查看当前 BPF Map 使用情况\n"
+    printf "  0) 返回\n"
+    printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "请输入选项: "
+    read -r mchoice
+
+    case "${mchoice:-0}" in
+        1)
+            step "释放系统缓存..."
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+            local new_free
+            new_free=$(get_free_memory_mb)
+            info "释放完成，当前可用内存: ${new_free} MB"
+            ;;
+        2)
+            local target=$((512 * 1024 * 1024))
+            echo "$target" > /proc/sys/net/core/bpf_jit_limit \
+                2>/dev/null || true
+            info "BPF JIT limit 已设置为 512 MB"
+            # 持久化
+            grep -q 'bpf_jit_limit' /etc/sysctl.conf 2>/dev/null \
+                || echo 'net.core.bpf_jit_limit=536870912' \
+                >> /etc/sysctl.conf
+            ;;
+        3)
+            step "释放内存并重启服务..."
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+            sleep 1
+            local svc_restart
+            svc_restart=$([ "$cur_mode" = "daed" ] \
+                && echo "daed" || echo "dae")
+            manage_service_generic "$svc_restart" "stop" 2>/dev/null \
+                || true
+            sleep 1
+            manage_service_generic "$svc_restart" "start" 2>/dev/null \
+                || true
+            if ! verify_start_no_lpm_oom "$svc_restart"; then
+                guide_memory_fix
+            else
+                print_service_live_status "$svc_restart"
+            fi
+            ;;
+        4)
+            guide_memory_fix
+            ;;
+        5)
+            printf "\n${BLUE}── BPF Map 使用情况 ────────────────────────────────────${NC}\n"
+            if [ -d /sys/fs/bpf ]; then
+                local bpf_count
+                bpf_count=$(find /sys/fs/bpf -type f 2>/dev/null \
+                    | wc -l || echo 0)
+                printf "  BPF FS 挂载对象数: ${CYAN}%s${NC}\n" "$bpf_count"
+            fi
+            if [ -f /proc/vmallocinfo ]; then
+                local bpf_vmalloc
+                bpf_vmalloc=$(grep -c bpf /proc/vmallocinfo \
+                    2>/dev/null || echo 0)
+                printf "  vmalloc BPF 条目数: ${CYAN}%s${NC}\n" \
+                    "$bpf_vmalloc"
+            fi
+            if command -v bpftool >/dev/null 2>&1; then
+                printf "  BPF Map 列表:\n"
+                bpftool map list 2>/dev/null \
+                    | grep -E 'lpm|hash|array' \
+                    | head -n 10 || true
+            else
+                printf "  ${YELLOW}△ bpftool 未安装，无法查看详细 Map 信息${NC}\n"
+            fi
+            ;;
+        0) return ;;
+        *) err "无效选项。" ;;
+    esac
 }
 
 # ==================== GEO 数据更新 ====================
@@ -837,7 +1326,8 @@ done
 for svc in dae daed; do
     pgrep -x "$svc" >/dev/null 2>&1 || continue
     echo "[GEO] $svc 运行中，热重载..."
-    if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 \
+        && pidof systemd >/dev/null 2>&1; then
         systemctl reload-or-restart "$svc" 2>/dev/null || true
     elif [ -f "/etc/init.d/$svc" ]; then
         "/etc/init.d/$svc" restart 2>/dev/null || true
@@ -876,20 +1366,95 @@ resolve_arch() {
 
 # ==================== dae 配置生成 ====================
 generate_dae_config() {
-    [ -z "${LAN_IFACE_SETTING:-}" ] && LAN_IFACE_SETTING="lan_interface: auto"
+    [ -z "${LAN_IFACE_SETTING:-}" ] && \
+        LAN_IFACE_SETTING="lan_interface: auto"
 
     collect_subscriptions
 
+    # ── 所有局部变量统一在此声明 ──
     local sub_section="$SUB_LINES"
     local filter_expr="subtag(my_sub)"
+    local ai_filter_expr=""
+    local ai_filter_choice=""
+    local ai_keywords=""
+    local built_filter=""
+    local kw_filter=""
+    local sub_name=""
+    local kw=""
+    local first_sub=""
+    local IFS_BAK=""
+    local IFS_BAK2=""
+
+    # ── 构建 proxy 组 filter ──
     if [ -n "${SUB_NAMES:-}" ]; then
-        local first_name
-        first_name=$(printf '%s' "$SUB_NAMES" | cut -d',' -f1)
-        filter_expr="subtag(${first_name})"
-        if printf '%s' "$SUB_NAMES" | grep -q ','; then
-            local names_spaced
-            names_spaced=$(printf '%s' "$SUB_NAMES" | sed 's/,/, /g')
-            filter_expr="subtag(${names_spaced})"
+        IFS_BAK="$IFS"; IFS=','
+        for sub_name in ${SUB_NAMES}; do
+            sub_name=$(printf '%s' "$sub_name" | tr -d ' ')
+            [ -z "$sub_name" ] && continue
+            if [ -z "$built_filter" ]; then
+                built_filter="subtag(${sub_name})"
+            else
+                built_filter="${built_filter} || subtag(${sub_name})"
+            fi
+        done
+        IFS="$IFS_BAK"
+        [ -n "$built_filter" ] && filter_expr="$built_filter"
+    fi
+
+    # ── AI 组筛选方式交互 ──
+    ai_filter_expr="$filter_expr"
+    printf "\n${CYAN}AI/开发工具组（ai）节点筛选方式：${NC}\n"
+    printf " 1) 与 proxy 组相同（使用全部节点）\n"
+    printf " 2) 按节点名关键词筛选（如 US、JP、美国、日本）\n"
+    printf "选择 [1-2, 默认1]: "; read -r ai_filter_choice
+
+    if [ "${ai_filter_choice:-1}" = "2" ]; then
+        printf "输入关键词（多个用逗号分隔，如 US,JP,美国）: "
+        read -r ai_keywords
+        if [ -n "${ai_keywords:-}" ]; then
+            IFS_BAK2="$IFS"; IFS=','
+            for kw in ${ai_keywords}; do
+                kw=$(printf '%s' "$kw" | tr -d ' ')
+                [ -z "$kw" ] && continue
+                if [ -z "$kw_filter" ]; then
+                    kw_filter="name(keyword: '${kw}')"
+                else
+                    kw_filter="${kw_filter} || name(keyword: '${kw}')"
+                fi
+            done
+            IFS="$IFS_BAK2"
+            if [ -n "$kw_filter" ]; then
+    first_sub=$(printf '%s' "$SUB_NAMES" \
+        | cut -d',' -f1 | tr -d ' ')
+
+    # dae filter 语法不支持括号分组
+    # 单关键词：subtag(sub1) && name(keyword: 'us')
+    # 多关键词：每条独立展开，用 || 连接
+    local kw_count
+    kw_count=$(printf '%s' "${ai_keywords}" | tr -cd ',' | wc -c)
+
+    if [ "${kw_count}" -eq 0 ]; then
+        # 单关键词，直接 &&
+        ai_filter_expr="subtag(${first_sub}) && ${kw_filter}"
+    else
+        # 多关键词，每个关键词都带上 subtag 展开
+        local expanded="" kw2 IFS_BAK3
+        IFS_BAK3="$IFS"; IFS=','
+        for kw2 in ${ai_keywords}; do
+            kw2=$(printf '%s' "$kw2" | tr -d ' ')
+            [ -z "$kw2" ] && continue
+            if [ -z "$expanded" ]; then
+                expanded="subtag(${first_sub}) && name(keyword: '${kw2}')"
+            else
+                expanded="${expanded} || subtag(${first_sub}) && name(keyword: '${kw2}')"
+            fi
+        done
+        IFS="$IFS_BAK3"
+        ai_filter_expr="$expanded"
+    fi
+
+    printf "${GREEN}  AI 组 filter: %s${NC}\n" "$ai_filter_expr"
+        fi
         fi
     fi
 
@@ -997,7 +1562,7 @@ group {
     }
 
     ai {
-        filter: ${filter_expr}
+        filter: ${ai_filter_expr}
         policy: min_moving_avg
     }
 }
@@ -1064,14 +1629,16 @@ EOF
     chmod 0600 "$DAE_CONFIG_FILE"
     info "配置文件已生成: $DAE_CONFIG_FILE"
 
-    if [ ! -f "$GEO_DIR/geoip.dat" ] || [ ! -f "$GEO_DIR/geosite.dat" ]; then
+    if [ ! -f "$GEO_DIR/geoip.dat" ] \
+        || [ ! -f "$GEO_DIR/geosite.dat" ]; then
         warn "GEO 缺失，自动拉取..."
         update_geo_data
     fi
 
     if command -v dae >/dev/null 2>&1; then
         step "校验配置语法..."
-        if dae validate -c "$DAE_CONFIG_FILE" > /tmp/dae_validate.log 2>&1; then
+        if dae validate -c "$DAE_CONFIG_FILE" \
+            > /tmp/dae_validate.log 2>&1; then
             info "配置语法校验通过"
         else
             err "语法错误："; cat /tmp/dae_validate.log
@@ -1088,8 +1655,9 @@ manage_service_generic() {
         bin_path="$DAED_BIN_PATH"; cfg_or_dir="$DAED_CONFIG_DIR"
         log_path="$DAED_LOG_FILE"; exec_start="${bin_path} run"
     else
-        bin_path="$DAE_BIN_PATH";  cfg_or_dir="$DAE_CONFIG_FILE"
-        log_path="$LOG_FILE";      exec_start="${bin_path} run -c ${cfg_or_dir}"
+        bin_path="$DAE_BIN_PATH"; cfg_or_dir="$DAE_CONFIG_FILE"
+        log_path="$LOG_FILE"
+        exec_start="${bin_path} run -c ${cfg_or_dir}"
     fi
 
     case "${SERVICE_MGR:-initd}" in
@@ -1102,20 +1670,23 @@ manage_service_generic() {
                 enable|disable|start|stop|restart)
                     systemctl "$action" "$svc" 2>/dev/null || true ;;
             esac ;;
-
         openrc)
             case "$action" in
-                start|stop|restart) rc-service "$svc" "$action" 2>/dev/null || true ;;
-                enable)  rc-update add "$svc" default 2>/dev/null || true ;;
-                disable) rc-update del "$svc" default 2>/dev/null || true ;;
-                status)  rc-service "$svc" status 2>/dev/null || true ;;
+                start|stop|restart)
+                    rc-service "$svc" "$action" 2>/dev/null || true ;;
+                enable)
+                    rc-update add "$svc" default 2>/dev/null || true ;;
+                disable)
+                    rc-update del "$svc" default 2>/dev/null || true ;;
+                status)
+                    rc-service "$svc" status 2>/dev/null || true ;;
             esac ;;
-
         procd|initd)
             if [ -f "/etc/init.d/${svc}" ]; then
                 case "$action" in
                     start|stop|restart|enable|disable)
-                        "/etc/init.d/${svc}" "$action" 2>/dev/null || true ;;
+                        "/etc/init.d/${svc}" "$action" 2>/dev/null \
+                            || true ;;
                     status)
                         pgrep -x "$svc" >/dev/null \
                             && printf "${GREEN}%s 运行中${NC}\n" "$svc" \
@@ -1126,7 +1697,8 @@ manage_service_generic() {
                     start)
                         nohup $exec_start > "$log_path" 2>&1 &
                         printf "${GREEN}%s 已后台启动${NC}\n" "$svc" ;;
-                    stop)   killall "$svc" 2>/dev/null || true ;;
+                    stop)
+                        killall "$svc" 2>/dev/null || true ;;
                     restart)
                         killall "$svc" 2>/dev/null || true; sleep 1
                         nohup $exec_start > "$log_path" 2>&1 &
@@ -1154,9 +1726,9 @@ print_service_live_status() {
         local pid
         pid=$(pgrep -x "$svc" | head -n1)
         printf "  状态: ${GREEN}● 活跃${NC} | PID: ${CYAN}%s${NC}\n" "$pid"
-        if [ "$svc" = "daed" ]; then
-            printf "  面板: ${GREEN}http://%s:2023${NC}\n" "${LAN_IP:-localhost}"
-        fi
+        [ "$svc" = "daed" ] && \
+            printf "  面板: ${GREEN}http://%s:2023${NC}\n" \
+                "${LAN_IP:-localhost}"
         return 0
     else
         printf "  状态: ${RED}■ 停止/启动失败${NC}\n"
@@ -1177,9 +1749,10 @@ install_service_unit() {
         desc="daed eBPF Proxy with Web Dashboard"
         log_path="$DAED_LOG_FILE"; exec_start="${bin_path} run"
     else
-        bin_path="$DAE_BIN_PATH";  cfg_or_dir="$DAE_CONFIG_FILE"
+        bin_path="$DAE_BIN_PATH"; cfg_or_dir="$DAE_CONFIG_FILE"
         desc="dae eBPF Transparent Proxy"
-        log_path="$LOG_FILE"; exec_start="${bin_path} run -c ${cfg_or_dir}"
+        log_path="$LOG_FILE"
+        exec_start="${bin_path} run -c ${cfg_or_dir}"
     fi
 
     case "${SERVICE_MGR:-initd}" in
@@ -1210,14 +1783,14 @@ EOF
                 systemctl daemon-reload
                 info "systemd: ${svc}.service 已安装"
             fi ;;
-
         openrc)
             if [ ! -f "/etc/init.d/${svc}" ]; then
                 cat > "/etc/init.d/${svc}" << EOF
 #!/sbin/openrc-run
 description="${desc}"
 command="${bin_path}"
-command_args="run$([ "$svc" = "dae" ] && echo " -c ${cfg_or_dir}" || echo "")"
+command_args="run$([ "$svc" = "dae" ] \
+    && echo " -c ${cfg_or_dir}" || echo "")"
 command_background=true
 pidfile="/run/${svc}.pid"
 depend() { need net; }
@@ -1226,7 +1799,6 @@ EOF
                 rc-update add "$svc" default 2>/dev/null || true
                 info "OpenRC: /etc/init.d/${svc} 已安装"
             fi ;;
-
         procd)
             if [ ! -f "/etc/init.d/${svc}" ]; then
                 cat > "/etc/init.d/${svc}" << EOF
@@ -1247,7 +1819,6 @@ EOF
                 "/etc/init.d/${svc}" enable 2>/dev/null || true
                 info "procd: /etc/init.d/${svc} 已安装"
             fi ;;
-
         initd)
             if [ ! -f "/etc/init.d/${svc}" ]; then
                 cat > "/etc/init.d/${svc}" << EOF
@@ -1262,12 +1833,14 @@ EOF
 ### END INIT INFO
 BIN="${bin_path}"
 LOG="${log_path}"
-ARGS="$([ "$svc" = "dae" ] && echo "run -c ${cfg_or_dir}" || echo "run")"
+ARGS="$([ "$svc" = "dae" ] \
+    && echo "run -c ${cfg_or_dir}" || echo "run")"
 case "\$1" in
     start)   nohup "\$BIN" \$ARGS > "\$LOG" 2>&1 & ;;
     stop)    killall ${svc} 2>/dev/null || true ;;
     restart) \$0 stop; sleep 1; \$0 start ;;
-    status)  pgrep -x ${svc} >/dev/null && echo "running" || echo "stopped" ;;
+    status)  pgrep -x ${svc} >/dev/null \
+                 && echo "running" || echo "stopped" ;;
     *)       echo "Usage: \$0 {start|stop|restart|status}" ;;
 esac
 EOF
@@ -1278,73 +1851,64 @@ EOF
     esac
 }
 
-# ==================== ★ 新增：独立卸载函数 ====================
+# ==================== 独立卸载 ====================
 uninstall_daed_only() {
     printf "\n${RED}--- 卸载 daed（保留 dae CLI）---${NC}\n"
-    printf "${YELLOW}将删除 daed 二进制、服务文件、面板配置。确认？(y/n): ${NC}"
-    read -r confirm
+    printf "${YELLOW}确认？(y/n): ${NC}"; read -r confirm
     [ "${confirm:-n}" != "y" ] && [ "${confirm:-n}" != "Y" ] && {
         info "已取消。"; return; }
-
     manage_service_generic "daed" "stop"    2>/dev/null || true
     manage_service_generic "daed" "disable" 2>/dev/null || true
     docker rm -f daed 2>/dev/null || true
-
     rm -f "$DAED_BIN_PATH" \
         /etc/systemd/system/daed.service \
         /etc/init.d/daed
     rm -rf /etc/daed
-
-    [ "${SERVICE_MGR:-}" = "systemd" ] && systemctl daemon-reload 2>/dev/null || true
-    info "daed 已卸载（dae CLI 保留）"
+    [ "${SERVICE_MGR:-}" = "systemd" ] && \
+        systemctl daemon-reload 2>/dev/null || true
+    info "daed 已卸载"
     send_wechat_notification "daed 已卸载"
 }
 
 uninstall_dae_only() {
     printf "\n${RED}--- 卸载 dae CLI（保留 daed 面板）---${NC}\n"
-    printf "${YELLOW}将删除 dae 二进制、服务文件、代理配置。确认？(y/n): ${NC}"
-    read -r confirm
+    printf "${YELLOW}确认？(y/n): ${NC}"; read -r confirm
     [ "${confirm:-n}" != "y" ] && [ "${confirm:-n}" != "Y" ] && {
         info "已取消。"; return; }
-
     manage_service_generic "dae" "stop"    2>/dev/null || true
     manage_service_generic "dae" "disable" 2>/dev/null || true
     clean_network_resources force
-
     rm -f "$DAE_BIN_PATH" \
         /etc/systemd/system/dae.service \
         /etc/init.d/dae
     rm -rf /etc/dae
-
-    [ "${SERVICE_MGR:-}" = "systemd" ] && systemctl daemon-reload 2>/dev/null || true
-    info "dae CLI 已卸载（daed 面板保留）"
+    [ "${SERVICE_MGR:-}" = "systemd" ] && \
+        systemctl daemon-reload 2>/dev/null || true
+    info "dae CLI 已卸载"
     send_wechat_notification "dae CLI 已卸载"
 }
 
 uninstall_all() {
     printf "\n${RED}--- ☠️ 彻底卸载（dae + daed 全部组件）---${NC}\n"
-    printf "${YELLOW}将删除所有二进制、配置、GEO、服务。确认？(y/n): ${NC}"
-    read -r confirm
+    printf "${YELLOW}确认？(y/n): ${NC}"; read -r confirm
     [ "${confirm:-n}" != "y" ] && [ "${confirm:-n}" != "Y" ] && {
         info "已取消。"; return; }
-
     for svc in dae daed; do
         manage_service_generic "$svc" "stop"    2>/dev/null || true
         manage_service_generic "$svc" "disable" 2>/dev/null || true
     done
     clean_network_resources force
     docker rm -f dae-container daed 2>/dev/null || true
-
     rm -f "$DAE_BIN_PATH" "$DAED_BIN_PATH" \
         /etc/systemd/system/dae.service \
         /etc/systemd/system/daed.service \
-        /etc/init.d/dae /etc/init.d/daed \
-        "$ENV_FILE"
+        /etc/init.d/dae /etc/init.d/daed "$ENV_FILE"
     rm -rf /etc/dae /etc/daed /usr/share/dae
-
     command -v crontab >/dev/null 2>&1 && \
-        (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT") | crontab - || true
-    [ "${SERVICE_MGR:-}" = "systemd" ] && systemctl daemon-reload 2>/dev/null || true
+        (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT") \
+        | crontab - || true
+    [ "${SERVICE_MGR:-}" = "systemd" ] && \
+        systemctl daemon-reload 2>/dev/null || true
     info "已完全卸载。"
     send_wechat_notification "dae/daed 已彻底卸载"
 }
@@ -1360,13 +1924,14 @@ install_daed_panel() {
 
     local target_arch
     target_arch=$(resolve_arch) || return 1
-    printf "${CYAN}[架构] %s${NC}\n" "$target_arch"
 
     step "拉取 daed 发行版列表..."
     local release_list
     release_list=$(curl -fsSL --connect-timeout 15 \
-        "https://api.github.com/repos/daeuniverse/daed/releases" 2>/dev/null || true)
-    [ -z "${release_list:-}" ] && { err "无法获取版本列表。"; return 1; }
+        "https://api.github.com/repos/daeuniverse/daed/releases" \
+        2>/dev/null || true)
+    [ -z "${release_list:-}" ] && {
+        err "无法获取版本列表。"; return 1; }
 
     local version_list
     version_list=$(printf '%s' "$release_list" \
@@ -1374,7 +1939,8 @@ install_daed_panel() {
         | sed -E 's/.*"([^"]+)".*/\1/' \
         | grep -E '^v[0-9]+\.[0-9]+' \
         | head -n 5)
-    [ -z "${version_list:-}" ] && { err "版本列表解析失败。"; return 1; }
+    [ -z "${version_list:-}" ] && {
+        err "版本列表解析失败。"; return 1; }
 
     local current_version="未安装"
     if [ -f "$DAED_BIN_PATH" ] && [ -x "$DAED_BIN_PATH" ]; then
@@ -1400,14 +1966,18 @@ VEREOF
     read -r choice
     local selected_version=""
     case "${choice:-0}" in
-        [1-5]) selected_version=$(printf '%s\n' "$version_list" | sed -n "${choice}p") ;;
+        [1-5])
+            selected_version=$(printf '%s\n' "$version_list" \
+                | sed -n "${choice}p") ;;
         0) info "已取消。"; return 0 ;;
         *) err "无效输入。"; return 1 ;;
     esac
-    [ -z "${selected_version:-}" ] && { err "版本选择失败。"; return 1; }
+    [ -z "${selected_version:-}" ] && {
+        err "版本选择失败。"; return 1; }
 
     local installed=0
-    local base_url="https://github.com/daeuniverse/daed/releases/download/${selected_version}"
+    local base_url="https://github.com/daeuniverse/daed/releases/\
+download/${selected_version}"
 
     if [ "$PKG_MANAGER" = "apt" ] && [ "$installed" -eq 0 ]; then
         local deb_url="${base_url}/installer-daed-linux-${target_arch}.deb"
@@ -1416,19 +1986,22 @@ VEREOF
         local hc
         hc=$(curl -fsSL -w "%{http_code}" --connect-timeout 60 \
             -o "$tmp_deb" "$deb_url" 2>/dev/null || echo "000")
-        if [ "$hc" = "200" ] && dpkg-deb -I "$tmp_deb" >/dev/null 2>&1; then
+        if [ "$hc" = "200" ] \
+            && dpkg-deb -I "$tmp_deb" >/dev/null 2>&1; then
             dpkg -i "$tmp_deb" 2>/dev/null || true
             apt-get --fix-broken install -y >/dev/null 2>&1 || true
-            command -v daed >/dev/null 2>&1 && installed=1 && info ".deb 安装成功"
+            command -v daed >/dev/null 2>&1 && installed=1 \
+                && info ".deb 安装成功"
             rm -f "$tmp_deb"
         else
             rm -f "$tmp_deb"
-            warn ".deb 下载失败 (HTTP $hc)，尝试裸二进制..."
+            warn ".deb 失败，尝试裸二进制..."
         fi
     fi
 
     if { [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ] \
-         || [ "$PKG_MANAGER" = "zypper" ]; } && [ "$installed" -eq 0 ]; then
+         || [ "$PKG_MANAGER" = "zypper" ]; } \
+        && [ "$installed" -eq 0 ]; then
         local rpm_url="${base_url}/installer-daed-linux-${target_arch}.rpm"
         local tmp_rpm="/tmp/daed-installer.$$.rpm"
         step "尝试 .rpm 包..."
@@ -1440,11 +2013,11 @@ VEREOF
                 zypper) zypper install -y "$tmp_rpm" 2>/dev/null || true ;;
                 *)      rpm -ivh "$tmp_rpm" 2>/dev/null || true ;;
             esac
-            command -v daed >/dev/null 2>&1 && installed=1 && info ".rpm 安装成功"
+            command -v daed >/dev/null 2>&1 && installed=1 \
+                && info ".rpm 安装成功"
             rm -f "$tmp_rpm"
         else
-            rm -f "$tmp_rpm"
-            warn ".rpm 下载失败 (HTTP $hc)..."
+            rm -f "$tmp_rpm"; warn ".rpm 失败..."
         fi
     fi
 
@@ -1462,13 +2035,15 @@ VEREOF
             step "尝试 .zip 包..."
             hc=$(curl -fsSL -w "%{http_code}" --connect-timeout 60 \
                 -o "$tmp_zip" "$zip_url" 2>/dev/null || echo "000")
-            if [ "$hc" = "200" ] && unzip -t "$tmp_zip" >/dev/null 2>&1; then
+            if [ "$hc" = "200" ] \
+                && unzip -t "$tmp_zip" >/dev/null 2>&1; then
                 local td="/tmp/daed-unzip-$$"
                 mkdir -p "$td"
                 unzip -o "$tmp_zip" -d "$td" >/dev/null 2>&1
                 local ef
-                ef=$(find "$td" -type f ! -name "*.zip" ! -name "*.md" \
-                    ! -name "*.txt" | head -n1 || true)
+                ef=$(find "$td" -type f ! -name "*.zip" \
+                    ! -name "*.md" ! -name "*.txt" \
+                    | head -n1 || true)
                 [ -n "${ef:-}" ] && mv "$ef" "$tmp_bin"
                 rm -rf "$td" "$tmp_zip"
             else
@@ -1485,30 +2060,30 @@ VEREOF
         fi
     fi
 
-    local actual_ver
-    actual_ver=$("$DAED_BIN_PATH" --version 2>/dev/null \
-        | awk 'NR==1{print $3}' | head -n1 || echo "未知")
-    info "已安装版本: $actual_ver"
-
-    mkdir -p "$DAED_CONFIG_DIR"
-    chmod 0700 "$DAED_CONFIG_DIR"
-    [ ! -f "$GEO_DIR/geoip.dat" ] || [ ! -f "$GEO_DIR/geosite.dat" ] && update_geo_data
+    mkdir -p "$DAED_CONFIG_DIR"; chmod 0700 "$DAED_CONFIG_DIR"
+    [ ! -f "$GEO_DIR/geoip.dat" ] \
+        || [ ! -f "$GEO_DIR/geosite.dat" ] && update_geo_data
     install_service_unit "daed"
     open_firewall_ports "2023,12345"
     fix_resolv_conf
 
     printf "\n${GREEN}╔══════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${GREEN}║  ✅ daed 安装完成！版本: %-30s║${NC}\n" "$selected_version"
-    printf "${GREEN}║  🌐 面板: http://%-37s║${NC}\n" "${LAN_IP:-localhost}:2023"
+    printf "${GREEN}║  ✅ daed 安装完成！版本: %-30s║${NC}\n" \
+        "$selected_version"
+    printf "${GREEN}║  🌐 面板: http://%-37s║${NC}\n" \
+        "${LAN_IP:-localhost}:2023"
     printf "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
 
     printf "\n立即启动 daed 服务？(y/n): "; read -r start_now
     if [ "${start_now:-n}" = "y" ] || [ "${start_now:-n}" = "Y" ]; then
         manage_service_generic "daed" "enable" 2>/dev/null || true
+        check_memory_before_start || true
         manage_service_generic "daed" "start"
-        print_service_live_status "daed"
-    else
-        printf "${YELLOW}手动启动: %s run${NC}\n" "$DAED_BIN_PATH"
+        if ! verify_start_no_lpm_oom "daed"; then
+            guide_memory_fix
+        else
+            print_service_live_status "daed"
+        fi
     fi
     send_wechat_notification "daed ${selected_version} 已安装"
 }
@@ -1522,7 +2097,6 @@ install_daed_docker_compose() {
     DC_CMD=$(docker_compose_cmd)
     [ -z "$DC_CMD" ] && {
         err "未找到 docker compose 或 docker-compose。"; return 1; }
-    printf "${CYAN}[Docker] 使用: %s${NC}\n" "$DC_CMD"
 
     if [ ! -f /sys/kernel/btf/vmlinux ]; then
         err "缺少 BTF，daed 容器启动将失败！"
@@ -1564,23 +2138,19 @@ services:
       - /etc/daed:/etc/daed
 EOF
 
-    info "Compose 文件: $compose_file"
     update_geo_data
     open_firewall_ports "2023,12345"
-
-    step "拉取 $daed_image..."
     docker pull "$daed_image" || { err "镜像拉取失败。"; return 1; }
-
-    step "启动容器..."
     $DC_CMD -f "$compose_file" up -d
-
     sleep 3
-    if [ "$(docker inspect -f '{{.State.Running}}' daed 2>/dev/null)" = "true" ]; then
-        printf "\n${GREEN}╔══════════════════════════════════════════════════════╗${NC}\n"
-        printf "${GREEN}║  🎉 daed Docker 容器启动成功！                       ║${NC}\n"
-        printf "${GREEN}║  面板: http://%-37s║${NC}\n" "${LAN_IP:-localhost}:2023"
-        printf "${GREEN}╚══════════════════════════════════════════════════════╝${NC}\n"
-        send_wechat_notification "daed Docker 已启动"
+
+    if [ "$(docker inspect -f '{{.State.Running}}' \
+        daed 2>/dev/null)" = "true" ]; then
+        printf "\n${GREEN}╔══════════════════════════════════════════════╗${NC}\n"
+        printf "${GREEN}║  🎉 daed Docker 容器启动成功！               ║${NC}\n"
+        printf "${GREEN}║  面板: http://%-29s║${NC}\n" \
+            "${LAN_IP:-localhost}:2023"
+        printf "${GREEN}╚══════════════════════════════════════════════╝${NC}\n"
     else
         err "容器异常退出："
         docker logs --tail=20 daed 2>/dev/null || true
@@ -1599,8 +2169,10 @@ upgrade_dae_core() {
     step "拉取 dae 发行版列表..."
     local release_list
     release_list=$(curl -fsSL --connect-timeout 15 \
-        "https://api.github.com/repos/daeuniverse/dae/releases" 2>/dev/null || true)
-    [ -z "${release_list:-}" ] && { err "无法获取版本列表。"; return 1; }
+        "https://api.github.com/repos/daeuniverse/dae/releases" \
+        2>/dev/null || true)
+    [ -z "${release_list:-}" ] && {
+        err "无法获取版本列表。"; return 1; }
 
     local version_list
     version_list=$(printf '%s' "$release_list" \
@@ -1608,7 +2180,8 @@ upgrade_dae_core() {
         | sed -E 's/.*"([^"]+)".*/\1/' \
         | grep -E '^v[0-9]+\.[0-9]+' \
         | head -n 5)
-    [ -z "${version_list:-}" ] && { err "版本列表解析失败。"; return 1; }
+    [ -z "${version_list:-}" ] && {
+        err "版本列表解析失败。"; return 1; }
 
     local current_version="未安装"
     if [ -f "$DAE_BIN_PATH" ] && [ -x "$DAE_BIN_PATH" ]; then
@@ -1621,9 +2194,13 @@ upgrade_dae_core() {
     local count=1
     while IFS= read -r v; do
         [ -z "$v" ] && continue
+        local rc_mark=""
+        printf '%s' "$v" | grep -qiE 'rc|alpha|beta' && \
+            rc_mark=" ${YELLOW}(预发布)${NC}"
         [ $count -eq 1 ] \
-            && printf " %d) %s ${YELLOW}(最新)${NC}\n" "$count" "$v" \
-            || printf " %d) %s\n" "$count" "$v"
+            && printf " %d) %s ${YELLOW}(最新)${NC}%b\n" \
+                "$count" "$v" "$rc_mark" \
+            || printf " %d) %s%b\n" "$count" "$v" "$rc_mark"
         count=$((count+1))
     done << VEREOF
 $version_list
@@ -1634,13 +2211,30 @@ VEREOF
     read -r choice
     local selected_version=""
     case "${choice:-0}" in
-        [1-5]) selected_version=$(printf '%s\n' "$version_list" | sed -n "${choice}p") ;;
+        [1-5])
+            selected_version=$(printf '%s\n' "$version_list" \
+                | sed -n "${choice}p") ;;
         0) info "已取消。"; return 0 ;;
         *) err "无效输入。"; return 1 ;;
     esac
-    [ -z "${selected_version:-}" ] && { err "版本选择失败。"; return 1; }
+    [ -z "${selected_version:-}" ] && {
+        err "版本选择失败。"; return 1; }
 
-    local download_url="https://github.com/daeuniverse/dae/releases/download/${selected_version}/dae-linux-${target_arch}.zip"
+    # RC 版本提示内存风险
+    if printf '%s' "$selected_version" | grep -qiE 'rc|alpha|beta'; then
+        printf "${YELLOW}[提示] %s 是预发布版本，可能比稳定版占用更多内存${NC}\n" \
+            "$selected_version"
+        printf "${YELLOW}       低内存设备建议选择稳定版（如 v1.1.0）${NC}\n"
+        printf "继续安装预发布版本？(y/n 默认y): "
+        read -r rc_confirm
+        if [ "${rc_confirm:-y}" != "y" ] \
+            && [ "${rc_confirm:-y}" != "Y" ]; then
+            info "已取消，请重新选择版本。"; return 0
+        fi
+    fi
+
+    local download_url="https://github.com/daeuniverse/dae/releases/\
+download/${selected_version}/dae-linux-${target_arch}.zip"
     local tmp_zip="/tmp/dae-update.$$.zip"
 
     step "下载 dae ${selected_version} (${target_arch})..."
@@ -1648,7 +2242,8 @@ VEREOF
     http_code=$(curl -fsSL -w "%{http_code}" --connect-timeout 60 \
         -o "$tmp_zip" "$download_url" 2>/dev/null || echo "000")
 
-    if [ "$http_code" != "200" ] || ! unzip -t "$tmp_zip" >/dev/null 2>&1; then
+    if [ "$http_code" != "200" ] \
+        || ! unzip -t "$tmp_zip" >/dev/null 2>&1; then
         err "下载失败 (HTTP $http_code)。"
         rm -f "$tmp_zip"; return 1
     fi
@@ -1681,8 +2276,13 @@ VEREOF
     if [ ! -f "$DAE_CONFIG_FILE" ]; then
         warn "首次安装：请执行菜单 3 同步规则，再执行菜单 2 生成配置。"
     else
+        check_memory_before_start || true
         manage_service_generic "dae" "start"
-        print_service_live_status "dae"
+        if ! verify_start_no_lpm_oom "dae"; then
+            guide_memory_fix
+        else
+            print_service_live_status "dae"
+        fi
     fi
     send_wechat_notification "dae 更新至 ${selected_version} (${target_arch})"
 }
@@ -1691,7 +2291,7 @@ VEREOF
 set_geo_update_schedule() {
     command -v crontab >/dev/null 2>&1 \
         || { err "未安装 crontab。"; return 1; }
-    printf " 1) 每天凌晨 3 点\n 2) 每周一凌晨 3 点\n 3) 每月 1 日凌晨 3 点\n"
+    printf " 1) 每天凌晨 3 点\n 2) 每周一凌晨 3 点\n 3) 每月 1 日\n"
     printf "选择 [1-3]: "; read -r freq
     local sched
     case "${freq:-2}" in
@@ -1701,14 +2301,16 @@ set_geo_update_schedule() {
         *) sched="0 3 * * 1" ;;
     esac
     (crontab -l 2>/dev/null | grep -v "$UPDATE_GEO_SCRIPT"; \
-     printf '%s %s >/dev/null 2>&1\n' "$sched" "$UPDATE_GEO_SCRIPT") | crontab -
+     printf '%s %s >/dev/null 2>&1\n' \
+         "$sched" "$UPDATE_GEO_SCRIPT") | crontab -
     info "定时任务已设置: $sched"
 }
 
 display_side_router_tip() {
     [ "$(detect_router_mode)" != "side" ] && return
     printf "\n${YELLOW}💡 旁路由提示：主路由需配置：${NC}\n"
-    printf "  1. DHCP 网关和 DNS 指向本机: ${CYAN}%s${NC}\n" "${LAN_IP:-<本机IP>}"
+    printf "  1. DHCP 网关和 DNS 指向本机: ${CYAN}%s${NC}\n" \
+        "${LAN_IP:-<本机IP>}"
     printf "  2. 放行端口 12345 (tproxy) 和 2023 (daed 面板)\n"
 }
 
@@ -1717,7 +2319,6 @@ main_menu() {
     detect_system_env
     check_dependencies
 
-    # ── ★ 修复：仅在无服务运行时执行启动清理 ──
     if [ "${1:-}" != "--no-clean" ]; then
         local running_on_start=""
         pgrep -x dae  >/dev/null 2>&1 && running_on_start="dae"
@@ -1750,42 +2351,46 @@ main_menu() {
         local free_mb
         free_mb=$(get_free_memory_mb)
 
+        # 内存预警标记
+        local mem_warn=""
+        if [ "$free_mb" -lt "$DAE_MIN_MEMORY_MB" ]; then
+            mem_warn=" ${RED}⚠️ 内存不足${NC}"
+        fi
+
         printf "\n"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
         printf "${GREEN}   🦢 dae 全平台管家 v%s${NC}\n" "$SCRIPT_VERSION"
         printf "   系统: ${CYAN}%s %s${NC} | 内核: ${PURPLE}%s${NC}\n" \
             "$(uname -s)" "${SERVICE_MGR:-?}" "$(uname -r)"
-        printf "   架构: ${PURPLE}%s${NC} | 内存: ${CYAN}%d MB 可用${NC}\n" \
-            "$(uname -m)" "$free_mb"
+        printf "   架构: ${PURPLE}%s${NC} | 内存: ${CYAN}%d MB${NC}%b\n" \
+            "$(uname -m)" "$free_mb" "$mem_warn"
         printf "   接口: ${GREEN}%s${NC} | IP: ${GREEN}%s${NC} | 拓扑: ${CYAN}%s路由${NC}\n" \
             "${LAN_IFACE:-?}" "${LAN_IP:-?}" "$(detect_router_mode)"
         printf "   状态: "; printf "$mode_display\n"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
 
-        # ── 面板模式（daed）──
         printf "\n  ${CYAN}── 面板模式（daed）──${NC}\n"
-        printf "  A) 安装/更新 daed Web 面板\n"
-        printf "  B) Docker Compose 一键部署 daed\n"
-        printf "  C) daed 服务控制（启动/停止/重启/状态）\n"
-        printf "  D) 查看 daed 实时日志\n"
-        printf "  ${RED}E) 卸载 daed（保留 dae CLI）${NC}\n"
+        printf "  A) 🖥️  安装/更新 daed Web 面板\n"
+        printf "  B) 🐳  Docker Compose 一键部署 daed\n"
+        printf "  C) ⚙️  daed 服务控制（启动/停止/重启/状态）\n"
+        printf "  D) 🔎  查看 daed 实时日志\n"
+        printf "  ${RED}E) 🗑️  卸载 daed（保留 dae CLI）${NC}\n"
 
-        # ── CLI 模式（dae）──
         printf "\n  ${CYAN}── CLI 模式（dae）──${NC}\n"
-        printf "  1) 安装/更新 dae CLI 核心\n"
-        printf "  2) 生成 dae 配置（含订阅链接交互式录入）\n"
-        printf "  3) 立即同步 GEO 规则数据库\n"
-        printf "  4) 设置 GEO 定时自动更新\n"
-        printf "  5) dae 服务控制（启动/停止/重启/状态）\n"
-        printf "  6) 查看 dae 实时日志\n"
-        printf "  ${RED}7) 卸载 dae CLI（保留 daed 面板）${NC}\n"
+        printf "  1) ⚡  安装/更新 dae CLI 核心\n"
+        printf "  2) ✍️  生成 dae 配置（含订阅链接交互式录入）\n"
+        printf "  3) 🔄  立即同步 GEO 规则数据库\n"
+        printf "  4) 🗓️  设置 GEO 定时自动更新\n"
+        printf "  5) ⚙️  dae 服务控制（启动/停止/重启/状态）\n"
+        printf "  6) 🔎  查看 dae 实时日志\n"
+        printf "  ${RED}7) 🗑️  卸载 dae CLI（保留 daed 面板）${NC}\n"
 
-        # ── 系统工具 ──
         printf "\n  ${CYAN}── 系统工具 ──${NC}\n"
-        printf "  8) eBPF & 内核兼容性完整预检\n"
-        printf "  9) 配置企业微信 Webhook 通知\n"
-        printf "  N) 订阅与节点信息查看\n"
-        printf "  ${RED}U) 彻底卸载 dae + daed 全部组件${NC}\n"
+        printf "  8) 🔬  eBPF & 内核兼容性完整预检\n"
+        printf "  9) 🔔  配置企业微信 Webhook 通知\n"
+        printf "  N) 📊  订阅与节点信息查看\n"
+        printf "  M) 🧠  内存诊断与 BPF LPM Map 缓解\n"
+        printf "  ${RED}U) ☠️  彻底卸载 dae + daed 全部组件${NC}\n"
         printf "  0) 退出\n"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
         printf "请输入选项: "
@@ -1793,26 +2398,33 @@ main_menu() {
 
         case "${choice:-}" in
             [Aa]) install_daed_panel ;;
-
             [Bb]) install_daed_docker_compose ;;
-
             [Cc])
                 printf "  1) 启动  2) 停止  3) 重启  4) 状态\n"
                 printf "选择 [1-4]: "; read -r sact
                 case "${sact:-}" in
                     1) clean_network_resources
+                       check_memory_before_start || true
                        manage_service_generic "daed" "start"
-                       print_service_live_status "daed" ;;
+                       if ! verify_start_no_lpm_oom "daed"; then
+                           guide_memory_fix
+                       else
+                           print_service_live_status "daed"
+                       fi ;;
                     2) manage_service_generic "daed" "stop"
                        clean_network_resources force
                        info "daed 已停止。" ;;
                     3) clean_network_resources force
+                       check_memory_before_start || true
                        manage_service_generic "daed" "restart"
-                       print_service_live_status "daed" ;;
+                       if ! verify_start_no_lpm_oom "daed"; then
+                           guide_memory_fix
+                       else
+                           print_service_live_status "daed"
+                       fi ;;
                     4) manage_service_generic "daed" "status" ;;
                     *) err "无效选项。" ;;
                 esac ;;
-
             [Dd])
                 if [ -f "$DAED_LOG_FILE" ] && [ -s "$DAED_LOG_FILE" ]; then
                     printf "${YELLOW}daed 日志（Ctrl+C 退出）...${NC}\n"
@@ -1825,12 +2437,8 @@ main_menu() {
                 else
                     warn "daed 日志不存在或为空。"
                 fi ;;
-
-            # ★ daed 独立卸载
             [Ee]) uninstall_daed_only ;;
-
             1) upgrade_dae_core ;;
-
             2)
                 smart_interface_sniffer
                 check_mode_conflict "dae" || continue
@@ -1838,29 +2446,41 @@ main_menu() {
                 display_side_router_tip
                 manage_service_generic "dae" "enable" 2>/dev/null || true
                 clean_network_resources force
+                check_memory_before_start || true
                 manage_service_generic "dae" "restart"
-                print_service_live_status "dae"
-                send_wechat_notification "dae 配置已更新" ;;
-
+                if ! verify_start_no_lpm_oom "dae"; then
+                    guide_memory_fix
+                else
+                    print_service_live_status "dae"
+                    send_wechat_notification "dae 配置已更新"
+                fi ;;
             3) update_geo_data ;;
             4) set_geo_update_schedule ;;
-
             5)
                 printf "  1) 启动  2) 停止  3) 重启  4) 状态\n"
                 printf "选择 [1-4]: "; read -r sact
                 case "${sact:-}" in
                     1) clean_network_resources
+                       check_memory_before_start || true
                        manage_service_generic "dae" "start"
-                       print_service_live_status "dae" ;;
+                       if ! verify_start_no_lpm_oom "dae"; then
+                           guide_memory_fix
+                       else
+                           print_service_live_status "dae"
+                       fi ;;
                     2) manage_service_generic "dae" "stop"
                        clean_network_resources force ;;
                     3) clean_network_resources force
+                       check_memory_before_start || true
                        manage_service_generic "dae" "restart"
-                       print_service_live_status "dae" ;;
+                       if ! verify_start_no_lpm_oom "dae"; then
+                           guide_memory_fix
+                       else
+                           print_service_live_status "dae"
+                       fi ;;
                     4) manage_service_generic "dae" "status" ;;
                     *) err "无效选项。" ;;
                 esac ;;
-
             6)
                 if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
                     printf "${YELLOW}dae 日志（Ctrl+C 退出）...${NC}\n"
@@ -1871,26 +2491,20 @@ main_menu() {
                 else
                     warn "dae 日志不存在或为空。"
                 fi ;;
-
-            # ★ dae CLI 独立卸载
             7) uninstall_dae_only ;;
-
             8) check_ebpf_full ;;
-
             9)
-                printf "企业微信 Webhook URL（留空清除）: "; read -r wx_url
+                printf "企业微信 Webhook URL（留空清除）: "
+                read -r wx_url
                 WECHAT_WEBHOOK="${wx_url:-}"
                 save_env "WECHAT_WEBHOOK" "${wx_url:-}"
                 [ -n "${wx_url:-}" ] \
                     && info "Webhook 已绑定。" \
                     || warn "Webhook 已清除。" ;;
-
             [Nn]) show_node_info ;;
-
+            [Mm]) memory_diagnostic_menu ;;
             [Uu]) uninstall_all ;;
-
             0) info "退出，祝网络畅通！"; exit 0 ;;
-
             *) err "无效选项「${choice:-}」。" ;;
         esac
 
