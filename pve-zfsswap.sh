@@ -1970,7 +1970,7 @@ main() {
     clear
     printf "\n"
     printf "${CYAN}╔══════════════════════════════════════════════════════╗${PLAIN}\n"
-    printf "${CYAN}║   全平台一键交互式 Swap 管理工具  v3.1             ║${PLAIN}\n"
+    printf "${CYAN}║   全平台一键交互式 Swap 管理工具  v1.1             ║${PLAIN}\n"
     printf "${CYAN}║   OpenWrt / Armbian / Debian / Ubuntu / PVE(ZFS)   ║${PLAIN}\n"
     printf "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}\n"
     printf "\n"
