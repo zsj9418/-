@@ -993,25 +993,45 @@ show_node_info() {
 
             # 打印原始内容供用户核查
             local raw_in_sub=0 raw_depth=0 raw_printed=0
-            while IFS= read -r raw_line; do
-                if [ "$raw_in_sub" = "0" ] && \
-                   printf '%s' "$raw_line" \
-                       | grep -qE '^[[:space:]]*subscription[[:space:]]*\{'; then
-                    raw_in_sub=1; raw_depth=1; continue
-                fi
-                if [ "$raw_in_sub" = "1" ]; then
-                    local oc cc
-                    oc=$(printf '%s' "$raw_line" | tr -cd '{' | wc -c)
-                    cc=$(printf '%s' "$raw_line" | tr -cd '}' | wc -c)
-                    raw_depth=$((raw_depth + oc - cc))
-                    [ "$raw_depth" -le 0 ] && break
-                    # 跳过纯注释和空行
-                    printf '%s' "$raw_line" \
-                        | grep -qE '^\s*$' && continue
-                    printf "  ${CYAN}│ %s${NC}\n" "$raw_line"
-                    raw_printed=$((raw_printed+1))
-                fi
-            done < "$DAE_CONFIG_FILE"
+            while IFS= read -r line; do
+    if [ "$in_sub" = "0" ] && \
+       printf '%s' "$line" \
+           | grep -qE '^[[:space:]]*subscription[[:space:]]*\{'; then
+        in_sub=1; brace_depth=1; continue
+    fi
+
+    if [ "$in_sub" = "1" ]; then
+        # ★ 修复：先提取 URL，再更新深度，再判断是否退出
+
+        # 跳过纯空行
+        printf '%s' "$line" | grep -qE '^\s*$' && continue
+
+        # 先提取（不管本行是否含 }）
+        local sub_name sub_url
+        sub_name=$(printf '%s' "$line" \
+            | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*:[[:space:]]*'(https?:\/\/[^']+)'.*/\1/p")
+        sub_url=$(printf '%s' "$line" \
+            | sed -nE "s/^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*:[[:space:]]*'(https?:\/\/[^']+)'.*/\2/p")
+
+        # 有效订阅则记录
+        if [ -n "$sub_name" ] && [ -n "$sub_url" ]; then
+            sub_idx=$((sub_idx+1))
+            local url_display
+            url_display=$(printf '%s' "$sub_url" | cut -c1-52)
+            [ ${#sub_url} -gt 52 ] && url_display="${url_display}..."
+            printf "  %d) ${GREEN}%-12s${NC} %s\n" \
+                "$sub_idx" "$sub_name" "$url_display"
+            sub_count=$((sub_count+1))
+        fi
+
+        # ★ 后更新深度，再决定是否退出
+        local oc cc
+        oc=$(printf '%s' "$line" | tr -cd '{' | wc -c)
+        cc=$(printf '%s' "$line" | tr -cd '}' | wc -c)
+        brace_depth=$((brace_depth + oc - cc))
+        [ "$brace_depth" -le 0 ] && break
+    fi
+done < "$DAE_CONFIG_FILE"
 
             if [ "$raw_printed" -eq 0 ]; then
                 printf "  ${RED}  subscription {} 块为空或不存在${NC}\n"
@@ -1498,7 +1518,8 @@ global {
 }
 
 subscription {
-$(printf '%b' "$sub_section")}
+$(printf '%b' "$sub_section")
+}
 
 node {}
 
