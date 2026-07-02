@@ -1934,6 +1934,238 @@ uninstall_all() {
     send_wechat_notification "dae/daed 已彻底卸载"
 }
 
+# ==================== ★ 新增：节点拉取验证 ====================
+verify_node_fetch() {
+    local cfg="$DAE_CONFIG_FILE"
+
+    printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "${CYAN}   🔍 节点拉取验证                                          ${NC}\n"
+    printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n\n"
+
+    if ! pgrep -x dae >/dev/null 2>&1; then
+        err "dae 未运行，请先启动服务（菜单 5 → 1）"
+        return 1
+    fi
+    if [ ! -f "$cfg" ]; then
+        err "配置文件不存在: $cfg"
+        return 1
+    fi
+
+    local orig_level
+    orig_level=$(grep -E '^[[:space:]]*log_level[[:space:]]*:' "$cfg" \
+        2>/dev/null \
+        | head -n1 \
+        | sed -E 's/^[[:space:]]*log_level[[:space:]]*:[[:space:]]*//' \
+        | tr -d "'\" ")
+    orig_level="${orig_level:-error}"
+
+    printf "${CYAN}当前日志级别: ${YELLOW}%s${NC}\n" "$orig_level"
+    printf "${CYAN}临时切换为: ${GREEN}info${NC}（验证完成后自动还原）\n\n"
+
+    sed -i "s/log_level: ${orig_level}/log_level: info/" "$cfg" 2>/dev/null \
+        || true
+
+    step "重载 dae 配置..."
+    local dae_pid
+    dae_pid=$(pgrep -x dae | head -n1)
+    kill -HUP "$dae_pid" 2>/dev/null \
+        || systemctl reload dae 2>/dev/null \
+        || systemctl restart dae 2>/dev/null \
+        || true
+    sleep 3
+
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    printf "${YELLOW}  实时节点日志（只显示节点/订阅相关行）                    ${NC}\n"
+    printf "${YELLOW}  按 Ctrl+C 结束查看并自动还原日志级别                     ${NC}\n"
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n\n"
+
+    local restored=0
+    _restore_log_level() {
+        [ "$restored" = "1" ] && return
+        restored=1
+        printf "\n${YELLOW}[还原] 将日志级别还原为 %s...${NC}\n" "$orig_level"
+        sed -i "s/log_level: info/log_level: ${orig_level}/" \
+            "$cfg" 2>/dev/null || true
+        local pid
+        pid=$(pgrep -x dae | head -n1)
+        kill -HUP "$pid" 2>/dev/null \
+            || systemctl reload dae 2>/dev/null \
+            || true
+        sleep 1
+        info "日志级别已还原为: $orig_level"
+    }
+    trap '_restore_log_level' INT TERM
+
+    if command -v journalctl >/dev/null 2>&1 \
+        && [ "${SERVICE_MGR:-}" = "systemd" ]; then
+        journalctl -u dae -f --no-pager 2>/dev/null \
+            | grep --line-buffered -iE \
+                'node|subscript|fetch|latency|chosen|group|select|policy|fail|error|warn|alive|dead|connect' \
+            | while IFS= read -r line; do
+                if printf '%s' "$line" | grep -qiE 'error|fail|dead'; then
+                    printf "${RED}  %s${NC}\n" "$line"
+                elif printf '%s' "$line" \
+                    | grep -qiE 'chosen|select|alive|latency'; then
+                    printf "${GREEN}  %s${NC}\n" "$line"
+                elif printf '%s' "$line" | grep -qiE 'warn|no node'; then
+                    printf "${YELLOW}  %s${NC}\n" "$line"
+                else
+                    printf "${CYAN}  %s${NC}\n" "$line"
+                fi
+            done
+    elif [ -f "$LOG_FILE" ]; then
+        tail -f "$LOG_FILE" 2>/dev/null \
+            | grep --line-buffered -iE \
+                'node|subscript|fetch|latency|chosen|group|select|policy|fail|error|warn|alive|dead|connect' \
+            | while IFS= read -r line; do
+                if printf '%s' "$line" | grep -qiE 'error|fail|dead'; then
+                    printf "${RED}  %s${NC}\n" "$line"
+                elif printf '%s' "$line" \
+                    | grep -qiE 'chosen|select|alive|latency'; then
+                    printf "${GREEN}  %s${NC}\n" "$line"
+                else
+                    printf "${CYAN}  %s${NC}\n" "$line"
+                fi
+            done
+    else
+        warn "无法读取日志"
+    fi
+
+    _restore_log_level
+    trap - INT TERM
+
+    printf "\n"
+    printf "日志查看完毕，是否立即进行代理连通性验证？(y/n 默认y): "
+    read -r do_verify
+    if [ "${do_verify:-y}" = "y" ] || [ "${do_verify:-y}" = "Y" ]; then
+        verify_proxy_effectiveness
+    fi
+}
+
+verify_proxy_effectiveness() {
+    printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+    printf "${CYAN}   🌐 代理连通性验证                                        ${NC}\n"
+    printf "${CYAN}═══════════════════════════════════════════════════════════${NC}\n\n"
+
+    if ! pgrep -x dae >/dev/null 2>&1; then
+        err "dae 未运行，请先启动服务"
+        return 1
+    fi
+
+    printf "${BLUE}── 测试一：国内直连 ────────────────────────────────────────${NC}\n"
+    for entry in "baidu.com:百度" "qq.com:腾讯" "163.com:网易"; do
+        local host label code duration rtt
+        host=$(printf '%s' "$entry" | cut -d: -f1)
+        label=$(printf '%s' "$entry" | cut -d: -f2)
+        local result
+        result=$(curl -s -o /dev/null \
+            --connect-timeout 5 \
+            -w "%{http_code} %{time_total}" \
+            "http://${host}" 2>/dev/null || echo "000 0")
+        code=$(printf '%s' "$result" | awk '{print $1}')
+        duration=$(printf '%s' "$result" | awk '{print $2}')
+        if [ "${code:-000}" != "000" ]; then
+            rtt=$(awk "BEGIN{printf \"%.0f\", ${duration}*1000}")
+            printf "  ${GREEN}✓ %-8s${NC} %-12s HTTP %-5s ${CYAN}%s ms${NC}\n" \
+                "$label" "($host)" "$code" "$rtt"
+        else
+            printf "  ${RED}✗ %-8s${NC} %-12s 连接失败\n" "$label" "($host)"
+        fi
+    done
+
+    printf "\n${BLUE}── 测试二：境外代理 ────────────────────────────────────────${NC}\n"
+    for entry in "google.com:Google" "github.com:GitHub" "youtube.com:YouTube"; do
+        local host label code duration rtt
+        host=$(printf '%s' "$entry" | cut -d: -f1)
+        label=$(printf '%s' "$entry" | cut -d: -f2)
+        local result
+        result=$(curl -s -o /dev/null \
+            --connect-timeout 10 \
+            -w "%{http_code} %{time_total}" \
+            "https://${host}" 2>/dev/null || echo "000 0")
+        code=$(printf '%s' "$result" | awk '{print $1}')
+        duration=$(printf '%s' "$result" | awk '{print $2}')
+        if [ "${code:-000}" != "000" ]; then
+            rtt=$(awk "BEGIN{printf \"%.0f\", ${duration}*1000}")
+            printf "  ${GREEN}✓ %-8s${NC} %-12s HTTP %-5s ${CYAN}%s ms${NC}\n" \
+                "$label" "($host)" "$code" "$rtt"
+        else
+            printf "  ${RED}✗ %-8s${NC} %-12s 连接失败（代理可能未生效）\n" \
+                "$label" "($host)"
+        fi
+    done
+
+    printf "\n${BLUE}── 测试三：出口 IP 检测 ────────────────────────────────────${NC}\n"
+    printf "  ${YELLOW}正在检测...${NC}\n"
+    local exit_ip=""
+    for ip_api in \
+        "https://api.ipify.org" \
+        "https://ip.sb" \
+        "https://ifconfig.me"; do
+        exit_ip=$(curl -s --connect-timeout 8 "$ip_api" 2>/dev/null \
+            | tr -cd '0-9.' | head -c 15 || true)
+        [ -n "$exit_ip" ] && break
+    done
+
+    if [ -n "$exit_ip" ]; then
+        printf "  出口 IP: ${GREEN}%s${NC}\n" "$exit_ip"
+        local geo_info country city org
+        geo_info=$(curl -s --connect-timeout 8 \
+            "https://ipinfo.io/${exit_ip}/json" 2>/dev/null || true)
+        if [ -n "$geo_info" ]; then
+            country=$(printf '%s' "$geo_info" \
+                | grep '"country"' \
+                | sed -E 's/.*"country"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+                || true)
+            city=$(printf '%s' "$geo_info" \
+                | grep '"city"' \
+                | sed -E 's/.*"city"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+                || true)
+            org=$(printf '%s' "$geo_info" \
+                | grep '"org"' \
+                | sed -E 's/.*"org"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+                || true)
+            printf "  归属地: ${CYAN}%s %s${NC}\n" "$country" "$city"
+            printf "  运营商: ${CYAN}%s${NC}\n" "$org"
+            if [ "${country:-CN}" = "CN" ]; then
+                printf "\n  ${RED}⚠️  出口 IP 位于中国大陆，代理可能未正常工作！${NC}\n"
+                printf "  ${YELLOW}检查建议：${NC}\n"
+                printf "  1. 用菜单 L 确认订阅节点是否拉取成功\n"
+                printf "  2. 确认主路由网关已指向本机 %s\n" "${LAN_IP:-本机IP}"
+                printf "  3. 检查 routing 中 pname 规则是否排除了本机进程\n"
+            else
+                printf "\n  ${GREEN}✅ 出口 IP 位于境外（%s），代理正常工作！${NC}\n" \
+                    "$country"
+            fi
+        fi
+    else
+        printf "  ${RED}✗ 无法获取出口 IP（境外服务均不可达）${NC}\n"
+        printf "  ${YELLOW}  代理可能未生效，或节点全部不可用${NC}\n"
+    fi
+
+    printf "\n${BLUE}── 测试四：DNS 泄露检测 ────────────────────────────────────${NC}\n"
+    printf "  ${YELLOW}检测中...${NC}\n"
+    local dns_result dns_ip dns_loc
+    dns_result=$(curl -s --connect-timeout 8 \
+        "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null || true)
+    if [ -n "$dns_result" ]; then
+        dns_ip=$(printf '%s' "$dns_result" \
+            | grep '^ip=' | cut -d= -f2 || true)
+        dns_loc=$(printf '%s' "$dns_result" \
+            | grep '^loc=' | cut -d= -f2 || true)
+        printf "  Cloudflare 检测 IP: ${CYAN}%s${NC}\n" "$dns_ip"
+        printf "  Cloudflare 检测地区: ${CYAN}%s${NC}\n" "$dns_loc"
+        if [ "${dns_loc:-CN}" = "CN" ]; then
+            printf "  ${RED}⚠️  检测到中国大陆，可能存在 DNS 泄露${NC}\n"
+        else
+            printf "  ${GREEN}✅ DNS 未泄露（地区: %s）${NC}\n" "$dns_loc"
+        fi
+    else
+        printf "  ${YELLOW}△ 无法访问 Cloudflare 检测接口${NC}\n"
+    fi
+
+    printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
+}
 # ==================== daed 面板安装/更新 ====================
 install_daed_panel() {
     printf "\n${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
@@ -2411,6 +2643,8 @@ main_menu() {
         printf "  9) 🔔  配置企业微信 Webhook 通知\n"
         printf "  N) 📊  订阅与节点信息查看\n"
         printf "  M) 🧠  内存诊断与 BPF LPM Map 缓解\n"
+        printf "  L) 🔍  节点拉取验证（临时 info 日志，自动还原）\n"
+        printf "  P) 🌐  代理连通性验证（出口 IP / DNS 泄露检测）\n"
         printf "  ${RED}U) ☠️  彻底卸载 dae + daed 全部组件${NC}\n"
         printf "  0) 退出\n"
         printf "${GREEN}═══════════════════════════════════════════════════════════${NC}\n"
@@ -2524,6 +2758,8 @@ main_menu() {
                     || warn "Webhook 已清除。" ;;
             [Nn]) show_node_info ;;
             [Mm]) memory_diagnostic_menu ;;
+            [Ll]) verify_node_fetch ;;
+            [Pp]) verify_proxy_effectiveness ;;
             [Uu]) uninstall_all ;;
             0) info "退出，祝网络畅通！"; exit 0 ;;
             *) err "无效选项「${choice:-}」。" ;;
