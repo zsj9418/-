@@ -21,6 +21,16 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+# 候选镜像源（含直连）
+MIRROR_CANDIDATES=(
+  "direct"
+  "https://docker.1ms.run"
+  "https://docker.xuanyuan.me"
+  "https://docker.m.daocloud.io"
+  "https://dockerproxy.net"
+  "https://docker.1panel.live"
+)
+
 # 日志
 log() {
   local level=$1
@@ -158,6 +168,110 @@ install_dependencies() {
   fi
 }
 
+# 测试单个镜像源速度
+test_mirror_speed() {
+  local mirror=$1
+  local test_url=""
+  local start end elapsed
+
+  if [[ "$mirror" == "direct" ]]; then
+    test_url="https://hub.docker.com"
+  else
+    test_url="${mirror}/v2/"
+  fi
+
+  start=$(date +%s%3N)
+  local http_code
+  http_code=$(curl -o /dev/null -s -m 5 -w "%{http_code}" "$test_url" 2>/dev/null)
+  end=$(date +%s%3N)
+  elapsed=$((end - start))
+
+  # 200/301/302/401 均视为可达（401 为未认证，属正常响应）
+  if [[ "$http_code" =~ ^(200|301|302|401)$ ]]; then
+    echo "$elapsed $mirror"
+  else
+    echo "9999 $mirror"
+  fi
+}
+
+# 测速并自动配置最优镜像源
+configure_docker_mirror() {
+  log "INFO" "开始测速所有镜像源，请稍候..."
+  echo ""
+
+  local results=()
+  for mirror in "${MIRROR_CANDIDATES[@]}"; do
+    local result
+    result=$(test_mirror_speed "$mirror")
+    results+=("$result")
+    local ms
+    ms=$(echo "$result" | awk '{print $1}')
+    local name
+    name=$(echo "$result" | awk '{print $2}')
+    if [[ "$ms" == "9999" ]]; then
+      echo -e "  ${RED}✗ $name (不可达或超时)${NC}"
+    else
+      echo -e "  ${GREEN}✓ $name : ${ms}ms${NC}"
+    fi
+  done
+
+  echo ""
+
+  # 按延迟升序排序，过滤掉不可达的
+  local sorted
+  sorted=$(printf '%s\n' "${results[@]}" | sort -n | awk '$1 != 9999')
+
+  if [[ -z "$sorted" ]]; then
+    log "WARN" "所有镜像源均不可达，保持现有 Docker 配置不变"
+    return
+  fi
+
+  local best_mirror
+  best_mirror=$(echo "$sorted" | head -n 1 | awk '{print $2}')
+  local best_ms
+  best_ms=$(echo "$sorted" | head -n 1 | awk '{print $1}')
+
+  log "INFO" "最快镜像源: $best_mirror (${best_ms}ms)"
+
+  # 直连最快则清空镜像加速配置
+  if [[ "$best_mirror" == "direct" ]]; then
+    log "INFO" "直连 Docker Hub 最快，不配置镜像加速"
+    sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+{}
+EOF
+  else
+    # 最快的排第一，其余可用源依次追加兜底（排除 direct）
+    local mirror_list=("$best_mirror")
+    while IFS= read -r line; do
+      local m
+      m=$(echo "$line" | awk '{print $2}')
+      if [[ "$m" != "$best_mirror" && "$m" != "direct" ]]; then
+        mirror_list+=("$m")
+      fi
+    done <<< "$sorted"
+
+    # 构建 daemon.json
+    sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+{
+  "registry-mirrors": [
+$(printf '    "%s",\n' "${mirror_list[@]}" | sed '$ s/,$//')
+  ]
+}
+EOF
+  fi
+
+  # OpenWrt 使用 service 重启，其余用 systemctl
+  if [[ "$OS" == "openwrt" ]]; then
+    service docker restart >/dev/null 2>&1 || log "WARN" "Docker 重启失败，请手动执行: service docker restart"
+  else
+    sudo systemctl daemon-reload
+    sudo systemctl restart docker
+  fi
+
+  log "INFO" "Docker 镜像源配置完成"
+  echo ""
+}
+
 pull_image() {
   local image_name=$1
   local image_tag=$2
@@ -165,6 +279,7 @@ pull_image() {
     if docker pull "$image_name:$image_tag"; then
       return 0
     fi
+    log "WARN" "第 $i 次拉取失败，5 秒后重试..."
     sleep 5
   done
   log "ERROR" "拉取镜像 $image_name:$image_tag 失败。请确认镜像支持你的架构($ARCH)。"
@@ -506,7 +621,8 @@ interactive_menu() {
     echo "6. 卸载容器（Sub-Store 或 Watchtower）"
     echo "7. 数据备份"
     echo "8. 数据恢复"
-    echo "9. 退出"
+    echo "9. 重新检测并配置最优镜像源"
+    echo "10. 退出"
     read -p "请输入选项编号: " choice
     case $choice in
       1) create_directories; install_substore ;;
@@ -526,7 +642,8 @@ interactive_menu() {
         ;;
       7) backup_data ;;
       8) restore_data ;;
-      9) log "INFO" "退出脚本"; exit 0 ;;
+      9) configure_docker_mirror ;;
+      10) log "INFO" "退出脚本"; exit 0 ;;
       *) log "WARN" "无效输入，请重新选择" ;;
     esac
   done
@@ -538,6 +655,7 @@ main() {
   check_network
   check_docker_permissions
   install_dependencies
+  configure_docker_mirror
   interactive_menu
 }
 
