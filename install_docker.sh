@@ -23,6 +23,9 @@ REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.m.daocloud.io"
   "https://hub.rat.dev"
   "https://dockerpull.com"
+  "https://docker.nju.edu.cn"
+  "https://dockerproxy.com"
+  "https://mirror.baidubce.com"
 )
 
 # 颜色
