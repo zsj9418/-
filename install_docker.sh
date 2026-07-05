@@ -301,12 +301,7 @@ cat >/etc/docker/daemon.json <<EOF
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" },
   "registry-mirrors": [
-    "${REGISTRY_MIRRORS_DEFAULT[0]}",
-    "${REGISTRY_MIRRORS_DEFAULT[1]}",
-    "${REGISTRY_MIRRORS_DEFAULT[2]}"
-    "${REGISTRY_MIRRORS_DEFAULT[3]}",
-    "${REGISTRY_MIRRORS_DEFAULT[4]}",
-    "${REGISTRY_MIRRORS_DEFAULT[5]}"
+    "${REGISTRY_MIRRORS_DEFAULT[0]}"
   ]
 }
 EOF
