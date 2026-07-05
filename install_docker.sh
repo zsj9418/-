@@ -3,34 +3,38 @@ set -o pipefail
 
 #====================== 基本配置 ======================#
 
-# 必需依赖（脚本自身 + Docker 运行时）与可选依赖
-# 将所有依赖集中于此，一次性安装
 REQ_DEPS=("curl" "wget" "jq")
 OPT_DEPS=("fzf")
 
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
 
-# 代理前缀（按顺序尝试）
+# 仅用于代理 GitHub 相关 URL
 PROXY_PREFIXES=(
-  "https://fastly.jsdelivr.net/"
+  "https://ghproxy.com/"
   "https://gitclone.com/"
   "https://gitdl.cn/"
 )
 
-# 默认镜像加速源（daemon.json 用）
+# 默认镜像加速源
 REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.1ms.run"
 )
+
+# daemon.json 备份目录
+DAEMON_BACKUP_DIR="/etc/docker/backups"
 
 # 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 # 全局变量
-INSTALL_STATUS=$(mktemp)
+LOG_FILE="/var/log/docker_install_$(date +%Y%m%d_%H%M%S).log"
 DOCKER_URL=""
 DOCKER_INSTALL_DIR=""
 ARCH=""
@@ -39,6 +43,19 @@ PKG_MANAGER=""
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.3.1"
 
+#====================== 信号捕获 & 日志 ======================#
+
+# 中断/终止信号统一清理
+cleanup() {
+  echo -e "\n${YELLOW}检测到中断信号，正在清理临时文件...${NC}"
+  [[ -n "$DOCKER_INSTALL_DIR" && -d "$DOCKER_INSTALL_DIR" ]] && rm -rf "$DOCKER_INSTALL_DIR"
+  echo -e "${YELLOW}日志已保存至: ${LOG_FILE}${NC}"
+  exit 130
+}
+trap cleanup INT TERM
+
+# 所有输出同时写入日志文件
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 #====================== 通用工具函数 ======================#
 
@@ -62,50 +79,43 @@ detect_package_manager() {
   fi
 }
 
-# 按不同包管理器安装所有依赖（必需 + 可选），只在脚本启动时执行一次
 install_dependencies() {
   echo "正在检测并安装所有缺失的依赖..."
   local missing_req_deps=()
   for dep in "${REQ_DEPS[@]}"; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
-      missing_req_deps+=("$dep")
-    fi
+    command -v "$dep" >/dev/null 2>&1 || missing_req_deps+=("$dep")
   done
 
   local missing_opt_deps=()
   for dep in "${OPT_DEPS[@]}"; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
-      missing_opt_deps+=("$dep")
-    fi
+    command -v "$dep" >/dev/null 2>&1 || missing_opt_deps+=("$dep")
   done
 
-  # 如果没有任何依赖缺失，则直接返回
-  if [ ${#missing_req_deps[@]} -eq 0 ] && [ ${#missing_opt_deps[@]} -eq 0 ]; then
+  if [[ ${#missing_req_deps[@]} -eq 0 && ${#missing_opt_deps[@]} -eq 0 ]]; then
     echo -e "${GREEN}所有依赖均已安装。${NC}"
     return 0
   fi
 
-  # 只有在需要安装时才执行包管理器操作
   case "$PKG_MANAGER" in
     apt-get)
       apt-get update || true
-      if [ ${#missing_req_deps[@]} -gt 0 ]; then
+      if [[ ${#missing_req_deps[@]} -gt 0 ]]; then
         echo "正在安装必需依赖: ${missing_req_deps[*]}"
         apt-get install -y --no-install-recommends "${missing_req_deps[@]}" || {
           echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
       fi
-      if [ ${#missing_opt_deps[@]} -gt 0 ]; then
+      if [[ ${#missing_opt_deps[@]} -gt 0 ]]; then
         echo "正在安装可选依赖: ${missing_opt_deps[*]}"
         apt-get install -y --no-install-recommends "${missing_opt_deps[@]}" 2>/dev/null || true
       fi
       ;;
     dnf|yum)
-      if [ ${#missing_req_deps[@]} -gt 0 ]; then
+      if [[ ${#missing_req_deps[@]} -gt 0 ]]; then
         echo "正在安装必需依赖: ${missing_req_deps[*]}"
         "${PKG_MANAGER}" install -y "${missing_req_deps[@]}" || {
           echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
       fi
-      if [ ${#missing_opt_deps[@]} -gt 0 ]; then
+      if [[ ${#missing_opt_deps[@]} -gt 0 ]]; then
         echo "正在安装可选依赖: ${missing_opt_deps[*]}"
         "${PKG_MANAGER}" install -y "${missing_opt_deps[@]}" 2>/dev/null || true
       fi
@@ -114,38 +124,41 @@ install_dependencies() {
 }
 
 get_architecture() {
-  local m=$(uname -m)
+  local m
+  m=$(uname -m)
   case "$m" in
-    x86_64) ARCH="x86_64" ;;
+    x86_64)  ARCH="x86_64" ;;
     aarch64) ARCH="aarch64" ;;
-    armv7l) ARCH="armv7" ;; # 注意 Docker 静态包的命名 armv7
-    armv6l) ARCH="armv6" ;; # 注意 Docker 静态包的命名 armv6
-    *) echo -e "${RED}不支持的架构: $m${NC}"; exit 1 ;;
+    armv7l)  ARCH="armv7" ;;
+    armv6l)  ARCH="armv6" ;;
+    *) echo -e "${RED}不支持的架构: $m${NC}" >&2; exit 1 ;;
   esac
   echo "$ARCH"
 }
 
 get_os_version() {
-  if [ -f /etc/os-release ]; then
+  if [[ -f /etc/os-release ]]; then
     OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     echo "$OS_NAME $OS_VERSION"
   else
-    echo -e "${RED}无法检测系统版本（缺少 /etc/os-release）。${NC}"
-    exit 1
+    echo -e "${YELLOW}警告: 无法读取 /etc/os-release，系统版本未知。${NC}" >&2
+    echo "unknown"
   fi
 }
 
 check_and_set_install_dir() {
   local REQUIRED_SPACE=500  # MB
   local realpath_cmd
-  if command -v realpath >/dev/null 2>&1; then
-    realpath_cmd="realpath"
-  else
-    realpath_cmd="readlink -f"
-  fi
+  realpath_cmd=$(command -v realpath 2>/dev/null || echo "readlink -f")
+
+  # ✅ 修复：curl|bash 管道执行时 $0 为 "bash"，需要回退到 /tmp
   local DIR
-  DIR=$(dirname "$($realpath_cmd "$0")")
+  if [[ "$0" == "bash" || "$0" == "-bash" || "$0" == "sh" || "$0" == "-sh" ]]; then
+    DIR="/tmp"
+  else
+    DIR=$(dirname "$($realpath_cmd "$0" 2>/dev/null || echo "$0")")
+  fi
   local DEFAULT_DIR="${DIR}/docker_install"
 
   mkdir -p "$DEFAULT_DIR" 2>/dev/null || {
@@ -206,24 +219,50 @@ check_docker_compose_installed() {
   return 1
 }
 
+# ✅ 新增：统一下载函数，区分 GitHub URL 与其他 URL 的代理策略
+download_with_fallback() {
+  local url="$1"
+  local dest="$2"
+
+  echo "下载: $url" >&2
+  if curl -fSL --retry 3 --connect-timeout 20 "$url" -o "$dest"; then
+    return 0
+  fi
+
+  echo -e "${YELLOW}直连失败，尝试代理...${NC}" >&2
+
+  # 代理前缀仅对 GitHub 域名有效
+  if [[ "$url" == *"github.com"* || "$url" == *"githubusercontent.com"* ]]; then
+    for prefix in "${PROXY_PREFIXES[@]}"; do
+      local proxy_url="${prefix}${url}"
+      echo "代理下载: $proxy_url" >&2
+      if curl -fSL --retry 3 --connect-timeout 20 "$proxy_url" -o "$dest"; then
+        echo -e "${GREEN}代理下载成功${NC}" >&2
+        return 0
+      fi
+      echo -e "${YELLOW}代理失败: $proxy_url${NC}" >&2
+    done
+  else
+    # 非 GitHub URL（如 download.docker.com）多重试几次，无有效代理
+    echo -e "${YELLOW}注意：该地址不支持代理加速，已重试3次仍失败。${NC}" >&2
+  fi
+
+  return 1
+}
+
 #====================== Docker 前置准备 ======================#
 
 ensure_docker_prereqs() {
   echo "正在配置 Docker 运行环境..."
 
-  # 1) 【核心】检查并加载 Docker 必需的内核模块
   echo "检查 Docker 必需的内核模块..."
-  
-  # 1a) 检查并加载基础模块
   modprobe overlay 2>/dev/null || true
   modprobe br_netfilter 2>/dev/null || true
 
-  # 1b) 【智能降级检测】检查 iptable_raw 模块
   if ! iptables -t raw -L >/dev/null 2>&1; then
     echo -e "${YELLOW}检测到 iptables 'raw' 表不可用，新版 Docker (>=28) 强依赖此功能。${NC}"
     echo -e "${YELLOW}正在尝试加载 'iptable_raw' 内核模块...${NC}"
-    modprobe iptable_raw
-    # 再次检查，如果仍然失败，则设置降级标志
+    modprobe iptable_raw 2>/dev/null || true
     if ! iptables -t raw -L >/dev/null 2>&1; then
       echo -e "${RED}警告: 'iptable_raw' 内核模块加载失败！${NC}"
       echo -e "${YELLOW}这通常发生在内核过于精简或在特殊的虚拟化环境（如 OpenVZ）中。${NC}"
@@ -233,19 +272,15 @@ ensure_docker_prereqs() {
       echo -e "${GREEN}'iptable_raw' 模块加载成功，系统支持最新版 Docker。${NC}"
     fi
   else
-      echo -e "${GREEN}iptables 'raw' 表可用，兼容性良好。${NC}"
+    echo -e "${GREEN}iptables 'raw' 表可用，兼容性良好。${NC}"
   fi
-  
-  # 2) 将必需模块写入配置文件，确保开机自启
+
   if [[ "$FORCE_LEGACY_DOCKER" == "false" ]]; then
-    # 正常模式下，添加所有模块
     printf "overlay\nbr_netfilter\niptable_raw\n" >/etc/modules-load.d/docker.conf
   else
-    # 降级模式下，不需要 raw 模块
     printf "overlay\nbr_netfilter\n" >/etc/modules-load.d/docker.conf
   fi
 
-  # 3) sysctl 开启转发与桥接
   cat >/etc/sysctl.d/99-docker.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
@@ -253,13 +288,12 @@ net.bridge.bridge-nf-call-ip6tables=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 
-  # 4) 智能检测并切换 iptables 后端
-  if command -v update-alternatives >/dev/null 2>&1 && [ -f /usr/sbin/iptables-legacy ]; then
-    if iptables -V | grep -q 'nf_tables'; then
+  if command -v update-alternatives >/dev/null 2>&1 && [[ -f /usr/sbin/iptables-legacy ]]; then
+    if iptables -V 2>/dev/null | grep -q 'nf_tables'; then
       echo -e "${YELLOW}检测到系统正在使用 iptables-nft 后端... 正在切换到 legacy...${NC}"
       update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1
       update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1
-      if iptables -V | grep -q 'legacy'; then
+      if iptables -V 2>/dev/null | grep -q 'legacy'; then
         echo -e "${GREEN}iptables 后端已成功切换到 legacy 模式。${NC}"
       else
         echo -e "${RED}iptables 后端切换失败。${NC}"
@@ -269,17 +303,13 @@ EOF
     fi
   fi
 
-  # 5) 最终校验 NAT 表
-  # 确保 NAT 表可用；不通则尝试加载相关内核模块
   if ! iptables -t nat -L >/dev/null 2>&1; then
     modprobe iptable_nat nf_nat 2>/dev/null || true
-    # 再测一次
     if ! iptables -t nat -L >/dev/null 2>&1; then
-      echo -e "${YELLOW}警告：系统无法访问 iptables NAT 表。Docker 的端口映射等网络功能可能无法使用。${NC}"
+      echo -e "${YELLOW}警告：系统无法访问 iptables NAT 表。Docker 端口映射等网络功能可能无法使用。${NC}"
     fi
   fi
 
-  # 6) 提示 cgroup（仅提示）
   local cg
   cg=$(stat -f -c %T /sys/fs/cgroup 2>/dev/null || echo "")
   if [[ "$cg" != "cgroup2fs" && -n "$cg" ]]; then
@@ -289,11 +319,10 @@ EOF
   echo -e "${GREEN}Docker 运行环境配置完成。${NC}"
 }
 
-# 生成/补全 daemon.json（若不存在则创建）
 ensure_daemon_json() {
   mkdir -p /etc/docker
-  if [ ! -s /etc/docker/daemon.json ]; then
-cat >/etc/docker/daemon.json <<EOF
+  if [[ ! -s /etc/docker/daemon.json ]]; then
+    cat >/etc/docker/daemon.json <<EOF
 {
   "iptables": true,
   "ip6tables": true,
@@ -307,18 +336,20 @@ cat >/etc/docker/daemon.json <<EOF
 EOF
   fi
 
-  # 如内核无 overlay，尝试 fuse-overlayfs
   if ! grep -qw overlay /proc/filesystems; then
     case "$PKG_MANAGER" in
       apt-get) apt-get install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
       dnf|yum) "${PKG_MANAGER}" install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
     esac
     if command -v jq >/dev/null 2>&1; then
+      local tmp
       tmp=$(mktemp)
-      jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+      jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" \
+        && mv "$tmp" /etc/docker/daemon.json
     else
-      # 简化追加
-cat >/etc/docker/daemon.json <<'EOF'
+      # ✅ 修复：先备份，再覆盖，避免丢失已有配置
+      backup_daemon_json
+      cat >/etc/docker/daemon.json <<'EOF'
 {
   "iptables": true,
   "ip6tables": true,
@@ -333,23 +364,27 @@ EOF
 #====================== 版本获取/选择 ======================#
 
 fetch_docker_versions() {
-  local CACHE_FILE="$DOCKER_INSTALL_DIR/docker_versions_cache"
-  if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE") -gt $(($(date +%s) - 3600)) ]]; then
+  # 版本缓存放在 /tmp，避免随安装目录删除而失效
+  local CACHE_FILE="/tmp/docker_versions_cache"
+  if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) -gt $(( $(date +%s) - 3600 )) ]]; then
     cat "$CACHE_FILE"
     return
   fi
   ARCH=$(get_architecture)
   local URL="$DOCKER_VERSIONS_URL$ARCH/"
   local VERSIONS
-  VERSIONS=$(curl -s "$URL" | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
-  if [ -z "$VERSIONS" ]; then
-    echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}"
+  VERSIONS=$(curl -s --connect-timeout 15 "$URL" \
+    | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' \
+    | sort -Vr | uniq)
+  if [[ -z "$VERSIONS" ]]; then
+    echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}" >&2
     exit 1
   fi
   echo "$VERSIONS" > "$CACHE_FILE"
   echo "$VERSIONS"
 }
 
+# ✅ 修复：所有提示信息改为 >&2，避免污染命令替换的返回值
 select_version() {
   local VERSIONS=("$@")
   if command -v fzf >/dev/null 2>&1; then
@@ -358,36 +393,362 @@ select_version() {
       --prompt="请选择版本 > " \
       --header="选择版本（回车确认）" \
       --height=20 --reverse --border)
-    if [ -n "$SELECTED_VERSION" ]; then
-      echo "$SELECTED_VERSION"; return
+    if [[ -n "$SELECTED_VERSION" ]]; then
+      echo "$SELECTED_VERSION"
+      return
     else
-      echo -e "${YELLOW}未选择，使用最新版本...${NC}"
-      echo "${VERSIONS[0]}"; return
+      echo -e "${YELLOW}未选择，使用最新版本...${NC}" >&2
+      echo "${VERSIONS[0]}"
+      return
     fi
   fi
 
-  echo "可用版本列表:"
+  echo "可用版本列表:" >&2
   PS3="请选择版本 (默认1为最新): "
   select VERSION in "${VERSIONS[@]}" "取消"; do
     case $REPLY in
-      ''|1) echo "${VERSIONS[0]}"; return ;;
-      [2-9]|[1-9][0-9]) 
-        if [ "$REPLY" -le "${#VERSIONS[@]}" ]; then
-          echo "${VERSIONS[$((REPLY-1))]}"; return
-        fi ;;
-      *) echo -e "${YELLOW}未选择，使用最新版本...${NC}"; echo "${VERSIONS[0]}"; return ;;
+      ''|1)
+        echo "${VERSIONS[0]}"
+        return
+        ;;
+      *)
+        if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 2 && REPLY <= ${#VERSIONS[@]} )); then
+          echo "${VERSIONS[$((REPLY-1))]}"
+          return
+        else
+          echo -e "${YELLOW}无效选择，使用最新版本...${NC}" >&2
+          echo "${VERSIONS[0]}"
+          return
+        fi
+        ;;
     esac
   done
 }
 
 fetch_docker_compose_versions() {
   local VERSIONS
-  VERSIONS=$(curl -s "$COMPOSE_RELEASES_URL" | jq -r '.[].tag_name' | sort -Vr | uniq)
-  if [ -z "$VERSIONS" ]; then
-    echo -e "${RED}无法获取 Docker Compose 版本列表。${NC}"
+  VERSIONS=$(curl -s --connect-timeout 15 "$COMPOSE_RELEASES_URL" \
+    | jq -r '.[].tag_name' | sort -Vr | uniq)
+  if [[ -z "$VERSIONS" ]]; then
+    echo -e "${RED}无法获取 Docker Compose 版本列表。${NC}" >&2
     exit 1
   fi
   echo "$VERSIONS"
+}
+
+#====================== daemon.json 备份与回滚 ======================#
+
+backup_daemon_json() {
+  [[ -f /etc/docker/daemon.json ]] || return 0
+  mkdir -p "$DAEMON_BACKUP_DIR"
+  local bak="${DAEMON_BACKUP_DIR}/daemon.json.$(date +%Y%m%d_%H%M%S)"
+  cp /etc/docker/daemon.json "$bak" && \
+    echo -e "${GREEN}已备份 daemon.json 至: $bak${NC}" || \
+    echo -e "${RED}备份失败${NC}"
+}
+
+restore_daemon_json() {
+  mkdir -p "$DAEMON_BACKUP_DIR"
+  local backups=()
+  while IFS= read -r -d '' f; do
+    backups+=("$f")
+  done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
+
+  if [[ ${#backups[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}暂无备份文件，请先执行备份操作。${NC}"
+    return
+  fi
+
+  echo -e "${CYAN}可用的备份列表：${NC}"
+  local i=1
+  for f in "${backups[@]}"; do
+    echo "  $i) $(basename "$f")  ($(stat -c %y "$f" 2>/dev/null | cut -d. -f1))"
+    ((i++))
+  done
+
+  read -r -p "请输入要回滚的备份编号 (回车取消): " IDX
+  if [[ -z "$IDX" ]]; then
+    echo -e "${YELLOW}已取消回滚。${NC}"
+    return
+  fi
+  if ! [[ "$IDX" =~ ^[0-9]+$ ]] || (( IDX < 1 || IDX > ${#backups[@]} )); then
+    echo -e "${RED}无效编号。${NC}"
+    return
+  fi
+
+  local selected="${backups[$((IDX-1))]}"
+  backup_daemon_json   # 回滚前先备份当前配置
+  cp "$selected" /etc/docker/daemon.json && \
+    echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}" || \
+    { echo -e "${RED}回滚失败${NC}"; return; }
+
+  if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+    echo -e "${GREEN}daemon.json 格式校验通过。${NC}"
+    read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
+    if [[ "$DORESTART" == "y" ]]; then
+      _restart_docker
+    fi
+  else
+    echo -e "${RED}警告：回滚后的 daemon.json 格式不正确，请检查！${NC}"
+  fi
+}
+
+manage_daemon_json() {
+  while true; do
+    echo -e "\n${CYAN}========== daemon.json 备份与回滚 ==========${NC}"
+    echo "  1. 备份当前 daemon.json"
+    echo "  2. 查看所有备份"
+    echo "  3. 回滚到指定备份"
+    echo "  4. 删除指定备份"
+    echo "  0. 返回主菜单"
+    read -r -p "请选择操作: " DCHOICE
+    case "$DCHOICE" in
+      1) backup_daemon_json ;;
+      2)
+        local backups=()
+        while IFS= read -r -d '' f; do
+          backups+=("$f")
+        done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
+        if [[ ${#backups[@]} -eq 0 ]]; then
+          echo -e "${YELLOW}暂无备份。${NC}"
+        else
+          echo -e "${CYAN}现有备份：${NC}"
+          for f in "${backups[@]}"; do
+            echo "  - $(basename "$f")  ($(stat -c %y "$f" 2>/dev/null | cut -d. -f1))"
+          done
+        fi
+        ;;
+      3) restore_daemon_json ;;
+      4)
+        local backups=()
+        while IFS= read -r -d '' f; do
+          backups+=("$f")
+        done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
+        if [[ ${#backups[@]} -eq 0 ]]; then
+          echo -e "${YELLOW}暂无备份。${NC}"
+        else
+          local i=1
+          for f in "${backups[@]}"; do
+            echo "  $i) $(basename "$f")"
+            ((i++))
+          done
+          read -r -p "请输入要删除的编号 (回车取消): " DIDX
+          if [[ "$DIDX" =~ ^[0-9]+$ ]] && (( DIDX >= 1 && DIDX <= ${#backups[@]} )); then
+            rm -f "${backups[$((DIDX-1))]}" && \
+              echo -e "${GREEN}已删除备份。${NC}" || \
+              echo -e "${RED}删除失败。${NC}"
+          else
+            echo -e "${YELLOW}已取消。${NC}"
+          fi
+        fi
+        ;;
+      0) break ;;
+      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+    esac
+  done
+}
+
+#====================== Docker 服务管理 ======================#
+
+_start_docker() {
+  echo -e "${CYAN}正在启动 Docker 服务...${NC}"
+  if systemctl start docker; then
+    echo -e "${GREEN}Docker 服务已启动。${NC}"
+  else
+    echo -e "${RED}Docker 服务启动失败，请查看日志：journalctl -u docker -n 50 --no-pager${NC}"
+  fi
+}
+
+_stop_docker() {
+  echo -e "${CYAN}正在停止 Docker 服务...${NC}"
+  read -r -p "停止 Docker 会中断所有运行中容器，确认继续？(y/n): " CONFIRM
+  [[ "$CONFIRM" != "y" ]] && { echo -e "${YELLOW}已取消。${NC}"; return; }
+  if systemctl stop docker; then
+    echo -e "${GREEN}Docker 服务已停止。${NC}"
+  else
+    echo -e "${RED}Docker 服务停止失败。${NC}"
+  fi
+}
+
+_restart_docker() {
+  echo -e "${CYAN}正在重启 Docker 服务...${NC}"
+  if systemctl restart docker; then
+    echo -e "${GREEN}Docker 服务已重启。${NC}"
+  else
+    echo -e "${RED}Docker 服务重启失败，请查看日志：journalctl -u docker -n 50 --no-pager${NC}"
+  fi
+}
+
+manage_docker_service() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${RED}Docker 未安装，无法进行服务管理。${NC}"
+    return
+  fi
+  while true; do
+    local svc_status
+    svc_status=$(systemctl is-active docker 2>/dev/null)
+    local svc_enabled
+    svc_enabled=$(systemctl is-enabled docker 2>/dev/null)
+
+    echo -e "\n${CYAN}========== Docker 服务管理 ==========${NC}"
+    if [[ "$svc_status" == "active" ]]; then
+      echo -e "  当前状态: ${GREEN}● 运行中${NC}  开机自启: ${svc_enabled}"
+    else
+      echo -e "  当前状态: ${RED}● 已停止${NC}  开机自启: ${svc_enabled}"
+    fi
+    echo "  1. 启动 Docker"
+    echo "  2. 停止 Docker"
+    echo "  3. 重启 Docker"
+    echo "  4. 开启开机自启"
+    echo "  5. 关闭开机自启"
+    echo "  6. 查看实时日志（最近 50 行）"
+    echo "  0. 返回主菜单"
+    read -r -p "请选择操作: " SCHOICE
+    case "$SCHOICE" in
+      1) _start_docker ;;
+      2) _stop_docker ;;
+      3) _restart_docker ;;
+      4)
+        systemctl enable docker >/dev/null 2>&1 && \
+          echo -e "${GREEN}已开启开机自启。${NC}" || \
+          echo -e "${RED}操作失败。${NC}"
+        ;;
+      5)
+        systemctl disable docker >/dev/null 2>&1 && \
+          echo -e "${GREEN}已关闭开机自启。${NC}" || \
+          echo -e "${RED}操作失败。${NC}"
+        ;;
+      6)
+        echo -e "${CYAN}--- Docker 服务日志（最近 50 行，Ctrl+C 退出）---${NC}"
+        journalctl -u docker -n 50 --no-pager 2>/dev/null || \
+          echo -e "${RED}无法读取 Docker 日志。${NC}"
+        ;;
+      0) break ;;
+      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+    esac
+  done
+}
+
+#====================== Docker 状态仪表盘 ======================#
+
+show_docker_status() {
+  echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║         Docker 状态仪表盘                ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+
+  # ── 安装状态 ──────────────────────────────
+  echo -e "\n${BOLD}[ 安装状态 ]${NC}"
+  if command -v docker >/dev/null 2>&1; then
+    echo -e "  Docker:         ${GREEN}已安装 $(docker --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
+  else
+    echo -e "  Docker:         ${RED}未安装${NC}"
+  fi
+
+  if command -v docker-compose >/dev/null 2>&1; then
+    echo -e "  Compose 独立版: ${GREEN}已安装 $(docker-compose --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
+  else
+    echo -e "  Compose 独立版: ${YELLOW}未安装${NC}"
+  fi
+
+  if docker compose version >/dev/null 2>&1; then
+    echo -e "  Compose 插件:   ${GREEN}已安装 $(docker compose version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
+  else
+    echo -e "  Compose 插件:   ${YELLOW}未安装${NC}"
+  fi
+
+  # ── 服务状态 ──────────────────────────────
+  echo -e "\n${BOLD}[ 服务状态 ]${NC}"
+  local svc_status svc_enabled
+  svc_status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
+  svc_enabled=$(systemctl is-enabled docker 2>/dev/null || echo "disabled")
+
+  if [[ "$svc_status" == "active" ]]; then
+    echo -e "  服务:     ${GREEN}● 运行中${NC}"
+  else
+    echo -e "  服务:     ${RED}● ${svc_status}${NC}"
+  fi
+
+  if [[ "$svc_enabled" == "enabled" ]]; then
+    echo -e "  开机自启: ${GREEN}已开启${NC}"
+  else
+    echo -e "  开机自启: ${YELLOW}${svc_enabled}${NC}"
+  fi
+
+  # ── 运行时资源 ────────────────────────────
+  if [[ "$svc_status" == "active" ]] && command -v docker >/dev/null 2>&1; then
+    echo -e "\n${BOLD}[ 运行时资源 ]${NC}"
+
+    local total_c running_c stopped_c
+    total_c=$(docker ps -aq 2>/dev/null | wc -l)
+    running_c=$(docker ps -q 2>/dev/null | wc -l)
+    stopped_c=$(( total_c - running_c ))
+    echo -e "  容器: ${GREEN}${running_c} 运行中${NC} / ${YELLOW}${stopped_c} 已停止${NC} / 共 ${total_c}"
+
+    local img_c
+    img_c=$(docker images -q 2>/dev/null | wc -l)
+    echo -e "  镜像: ${img_c} 个"
+
+    local vol_c
+    vol_c=$(docker volume ls -q 2>/dev/null | wc -l)
+    echo -e "  数据卷: ${vol_c} 个"
+
+    local net_c
+    net_c=$(docker network ls -q 2>/dev/null | wc -l)
+    echo -e "  网络: ${net_c} 个"
+
+    echo -e "\n${BOLD}[ 磁盘占用 (docker system df) ]${NC}"
+    docker system df 2>/dev/null | while IFS= read -r line; do
+      echo "  $line"
+    done
+
+    # 运行中容器简表
+    local running_list
+    running_list=$(docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
+    if [[ -n "$running_list" ]]; then
+      echo -e "\n${BOLD}[ 运行中容器 ]${NC}"
+      echo "$running_list" | while IFS= read -r line; do
+        echo "  $line"
+      done
+    fi
+  fi
+
+  # ── 配置文件状态 ──────────────────────────
+  echo -e "\n${BOLD}[ 配置文件 ]${NC}"
+  if [[ -f /etc/docker/daemon.json ]]; then
+    if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+      echo -e "  daemon.json: ${GREEN}存在，格式合法${NC}"
+      # 显示关键配置项
+      local mirrors storage log_driver
+      mirrors=$(jq -r '.["registry-mirrors"][]? // empty' /etc/docker/daemon.json 2>/dev/null | tr '\n' ' ')
+      storage=$(jq -r '."storage-driver" // "overlay2 (默认)"' /etc/docker/daemon.json 2>/dev/null)
+      log_driver=$(jq -r '."log-driver" // "json-file (默认)"' /etc/docker/daemon.json 2>/dev/null)
+      [[ -n "$mirrors" ]] && echo -e "    镜像加速: ${CYAN}${mirrors}${NC}"
+      echo -e "    存储驱动: ${CYAN}${storage}${NC}"
+      echo -e "    日志驱动: ${CYAN}${log_driver}${NC}"
+    else
+      echo -e "  daemon.json: ${RED}存在，但 JSON 格式错误！${NC}"
+    fi
+    local bak_count
+    bak_count=$(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" 2>/dev/null | wc -l)
+    echo -e "  备份数量: ${bak_count} 个（目录: ${DAEMON_BACKUP_DIR}）"
+  else
+    echo -e "  daemon.json: ${YELLOW}不存在${NC}"
+  fi
+
+  # ── 系统信息 ──────────────────────────────
+  echo -e "\n${BOLD}[ 系统信息 ]${NC}"
+  echo -e "  架构:   $(uname -m)"
+  echo -e "  内核:   $(uname -r)"
+  echo -e "  系统:   $(get_os_version 2>/dev/null)"
+  local mem_total mem_free
+  mem_total=$(free -m 2>/dev/null | awk '/^Mem/{print $2}')
+  mem_free=$(free -m 2>/dev/null | awk '/^Mem/{print $4}')
+  echo -e "  内存:   已用 $((mem_total - mem_free))MB / 共 ${mem_total}MB"
+  echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
+
+  echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"
+  echo -e "  日志文件: ${LOG_FILE}"
+  echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
 }
 
 #====================== 核心：安装/卸载 ======================#
@@ -398,8 +759,6 @@ install_docker() {
     [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker 安装。${NC}"; return; }
   fi
 
-  # 配置 Docker 运行环境（内核模块、sysctl 等）
-  # 这一步会根据系统情况设置 FORCE_LEGACY_DOCKER 标志
   ensure_docker_prereqs
 
   ARCH=$(get_architecture)
@@ -407,45 +766,31 @@ install_docker() {
 
   local VERSION
 
-  # 【核心智能降级逻辑】
   if [[ "$FORCE_LEGACY_DOCKER" == "true" ]]; then
     echo -e "${YELLOW}由于系统环境限制，将为您安装兼容性最好的旧版 Docker。${NC}"
     VERSION="$RECOMMENDED_LEGACY_DOCKER_VERSION"
-    # 检查推荐的版本是否存在
     local available_versions
     available_versions=$(fetch_docker_versions)
     if ! echo "$available_versions" | grep -q "^${VERSION}$"; then
-      echo -e "${RED}推荐的兼容版本 ${VERSION} 不在可用列表中！${NC}"
-      echo -e "${RED}安装中止。请检查网络或手动选择一个可用版本。${NC}"
+      echo -e "${RED}推荐的兼容版本 ${VERSION} 不在可用列表中！安装中止。${NC}"
       exit 1
     fi
   else
     echo "获取可用 Docker 版本..."
-    local VERSIONS
-    VERSIONS=$(fetch_docker_versions)
-    VERSION=$(select_version $VERSIONS)
+    # ✅ 修复：使用 mapfile 将版本列表正确转为数组，避免分词问题
+    mapfile -t VERSIONS_ARR <<< "$(fetch_docker_versions)"
+    VERSION=$(select_version "${VERSIONS_ARR[@]}")
     [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
   fi
 
   echo -e "${GREEN}选择的 Docker 版本：$VERSION${NC}"
-  DOCKER_URL="$DOCKER_VERSIONS_URL$ARCH/docker-$VERSION.tgz"
+  DOCKER_URL="${DOCKER_VERSIONS_URL}${ARCH}/docker-${VERSION}.tgz"
 
   echo "下载 Docker 二进制包：$DOCKER_URL"
-  if ! curl -fSL --retry 3 "$DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
-    echo -e "${YELLOW}直连失败，尝试代理...${NC}"
-    local DOWNLOAD_SUCCESS=false
-    for PROXY_PREFIX in "${PROXY_PREFIXES[@]}"; do
-      local PROXY_DOCKER_URL="${PROXY_PREFIX}${DOCKER_URL}"
-      echo "代理下载：$PROXY_DOCKER_URL"
-      if curl -fSL --retry 3 "$PROXY_DOCKER_URL" -o "$DOCKER_INSTALL_DIR/docker.tgz"; then
-        echo -e "${GREEN}代理下载成功${NC}"
-        DOWNLOAD_SUCCESS=true
-        break
-      else
-        echo -e "${YELLOW}代理下载失败：${PROXY_DOCKER_URL}${NC}"
-      fi
-    done
-    $DOWNLOAD_SUCCESS || { echo -e "${RED}所有下载方式均失败${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
+  if ! download_with_fallback "$DOCKER_URL" "$DOCKER_INSTALL_DIR/docker.tgz"; then
+    echo -e "${RED}所有下载方式均失败，请检查网络后重试。${NC}"
+    rm -rf "$DOCKER_INSTALL_DIR"
+    exit 1
   fi
 
   echo "解压 Docker 包..."
@@ -457,18 +802,17 @@ install_docker() {
   mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || {
     echo -e "${RED}移动文件失败${NC}"; exit 1; }
 
-  echo "创建 docker 用户组并加入当前用户（可选）..."
+  echo "创建 docker 用户组..."
   groupadd -f docker
   CURRENT_USER="${SUDO_USER:-$USER}"
   if [[ -n "$CURRENT_USER" && "$CURRENT_USER" != "root" ]]; then
     gpasswd -a "$CURRENT_USER" docker >/dev/null 2>&1 || true
   fi
 
-  # 生成/补全 daemon.json
   ensure_daemon_json
 
   echo "写入 systemd Unit ..."
-cat >/etc/systemd/system/docker.service <<'EOF'
+  cat >/etc/systemd/system/docker.service <<'EOF'
 [Unit]
 Description=Docker Application Container Engine
 Documentation=https://docs.docker.com
@@ -517,13 +861,14 @@ install_docker_compose() {
   fi
 
   echo "获取 Docker Compose 版本列表..."
-  local COMPOSE_VERSIONS
-  COMPOSE_VERSIONS=$(fetch_docker_compose_versions)
+  # ✅ 修复：使用 mapfile 正确构建数组
+  mapfile -t COMPOSE_ARR <<< "$(fetch_docker_compose_versions)"
   local COMPOSE_VERSION
-  COMPOSE_VERSION=$(select_version $COMPOSE_VERSIONS)
-  if [ -z "$COMPOSE_VERSION" ]; then
+  COMPOSE_VERSION=$(select_version "${COMPOSE_ARR[@]}")
+  if [[ -z "$COMPOSE_VERSION" ]]; then
     echo -e "${YELLOW}未选择，将安装最新版本...${NC}"
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+    COMPOSE_VERSION=$(curl -s --connect-timeout 15 \
+      https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
   else
     COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
   fi
@@ -535,10 +880,10 @@ install_docker_compose() {
   case "$os_name" in
     Linux)
       case "$arch_name" in
-        x86_64) compose_file="docker-compose-linux-x86_64" ;;
+        x86_64)  compose_file="docker-compose-linux-x86_64" ;;
         aarch64) compose_file="docker-compose-linux-aarch64" ;;
-        armv7l) compose_file="docker-compose-linux-armv7" ;;
-        armv6l) compose_file="docker-compose-linux-armv6" ;;
+        armv7l)  compose_file="docker-compose-linux-armv7" ;;
+        armv6l)  compose_file="docker-compose-linux-armv6" ;;
         *) echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"; exit 1 ;;
       esac ;;
     Darwin)
@@ -547,16 +892,18 @@ install_docker_compose() {
         arm64)  compose_file="docker-compose-darwin-aarch64" ;;
         *) echo -e "${RED}不支持的 macOS 架构: $arch_name${NC}"; exit 1 ;;
       esac ;;
-    *)
-      echo -e "${RED}不支持的操作系统: $os_name${NC}"; exit 1 ;;
+    *) echo -e "${RED}不支持的操作系统: $os_name${NC}"; exit 1 ;;
   esac
 
-  echo "下载 Docker Compose：$COMPOSE_VERSION"
-  curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/$compose_file" \
-      -o /usr/local/bin/docker-compose || { echo -e "${RED}下载失败${NC}"; exit 1; }
+  local COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${compose_file}"
+  echo "下载 Docker Compose：$COMPOSE_URL"
+  # ✅ 修复：使用统一下载函数，GitHub URL 自动尝试代理
+  if ! download_with_fallback "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
+    echo -e "${RED}Docker Compose 下载失败，请检查网络后重试。${NC}"
+    exit 1
+  fi
   chmod +x /usr/local/bin/docker-compose
 
-  # 安装为 CLI 插件，支持 `docker compose`
   mkdir -p /usr/local/lib/docker/cli-plugins
   cp /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 
@@ -566,30 +913,34 @@ install_docker_compose() {
 uninstall_docker() {
   echo "正在卸载 Docker..."
 
-  # 优先清理镜像/容器（若可用）
-  docker system prune -a -f 2>/dev/null || true
+  # ✅ 修复：先确认 Docker 在运行再 prune，避免操作其他环境
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    read -r -p "是否清理所有容器/镜像/数据卷？(y/n): " DOPRUNE
+    [[ "$DOPRUNE" == "y" ]] && docker system prune -a -f 2>/dev/null || true
+  fi
 
-  # 停止与禁用服务
   systemctl stop docker.service 2>/dev/null || true
   systemctl disable docker.service 2>/dev/null || true
 
-  # 移除可能通过包管理器安装的包（忽略失败）
   case "$PKG_MANAGER" in
-    apt-get) apt-get remove -y --purge docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
-    dnf|yum) "${PKG_MANAGER}" remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
+    apt-get)
+      apt-get remove -y --purge docker docker-engine docker.io \
+        containerd runc docker-ce docker-ce-cli 2>/dev/null || true
+      ;;
+    dnf|yum)
+      "${PKG_MANAGER}" remove -y docker docker-engine docker.io \
+        containerd runc docker-ce docker-ce-cli 2>/dev/null || true
+      ;;
   esac
 
-  # 删除静态二进制与目录
-  rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* /usr/bin/docker* /usr/sbin/docker* /opt/docker
+  rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* \
+    /usr/bin/docker* /usr/sbin/docker* /opt/docker
   rm -f /etc/systemd/system/docker.service /etc/systemd/system/docker.socket
   rm -f /etc/modules-load.d/docker.conf /etc/sysctl.d/99-docker.conf
+  rm -rf /var/lib/containerd /run/containerd \
+    /usr/local/bin/containerd* /usr/local/bin/runc 2>/dev/null || true
 
-  # 清理 containerd/runc 残留
-  rm -rf /var/lib/containerd /run/containerd /usr/local/bin/containerd* /usr/local/bin/runc 2>/dev/null || true
-
-  # 删除 docker 组
   groupdel docker 2>/dev/null || true
-
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed 2>/dev/null || true
 
@@ -607,6 +958,10 @@ uninstall_docker_compose() {
 
 generate_daemon_config() {
   echo "正在生成 Docker daemon.json 配置文件..."
+
+  # 生成前先备份
+  backup_daemon_json
+
   local DEFAULT_DATA_ROOT="/var/lib/docker"
   local DEFAULT_LOG_MAX_SIZE="10m"
   local DEFAULT_LOG_MAX_FILE="3"
@@ -617,6 +972,7 @@ generate_daemon_config() {
   local REGISTRY_MIRRORS_JSON
   REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
 
+  local DAEMON_CONFIG
   DAEMON_CONFIG=$(cat <<EOF
 {
   "iptables": true,
@@ -632,25 +988,21 @@ generate_daemon_config() {
 }
 EOF
 )
+
   echo "daemon.json 内容："
   echo "$DAEMON_CONFIG"
 
   if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
-    echo -e "${RED}生成的 JSON 格式不正确（请确认 jq 可用）。${NC}"
+    echo -e "${RED}生成的 JSON 格式不正确。${NC}"
     exit 1
   fi
 
   mkdir -p /etc/docker
-  echo "$DAEMON_CONFIG" > /etc/docker/daemon.json
-
-  if [ $? -eq 0 ]; then
+  # ✅ 修复：直接判断写入结果，不依赖 $?
+  if echo "$DAEMON_CONFIG" > /etc/docker/daemon.json; then
     echo -e "${GREEN}/etc/docker/daemon.json 生成成功。${NC}"
-    echo "重启 Docker 以应用配置..."
-    if systemctl restart docker; then
-      echo -e "${GREEN}Docker 重启成功。${NC}"
-    else
-      echo -e "${YELLOW}Docker 重启失败，请手动执行：systemctl restart docker${NC}"
-    fi
+    read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
+    [[ "$DORESTART" == "y" ]] && _restart_docker
   else
     echo -e "${RED}写入 /etc/docker/daemon.json 失败。${NC}"
   fi
@@ -669,7 +1021,7 @@ check_iptables_mode() {
   if echo "$iptables_version" | grep -q 'nf_tables'; then
     echo -e "当前 iptables 后端为: ${YELLOW}nf_tables${NC}"
     echo -e "版本信息: $iptables_version"
-    echo -e "${YELLOW}提示: Docker 目前对 nf_tables 支持不完善，建议使用 legacy 模式以获得最佳兼容性。${NC}"
+    echo -e "${YELLOW}提示: Docker 目前对 nf_tables 支持不完善，建议使用 legacy 模式。${NC}"
   elif echo "$iptables_version" | grep -q 'legacy'; then
     echo -e "当前 iptables 后端为: ${GREEN}legacy${NC}"
     echo -e "版本信息: $iptables_version"
@@ -682,49 +1034,81 @@ check_iptables_mode() {
 
 #====================== 主菜单 ======================#
 
+print_menu() {
+  echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║      Docker / Compose 智能管理脚本       ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+  echo -e "  架构: ${ARCH}  |  系统: ${OS}  |  包管理: ${PKG_MANAGER}"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${GREEN}1.${NC}  安装 Docker"
+  echo -e "  ${GREEN}2.${NC}  安装 Docker Compose"
+  echo -e "  ${GREEN}3.${NC}  安装 Docker 和 Docker Compose"
+  echo -e "  ${RED}4.${NC}  卸载 Docker"
+  echo -e "  ${RED}5.${NC}  卸载 Docker Compose"
+  echo -e "  ${RED}6.${NC}  卸载 Docker 和 Docker Compose"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${YELLOW}7.${NC}  查询安装状态"
+  echo -e "  ${YELLOW}8.${NC}  生成 daemon.json 配置文件"
+  echo -e "  ${YELLOW}9.${NC}  查看当前 iptables 后端模式"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${BLUE}10.${NC} Docker 服务管理（启动/停止/重启）"
+  echo -e "  ${BLUE}11.${NC} Docker 状态仪表盘"
+  echo -e "  ${BLUE}12.${NC} daemon.json 备份与回滚"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${RED}0.${NC}  退出脚本"
+  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  日志: ${LOG_FILE}"
+}
+
 main() {
   check_sudo
   detect_package_manager
-  # 在脚本开始时，一次性安装所有依赖
   install_dependencies
 
-  echo "欢迎使用 Docker/Compose 智能安装脚本"
   echo "检测系统信息..."
   ARCH=$(get_architecture)
   OS=$(get_os_version)
-  echo "系统架构: $ARCH"
-  echo "系统版本: $OS"
 
   while true; do
-    echo -e "\n${YELLOW}请选择要执行的操作：${NC}"
-    echo -e "${GREEN}1. 安装 Docker${NC}"
-    echo -e "${GREEN}2. 安装 Docker Compose${NC}"
-    echo -e "${GREEN}3. 安装 Docker 和 Docker Compose${NC}"
-    echo -e "${RED}4. 卸载 Docker${NC}"
-    echo -e "${RED}5. 卸载 Docker Compose${NC}"
-    echo -e "${RED}6. 卸载 Docker 和 Docker Compose${NC}"
-    echo -e "${YELLOW}7. 查询 Docker 和 Docker Compose 的安装状态${NC}"
-    echo -e "${YELLOW}8. 生成 daemon.json 配置文件${NC}"
-    echo -e "${GREEN}9. 查看当前 iptables 后端模式${NC}"
-    echo -e "${RED}10. 退出脚本${NC}"
-    read -r -p "请输入数字 (1-10): " CHOICE
+    print_menu
+    read -r -p "请输入数字 (0-12): " CHOICE
+
+    # ✅ 修复：非数字输入不进入算术比较，避免 bash 报错
+    if [[ -z "$CHOICE" ]]; then
+      echo -e "${RED}请输入有效数字。${NC}"
+      continue
+    fi
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+      echo -e "${RED}无效的选择，请输入数字。${NC}"
+      continue
+    fi
 
     case "$CHOICE" in
-      1) install_docker ;;
-      2) install_docker_compose ;;
-      3) install_docker; install_docker_compose ;;
-      4) uninstall_docker ;;
-      5) uninstall_docker_compose ;;
-      6) uninstall_docker; uninstall_docker_compose ;;
-      7) check_docker_installed; check_docker_compose_installed ;;
-      8) generate_daemon_config ;;
-      9) check_iptables_mode ;;
-      10) echo -e "${GREEN}退出脚本。${NC}"; break ;;
-      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+      1)  install_docker ;;
+      2)  install_docker_compose ;;
+      3)  install_docker; install_docker_compose ;;
+      4)  uninstall_docker ;;
+      5)  uninstall_docker_compose ;;
+      6)  uninstall_docker; uninstall_docker_compose ;;
+      7)  check_docker_installed; check_docker_compose_installed ;;
+      8)  generate_daemon_config ;;
+      9)  check_iptables_mode ;;
+      10) manage_docker_service ;;
+      11) show_docker_status ;;
+      12) manage_daemon_json ;;
+      0)
+        echo -e "${GREEN}退出脚本。日志已保存至: ${LOG_FILE}${NC}"
+        break
+        ;;
+      *)
+        echo -e "${RED}无效的选择，请输入 0-12 之间的数字。${NC}"
+        continue
+        ;;
     esac
-    [[ -n "$CHOICE" && "$CHOICE" -ne 10 ]] && read -n 1 -s -r -p "按任意键返回主菜单..."
+
+    # ✅ 修复：只有执行了有效操作（非退出）才提示按键返回
+    [[ "$CHOICE" -ne 0 ]] && read -n 1 -s -r -p $'\n按任意键返回主菜单...'
   done
 }
 
 main
-rm -f "$INSTALL_STATUS"
