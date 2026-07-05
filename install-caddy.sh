@@ -27,6 +27,7 @@ declare -A ARCH_MAP=(
 # 命令与包名映射
 declare -A CMD_PKG_MAP=(
     ["netstat"]="net-tools"
+    ["ss"]="iproute2"
     ["ps"]="procps-ng"
     ["wget"]="wget"
     ["curl"]="curl"
@@ -140,10 +141,11 @@ select_caddy_version() {
 # 根据架构拼接下载链接
 get_caddy_download_url() {
     local version_tag=$1
-    local arch=$(uname -m)
+    local arch
+    arch=$(uname -m)
     local mapped_arch=${ARCH_MAP[$arch]:-$arch}
-    # 去掉v前缀
-    local version_nov=$(echo "$version_tag" | sed 's/^v//')
+    local version_nov
+    version_nov=$(echo "$version_tag" | sed 's/^v//')
     echo "https://github.com/caddyserver/caddy/releases/download/$version_tag/caddy_${version_nov}_linux_${mapped_arch}.tar.gz"
 }
 
@@ -164,17 +166,14 @@ install_caddy() {
     fi
     echo "下载地址：$download_url"
 
-    # 创建必要目录
     mkdir -p "$(dirname "$CADDY_BIN_PATH")"
     mkdir -p "$CADDY_CONF_DIR"
     mkdir -p "$CADDY_LOG_DIR"
 
-    # 设置用户权限
     if id "$CADDY_USER" &>/dev/null; then
         $SUDO chown -R "$CADDY_USER":"$CADDY_USER" "$CADDY_CONF_DIR" "$CADDY_LOG_DIR"
     fi
 
-    # 下载压缩包
     TMP_DIR="/tmp/caddy_install"
     mkdir -p "$TMP_DIR"
     if ! wget -O "$TMP_DIR/caddy.tar.gz" "$download_url"; then
@@ -182,10 +181,8 @@ install_caddy() {
         return 1
     fi
 
-    # 解压
     tar -xzf "$TMP_DIR/caddy.tar.gz" -C "$TMP_DIR" || { echo "解压失败"; return 1; }
 
-    # 复制二进制
     if [ -f "$TMP_DIR/caddy" ]; then
         $SUDO cp "$TMP_DIR/caddy" "$CADDY_BIN_PATH" || { echo "复制失败"; return 1; }
         $SUDO chmod +x "$CADDY_BIN_PATH"
@@ -194,7 +191,6 @@ install_caddy() {
         return 1
     fi
 
-    # 清理
     rm -rf "$TMP_DIR"
     echo "Caddy已安装到 $CADDY_BIN_PATH"
 }
@@ -353,19 +349,204 @@ view_status() {
     echo "系统类型：$SYSTEM_TYPE"
     echo "服务状态：$SERVICE_STATUS"
     echo "Caddy运行：$([ "$CADDY_RUNNING" -eq 1 ] && echo "是" || echo "否")"
-    echo "端口占用："
-    netstat -tulnp 2>/dev/null | grep -E ':(80|443|8080)'
+    echo "端口占用（80/443/8080）："
+    if command -v ss >/dev/null 2>&1; then
+        $SUDO ss -tulnp 2>/dev/null | grep -E ':(80|443|8080)\b'
+    elif command -v netstat >/dev/null 2>&1; then
+        $SUDO netstat -tulnp 2>/dev/null | grep -E ':(80|443|8080)\b'
+    fi
 
-    # 显示当前运行的端口
     echo "当前运行的端口："
     if pgrep -x "caddy" > /dev/null; then
         echo "Caddy 正在运行，监听端口："
-        netstat -tulnp 2>/dev/null | grep -E 'caddy' | awk '{print $4}' | cut -d':' -f2 | sort -u
+        if command -v ss >/dev/null 2>&1; then
+            $SUDO ss -tulnp 2>/dev/null | grep 'caddy' | awk '{print $5}' | rev | cut -d':' -f1 | rev | sort -un
+        elif command -v netstat >/dev/null 2>&1; then
+            $SUDO netstat -tulnp 2>/dev/null | grep 'caddy' | awk '{print $4}' | rev | cut -d':' -f1 | rev | sort -un
+        fi
     fi
     if pgrep -x "uhttpd" > /dev/null; then
         echo "uHTTPd 正在运行，监听端口："
-        netstat -tulnp 2>/dev/null | grep -E 'uhttpd' | awk '{print $4}' | cut -d':' -f2 | sort -u
+        if command -v ss >/dev/null 2>&1; then
+            $SUDO ss -tulnp 2>/dev/null | grep 'uhttpd' | awk '{print $5}' | rev | cut -d':' -f1 | rev | sort -un
+        elif command -v netstat >/dev/null 2>&1; then
+            $SUDO netstat -tulnp 2>/dev/null | grep 'uhttpd' | awk '{print $4}' | rev | cut -d':' -f1 | rev | sort -un
+        fi
     fi
+}
+
+# ============================================================
+# 查看本机所有端口占用情况（跨平台/跨架构三级降级策略）
+# ============================================================
+show_port_usage() {
+    echo "=============================="
+    echo "  本机端口占用情况"
+    echo "=============================="
+
+    # ---------- 方法一：ss（iproute2，最推荐） ----------
+    if command -v ss >/dev/null 2>&1; then
+        echo "【工具: ss (iproute2)】"
+        printf "%-6s %-40s %-14s %s\n" "协议" "本地地址:端口" "状态" "PID/程序名"
+        printf '%0.s-' {1..80}; echo
+        $SUDO ss -tulnp 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+            proto=$(echo "$line" | awk '{print $1}')
+            state=$(echo "$line" | awk '{print $2}')
+            local_addr=$(echo "$line" | awk '{print $5}')
+            # 兼容 ss 两种输出格式:
+            # 旧版: users:(("nginx",pid=123,fd=6))
+            # 新版: users:(("nginx",pid=123,fd=6))
+            raw_proc=$(echo "$line" | grep -oE 'users:\(\("[^"]+",pid=[0-9]+,fd=[0-9]+\)\)')
+            if [ -n "$raw_proc" ]; then
+                pname=$(echo "$raw_proc" | sed 's/users:(("\(.*\)",pid=\([0-9]*\),fd=[0-9]*))/\2\/\1/')
+            else
+                # 部分精简版ss只输出pid
+                pname=$(echo "$line" | awk '{print $NF}')
+                [ "$pname" = "$proto" ] && pname="-"
+            fi
+            printf "%-6s %-40s %-14s %s\n" "$proto" "$local_addr" "$state" "$pname"
+        done
+        echo ""
+        return 0
+    fi
+
+    # ---------- 方法二：netstat（net-tools，兼容旧系统） ----------
+    if command -v netstat >/dev/null 2>&1; then
+        echo "【工具: netstat (net-tools)】"
+        printf "%-6s %-40s %-14s %s\n" "协议" "本地地址:端口" "状态" "PID/程序名"
+        printf '%0.s-' {1..80}; echo
+        $SUDO netstat -tulnp 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+            # netstat 列: Proto RefCnt Flags Type State I-Node PID/Program
+            # 对于 -tulnp: Proto Recv-Q Send-Q LocalAddr ForeignAddr State PID/Program
+            proto=$(echo "$line" | awk '{print $1}')
+            local_addr=$(echo "$line" | awk '{print $4}')
+            state=$(echo "$line" | awk '{print $6}')
+            pid_prog=$(echo "$line" | awk '{print $7}')
+            [ -z "$pid_prog" ] && pid_prog="-"
+            printf "%-6s %-40s %-14s %s\n" "$proto" "$local_addr" "$state" "$pid_prog"
+        done
+        echo ""
+        return 0
+    fi
+
+    # ---------- 方法三：纯 /proc/net/tcp 解析（无需任何外部工具） ----------
+    if [ -f /proc/net/tcp ] || [ -f /proc/net/tcp6 ]; then
+        echo "【工具: /proc/net/tcp 纯Shell解析 (回退模式)】"
+        printf "%-6s %-40s %-14s %s\n" "协议" "本地地址:端口" "状态" "PID/程序名"
+        printf '%0.s-' {1..80}; echo
+
+        # ── 构建 inode → PID/程序名 映射表（写入临时文件避免子shell变量丢失）──
+        local inode_map_file
+        inode_map_file=$(mktemp /tmp/inode_map.XXXXXX)
+
+        for pid_dir in /proc/[0-9]*/fd/; do
+            local pid
+            pid=$(echo "$pid_dir" | awk -F'/' '{print $3}')
+            # 必须有读权限才继续
+            [ -r "$pid_dir" ] || continue
+            for fd_link in "${pid_dir}"*; do
+                [ -L "$fd_link" ] || continue
+                local link_target
+                link_target=$(readlink "$fd_link" 2>/dev/null) || continue
+                case "$link_target" in
+                    socket:\[*\])
+                        local inode
+                        inode=$(echo "$link_target" | sed 's/socket:\[\(.*\)\]/\1/')
+                        local comm="-"
+                        [ -r "/proc/$pid/comm" ] && comm=$(tr -d '\n' < "/proc/$pid/comm" 2>/dev/null)
+                        # 格式: inode pid/comm
+                        echo "$inode $pid/$comm" >> "$inode_map_file"
+                        ;;
+                esac
+            done
+        done
+
+        # ── 状态码 → 名称 ──
+        _tcp_state() {
+            case "$1" in
+                01) echo "ESTABLISHED" ;;  02) echo "SYN_SENT"   ;;
+                03) echo "SYN_RECV"    ;;  04) echo "FIN_WAIT1"  ;;
+                05) echo "FIN_WAIT2"   ;;  06) echo "TIME_WAIT"  ;;
+                07) echo "CLOSE"       ;;  08) echo "CLOSE_WAIT" ;;
+                09) echo "LAST_ACK"    ;;  0A) echo "LISTEN"     ;;
+                0B) echo "CLOSING"     ;;   *)  echo "UNKNOWN"   ;;
+            esac
+        }
+
+        # ── 小端序十六进制IPv4 → 点分十进制 ──
+        _hex4_to_ip() {
+            # 输入: AABBCCDD (小端序)
+            local h=$1
+            printf "%d.%d.%d.%d" \
+                "0x${h:6:2}" "0x${h:4:2}" "0x${h:2:2}" "0x${h:0:2}"
+        }
+
+        # ── 小端序十六进制IPv6 → 标准IPv6 ──
+        _hex6_to_ip() {
+            # /proc/net/tcp6 每段32bit小端序，共4段，合计128bit
+            local raw=$1
+            local out=""
+            local i=0
+            while [ $i -lt 32 ]; do
+                local chunk="${raw:$i:8}"
+                # 每个32bit块按小端序翻转为4字节
+                local be="${chunk:6:2}${chunk:4:2}${chunk:2:2}${chunk:0:2}"
+                out="${out}${be:0:4}:${be:4:4}"
+                i=$((i+8))
+                [ $i -lt 32 ] && out="${out}:"
+            done
+            echo "$out"
+        }
+
+        # ── 解析单个 /proc/net/tcp[6] 文件 ──
+        _parse_proc_net() {
+            local file=$1
+            local proto=$2
+            local is_v6=$3   # 1=IPv6, 0=IPv4
+
+            tail -n +2 "$file" 2>/dev/null | \
+            while read -r _sl local_hex rem_hex st _tq _rq _tr _tm _re _uid _to inode _rest; do
+                local state
+                state=$(_tcp_state "$st")
+                # 仅显示 LISTEN / ESTABLISHED（可按需去掉过滤）
+                local hex_laddr="${local_hex%:*}"
+                local hex_lport="${local_hex##*:}"
+                local port
+                port=$(printf "%d" "0x$hex_lport")
+                local ip
+                if [ "$is_v6" -eq 1 ]; then
+                    ip=$(_hex6_to_ip "$hex_laddr")
+                    local_display="[$ip]:$port"
+                else
+                    ip=$(_hex4_to_ip "$hex_laddr")
+                    local_display="$ip:$port"
+                fi
+                # 查 inode → pid/comm
+                local pid_comm="-"
+                if [ -f "$inode_map_file" ]; then
+                    pid_comm=$(grep "^$inode " "$inode_map_file" 2>/dev/null | head -1 | awk '{print $2}')
+                    [ -z "$pid_comm" ] && pid_comm="-"
+                fi
+                printf "%-6s %-40s %-14s %s\n" "$proto" "$local_display" "$state" "$pid_comm"
+            done
+        }
+
+        [ -f /proc/net/tcp  ] && _parse_proc_net /proc/net/tcp  "tcp"  0
+        [ -f /proc/net/tcp6 ] && _parse_proc_net /proc/net/tcp6 "tcp6" 1
+        [ -f /proc/net/udp  ] && _parse_proc_net /proc/net/udp  "udp"  0
+        [ -f /proc/net/udp6 ] && _parse_proc_net /proc/net/udp6 "udp6" 1
+
+        rm -f "$inode_map_file"
+        echo ""
+        return 0
+    fi
+
+    # ---------- 全部方法均不可用 ----------
+    echo "❌ 无法获取端口信息：ss / netstat / /proc/net/tcp 均不可用。"
+    echo "   请安装 iproute2（推荐）或 net-tools 后重试："
+    echo "   opkg install ip-full    # OpenWrt"
+    echo "   apk add iproute2        # Alpine"
+    echo "   apt install iproute2    # Debian/Ubuntu"
+    echo "   yum install iproute     # RHEL/CentOS"
 }
 
 # 停止端口（80/443/两者）
@@ -376,25 +557,14 @@ stop_ports() {
     echo "3. 停止80和443端口"
     read -rp "选择 (1/2/3): " port_choice
     case "$port_choice" in
-        1)
-            stop_service uhttpd
-            ;;
-        2)
-            stop_service caddy
-            ;;
-        3)
-            stop_service uhttpd
-            stop_service caddy
-            ;;
-        *)
-            echo "无效选择"
-            return
-            ;;
+        1) stop_service uhttpd ;;
+        2) stop_service caddy  ;;
+        3) stop_service uhttpd; stop_service caddy ;;
+        *) echo "无效选择"; return ;;
     esac
-    # 只杀caddy和uhttpd残留进程
     for pname in caddy uhttpd; do
         local PIDS
-        PIDS=$(pgrep -x $pname)
+        PIDS=$(pgrep -x "$pname")
         for pid in $PIDS; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 echo "杀掉进程ID：$pid ($pname)"
@@ -443,10 +613,7 @@ stop_service() {
                 kill $PIDS 2>/dev/null
                 sleep 2
                 PIDS=$(pgrep -x caddy)
-                if [ -n "$PIDS" ]; then
-                    echo "强制杀掉caddy进程: $PIDS"
-                    kill -9 $PIDS 2>/dev/null
-                fi
+                [ -n "$PIDS" ] && kill -9 $PIDS 2>/dev/null
             else
                 echo "未检测到caddy进程"
             fi
@@ -468,20 +635,20 @@ stop_service() {
     else
         case $INIT_SYSTEM in
             systemd)
-                $SUDO systemctl stop $svc
-                $SUDO systemctl disable $svc
+                $SUDO systemctl stop "$svc"
+                $SUDO systemctl disable "$svc"
                 ;;
             openrc)
-                $SUDO rc-service $svc stop
-                $SUDO rc-update del $svc
+                $SUDO rc-service "$svc" stop
+                $SUDO rc-update del "$svc"
                 ;;
             sysvinit)
-                $SUDO service $svc stop
-                $SUDO update-rc.d $svc remove
+                $SUDO service "$svc" stop
+                $SUDO update-rc.d "$svc" remove
                 ;;
             *)
-                $SUDO /etc/init.d/$svc stop
-                $SUDO /etc/init.d/$svc disable
+                $SUDO /etc/init.d/"$svc" stop
+                $SUDO /etc/init.d/"$svc" disable
                 ;;
         esac
     fi
@@ -503,26 +670,26 @@ start_service() {
                 /etc/init.d/$svc start
                 /etc/init.d/$svc enable
             else
-                "$svc" &  # 仅适用于可直接运行的二进制
+                "$svc" &
             fi
         fi
     else
         case $INIT_SYSTEM in
             systemd)
-                $SUDO systemctl start $svc
-                $SUDO systemctl enable $svc
+                $SUDO systemctl start "$svc"
+                $SUDO systemctl enable "$svc"
                 ;;
             openrc)
-                $SUDO rc-service $svc start
-                $SUDO rc-update add $svc default
+                $SUDO rc-service "$svc" start
+                $SUDO rc-update add "$svc" default
                 ;;
             sysvinit)
-                $SUDO service $svc start
-                $SUDO update-rc.d $svc defaults
+                $SUDO service "$svc" start
+                $SUDO update-rc.d "$svc" defaults
                 ;;
             *)
-                $SUDO /etc/init.d/$svc start
-                $SUDO /etc/init.d/$svc enable
+                $SUDO /etc/init.d/"$svc" start
+                $SUDO /etc/init.d/"$svc" enable
                 ;;
         esac
     fi
@@ -557,18 +724,10 @@ restart_service() {
         fi
     else
         case $INIT_SYSTEM in
-            systemd)
-                $SUDO systemctl restart $svc
-                ;;
-            openrc)
-                $SUDO rc-service $svc restart
-                ;;
-            sysvinit)
-                $SUDO service $svc restart
-                ;;
-            *)
-                $SUDO /etc/init.d/$svc restart
-                ;;
+            systemd) $SUDO systemctl restart "$svc" ;;
+            openrc)  $SUDO rc-service "$svc" restart ;;
+            sysvinit) $SUDO service "$svc" restart ;;
+            *) $SUDO /etc/init.d/"$svc" restart ;;
         esac
     fi
     echo "$svc已重启"
@@ -595,20 +754,20 @@ get_service_status() {
     else
         case $INIT_SYSTEM in
             systemd)
-                $SUDO systemctl is-active --quiet $svc_name && running="是"
-                $SUDO systemctl is-enabled --quiet $svc_name && enabled="是"
+                $SUDO systemctl is-active  --quiet "$svc_name" && running="是"
+                $SUDO systemctl is-enabled --quiet "$svc_name" && enabled="是"
                 ;;
             openrc)
-                $SUDO rc-service $svc_name status &>/dev/null && running="是"
-                $SUDO rc-update show | grep -q $svc_name && enabled="是"
+                $SUDO rc-service "$svc_name" status &>/dev/null && running="是"
+                $SUDO rc-update show | grep -q "$svc_name" && enabled="是"
                 ;;
             sysvinit)
-                $SUDO service $svc_name status &>/dev/null && running="是"
-                [ -x /etc/init.d/$svc_name ] && enabled="是"
+                $SUDO service "$svc_name" status &>/dev/null && running="是"
+                [ -x "/etc/init.d/$svc_name" ] && enabled="是"
                 ;;
             *)
-                $SUDO /etc/init.d/$svc_name status &>/dev/null && running="是"
-                $SUDO /etc/init.d/$svc_name enabled &>/dev/null && enabled="是"
+                $SUDO /etc/init.d/"$svc_name" status &>/dev/null && running="是"
+                $SUDO /etc/init.d/"$svc_name" enabled &>/dev/null && enabled="是"
                 ;;
         esac
     fi
@@ -622,9 +781,8 @@ modify_uhttpd_port() {
         echo "无效的端口号"
         return
     fi
-    # 只替换 option listen_http 行
     if grep -q "option listen_http" "$UHTTPD_CONF_FILE"; then
-        $SUDO sed -i "s/^KATEX_INLINE_OPEN.*option listen_http[[:space:]]*KATEX_INLINE_CLOSE[0-9]\+/\1$new_port/" "$UHTTPD_CONF_FILE"
+        $SUDO sed -i "s/\(.*option listen_http[[:space:]]*\)[0-9]\+/\1$new_port/" "$UHTTPD_CONF_FILE"
     else
         echo "option listen_http $new_port" >> "$UHTTPD_CONF_FILE"
     fi
@@ -648,11 +806,13 @@ restore_previous() {
     fi
 }
 
+# ============================================================
 # 主菜单
+# ============================================================
 main_menu() {
     detect_system
     load_state
-    for cmd in netstat ps wget curl awk sed tar; do
+    for cmd in ss netstat ps wget curl awk sed tar; do
         check_and_install "$cmd"
     done
 
@@ -660,20 +820,21 @@ main_menu() {
         echo "=============================="
         echo "  交互式部署菜单"
         echo "=============================="
-        echo "1. 查看当前系统和端口状态"
-        echo "2. 停止端口（80/443/两者）"
-        echo "3. 启动端口（80/443/两者）"
-        echo "4. 停止服务（uhttpd或caddy）"
-        echo "5. 启动服务（uhttpd或caddy）"
-        echo "6. 配置caddy反向代理"
-        echo "7. 添加新反向代理"
-        echo "8. 恢复到之前的运行状态"
-        echo "9. 卸载caddy"
+        echo "1.  查看当前系统和端口状态"
+        echo "2.  停止端口（80/443/两者）"
+        echo "3.  启动端口（80/443/两者）"
+        echo "4.  停止服务（uhttpd或caddy）"
+        echo "5.  启动服务（uhttpd或caddy）"
+        echo "6.  配置caddy反向代理"
+        echo "7.  添加新反向代理"
+        echo "8.  恢复到之前的运行状态"
+        echo "9.  卸载caddy"
         echo "10. 修改uHTTPd端口"
         echo "11. 重启uHTTPd"
         echo "12. 查看uHTTPd状态"
-        echo "13. 退出"
-        read -rp "请选择操作(1-13): " opt
+        echo "13. 查看本机端口占用情况"   # ← 新增
+        echo "14. 退出"
+        read -rp "请选择操作(1-14): " opt
 
         case "$opt" in
             1) view_status ;;
@@ -685,31 +846,27 @@ main_menu() {
                 echo "3. 启动80和443端口"
                 read -rp "选择 (1/2/3): " port_choice
                 case "$port_choice" in
-                    1) start_port_80 ;;
-                    2) start_port_443 ;;
+                    1) start_port_80    ;;
+                    2) start_port_443   ;;
                     3) start_both_ports ;;
-                    *) echo "无效选择" ;;
+                    *) echo "无效选择"  ;;
                 esac
                 ;;
             4)
-                # 显示状态
                 echo "当前服务状态："
                 uhttpd_status=$(get_service_status uhttpd)
                 caddy_status=$(get_service_status caddy)
-                echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
-                echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
-                # 停止
+                echo "uhttpd：$(echo "$uhttpd_status" | cut -d'|' -f1)，启用：$(echo "$uhttpd_status" | cut -d'|' -f2)"
+                echo "caddy：$(echo "$caddy_status"  | cut -d'|' -f1)，启用：$(echo "$caddy_status"  | cut -d'|' -f2)"
                 read -rp "选择要停止的服务 (uhttpd/caddy): " svc_to_stop
                 stop_service "$svc_to_stop"
                 ;;
             5)
-                # 显示状态
                 echo "当前服务状态："
                 uhttpd_status=$(get_service_status uhttpd)
                 caddy_status=$(get_service_status caddy)
-                echo "uhttpd：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
-                echo "caddy：$(echo $caddy_status | cut -d'|' -f1)，启用：$(echo $caddy_status | cut -d'|' -f2)"
-                # 启动
+                echo "uhttpd：$(echo "$uhttpd_status" | cut -d'|' -f1)，启用：$(echo "$uhttpd_status" | cut -d'|' -f2)"
+                echo "caddy：$(echo "$caddy_status"  | cut -d'|' -f1)，启用：$(echo "$caddy_status"  | cut -d'|' -f2)"
                 read -rp "选择要启动的服务 (uhttpd/caddy): " svc_to_start
                 start_service "$svc_to_start"
                 ;;
@@ -720,17 +877,18 @@ main_menu() {
                     echo "请先安装caddy"
                 fi
                 ;;
-            7) add_new_proxy ;;
-            8) restore_previous ;;
-            9) uninstall_caddy ;;
+            7)  add_new_proxy    ;;
+            8)  restore_previous ;;
+            9)  uninstall_caddy  ;;
             10) modify_uhttpd_port ;;
             11) restart_service uhttpd ;;
             12)
                 uhttpd_status=$(get_service_status uhttpd)
-                echo "uhttpd状态：$(echo $uhttpd_status | cut -d'|' -f1)，启用：$(echo $uhttpd_status | cut -d'|' -f2)"
+                echo "uhttpd状态：$(echo "$uhttpd_status" | cut -d'|' -f1)，启用：$(echo "$uhttpd_status" | cut -d'|' -f2)"
                 ;;
-            13) echo "退出"; exit 0 ;;
-            *) echo "无效选择" ;;
+            13) show_port_usage ;;   # ← 新增
+            14) echo "退出"; exit 0 ;;
+            *)  echo "无效选择" ;;
         esac
         read -rp "按回车键继续..."
     done
