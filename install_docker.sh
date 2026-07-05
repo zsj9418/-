@@ -16,9 +16,13 @@ PROXY_PREFIXES=(
   "https://gitdl.cn/"
 )
 
-# 默认镜像加速源
+# 默认镜像加速源（daemon.json 用）
 REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.1ms.run"
+  "https://docker.xuanyuan.me"
+  "https://docker.m.daocloud.io"
+  "https://dockerproxy.net"
+  "https://docker.1panel.live"
 )
 
 # daemon.json 备份目录
@@ -34,7 +38,6 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # 全局变量
-LOG_FILE="/var/log/docker_install_$(date +%Y%m%d_%H%M%S).log"
 DOCKER_URL=""
 DOCKER_INSTALL_DIR=""
 ARCH=""
@@ -43,9 +46,56 @@ PKG_MANAGER=""
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.3.1"
 
-#====================== 信号捕获 & 日志 ======================#
+#====================== 日志配置 ======================#
 
-# 中断/终止信号统一清理
+LOG_DIR="/var/log/docker_manager"
+LOG_FILE="${LOG_DIR}/docker_manager.log"
+LOG_MAX_SIZE_MB=5
+LOG_MAX_BACKUPS=3
+
+rotate_log() {
+  [[ ! -f "$LOG_FILE" ]] && return 0
+
+  local size_bytes
+  size_bytes=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  local size_mb=$(( size_bytes / 1024 / 1024 ))
+
+  if (( size_mb < LOG_MAX_SIZE_MB )); then
+    return 0
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志文件达到 ${size_mb}MB，触发轮转..." >> "$LOG_FILE"
+
+  local oldest="${LOG_FILE}.${LOG_MAX_BACKUPS}.gz"
+  [[ -f "$oldest" ]] && rm -f "$oldest"
+
+  for (( i = LOG_MAX_BACKUPS - 1; i >= 1; i-- )); do
+    local src="${LOG_FILE}.${i}.gz"
+    local dst="${LOG_FILE}.$((i+1)).gz"
+    [[ -f "$src" ]] && mv "$src" "$dst"
+  done
+
+  gzip -c "$LOG_FILE" > "${LOG_FILE}.1.gz"
+  : > "$LOG_FILE"
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志轮转完成，已归档至 ${LOG_FILE}.1.gz" >> "$LOG_FILE"
+}
+
+init_log() {
+  mkdir -p "$LOG_DIR"
+  rotate_log
+  {
+    echo ""
+    echo "════════════════════════════════════════"
+    echo "  会话开始: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "  PID: $$  |  用户: ${SUDO_USER:-$USER}"
+    echo "════════════════════════════════════════"
+  } >> "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+#====================== 信号捕获 ======================#
+
 cleanup() {
   echo -e "\n${YELLOW}检测到中断信号，正在清理临时文件...${NC}"
   [[ -n "$DOCKER_INSTALL_DIR" && -d "$DOCKER_INSTALL_DIR" ]] && rm -rf "$DOCKER_INSTALL_DIR"
@@ -53,9 +103,6 @@ cleanup() {
   exit 130
 }
 trap cleanup INT TERM
-
-# 所有输出同时写入日志文件
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 #====================== 通用工具函数 ======================#
 
@@ -148,11 +195,10 @@ get_os_version() {
 }
 
 check_and_set_install_dir() {
-  local REQUIRED_SPACE=500  # MB
+  local REQUIRED_SPACE=500
   local realpath_cmd
   realpath_cmd=$(command -v realpath 2>/dev/null || echo "readlink -f")
 
-  # ✅ 修复：curl|bash 管道执行时 $0 为 "bash"，需要回退到 /tmp
   local DIR
   if [[ "$0" == "bash" || "$0" == "-bash" || "$0" == "sh" || "$0" == "-sh" ]]; then
     DIR="/tmp"
@@ -219,7 +265,7 @@ check_docker_compose_installed() {
   return 1
 }
 
-# ✅ 新增：统一下载函数，区分 GitHub URL 与其他 URL 的代理策略
+# 统一下载函数，区分 GitHub URL 与其他 URL 的代理策略
 download_with_fallback() {
   local url="$1"
   local dest="$2"
@@ -231,7 +277,6 @@ download_with_fallback() {
 
   echo -e "${YELLOW}直连失败，尝试代理...${NC}" >&2
 
-  # 代理前缀仅对 GitHub 域名有效
   if [[ "$url" == *"github.com"* || "$url" == *"githubusercontent.com"* ]]; then
     for prefix in "${PROXY_PREFIXES[@]}"; do
       local proxy_url="${prefix}${url}"
@@ -243,8 +288,7 @@ download_with_fallback() {
       echo -e "${YELLOW}代理失败: $proxy_url${NC}" >&2
     done
   else
-    # 非 GitHub URL（如 download.docker.com）多重试几次，无有效代理
-    echo -e "${YELLOW}注意：该地址不支持代理加速，已重试3次仍失败。${NC}" >&2
+    echo -e "${YELLOW}注意：该地址不支持代理加速，已重试 3 次仍失败。${NC}" >&2
   fi
 
   return 1
@@ -322,6 +366,9 @@ EOF
 ensure_daemon_json() {
   mkdir -p /etc/docker
   if [[ ! -s /etc/docker/daemon.json ]]; then
+    # 将 REGISTRY_MIRRORS_DEFAULT 数组转为 JSON 数组
+    local mirrors_json
+    mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
     cat >/etc/docker/daemon.json <<EOF
 {
   "iptables": true,
@@ -329,9 +376,7 @@ ensure_daemon_json() {
   "exec-opts": ["native.cgroupdriver=systemd"],
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" },
-  "registry-mirrors": [
-    "${REGISTRY_MIRRORS_DEFAULT[0]}"
-  ]
+  "registry-mirrors": ${mirrors_json}
 }
 EOF
   fi
@@ -347,14 +392,17 @@ EOF
       jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" \
         && mv "$tmp" /etc/docker/daemon.json
     else
-      # ✅ 修复：先备份，再覆盖，避免丢失已有配置
       backup_daemon_json
-      cat >/etc/docker/daemon.json <<'EOF'
+      local mirrors_json
+      mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s . 2>/dev/null \
+        || printf '[\n%s\n]' "$(printf '    "%s",\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | sed '$s/,$//')")
+      cat >/etc/docker/daemon.json <<EOF
 {
   "iptables": true,
   "ip6tables": true,
   "exec-opts": ["native.cgroupdriver=systemd"],
-  "storage-driver": "fuse-overlayfs"
+  "storage-driver": "fuse-overlayfs",
+  "registry-mirrors": ${mirrors_json}
 }
 EOF
     fi
@@ -364,14 +412,14 @@ EOF
 #====================== 版本获取/选择 ======================#
 
 fetch_docker_versions() {
-  # 版本缓存放在 /tmp，避免随安装目录删除而失效
   local CACHE_FILE="/tmp/docker_versions_cache"
-  if [[ -f "$CACHE_FILE" && $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) -gt $(( $(date +%s) - 3600 )) ]]; then
+  if [[ -f "$CACHE_FILE" && \
+        $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) -gt $(( $(date +%s) - 3600 )) ]]; then
     cat "$CACHE_FILE"
     return
   fi
   ARCH=$(get_architecture)
-  local URL="$DOCKER_VERSIONS_URL$ARCH/"
+  local URL="${DOCKER_VERSIONS_URL}${ARCH}/"
   local VERSIONS
   VERSIONS=$(curl -s --connect-timeout 15 "$URL" \
     | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' \
@@ -384,7 +432,6 @@ fetch_docker_versions() {
   echo "$VERSIONS"
 }
 
-# ✅ 修复：所有提示信息改为 >&2，避免污染命令替换的返回值
 select_version() {
   local VERSIONS=("$@")
   if command -v fzf >/dev/null 2>&1; then
@@ -404,7 +451,7 @@ select_version() {
   fi
 
   echo "可用版本列表:" >&2
-  PS3="请选择版本 (默认1为最新): "
+  PS3="请选择版本 (默认 1 为最新): "
   select VERSION in "${VERSIONS[@]}" "取消"; do
     case $REPLY in
       ''|1)
@@ -442,9 +489,11 @@ backup_daemon_json() {
   [[ -f /etc/docker/daemon.json ]] || return 0
   mkdir -p "$DAEMON_BACKUP_DIR"
   local bak="${DAEMON_BACKUP_DIR}/daemon.json.$(date +%Y%m%d_%H%M%S)"
-  cp /etc/docker/daemon.json "$bak" && \
-    echo -e "${GREEN}已备份 daemon.json 至: $bak${NC}" || \
+  if cp /etc/docker/daemon.json "$bak"; then
+    echo -e "${GREEN}已备份 daemon.json 至: $bak${NC}"
+  else
     echo -e "${RED}备份失败${NC}"
+  fi
 }
 
 restore_daemon_json() {
@@ -477,17 +526,18 @@ restore_daemon_json() {
   fi
 
   local selected="${backups[$((IDX-1))]}"
-  backup_daemon_json   # 回滚前先备份当前配置
-  cp "$selected" /etc/docker/daemon.json && \
-    echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}" || \
-    { echo -e "${RED}回滚失败${NC}"; return; }
+  backup_daemon_json
+  if cp "$selected" /etc/docker/daemon.json; then
+    echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}"
+  else
+    echo -e "${RED}回滚失败${NC}"
+    return
+  fi
 
   if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
     echo -e "${GREEN}daemon.json 格式校验通过。${NC}"
     read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
-    if [[ "$DORESTART" == "y" ]]; then
-      _restart_docker
-    fi
+    [[ "$DORESTART" == "y" ]] && _restart_docker
   else
     echo -e "${RED}警告：回滚后的 daemon.json 格式不正确，请检查！${NC}"
   fi
@@ -495,7 +545,9 @@ restore_daemon_json() {
 
 manage_daemon_json() {
   while true; do
-    echo -e "\n${CYAN}========== daemon.json 备份与回滚 ==========${NC}"
+    echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║       daemon.json 备份与回滚             ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo "  1. 备份当前 daemon.json"
     echo "  2. 查看所有备份"
     echo "  3. 回滚到指定备份"
@@ -585,17 +637,19 @@ manage_docker_service() {
     return
   fi
   while true; do
-    local svc_status
+    local svc_status svc_enabled
     svc_status=$(systemctl is-active docker 2>/dev/null)
-    local svc_enabled
     svc_enabled=$(systemctl is-enabled docker 2>/dev/null)
 
-    echo -e "\n${CYAN}========== Docker 服务管理 ==========${NC}"
+    echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║          Docker 服务管理                 ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     if [[ "$svc_status" == "active" ]]; then
-      echo -e "  当前状态: ${GREEN}● 运行中${NC}  开机自启: ${svc_enabled}"
+      echo -e "  当前状态: ${GREEN}● 运行中${NC}  |  开机自启: ${svc_enabled}"
     else
-      echo -e "  当前状态: ${RED}● 已停止${NC}  开机自启: ${svc_enabled}"
+      echo -e "  当前状态: ${RED}● ${svc_status}${NC}  |  开机自启: ${svc_enabled}"
     fi
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
     echo "  1. 启动 Docker"
     echo "  2. 停止 Docker"
     echo "  3. 重启 Docker"
@@ -603,6 +657,7 @@ manage_docker_service() {
     echo "  5. 关闭开机自启"
     echo "  6. 查看实时日志（最近 50 行）"
     echo "  0. 返回主菜单"
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
     read -r -p "请选择操作: " SCHOICE
     case "$SCHOICE" in
       1) _start_docker ;;
@@ -619,7 +674,7 @@ manage_docker_service() {
           echo -e "${RED}操作失败。${NC}"
         ;;
       6)
-        echo -e "${CYAN}--- Docker 服务日志（最近 50 行，Ctrl+C 退出）---${NC}"
+        echo -e "${CYAN}--- Docker 服务日志（最近 50 行）---${NC}"
         journalctl -u docker -n 50 --no-pager 2>/dev/null || \
           echo -e "${RED}无法读取 Docker 日志。${NC}"
         ;;
@@ -633,7 +688,7 @@ manage_docker_service() {
 
 show_docker_status() {
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║         Docker 状态仪表盘                ║${NC}"
+  echo -e "${BOLD}${CYAN}║           Docker 状态仪表盘              ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
 
   # ── 安装状态 ──────────────────────────────
@@ -643,13 +698,11 @@ show_docker_status() {
   else
     echo -e "  Docker:         ${RED}未安装${NC}"
   fi
-
   if command -v docker-compose >/dev/null 2>&1; then
     echo -e "  Compose 独立版: ${GREEN}已安装 $(docker-compose --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
   else
     echo -e "  Compose 独立版: ${YELLOW}未安装${NC}"
   fi
-
   if docker compose version >/dev/null 2>&1; then
     echo -e "  Compose 插件:   ${GREEN}已安装 $(docker compose version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
   else
@@ -661,13 +714,11 @@ show_docker_status() {
   local svc_status svc_enabled
   svc_status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
   svc_enabled=$(systemctl is-enabled docker 2>/dev/null || echo "disabled")
-
   if [[ "$svc_status" == "active" ]]; then
     echo -e "  服务:     ${GREEN}● 运行中${NC}"
   else
     echo -e "  服务:     ${RED}● ${svc_status}${NC}"
   fi
-
   if [[ "$svc_enabled" == "enabled" ]]; then
     echo -e "  开机自启: ${GREEN}已开启${NC}"
   else
@@ -677,33 +728,23 @@ show_docker_status() {
   # ── 运行时资源 ────────────────────────────
   if [[ "$svc_status" == "active" ]] && command -v docker >/dev/null 2>&1; then
     echo -e "\n${BOLD}[ 运行时资源 ]${NC}"
-
     local total_c running_c stopped_c
     total_c=$(docker ps -aq 2>/dev/null | wc -l)
     running_c=$(docker ps -q 2>/dev/null | wc -l)
     stopped_c=$(( total_c - running_c ))
     echo -e "  容器: ${GREEN}${running_c} 运行中${NC} / ${YELLOW}${stopped_c} 已停止${NC} / 共 ${total_c}"
+    echo -e "  镜像: $(docker images -q 2>/dev/null | wc -l) 个"
+    echo -e "  数据卷: $(docker volume ls -q 2>/dev/null | wc -l) 个"
+    echo -e "  网络: $(docker network ls -q 2>/dev/null | wc -l) 个"
 
-    local img_c
-    img_c=$(docker images -q 2>/dev/null | wc -l)
-    echo -e "  镜像: ${img_c} 个"
-
-    local vol_c
-    vol_c=$(docker volume ls -q 2>/dev/null | wc -l)
-    echo -e "  数据卷: ${vol_c} 个"
-
-    local net_c
-    net_c=$(docker network ls -q 2>/dev/null | wc -l)
-    echo -e "  网络: ${net_c} 个"
-
-    echo -e "\n${BOLD}[ 磁盘占用 (docker system df) ]${NC}"
+    echo -e "\n${BOLD}[ 磁盘占用 ]${NC}"
     docker system df 2>/dev/null | while IFS= read -r line; do
       echo "  $line"
     done
 
-    # 运行中容器简表
     local running_list
-    running_list=$(docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
+    running_list=$(docker ps --format \
+      "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
     if [[ -n "$running_list" ]]; then
       echo -e "\n${BOLD}[ 运行中容器 ]${NC}"
       echo "$running_list" | while IFS= read -r line; do
@@ -712,27 +753,42 @@ show_docker_status() {
     fi
   fi
 
+  # ── 镜像加速源 ────────────────────────────
+  echo -e "\n${BOLD}[ 镜像加速源 ]${NC}"
+  echo -e "  ${CYAN}脚本内置默认源（共 ${#REGISTRY_MIRRORS_DEFAULT[@]} 个）:${NC}"
+  for m in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
+    echo -e "    ${CYAN}• ${m}${NC}"
+  done
+
   # ── 配置文件状态 ──────────────────────────
-  echo -e "\n${BOLD}[ 配置文件 ]${NC}"
+  echo -e "\n${BOLD}[ daemon.json 配置 ]${NC}"
   if [[ -f /etc/docker/daemon.json ]]; then
     if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
-      echo -e "  daemon.json: ${GREEN}存在，格式合法${NC}"
-      # 显示关键配置项
-      local mirrors storage log_driver
-      mirrors=$(jq -r '.["registry-mirrors"][]? // empty' /etc/docker/daemon.json 2>/dev/null | tr '\n' ' ')
+      echo -e "  状态:     ${GREEN}存在，格式合法${NC}"
+      local mirrors storage log_driver data_root
+      mirrors=$(jq -r '.["registry-mirrors"][]? // empty' /etc/docker/daemon.json 2>/dev/null)
       storage=$(jq -r '."storage-driver" // "overlay2 (默认)"' /etc/docker/daemon.json 2>/dev/null)
       log_driver=$(jq -r '."log-driver" // "json-file (默认)"' /etc/docker/daemon.json 2>/dev/null)
-      [[ -n "$mirrors" ]] && echo -e "    镜像加速: ${CYAN}${mirrors}${NC}"
-      echo -e "    存储驱动: ${CYAN}${storage}${NC}"
-      echo -e "    日志驱动: ${CYAN}${log_driver}${NC}"
+      data_root=$(jq -r '."data-root" // "/var/lib/docker (默认)"' /etc/docker/daemon.json 2>/dev/null)
+      if [[ -n "$mirrors" ]]; then
+        echo -e "  镜像加速:"
+        while IFS= read -r m; do
+          echo -e "    ${CYAN}• ${m}${NC}"
+        done <<< "$mirrors"
+      else
+        echo -e "  镜像加速: ${YELLOW}未配置${NC}"
+      fi
+      echo -e "  存储驱动: ${CYAN}${storage}${NC}"
+      echo -e "  日志驱动: ${CYAN}${log_driver}${NC}"
+      echo -e "  数据目录: ${CYAN}${data_root}${NC}"
     else
-      echo -e "  daemon.json: ${RED}存在，但 JSON 格式错误！${NC}"
+      echo -e "  状态:     ${RED}存在，但 JSON 格式错误！${NC}"
     fi
     local bak_count
     bak_count=$(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" 2>/dev/null | wc -l)
     echo -e "  备份数量: ${bak_count} 个（目录: ${DAEMON_BACKUP_DIR}）"
   else
-    echo -e "  daemon.json: ${YELLOW}不存在${NC}"
+    echo -e "  状态:     ${YELLOW}daemon.json 不存在${NC}"
   fi
 
   # ── 系统信息 ──────────────────────────────
@@ -744,11 +800,159 @@ show_docker_status() {
   mem_total=$(free -m 2>/dev/null | awk '/^Mem/{print $2}')
   mem_free=$(free -m 2>/dev/null | awk '/^Mem/{print $4}')
   echo -e "  内存:   已用 $((mem_total - mem_free))MB / 共 ${mem_total}MB"
-  echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
+  echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | \
+    awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
 
-  echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"
-  echo -e "  日志文件: ${LOG_FILE}"
-  echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
+  # ── 日志信息 ──────────────────────────────
+  echo -e "\n${BOLD}[ 日志信息 ]${NC}"
+  if [[ -f "$LOG_FILE" ]]; then
+    local log_size
+    log_size=$(du -sh "$LOG_FILE" 2>/dev/null | awk '{print $1}')
+    local log_bak
+    log_bak=$(find "$LOG_DIR" -maxdepth 1 -name "*.gz" 2>/dev/null | wc -l)
+    echo -e "  当前日志: ${log_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
+    echo -e "  历史备份: ${log_bak} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
+    echo -e "  日志路径: ${LOG_FILE}"
+  else
+    echo -e "  ${YELLOW}日志文件不存在${NC}"
+  fi
+
+  echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
+}
+
+#====================== 日志管理菜单 ======================#
+
+_human_size() {
+  du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "未知"
+}
+
+manage_logs() {
+  while true; do
+    local current_size="N/A" total_size="N/A" backup_count=0
+    [[ -f "$LOG_FILE" ]] && current_size=$(_human_size "$LOG_FILE")
+    backup_count=$(find "$LOG_DIR" -maxdepth 1 -name "*.gz" 2>/dev/null | wc -l)
+    [[ -d "$LOG_DIR" ]] && total_size=$(_human_size "$LOG_DIR")
+
+    echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║              日志管理                    ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+    echo -e "  日志目录:   ${LOG_DIR}"
+    echo -e "  当前日志:   ${current_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
+    echo -e "  历史备份:   ${backup_count} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
+    echo -e "  目录总占用: ${total_size}"
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
+    echo "  1. 查看当前日志（最后 50 行）"
+    echo "  2. 查看所有历史备份"
+    echo "  3. 立即手动轮转日志"
+    echo "  4. 清空当前日志"
+    echo "  5. 删除所有历史备份（保留当前）"
+    echo "  6. 删除全部日志（当前 + 历史）"
+    echo "  7. 修改日志策略（大小上限 / 保留数量）"
+    echo "  0. 返回主菜单"
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
+    read -r -p "请选择操作: " LCHOICE
+
+    case "$LCHOICE" in
+      1)
+        if [[ ! -f "$LOG_FILE" ]]; then
+          echo -e "${YELLOW}当前日志文件不存在。${NC}"
+        else
+          echo -e "${CYAN}── 当前日志（最后 50 行）──${NC}"
+          tail -n 50 "$LOG_FILE"
+          echo -e "${CYAN}────────────────────────────${NC}"
+          echo -e "完整日志路径: ${LOG_FILE}"
+        fi
+        ;;
+      2)
+        local backups=()
+        while IFS= read -r -d '' f; do
+          backups+=("$f")
+        done < <(find "$LOG_DIR" -maxdepth 1 -name "*.gz" -print0 2>/dev/null | sort -z)
+        if [[ ${#backups[@]} -eq 0 ]]; then
+          echo -e "${YELLOW}暂无历史备份。${NC}"
+        else
+          echo -e "${CYAN}历史备份列表：${NC}"
+          local i=1
+          for f in "${backups[@]}"; do
+            printf "  %2d) %-45s  %s\n" "$i" "$(basename "$f")" "$(_human_size "$f")"
+            ((i++))
+          done
+          read -r -p "是否查看某个备份内容？输入编号（回车跳过）: " BIDX
+          if [[ "$BIDX" =~ ^[0-9]+$ ]] && \
+             (( BIDX >= 1 && BIDX <= ${#backups[@]} )); then
+            echo -e "${CYAN}── 备份内容（最后 50 行）──${NC}"
+            zcat "${backups[$((BIDX-1))]}" 2>/dev/null | tail -n 50
+          fi
+        fi
+        ;;
+      3)
+        local old_max=$LOG_MAX_SIZE_MB
+        LOG_MAX_SIZE_MB=0
+        rotate_log
+        LOG_MAX_SIZE_MB=$old_max
+        echo -e "${GREEN}手动轮转完成。${NC}"
+        ;;
+      4)
+        read -r -p "确认清空当前日志内容？操作不可恢复 (y/n): " CONFIRM
+        if [[ "$CONFIRM" == "y" ]]; then
+          : > "$LOG_FILE"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志已手动清空。" >> "$LOG_FILE"
+          echo -e "${GREEN}当前日志已清空。${NC}"
+        else
+          echo -e "${YELLOW}已取消。${NC}"
+        fi
+        ;;
+      5)
+        local gz_files=()
+        while IFS= read -r -d '' f; do
+          gz_files+=("$f")
+        done < <(find "$LOG_DIR" -maxdepth 1 -name "*.gz" -print0 2>/dev/null)
+        if [[ ${#gz_files[@]} -eq 0 ]]; then
+          echo -e "${YELLOW}没有历史备份文件。${NC}"
+        else
+          read -r -p "确认删除 ${#gz_files[@]} 个历史备份？(y/n): " CONFIRM
+          if [[ "$CONFIRM" == "y" ]]; then
+            rm -f "${gz_files[@]}"
+            echo -e "${GREEN}已删除所有历史备份。${NC}"
+          else
+            echo -e "${YELLOW}已取消。${NC}"
+          fi
+        fi
+        ;;
+      6)
+        read -r -p "确认删除所有日志（含当前 + 历史）？操作不可恢复 (y/n): " CONFIRM
+        if [[ "$CONFIRM" == "y" ]]; then
+          find "$LOG_DIR" -maxdepth 1 -name "*.gz" -delete 2>/dev/null
+          : > "$LOG_FILE"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] 所有日志已清除。" >> "$LOG_FILE"
+          echo -e "${GREEN}所有日志已清除。${NC}"
+        else
+          echo -e "${YELLOW}已取消。${NC}"
+        fi
+        ;;
+      7)
+        echo -e "${CYAN}当前策略: 单文件上限 ${LOG_MAX_SIZE_MB}MB，保留 ${LOG_MAX_BACKUPS} 个备份${NC}"
+        read -r -p "新的单文件大小上限 MB（当前 ${LOG_MAX_SIZE_MB}，回车不改）: " NEW_SIZE
+        if [[ "$NEW_SIZE" =~ ^[0-9]+$ ]] && (( NEW_SIZE > 0 )); then
+          LOG_MAX_SIZE_MB=$NEW_SIZE
+          echo -e "${GREEN}大小上限已更新为 ${LOG_MAX_SIZE_MB}MB${NC}"
+        elif [[ -n "$NEW_SIZE" ]]; then
+          echo -e "${RED}无效输入，保持原值 ${LOG_MAX_SIZE_MB}MB${NC}"
+        fi
+        read -r -p "新的历史备份保留数量（当前 ${LOG_MAX_BACKUPS}，回车不改）: " NEW_BACKUPS
+        if [[ "$NEW_BACKUPS" =~ ^[0-9]+$ ]] && (( NEW_BACKUPS >= 1 )); then
+          LOG_MAX_BACKUPS=$NEW_BACKUPS
+          echo -e "${GREEN}保留数量已更新为 ${LOG_MAX_BACKUPS} 个${NC}"
+        elif [[ -n "$NEW_BACKUPS" ]]; then
+          echo -e "${RED}无效输入，保持原值 ${LOG_MAX_BACKUPS} 个${NC}"
+        fi
+        echo -e "${YELLOW}注意：策略修改仅对本次会话有效。"
+        echo -e "如需永久生效，请修改脚本顶部 LOG_MAX_SIZE_MB / LOG_MAX_BACKUPS 变量。${NC}"
+        ;;
+      0) break ;;
+      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+    esac
+  done
 }
 
 #====================== 核心：安装/卸载 ======================#
@@ -777,7 +981,6 @@ install_docker() {
     fi
   else
     echo "获取可用 Docker 版本..."
-    # ✅ 修复：使用 mapfile 将版本列表正确转为数组，避免分词问题
     mapfile -t VERSIONS_ARR <<< "$(fetch_docker_versions)"
     VERSION=$(select_version "${VERSIONS_ARR[@]}")
     [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
@@ -861,7 +1064,6 @@ install_docker_compose() {
   fi
 
   echo "获取 Docker Compose 版本列表..."
-  # ✅ 修复：使用 mapfile 正确构建数组
   mapfile -t COMPOSE_ARR <<< "$(fetch_docker_compose_versions)"
   local COMPOSE_VERSION
   COMPOSE_VERSION=$(select_version "${COMPOSE_ARR[@]}")
@@ -897,7 +1099,6 @@ install_docker_compose() {
 
   local COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${compose_file}"
   echo "下载 Docker Compose：$COMPOSE_URL"
-  # ✅ 修复：使用统一下载函数，GitHub URL 自动尝试代理
   if ! download_with_fallback "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
     echo -e "${RED}Docker Compose 下载失败，请检查网络后重试。${NC}"
     exit 1
@@ -913,7 +1114,6 @@ install_docker_compose() {
 uninstall_docker() {
   echo "正在卸载 Docker..."
 
-  # ✅ 修复：先确认 Docker 在运行再 prune，避免操作其他环境
   if systemctl is-active --quiet docker 2>/dev/null; then
     read -r -p "是否清理所有容器/镜像/数据卷？(y/n): " DOPRUNE
     [[ "$DOPRUNE" == "y" ]] && docker system prune -a -f 2>/dev/null || true
@@ -925,12 +1125,10 @@ uninstall_docker() {
   case "$PKG_MANAGER" in
     apt-get)
       apt-get remove -y --purge docker docker-engine docker.io \
-        containerd runc docker-ce docker-ce-cli 2>/dev/null || true
-      ;;
+        containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
     dnf|yum)
       "${PKG_MANAGER}" remove -y docker docker-engine docker.io \
-        containerd runc docker-ce docker-ce-cli 2>/dev/null || true
-      ;;
+        containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
   esac
 
   rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* \
@@ -958,8 +1156,6 @@ uninstall_docker_compose() {
 
 generate_daemon_config() {
   echo "正在生成 Docker daemon.json 配置文件..."
-
-  # 生成前先备份
   backup_daemon_json
 
   local DEFAULT_DATA_ROOT="/var/lib/docker"
@@ -967,7 +1163,7 @@ generate_daemon_config() {
   local DEFAULT_LOG_MAX_FILE="3"
 
   read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
-  DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
+  local DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
 
   local REGISTRY_MIRRORS_JSON
   REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
@@ -998,7 +1194,6 @@ EOF
   fi
 
   mkdir -p /etc/docker
-  # ✅ 修复：直接判断写入结果，不依赖 $?
   if echo "$DAEMON_CONFIG" > /etc/docker/daemon.json; then
     echo -e "${GREEN}/etc/docker/daemon.json 生成成功。${NC}"
     read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
@@ -1014,10 +1209,8 @@ check_iptables_mode() {
     echo -e "${RED}系统中未找到 iptables 命令。${NC}"
     return
   fi
-
   local iptables_version
   iptables_version=$(iptables -V 2>/dev/null)
-
   if echo "$iptables_version" | grep -q 'nf_tables'; then
     echo -e "当前 iptables 后端为: ${YELLOW}nf_tables${NC}"
     echo -e "版本信息: $iptables_version"
@@ -1051,9 +1244,10 @@ print_menu() {
   echo -e "  ${YELLOW}8.${NC}  生成 daemon.json 配置文件"
   echo -e "  ${YELLOW}9.${NC}  查看当前 iptables 后端模式"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
-  echo -e "  ${BLUE}10.${NC} Docker 服务管理（启动/停止/重启）"
+  echo -e "  ${BLUE}10.${NC} Docker 服务管理（启动 / 停止 / 重启）"
   echo -e "  ${BLUE}11.${NC} Docker 状态仪表盘"
   echo -e "  ${BLUE}12.${NC} daemon.json 备份与回滚"
+  echo -e "  ${BLUE}13.${NC} 日志管理"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  ${RED}0.${NC}  退出脚本"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
@@ -1063,6 +1257,7 @@ print_menu() {
 main() {
   check_sudo
   detect_package_manager
+  init_log
   install_dependencies
 
   echo "检测系统信息..."
@@ -1071,9 +1266,8 @@ main() {
 
   while true; do
     print_menu
-    read -r -p "请输入数字 (0-12): " CHOICE
+    read -r -p "请输入数字 (0-13): " CHOICE
 
-    # ✅ 修复：非数字输入不进入算术比较，避免 bash 报错
     if [[ -z "$CHOICE" ]]; then
       echo -e "${RED}请输入有效数字。${NC}"
       continue
@@ -1096,17 +1290,17 @@ main() {
       10) manage_docker_service ;;
       11) show_docker_status ;;
       12) manage_daemon_json ;;
+      13) manage_logs ;;
       0)
         echo -e "${GREEN}退出脚本。日志已保存至: ${LOG_FILE}${NC}"
         break
         ;;
       *)
-        echo -e "${RED}无效的选择，请输入 0-12 之间的数字。${NC}"
+        echo -e "${RED}无效的选择，请输入 0-13 之间的数字。${NC}"
         continue
         ;;
     esac
 
-    # ✅ 修复：只有执行了有效操作（非退出）才提示按键返回
     [[ "$CHOICE" -ne 0 ]] && read -n 1 -s -r -p $'\n按任意键返回主菜单...'
   done
 }
