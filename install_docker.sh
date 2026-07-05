@@ -20,12 +20,7 @@ PROXY_PREFIXES=(
 
 # 默认镜像加速源（daemon.json 用）
 REGISTRY_MIRRORS_DEFAULT=(
-  "https://docker.m.daocloud.io"
-  "https://hub.rat.dev"
-  "https://dockerpull.com"
-  "https://docker.nju.edu.cn"
-  "https://dockerproxy.com"
-  "https://mirror.baidubce.com"
+  "https://docker.1ms.run"
 )
 
 # 颜色
