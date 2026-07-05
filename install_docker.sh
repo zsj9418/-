@@ -25,6 +25,9 @@ REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.1panel.live"
 )
 
+# Docker Hub 直连测速端点
+DOCKER_DIRECT_ENDPOINT="https://registry-1.docker.io/v2/"
+
 # daemon.json 备份目录
 DAEMON_BACKUP_DIR="/etc/docker/backups"
 
@@ -46,39 +49,48 @@ PKG_MANAGER=""
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.3.1"
 
-#====================== 日志配置 ======================#
+# 测速结果全局存储（供 generate_daemon_config 复用）
+# 格式: "ms|label|url"，9999 表示不可达
+SPEED_TEST_RESULTS=()
 
+#====================== 日志配置 ======================#
+#
+# 存储结构：
+#   /var/log/docker_manager/
+#   ├── docker_manager.log        ← 当前日志，最大 LOG_MAX_SIZE_MB MB
+#   ├── docker_manager.log.1.gz   ← 最近一次轮转压缩
+#   ├── docker_manager.log.2.gz   ← 次旧
+#   └── docker_manager.log.3.gz   ← 最旧，超出后自动删除
+#   总占用上限 ≈ 5MB + 3×0.3MB ≈ 6MB，永不超出
+#
 LOG_DIR="/var/log/docker_manager"
 LOG_FILE="${LOG_DIR}/docker_manager.log"
 LOG_MAX_SIZE_MB=5
 LOG_MAX_BACKUPS=3
 
+# 日志轮转：超过 LOG_MAX_SIZE_MB 时压缩归档，最多保留 LOG_MAX_BACKUPS 个压缩包
 rotate_log() {
   [[ ! -f "$LOG_FILE" ]] && return 0
 
   local size_bytes
   size_bytes=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
   local size_mb=$(( size_bytes / 1024 / 1024 ))
+  (( size_mb < LOG_MAX_SIZE_MB )) && return 0
 
-  if (( size_mb < LOG_MAX_SIZE_MB )); then
-    return 0
-  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志达到 ${size_mb}MB，触发轮转..." >> "$LOG_FILE"
 
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志文件达到 ${size_mb}MB，触发轮转..." >> "$LOG_FILE"
+  # 删除最旧备份
+  [[ -f "${LOG_FILE}.${LOG_MAX_BACKUPS}.gz" ]] && rm -f "${LOG_FILE}.${LOG_MAX_BACKUPS}.gz"
 
-  local oldest="${LOG_FILE}.${LOG_MAX_BACKUPS}.gz"
-  [[ -f "$oldest" ]] && rm -f "$oldest"
-
+  # 依次向后移位：.2.gz → .3.gz，.1.gz → .2.gz
   for (( i = LOG_MAX_BACKUPS - 1; i >= 1; i-- )); do
-    local src="${LOG_FILE}.${i}.gz"
-    local dst="${LOG_FILE}.$((i+1)).gz"
-    [[ -f "$src" ]] && mv "$src" "$dst"
+    [[ -f "${LOG_FILE}.${i}.gz" ]] && mv "${LOG_FILE}.${i}.gz" "${LOG_FILE}.$((i+1)).gz"
   done
 
+  # 压缩当前日志为 .1.gz，清空当前文件（保持 inode，tee 文件描述符不中断）
   gzip -c "$LOG_FILE" > "${LOG_FILE}.1.gz"
   : > "$LOG_FILE"
-
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志轮转完成，已归档至 ${LOG_FILE}.1.gz" >> "$LOG_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 轮转完成，已归档至 ${LOG_FILE}.1.gz" >> "$LOG_FILE"
 }
 
 init_log() {
@@ -91,6 +103,7 @@ init_log() {
     echo "  PID: $$  |  用户: ${SUDO_USER:-$USER}"
     echo "════════════════════════════════════════"
   } >> "$LOG_FILE"
+  # 所有 stdout/stderr 同时写入日志
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
@@ -185,9 +198,10 @@ get_architecture() {
 
 get_os_version() {
   if [[ -f /etc/os-release ]]; then
-    OS_NAME=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
-    OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
-    echo "$OS_NAME $OS_VERSION"
+    local name ver
+    name=$(grep ^ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
+    ver=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
+    echo "$name $ver"
   else
     echo -e "${YELLOW}警告: 无法读取 /etc/os-release，系统版本未知。${NC}" >&2
     echo "unknown"
@@ -212,10 +226,8 @@ check_and_set_install_dir() {
 
   local AVAILABLE_SPACE
   AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
-  if [[ -z "$AVAILABLE_SPACE" ]]; then
-    echo -e "${RED}无法检测目录 $DEFAULT_DIR 的可用空间。${NC}"
-    exit 1
-  fi
+  [[ -z "$AVAILABLE_SPACE" ]] && {
+    echo -e "${RED}无法检测目录 $DEFAULT_DIR 的可用空间。${NC}"; exit 1; }
 
   echo -e "${YELLOW}默认目录: $DEFAULT_DIR (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
   read -r -p "是否指定自定义安装目录？(回车使用默认): " CUSTOM_DIR
@@ -224,17 +236,13 @@ check_and_set_install_dir() {
     mkdir -p "$CUSTOM_DIR" 2>/dev/null || { echo -e "${RED}无法创建 $CUSTOM_DIR${NC}"; exit 1; }
     AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
     [[ -z "$AVAILABLE_SPACE" ]] && { echo -e "${RED}无法检测 $CUSTOM_DIR 可用空间${NC}"; exit 1; }
-    if (( AVAILABLE_SPACE < REQUIRED_SPACE )); then
-      echo -e "${RED}$CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
-      exit 1
-    fi
+    (( AVAILABLE_SPACE < REQUIRED_SPACE )) && {
+      echo -e "${RED}$CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"; exit 1; }
     DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
     echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR${NC}"
   else
-    if (( AVAILABLE_SPACE < REQUIRED_SPACE )); then
-      echo -e "${RED}$DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
-      exit 1
-    fi
+    (( AVAILABLE_SPACE < REQUIRED_SPACE )) && {
+      echo -e "${RED}$DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"; exit 1; }
     DOCKER_INSTALL_DIR="$DEFAULT_DIR"
     echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR${NC}"
   fi
@@ -267,16 +275,12 @@ check_docker_compose_installed() {
 
 # 统一下载函数，区分 GitHub URL 与其他 URL 的代理策略
 download_with_fallback() {
-  local url="$1"
-  local dest="$2"
-
+  local url="$1" dest="$2"
   echo "下载: $url" >&2
   if curl -fSL --retry 3 --connect-timeout 20 "$url" -o "$dest"; then
     return 0
   fi
-
   echo -e "${YELLOW}直连失败，尝试代理...${NC}" >&2
-
   if [[ "$url" == *"github.com"* || "$url" == *"githubusercontent.com"* ]]; then
     for prefix in "${PROXY_PREFIXES[@]}"; do
       local proxy_url="${prefix}${url}"
@@ -290,8 +294,171 @@ download_with_fallback() {
   else
     echo -e "${YELLOW}注意：该地址不支持代理加速，已重试 3 次仍失败。${NC}" >&2
   fi
-
   return 1
+}
+
+#====================== 镜像源测速 ======================#
+
+# 测速单个端点，输出毫秒数（不可达输出 9999）
+# 用法: _probe_url "https://example.com/v2/"
+_probe_url() {
+  local url="$1"
+  local elapsed
+  elapsed=$(curl -o /dev/null -s -w "%{time_total}" \
+    --connect-timeout 5 --max-time 8 "$url" 2>/dev/null || echo "9.999")
+  # 转换为毫秒整数
+  local ms
+  ms=$(awk "BEGIN{printf \"%.0f\", ${elapsed} * 1000}")
+  echo "$ms"
+}
+
+# 主测速函数
+# 测完后将结果存入全局数组 SPEED_TEST_RESULTS（格式: "ms|label|url"）
+# 并打印格式化结果表，最后询问是否写入 daemon.json
+run_mirror_speed_test() {
+  SPEED_TEST_RESULTS=()
+
+  echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║          镜像源连通性测速                ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+  echo -e "[INFO] 开始测速，请稍候...\n"
+
+  # ── 1. 测试直连 Docker Hub ──────────────────
+  local direct_ms
+  direct_ms=$(_probe_url "$DOCKER_DIRECT_ENDPOINT")
+  if (( direct_ms >= 8000 )); then
+    printf "  ${RED}✗${NC} %-42s %s\n" "direct" "(不可达)"
+    SPEED_TEST_RESULTS+=("9999|direct|${DOCKER_DIRECT_ENDPOINT}")
+  else
+    printf "  ${GREEN}✓${NC} %-42s : ${GREEN}%sms${NC}\n" "direct" "$direct_ms"
+    SPEED_TEST_RESULTS+=("${direct_ms}|direct|${DOCKER_DIRECT_ENDPOINT}")
+  fi
+
+  # ── 2. 测试各镜像源 ─────────────────────────
+  for mirror in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
+    local probe_url="${mirror}/v2/"
+    local ms
+    ms=$(_probe_url "$probe_url")
+    if (( ms >= 8000 )); then
+      printf "  ${RED}✗${NC} %-42s %s\n" "$mirror" "(不可达)"
+      SPEED_TEST_RESULTS+=("9999|${mirror}|${probe_url}")
+    else
+      printf "  ${GREEN}✓${NC} %-42s : ${GREEN}%sms${NC}\n" "$mirror" "$ms"
+      SPEED_TEST_RESULTS+=("${ms}|${mirror}|${probe_url}")
+    fi
+  done
+
+  echo ""
+
+  # ── 3. 排序（按 ms 升序）───────────────────
+  # 利用 printf + sort 对数组排序，结果存回 SPEED_TEST_RESULTS
+  local sorted
+  sorted=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | sort -t'|' -k1 -n)
+  mapfile -t SPEED_TEST_RESULTS <<< "$sorted"
+
+  # ── 4. 提取最快可达源 ───────────────────────
+  local best_entry best_ms best_label
+  best_entry="${SPEED_TEST_RESULTS[0]}"
+  best_ms=$(echo "$best_entry" | cut -d'|' -f1)
+  best_label=$(echo "$best_entry" | cut -d'|' -f2)
+
+  if (( best_ms >= 8000 )); then
+    echo -e "[${RED}WARN${NC}] 所有源均不可达，请检查网络连接。"
+    return 1
+  fi
+
+  echo -e "[INFO] 最快源: ${GREEN}${best_label}${NC} (${best_ms}ms)"
+
+  # ── 5. 直连 vs 最快镜像源 对比建议 ─────────
+  echo ""
+  local direct_result
+  direct_result=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | grep '|direct|')
+  local direct_speed
+  direct_speed=$(echo "$direct_result" | cut -d'|' -f1)
+
+  if (( direct_speed < 8000 )) && [[ "$best_label" == "direct" ]]; then
+    echo -e "${GREEN}[INFO] 直连 Docker Hub 速度最快 (${direct_speed}ms)，无需配置镜像加速。${NC}"
+    echo -e "${YELLOW}[INFO] 是否仍要配置镜像源作为备用？${NC}"
+  else
+    if (( direct_speed >= 8000 )); then
+      echo -e "${RED}[INFO] 直连 Docker Hub 不可达。${NC}"
+    else
+      echo -e "${YELLOW}[INFO] 直连速度: ${direct_speed}ms  最快镜像: ${best_ms}ms"
+      local speedup=$(( direct_speed - best_ms ))
+      echo -e "[INFO] 使用镜像加速可提速约 ${speedup}ms。${NC}"
+    fi
+  fi
+
+  # ── 6. 询问是否写入 daemon.json ─────────────
+  echo ""
+  read -r -p "是否将可达镜像源（按速度排序）写入 daemon.json？(y/n): " DO_WRITE
+  if [[ "$DO_WRITE" == "y" ]]; then
+    _apply_speed_test_to_daemon
+  else
+    echo -e "${YELLOW}[INFO] 已跳过配置，测速结果保留供本次会话使用。${NC}"
+  fi
+}
+
+# 将测速结果中可达的镜像源（排除 direct）按速度写入 daemon.json
+_apply_speed_test_to_daemon() {
+  local reachable_mirrors=()
+
+  for entry in "${SPEED_TEST_RESULTS[@]}"; do
+    local ms label
+    ms=$(echo "$entry" | cut -d'|' -f1)
+    label=$(echo "$entry" | cut -d'|' -f2)
+    # 跳过直连条目和不可达条目
+    [[ "$label" == "direct" ]] && continue
+    (( ms >= 8000 )) && continue
+    reachable_mirrors+=("$label")
+  done
+
+  if [[ ${#reachable_mirrors[@]} -eq 0 ]]; then
+    echo -e "${RED}[WARN] 没有可达的镜像源，daemon.json 未修改。${NC}"
+    return
+  fi
+
+  # 展示将要写入的源
+  echo -e "\n[INFO] 将按以下顺序写入镜像源（已按速度排序）:"
+  for i in "${!reachable_mirrors[@]}"; do
+    # 查找对应 ms
+    local ms
+    ms=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" \
+      | grep "|${reachable_mirrors[$i]}|" | cut -d'|' -f1)
+    printf "  %d. %-42s %sms\n" "$((i+1))" "${reachable_mirrors[$i]}" "$ms"
+  done
+  echo ""
+
+  backup_daemon_json
+
+  mkdir -p /etc/docker
+  local mirrors_json
+  mirrors_json=$(printf '%s\n' "${reachable_mirrors[@]}" | jq -R . | jq -s .)
+
+  # 若 daemon.json 已存在且合法，用 jq 合并；否则新建
+  if [[ -f /etc/docker/daemon.json ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson mirrors "$mirrors_json" \
+      '. + {"registry-mirrors": $mirrors}' \
+      /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+  else
+    cat >/etc/docker/daemon.json <<EOF
+{
+  "iptables": true,
+  "ip6tables": true,
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "registry-mirrors": ${mirrors_json}
+}
+EOF
+  fi
+
+  echo -e "[INFO] ${GREEN}Docker 镜像源已配置完成。${NC}"
+
+  read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DO_RESTART
+  [[ "$DO_RESTART" == "y" ]] && _restart_docker
 }
 
 #====================== Docker 前置准备 ======================#
@@ -366,7 +533,6 @@ EOF
 ensure_daemon_json() {
   mkdir -p /etc/docker
   if [[ ! -s /etc/docker/daemon.json ]]; then
-    # 将 REGISTRY_MIRRORS_DEFAULT 数组转为 JSON 数组
     local mirrors_json
     mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
     cat >/etc/docker/daemon.json <<EOF
@@ -394,8 +560,7 @@ EOF
     else
       backup_daemon_json
       local mirrors_json
-      mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s . 2>/dev/null \
-        || printf '[\n%s\n]' "$(printf '    "%s",\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | sed '$s/,$//')")
+      mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
       cat >/etc/docker/daemon.json <<EOF
 {
   "iptables": true,
@@ -419,14 +584,11 @@ fetch_docker_versions() {
     return
   fi
   ARCH=$(get_architecture)
-  local URL="${DOCKER_VERSIONS_URL}${ARCH}/"
   local VERSIONS
-  VERSIONS=$(curl -s --connect-timeout 15 "$URL" \
-    | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' \
-    | sort -Vr | uniq)
+  VERSIONS=$(curl -s --connect-timeout 15 "${DOCKER_VERSIONS_URL}${ARCH}/" \
+    | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
   if [[ -z "$VERSIONS" ]]; then
-    echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}" >&2
-    exit 1
+    echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}" >&2; exit 1
   fi
   echo "$VERSIONS" > "$CACHE_FILE"
   echo "$VERSIONS"
@@ -435,18 +597,15 @@ fetch_docker_versions() {
 select_version() {
   local VERSIONS=("$@")
   if command -v fzf >/dev/null 2>&1; then
-    local SELECTED_VERSION
-    SELECTED_VERSION=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
-      --prompt="请选择版本 > " \
-      --header="选择版本（回车确认）" \
+    local SELECTED
+    SELECTED=$(printf "%s\n" "${VERSIONS[@]}" | fzf \
+      --prompt="请选择版本 > " --header="选择版本（回车确认）" \
       --height=20 --reverse --border)
-    if [[ -n "$SELECTED_VERSION" ]]; then
-      echo "$SELECTED_VERSION"
-      return
+    if [[ -n "$SELECTED" ]]; then
+      echo "$SELECTED"; return
     else
       echo -e "${YELLOW}未选择，使用最新版本...${NC}" >&2
-      echo "${VERSIONS[0]}"
-      return
+      echo "${VERSIONS[0]}"; return
     fi
   fi
 
@@ -454,18 +613,13 @@ select_version() {
   PS3="请选择版本 (默认 1 为最新): "
   select VERSION in "${VERSIONS[@]}" "取消"; do
     case $REPLY in
-      ''|1)
-        echo "${VERSIONS[0]}"
-        return
-        ;;
+      ''|1) echo "${VERSIONS[0]}"; return ;;
       *)
         if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 2 && REPLY <= ${#VERSIONS[@]} )); then
-          echo "${VERSIONS[$((REPLY-1))]}"
-          return
+          echo "${VERSIONS[$((REPLY-1))]}"; return
         else
           echo -e "${YELLOW}无效选择，使用最新版本...${NC}" >&2
-          echo "${VERSIONS[0]}"
-          return
+          echo "${VERSIONS[0]}"; return
         fi
         ;;
     esac
@@ -477,8 +631,7 @@ fetch_docker_compose_versions() {
   VERSIONS=$(curl -s --connect-timeout 15 "$COMPOSE_RELEASES_URL" \
     | jq -r '.[].tag_name' | sort -Vr | uniq)
   if [[ -z "$VERSIONS" ]]; then
-    echo -e "${RED}无法获取 Docker Compose 版本列表。${NC}" >&2
-    exit 1
+    echo -e "${RED}无法获取 Docker Compose 版本列表。${NC}" >&2; exit 1
   fi
   echo "$VERSIONS"
 }
@@ -504,8 +657,7 @@ restore_daemon_json() {
   done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
 
   if [[ ${#backups[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}暂无备份文件，请先执行备份操作。${NC}"
-    return
+    echo -e "${YELLOW}暂无备份文件，请先执行备份操作。${NC}"; return
   fi
 
   echo -e "${CYAN}可用的备份列表：${NC}"
@@ -516,13 +668,9 @@ restore_daemon_json() {
   done
 
   read -r -p "请输入要回滚的备份编号 (回车取消): " IDX
-  if [[ -z "$IDX" ]]; then
-    echo -e "${YELLOW}已取消回滚。${NC}"
-    return
-  fi
+  [[ -z "$IDX" ]] && { echo -e "${YELLOW}已取消回滚。${NC}"; return; }
   if ! [[ "$IDX" =~ ^[0-9]+$ ]] || (( IDX < 1 || IDX > ${#backups[@]} )); then
-    echo -e "${RED}无效编号。${NC}"
-    return
+    echo -e "${RED}无效编号。${NC}"; return
   fi
 
   local selected="${backups[$((IDX-1))]}"
@@ -530,8 +678,7 @@ restore_daemon_json() {
   if cp "$selected" /etc/docker/daemon.json; then
     echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}"
   else
-    echo -e "${RED}回滚失败${NC}"
-    return
+    echo -e "${RED}回滚失败${NC}"; return
   fi
 
   if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
@@ -581,14 +728,12 @@ manage_daemon_json() {
         else
           local i=1
           for f in "${backups[@]}"; do
-            echo "  $i) $(basename "$f")"
-            ((i++))
+            echo "  $i) $(basename "$f")"; ((i++))
           done
           read -r -p "请输入要删除的编号 (回车取消): " DIDX
           if [[ "$DIDX" =~ ^[0-9]+$ ]] && (( DIDX >= 1 && DIDX <= ${#backups[@]} )); then
             rm -f "${backups[$((DIDX-1))]}" && \
-              echo -e "${GREEN}已删除备份。${NC}" || \
-              echo -e "${RED}删除失败。${NC}"
+              echo -e "${GREEN}已删除备份。${NC}" || echo -e "${RED}删除失败。${NC}"
           else
             echo -e "${YELLOW}已取消。${NC}"
           fi
@@ -633,8 +778,7 @@ _restart_docker() {
 
 manage_docker_service() {
   if ! command -v docker >/dev/null 2>&1; then
-    echo -e "${RED}Docker 未安装，无法进行服务管理。${NC}"
-    return
+    echo -e "${RED}Docker 未安装，无法进行服务管理。${NC}"; return
   fi
   while true; do
     local svc_status svc_enabled
@@ -663,16 +807,10 @@ manage_docker_service() {
       1) _start_docker ;;
       2) _stop_docker ;;
       3) _restart_docker ;;
-      4)
-        systemctl enable docker >/dev/null 2>&1 && \
-          echo -e "${GREEN}已开启开机自启。${NC}" || \
-          echo -e "${RED}操作失败。${NC}"
-        ;;
-      5)
-        systemctl disable docker >/dev/null 2>&1 && \
-          echo -e "${GREEN}已关闭开机自启。${NC}" || \
-          echo -e "${RED}操作失败。${NC}"
-        ;;
+      4) systemctl enable docker >/dev/null 2>&1 && \
+           echo -e "${GREEN}已开启开机自启。${NC}" || echo -e "${RED}操作失败。${NC}" ;;
+      5) systemctl disable docker >/dev/null 2>&1 && \
+           echo -e "${GREEN}已关闭开机自启。${NC}" || echo -e "${RED}操作失败。${NC}" ;;
       6)
         echo -e "${CYAN}--- Docker 服务日志（最近 50 行）---${NC}"
         journalctl -u docker -n 50 --no-pager 2>/dev/null || \
@@ -691,7 +829,6 @@ show_docker_status() {
   echo -e "${BOLD}${CYAN}║           Docker 状态仪表盘              ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
 
-  # ── 安装状态 ──────────────────────────────
   echo -e "\n${BOLD}[ 安装状态 ]${NC}"
   if command -v docker >/dev/null 2>&1; then
     echo -e "  Docker:         ${GREEN}已安装 $(docker --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
@@ -709,23 +846,17 @@ show_docker_status() {
     echo -e "  Compose 插件:   ${YELLOW}未安装${NC}"
   fi
 
-  # ── 服务状态 ──────────────────────────────
   echo -e "\n${BOLD}[ 服务状态 ]${NC}"
   local svc_status svc_enabled
   svc_status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
   svc_enabled=$(systemctl is-enabled docker 2>/dev/null || echo "disabled")
-  if [[ "$svc_status" == "active" ]]; then
-    echo -e "  服务:     ${GREEN}● 运行中${NC}"
-  else
-    echo -e "  服务:     ${RED}● ${svc_status}${NC}"
-  fi
-  if [[ "$svc_enabled" == "enabled" ]]; then
-    echo -e "  开机自启: ${GREEN}已开启${NC}"
-  else
-    echo -e "  开机自启: ${YELLOW}${svc_enabled}${NC}"
-  fi
+  [[ "$svc_status" == "active" ]] \
+    && echo -e "  服务:     ${GREEN}● 运行中${NC}" \
+    || echo -e "  服务:     ${RED}● ${svc_status}${NC}"
+  [[ "$svc_enabled" == "enabled" ]] \
+    && echo -e "  开机自启: ${GREEN}已开启${NC}" \
+    || echo -e "  开机自启: ${YELLOW}${svc_enabled}${NC}"
 
-  # ── 运行时资源 ────────────────────────────
   if [[ "$svc_status" == "active" ]] && command -v docker >/dev/null 2>&1; then
     echo -e "\n${BOLD}[ 运行时资源 ]${NC}"
     local total_c running_c stopped_c
@@ -738,29 +869,23 @@ show_docker_status() {
     echo -e "  网络: $(docker network ls -q 2>/dev/null | wc -l) 个"
 
     echo -e "\n${BOLD}[ 磁盘占用 ]${NC}"
-    docker system df 2>/dev/null | while IFS= read -r line; do
-      echo "  $line"
-    done
+    docker system df 2>/dev/null | while IFS= read -r line; do echo "  $line"; done
 
     local running_list
     running_list=$(docker ps --format \
       "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
     if [[ -n "$running_list" ]]; then
       echo -e "\n${BOLD}[ 运行中容器 ]${NC}"
-      echo "$running_list" | while IFS= read -r line; do
-        echo "  $line"
-      done
+      echo "$running_list" | while IFS= read -r line; do echo "  $line"; done
     fi
   fi
 
-  # ── 镜像加速源 ────────────────────────────
   echo -e "\n${BOLD}[ 镜像加速源 ]${NC}"
   echo -e "  ${CYAN}脚本内置默认源（共 ${#REGISTRY_MIRRORS_DEFAULT[@]} 个）:${NC}"
   for m in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
     echo -e "    ${CYAN}• ${m}${NC}"
   done
 
-  # ── 配置文件状态 ──────────────────────────
   echo -e "\n${BOLD}[ daemon.json 配置 ]${NC}"
   if [[ -f /etc/docker/daemon.json ]]; then
     if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
@@ -772,9 +897,7 @@ show_docker_status() {
       data_root=$(jq -r '."data-root" // "/var/lib/docker (默认)"' /etc/docker/daemon.json 2>/dev/null)
       if [[ -n "$mirrors" ]]; then
         echo -e "  镜像加速:"
-        while IFS= read -r m; do
-          echo -e "    ${CYAN}• ${m}${NC}"
-        done <<< "$mirrors"
+        while IFS= read -r m; do echo -e "    ${CYAN}• ${m}${NC}"; done <<< "$mirrors"
       else
         echo -e "  镜像加速: ${YELLOW}未配置${NC}"
       fi
@@ -791,7 +914,6 @@ show_docker_status() {
     echo -e "  状态:     ${YELLOW}daemon.json 不存在${NC}"
   fi
 
-  # ── 系统信息 ──────────────────────────────
   echo -e "\n${BOLD}[ 系统信息 ]${NC}"
   echo -e "  架构:   $(uname -m)"
   echo -e "  内核:   $(uname -r)"
@@ -803,12 +925,10 @@ show_docker_status() {
   echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | \
     awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
 
-  # ── 日志信息 ──────────────────────────────
   echo -e "\n${BOLD}[ 日志信息 ]${NC}"
   if [[ -f "$LOG_FILE" ]]; then
-    local log_size
+    local log_size log_bak
     log_size=$(du -sh "$LOG_FILE" 2>/dev/null | awk '{print $1}')
-    local log_bak
     log_bak=$(find "$LOG_DIR" -maxdepth 1 -name "*.gz" 2>/dev/null | wc -l)
     echo -e "  当前日志: ${log_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
     echo -e "  历史备份: ${log_bak} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
@@ -840,6 +960,12 @@ manage_logs() {
     echo -e "  当前日志:   ${current_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
     echo -e "  历史备份:   ${backup_count} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
     echo -e "  目录总占用: ${total_size}"
+    echo -e "${CYAN}──────────────────────────────────────────${NC}"
+    echo -e "  存储结构说明:"
+    echo -e "    docker_manager.log        ← 当前日志 (≤${LOG_MAX_SIZE_MB}MB)"
+    echo -e "    docker_manager.log.1.gz   ← 最近一次轮转"
+    echo -e "    docker_manager.log.2.gz   ← 次旧 (最多 ${LOG_MAX_BACKUPS} 个)"
+    echo -e "    docker_manager.log.3.gz   ← 最旧，超出后自动删除"
     echo -e "${CYAN}──────────────────────────────────────────${NC}"
     echo "  1. 查看当前日志（最后 50 行）"
     echo "  2. 查看所有历史备份"
@@ -878,8 +1004,7 @@ manage_logs() {
             ((i++))
           done
           read -r -p "是否查看某个备份内容？输入编号（回车跳过）: " BIDX
-          if [[ "$BIDX" =~ ^[0-9]+$ ]] && \
-             (( BIDX >= 1 && BIDX <= ${#backups[@]} )); then
+          if [[ "$BIDX" =~ ^[0-9]+$ ]] && (( BIDX >= 1 && BIDX <= ${#backups[@]} )); then
             echo -e "${CYAN}── 备份内容（最后 50 行）──${NC}"
             zcat "${backups[$((BIDX-1))]}" 2>/dev/null | tail -n 50
           fi
@@ -964,20 +1089,17 @@ install_docker() {
   fi
 
   ensure_docker_prereqs
-
   ARCH=$(get_architecture)
   check_and_set_install_dir
 
   local VERSION
-
   if [[ "$FORCE_LEGACY_DOCKER" == "true" ]]; then
     echo -e "${YELLOW}由于系统环境限制，将为您安装兼容性最好的旧版 Docker。${NC}"
     VERSION="$RECOMMENDED_LEGACY_DOCKER_VERSION"
     local available_versions
     available_versions=$(fetch_docker_versions)
     if ! echo "$available_versions" | grep -q "^${VERSION}$"; then
-      echo -e "${RED}推荐的兼容版本 ${VERSION} 不在可用列表中！安装中止。${NC}"
-      exit 1
+      echo -e "${RED}推荐的兼容版本 ${VERSION} 不在可用列表中！安装中止。${NC}"; exit 1
     fi
   else
     echo "获取可用 Docker 版本..."
@@ -989,11 +1111,9 @@ install_docker() {
   echo -e "${GREEN}选择的 Docker 版本：$VERSION${NC}"
   DOCKER_URL="${DOCKER_VERSIONS_URL}${ARCH}/docker-${VERSION}.tgz"
 
-  echo "下载 Docker 二进制包：$DOCKER_URL"
   if ! download_with_fallback "$DOCKER_URL" "$DOCKER_INSTALL_DIR/docker.tgz"; then
     echo -e "${RED}所有下载方式均失败，请检查网络后重试。${NC}"
-    rm -rf "$DOCKER_INSTALL_DIR"
-    exit 1
+    rm -rf "$DOCKER_INSTALL_DIR"; exit 1
   fi
 
   echo "解压 Docker 包..."
@@ -1005,7 +1125,6 @@ install_docker() {
   mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || {
     echo -e "${RED}移动文件失败${NC}"; exit 1; }
 
-  echo "创建 docker 用户组..."
   groupadd -f docker
   CURRENT_USER="${SUDO_USER:-$USER}"
   if [[ -n "$CURRENT_USER" && "$CURRENT_USER" != "root" ]]; then
@@ -1014,7 +1133,6 @@ install_docker() {
 
   ensure_daemon_json
 
-  echo "写入 systemd Unit ..."
   cat >/etc/systemd/system/docker.service <<'EOF'
 [Unit]
 Description=Docker Application Container Engine
@@ -1041,16 +1159,14 @@ EOF
   systemctl enable docker >/dev/null 2>&1 || true
   echo "启动 Docker ..."
   if ! systemctl start docker; then
-    echo -e "${YELLOW}启动失败，查看日志：journalctl -u docker -n 200 --no-pager${NC}"
-    exit 1
+    echo -e "${YELLOW}启动失败，查看日志：journalctl -u docker -n 200 --no-pager${NC}"; exit 1
   fi
 
   if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
     echo -e "${GREEN}Docker 安装并启动成功！${NC}"
     echo -e "${YELLOW}若需要无 sudo 运行，请重新登录以应用用户组变更。${NC}"
   else
-    echo -e "${RED}Docker 安装或启动失败，请查看日志。${NC}"
-    exit 1
+    echo -e "${RED}Docker 安装或启动失败，请查看日志。${NC}"; exit 1
   fi
 
   echo "清理临时文件..."
@@ -1098,30 +1214,23 @@ install_docker_compose() {
   esac
 
   local COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${compose_file}"
-  echo "下载 Docker Compose：$COMPOSE_URL"
   if ! download_with_fallback "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
-    echo -e "${RED}Docker Compose 下载失败，请检查网络后重试。${NC}"
-    exit 1
+    echo -e "${RED}Docker Compose 下载失败，请检查网络后重试。${NC}"; exit 1
   fi
   chmod +x /usr/local/bin/docker-compose
-
   mkdir -p /usr/local/lib/docker/cli-plugins
   cp /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
-
   echo -e "${GREEN}Docker Compose 安装完成（支持 docker compose 与 docker-compose）。${NC}"
 }
 
 uninstall_docker() {
   echo "正在卸载 Docker..."
-
   if systemctl is-active --quiet docker 2>/dev/null; then
     read -r -p "是否清理所有容器/镜像/数据卷？(y/n): " DOPRUNE
     [[ "$DOPRUNE" == "y" ]] && docker system prune -a -f 2>/dev/null || true
   fi
-
   systemctl stop docker.service 2>/dev/null || true
   systemctl disable docker.service 2>/dev/null || true
-
   case "$PKG_MANAGER" in
     apt-get)
       apt-get remove -y --purge docker docker-engine docker.io \
@@ -1130,18 +1239,15 @@ uninstall_docker() {
       "${PKG_MANAGER}" remove -y docker docker-engine docker.io \
         containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
   esac
-
   rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* \
     /usr/bin/docker* /usr/sbin/docker* /opt/docker
   rm -f /etc/systemd/system/docker.service /etc/systemd/system/docker.socket
   rm -f /etc/modules-load.d/docker.conf /etc/sysctl.d/99-docker.conf
   rm -rf /var/lib/containerd /run/containerd \
     /usr/local/bin/containerd* /usr/local/bin/runc 2>/dev/null || true
-
   groupdel docker 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed 2>/dev/null || true
-
   echo -e "${GREEN}Docker 已卸载并清理。${NC}"
 }
 
@@ -1165,8 +1271,17 @@ generate_daemon_config() {
   read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
   local DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
 
+  # 询问是否先测速以选择最优镜像源
+  echo ""
+  read -r -p "是否先进行镜像源测速，自动选择最快的源？(y/n，默认使用全部内置源): " DO_SPEEDTEST
   local REGISTRY_MIRRORS_JSON
-  REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+  if [[ "$DO_SPEEDTEST" == "y" ]]; then
+    run_mirror_speed_test
+    # 测速完成后 _apply_speed_test_to_daemon 已写入，直接返回
+    return
+  else
+    REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+  fi
 
   local DAEMON_CONFIG
   DAEMON_CONFIG=$(cat <<EOF
@@ -1189,8 +1304,7 @@ EOF
   echo "$DAEMON_CONFIG"
 
   if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
-    echo -e "${RED}生成的 JSON 格式不正确。${NC}"
-    exit 1
+    echo -e "${RED}生成的 JSON 格式不正确。${NC}"; exit 1
   fi
 
   mkdir -p /etc/docker
@@ -1206,8 +1320,7 @@ EOF
 check_iptables_mode() {
   echo "正在检测 iptables 后端模式..."
   if ! command -v iptables >/dev/null 2>&1; then
-    echo -e "${RED}系统中未找到 iptables 命令。${NC}"
-    return
+    echo -e "${RED}系统中未找到 iptables 命令。${NC}"; return
   fi
   local iptables_version
   iptables_version=$(iptables -V 2>/dev/null)
@@ -1248,6 +1361,7 @@ print_menu() {
   echo -e "  ${BLUE}11.${NC} Docker 状态仪表盘"
   echo -e "  ${BLUE}12.${NC} daemon.json 备份与回滚"
   echo -e "  ${BLUE}13.${NC} 日志管理"
+  echo -e "  ${BLUE}14.${NC} 镜像源测速 & 一键配置"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  ${RED}0.${NC}  退出脚本"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
@@ -1266,15 +1380,13 @@ main() {
 
   while true; do
     print_menu
-    read -r -p "请输入数字 (0-13): " CHOICE
+    read -r -p "请输入数字 (0-14): " CHOICE
 
     if [[ -z "$CHOICE" ]]; then
-      echo -e "${RED}请输入有效数字。${NC}"
-      continue
+      echo -e "${RED}请输入有效数字。${NC}"; continue
     fi
     if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
-      echo -e "${RED}无效的选择，请输入数字。${NC}"
-      continue
+      echo -e "${RED}无效的选择，请输入数字。${NC}"; continue
     fi
 
     case "$CHOICE" in
@@ -1291,14 +1403,13 @@ main() {
       11) show_docker_status ;;
       12) manage_daemon_json ;;
       13) manage_logs ;;
+      14) run_mirror_speed_test ;;
       0)
         echo -e "${GREEN}退出脚本。日志已保存至: ${LOG_FILE}${NC}"
         break
         ;;
       *)
-        echo -e "${RED}无效的选择，请输入 0-13 之间的数字。${NC}"
-        continue
-        ;;
+        echo -e "${RED}无效的选择，请输入 0-14 之间的数字。${NC}"; continue ;;
     esac
 
     [[ "$CHOICE" -ne 0 ]] && read -n 1 -s -r -p $'\n按任意键返回主菜单...'
