@@ -3,7 +3,7 @@ set -euo pipefail
 trap 'echo -e "\n[!] 已中断"; exit 1' INT
 
 SCRIPT_NAME="Lucky 终极部署管理器"
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 
 CONTAINER_NAME="lucky"
 IMAGE_NAME="gdy666/lucky"
@@ -124,6 +124,166 @@ get_host_ip(){
   echo "${_ip:-}"
 }
 
+# ─────────────────────────────────────────────────────────────
+# IPv6 Enable / Fix (Multi-distro)
+# ─────────────────────────────────────────────────────────────
+detect_default_iface(){
+  local ifc=""
+  ifc="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}' || true)"
+  [[ -n "$ifc" ]] || ifc="$(ip -6 route show default 2>/dev/null | awk 'NR==1{print $5}' || true)"
+  [[ -n "$ifc" ]] || ifc="$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}' || true)"
+  echo "${ifc:-}"
+}
+
+ipv6_has_global_addr(){
+  local ifc="$1"
+  ip -6 addr show dev "$ifc" 2>/dev/null | grep -qE 'inet6 (2|3)[0-9a-fA-F:]+/.* scope global'
+}
+
+ipv6_has_default_route(){
+  ip -6 route show default 2>/dev/null | grep -q '^default'
+}
+
+ipv6_dns_ok(){
+  if have getent; then
+    getent ahosts ipv6.google.com 2>/dev/null | grep -q ':' && return 0
+    return 1
+  fi
+  if have nslookup; then
+    nslookup -type=AAAA ipv6.google.com 2>/dev/null | grep -qi 'Address:' && return 0
+    return 1
+  fi
+  if have dig; then
+    dig +short AAAA ipv6.google.com 2>/dev/null | grep -q ':' && return 0
+    return 1
+  fi
+  return 2
+}
+
+apply_sysctl_ipv6_runtime(){
+  local ifc="$1"
+  sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+
+  # 强制收 RA（即使 forwarding=1）
+  sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
+  [[ -n "$ifc" ]] && sysctl -w "net.ipv6.conf.${ifc}.accept_ra=2" >/dev/null 2>&1 || true
+
+  sysctl -w net.ipv6.conf.all.autoconf=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.autoconf=1 >/dev/null 2>&1 || true
+  [[ -n "$ifc" ]] && sysctl -w "net.ipv6.conf.${ifc}.autoconf=1" >/dev/null 2>&1 || true
+}
+
+persist_sysctl_ipv6(){
+  local conf="/etc/sysctl.d/99-lucky-ipv6.conf"
+  cat > "$conf" <<'EOF'
+# Managed by Lucky deploy manager: enable IPv6 + accept RA
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+
+# If forwarding is enabled, Linux may ignore RA unless accept_ra=2
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+
+net.ipv6.conf.all.autoconf = 1
+net.ipv6.conf.default.autoconf = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
+}
+
+kick_network_stack(){
+  local ifc="$1"
+
+  if [[ -n "$ifc" ]]; then
+    ip link set "$ifc" down >/dev/null 2>&1 || true
+    sleep 1
+    ip link set "$ifc" up >/dev/null 2>&1 || true
+  fi
+
+  if have nmcli && [[ -n "$ifc" ]]; then
+    nmcli dev disconnect "$ifc" >/dev/null 2>&1 || true
+    sleep 1
+    nmcli dev connect "$ifc" >/dev/null 2>&1 || true
+  fi
+
+  if have networkctl; then
+    networkctl reload >/dev/null 2>&1 || true
+    [[ -n "$ifc" ]] && networkctl reconfigure "$ifc" >/dev/null 2>&1 || true
+  fi
+
+  if have ifdown && have ifup && [[ -n "$ifc" ]]; then
+    ifdown "$ifc" >/dev/null 2>&1 || true
+    sleep 1
+    ifup "$ifc" >/dev/null 2>&1 || true
+  fi
+
+  # OpenWrt / ImmortalWrt 尝试
+  if have ifup; then
+    ifup wan >/dev/null 2>&1 || true
+    ifup wan6 >/dev/null 2>&1 || true
+  fi
+}
+
+enable_ipv6_auto(){
+  need_root
+  clear
+  echo -e "${BLUE}🌐 IPv6 自动开启/修复${RESET}"
+
+  local ifc; ifc="$(detect_default_iface)"
+  logi "默认出网接口：${ifc:-<未知>}"
+
+  logi "应用 sysctl（运行时生效）：disable_ipv6=0, accept_ra=2, autoconf=1"
+  apply_sysctl_ipv6_runtime "$ifc"
+
+  logi "写入持久化配置：/etc/sysctl.d/99-lucky-ipv6.conf"
+  persist_sysctl_ipv6
+
+  logi "触发网络重新获取 IPv6（接口 flap / NM / networkd / ifupdown / OpenWrt ifup）"
+  kick_network_stack "$ifc"
+  sleep 2
+
+  echo ""
+  logi "当前 IPv6 地址："
+  if [[ -n "$ifc" ]]; then
+    ip -6 addr show dev "$ifc" 2>/dev/null || true
+  else
+    ip -6 addr show 2>/dev/null || true
+  fi
+
+  echo ""
+  logi "当前 IPv6 路由："
+  ip -6 route 2>/dev/null || true
+
+  local ok_addr="false" ok_route="false"
+  [[ -n "$ifc" ]] && ipv6_has_global_addr "$ifc" && ok_addr="true"
+  ipv6_has_default_route && ok_route="true"
+
+  echo ""
+  if [[ "$ok_addr" == "true" && "$ok_route" == "true" ]]; then
+    ok "IPv6 看起来已工作：有全局地址 + 默认 IPv6 路由"
+  else
+    warn "IPv6 仍不完整："
+    [[ "$ok_addr" != "true" ]] && warn " - 未在 ${ifc:-接口} 上看到全局 IPv6 地址（仅 fe80 链路本地也会出现）"
+    [[ "$ok_route" != "true" ]] && warn " - 未看到默认 IPv6 路由（default via ...）"
+    warn "常见原因：上游未下发 RA/DHCPv6，或网络不透传 ICMPv6 RA。"
+  fi
+
+  local dns_rc=0
+  ipv6_dns_ok || dns_rc=$?
+  if [[ "$dns_rc" -eq 0 ]]; then
+    ok "IPv6 DNS 解析正常（能解析 ipv6.google.com 的 AAAA）"
+  else
+    warn "IPv6 DNS 解析可能不正常（ping6 报 no address associated 常见是 DNS 不返回 AAAA）。"
+    warn "可检查 /etc/resolv.conf，或上游 RA 是否下发 RDNSS。"
+  fi
+
+  echo ""
+  press_any
+}
+
 # ── Docker 部署逻辑 ────────────────────────────────────
 get_dockerhub_tags(){
   local url="https://hub.docker.com/v2/repositories/gdy666/lucky/tags?page_size=50&ordering=last_updated"
@@ -232,7 +392,6 @@ ensure_data_dir_ready(){
   ok "目录权限就绪"
 }
 
-# 🛠️ 修复：增加了 ExecStartPre=-/bin/rm -f /tmp/lucky.control.sock 防止意外崩溃留下的 socket 文件导致下次启动 panic
 create_native_service_lucky_caps(){
   cat > "$LUCKY_SERVICE" <<EOF
 [Unit]
@@ -308,7 +467,6 @@ EOF
 start_native_auto(){
   need_root
   systemctl stop lucky >/dev/null 2>&1 || true
-  # 清理一下，双保险
   rm -f /tmp/lucky.control.sock 2>/dev/null || true
 
   create_native_service_lucky_caps
@@ -538,7 +696,7 @@ main_menu(){
   echo -e "${BLUE}======================================${RESET}"
   echo -e "  ── Docker 模式 ──\n  1) 部署容器\n  2) 更新容器\n  3) 卸载容器\n  4) 查看状态\n  5) 管理容器"
   echo -e "  ── 原生模式 ──\n  6) 原生版管理（含修复）"
-  echo -e "  ── 维护 ──\n  7) PURGE 完全清理（回到未安装前）\n  0) 退出"
+  echo -e "  ── 维护 ──\n  7) PURGE 完全清理（回到未安装前）\n  8) 开启/修复 IPv6（自动）\n  0) 退出"
   echo -e "${BLUE}======================================${RESET}"
 }
 
@@ -547,8 +705,16 @@ main(){
   while true; do
     main_menu; local c=""; read_default "选择" "0" c
     case "$c" in
-      1) deploy_docker ;; 2) upgrade_docker ;; 3) uninstall_docker ;; 4) show_status ;; 5) manage_container ;;
-      6) native_menu ;; 7) purge_everything ;; 0) ok "再见"; exit 0 ;; *) warn "无效选择"; sleep 1 ;;
+      1) deploy_docker ;;
+      2) upgrade_docker ;;
+      3) uninstall_docker ;;
+      4) show_status ;;
+      5) manage_container ;;
+      6) native_menu ;;
+      7) purge_everything ;;
+      8) enable_ipv6_auto ;;
+      0) ok "再见"; exit 0 ;;
+      *) warn "无效选择"; sleep 1 ;;
     esac
   done
 }
