@@ -3,7 +3,7 @@ set -euo pipefail
 trap 'echo -e "\n[!] 已中断"; exit 1' INT
 
 SCRIPT_NAME="Lucky 终极部署管理器"
-SCRIPT_VERSION="1.6.8-fixed"
+SCRIPT_VERSION="1.1"
 
 CONTAINER_NAME="lucky"
 IMAGE_NAME="gdy666/lucky"
