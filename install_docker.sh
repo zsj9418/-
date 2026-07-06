@@ -30,6 +30,7 @@ DOCKER_DIRECT_ENDPOINT="https://registry-1.docker.io/v2/"
 
 # daemon.json 备份目录
 DAEMON_BACKUP_DIR="/etc/docker/backups"
+PROXY_MIRROR_URL=""
 
 # 颜色
 RED='\033[0;31m'
@@ -48,27 +49,13 @@ OS=""
 PKG_MANAGER=""
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.3.1"
-
-# 测速结果全局存储（供 generate_daemon_config 复用）
-# 格式: "ms|label|url"，9999 表示不可达
 SPEED_TEST_RESULTS=()
 
-#====================== 日志配置 ======================#
-#
-# 存储结构：
-#   /var/log/docker_manager/
-#   ├── docker_manager.log        ← 当前日志，最大 LOG_MAX_SIZE_MB MB
-#   ├── docker_manager.log.1.gz   ← 最近一次轮转压缩
-#   ├── docker_manager.log.2.gz   ← 次旧
-#   └── docker_manager.log.3.gz   ← 最旧，超出后自动删除
-#   总占用上限 ≈ 5MB + 3×0.3MB ≈ 6MB，永不超出
-#
 LOG_DIR="/var/log/docker_manager"
 LOG_FILE="${LOG_DIR}/docker_manager.log"
 LOG_MAX_SIZE_MB=5
 LOG_MAX_BACKUPS=3
 
-# 日志轮转：超过 LOG_MAX_SIZE_MB 时压缩归档，最多保留 LOG_MAX_BACKUPS 个压缩包
 rotate_log() {
   [[ ! -f "$LOG_FILE" ]] && return 0
 
@@ -297,6 +284,36 @@ download_with_fallback() {
   return 1
 }
 
+#====================== 代理镜像配置（后备 mirrors） ======================#
+
+configure_proxy_mirror() {
+  echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}║      配置代理镜像源（后备 mirrors）       ║${NC}"
+  echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
+  echo -e "当前代理镜像源: ${YELLOW}${PROXY_MIRROR_URL:-未配置}${NC}"
+  echo -e "${YELLOW}说明：Docker 会按 registry-mirrors 顺序尝试。${NC}"
+  echo -e "${YELLOW}配置后，脚本在写入 daemon.json 时会把它追加到 mirrors 最后，作为直连失败后备。${NC}"
+  echo ""
+
+  read -r -p "请输入代理镜像源 URL（留空=清空配置）: " input
+  input=$(echo "$input" | tr -d '[:space:]')
+
+  if [[ -z "$input" ]]; then
+    PROXY_MIRROR_URL=""
+    echo -e "${GREEN}已清空代理镜像源配置。${NC}"
+    return 0
+  fi
+
+  if ! [[ "$input" =~ ^https?:// ]]; then
+    echo -e "${RED}格式不正确：必须以 http:// 或 https:// 开头。${NC}"
+    return 1
+  fi
+
+  input="${input%/}"
+  PROXY_MIRROR_URL="$input"
+  echo -e "${GREEN}已设置代理镜像源：${PROXY_MIRROR_URL}${NC}"
+}
+
 #====================== 镜像源测速 ======================#
 
 # 测速单个端点，输出毫秒数（不可达输出 9999）
@@ -351,7 +368,6 @@ run_mirror_speed_test() {
   echo ""
 
   # ── 3. 排序（按 ms 升序）───────────────────
-  # 利用 printf + sort 对数组排序，结果存回 SPEED_TEST_RESULTS
   local sorted
   sorted=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | sort -t'|' -k1 -n)
   mapfile -t SPEED_TEST_RESULTS <<< "$sorted"
@@ -407,25 +423,34 @@ _apply_speed_test_to_daemon() {
     local ms label
     ms=$(echo "$entry" | cut -d'|' -f1)
     label=$(echo "$entry" | cut -d'|' -f2)
-    # 跳过直连条目和不可达条目
     [[ "$label" == "direct" ]] && continue
     (( ms >= 8000 )) && continue
     reachable_mirrors+=("$label")
   done
+
+  # 追加代理镜像源作为后备（如果配置了）
+  if [[ -n "$PROXY_MIRROR_URL" ]]; then
+    local exists="false"
+    for m in "${reachable_mirrors[@]}"; do
+      [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
+    done
+    if [[ "$exists" == "false" ]]; then
+      reachable_mirrors+=("$PROXY_MIRROR_URL")
+      echo -e "${YELLOW}[INFO] 已追加代理镜像源作为后备：${PROXY_MIRROR_URL}${NC}"
+    fi
+  fi
 
   if [[ ${#reachable_mirrors[@]} -eq 0 ]]; then
     echo -e "${RED}[WARN] 没有可达的镜像源，daemon.json 未修改。${NC}"
     return
   fi
 
-  # 展示将要写入的源
   echo -e "\n[INFO] 将按以下顺序写入镜像源（已按速度排序）:"
   for i in "${!reachable_mirrors[@]}"; do
-    # 查找对应 ms
-    local ms
-    ms=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" \
-      | grep "|${reachable_mirrors[$i]}|" | cut -d'|' -f1)
-    printf "  %d. %-42s %sms\n" "$((i+1))" "${reachable_mirrors[$i]}" "$ms"
+    local ms_show="N/A"
+    ms_show=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | grep "|${reachable_mirrors[$i]}|" | head -n1 | cut -d'|' -f1)
+    [[ -z "$ms_show" ]] && ms_show="(后备)"
+    printf "  %d. %-42s %s\n" "$((i+1))" "${reachable_mirrors[$i]}" "${ms_show}ms"
   done
   echo ""
 
@@ -435,7 +460,6 @@ _apply_speed_test_to_daemon() {
   local mirrors_json
   mirrors_json=$(printf '%s\n' "${reachable_mirrors[@]}" | jq -R . | jq -s .)
 
-  # 若 daemon.json 已存在且合法，用 jq 合并；否则新建
   if [[ -f /etc/docker/daemon.json ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
     local tmp
     tmp=$(mktemp)
@@ -533,8 +557,17 @@ EOF
 ensure_daemon_json() {
   mkdir -p /etc/docker
   if [[ ! -s /etc/docker/daemon.json ]]; then
+    local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
+    if [[ -n "$PROXY_MIRROR_URL" ]]; then
+      local exists="false"
+      for m in "${mirrors[@]}"; do
+        [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
+      done
+      [[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
+    fi
+
     local mirrors_json
-    mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+    mirrors_json=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
     cat >/etc/docker/daemon.json <<EOF
 {
   "iptables": true,
@@ -885,6 +918,7 @@ show_docker_status() {
   for m in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
     echo -e "    ${CYAN}• ${m}${NC}"
   done
+  echo -e "  ${CYAN}代理后备源:${NC} ${YELLOW}${PROXY_MIRROR_URL:-未配置}${NC}"
 
   echo -e "\n${BOLD}[ daemon.json 配置 ]${NC}"
   if [[ -f /etc/docker/daemon.json ]]; then
@@ -1271,16 +1305,23 @@ generate_daemon_config() {
   read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
   local DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
 
-  # 询问是否先测速以选择最优镜像源
   echo ""
   read -r -p "是否先进行镜像源测速，自动选择最快的源？(y/n，默认使用全部内置源): " DO_SPEEDTEST
   local REGISTRY_MIRRORS_JSON
   if [[ "$DO_SPEEDTEST" == "y" ]]; then
     run_mirror_speed_test
-    # 测速完成后 _apply_speed_test_to_daemon 已写入，直接返回
     return
   else
-    REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+    local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
+    if [[ -n "$PROXY_MIRROR_URL" ]]; then
+      local exists="false"
+      for m in "${mirrors[@]}"; do
+        [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
+      done
+      [[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
+      echo -e "${YELLOW}[INFO] 将追加代理镜像源作为后备：${PROXY_MIRROR_URL}${NC}"
+    fi
+    REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
   fi
 
   local DAEMON_CONFIG
@@ -1352,19 +1393,16 @@ print_menu() {
   echo -e "  ${RED}4.${NC}  卸载 Docker"
   echo -e "  ${RED}5.${NC}  卸载 Docker Compose"
   echo -e "  ${RED}6.${NC}  卸载 Docker 和 Docker Compose"
-  echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  ${YELLOW}7.${NC}  查询安装状态"
   echo -e "  ${YELLOW}8.${NC}  生成 daemon.json 配置文件"
   echo -e "  ${YELLOW}9.${NC}  查看当前 iptables 后端模式"
-  echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  ${BLUE}10.${NC} Docker 服务管理（启动 / 停止 / 重启）"
   echo -e "  ${BLUE}11.${NC} Docker 状态仪表盘"
   echo -e "  ${BLUE}12.${NC} daemon.json 备份与回滚"
   echo -e "  ${BLUE}13.${NC} 日志管理"
   echo -e "  ${BLUE}14.${NC} 镜像源测速 & 一键配置"
-  echo -e "${CYAN}──────────────────────────────────────────${NC}"
+  echo -e "  ${BLUE}15.${NC} 配置代理镜像源（直连失败后备）"
   echo -e "  ${RED}0.${NC}  退出脚本"
-  echo -e "${CYAN}──────────────────────────────────────────${NC}"
   echo -e "  日志: ${LOG_FILE}"
 }
 
@@ -1380,7 +1418,7 @@ main() {
 
   while true; do
     print_menu
-    read -r -p "请输入数字 (0-14): " CHOICE
+    read -r -p "请输入数字 (0-15): " CHOICE
 
     if [[ -z "$CHOICE" ]]; then
       echo -e "${RED}请输入有效数字。${NC}"; continue
@@ -1404,12 +1442,13 @@ main() {
       12) manage_daemon_json ;;
       13) manage_logs ;;
       14) run_mirror_speed_test ;;
+      15) configure_proxy_mirror ;;
       0)
         echo -e "${GREEN}退出脚本。日志已保存至: ${LOG_FILE}${NC}"
         break
         ;;
       *)
-        echo -e "${RED}无效的选择，请输入 0-14 之间的数字。${NC}"; continue ;;
+        echo -e "${RED}无效的选择，请输入 0-15 之间的数字。${NC}"; continue ;;
     esac
 
     [[ "$CHOICE" -ne 0 ]] && read -n 1 -s -r -p $'\n按任意键返回主菜单...'
