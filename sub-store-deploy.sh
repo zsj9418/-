@@ -24,11 +24,6 @@ NC='\033[0m'
 # 候选镜像源（含直连）
 MIRROR_CANDIDATES=(
   "direct"
-  "https://docker.1ms.run"
-  "https://docker.xuanyuan.me"
-  "https://docker.m.daocloud.io"
-  "https://dockerproxy.net"
-  "https://docker.1panel.live"
 )
 
 # 日志
