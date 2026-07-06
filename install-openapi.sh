@@ -1,10 +1,4 @@
 #!/bin/bash
-# ==============================================================
-#  Docker 服务管理脚本
-#  支持：One-API / New-API / FreeLLMAPI
-#  支持系统：Debian/Ubuntu / CentOS/RHEL/Fedora / Arch / OpenWrt
-#  支持架构：amd64 / arm64 / arm/v7 / 386
-# ==============================================================
 
 set -euo pipefail
 trap 'echo -e "\n\e[31m操作被用户中断。\e[0m"; exit 1' INT
@@ -1243,33 +1237,26 @@ function main_menu() {
       cv=$(docker-compose --version)
     fi
 
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║            Docker 服务管理脚本                             ║"
-    echo "║      支持 Linux / OpenWrt  ·  多架构 amd64/arm64          ║"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    printf "║  系统：%-20s 架构：%-15s  ║\n" "$OS" "$ARCH"
-    printf "║  Docker：%-50s ║\n" "$dv"
-    printf "║  Compose：%-49s ║\n" "$cv"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  ── 部署服务 ──────────────────────────────────────────  ║"
-    echo "║   1. 部署 One-API  (SQLite)   LLM API 管理分发           ║"
-    echo "║   2. 部署 One-API  (MySQL)    LLM API 管理分发           ║"
-    echo "║   3. 部署 New-API  (calciumion) 新一代 API 管理          ║"
-    echo "║   4. 部署 FreeLLMAPI  16家LLM免费额度聚合 /v1 端点       ║"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  ── FreeLLMAPI 管理 ────────────────────────────────── ║"
-    echo "║   5. 管理 FreeLLMAPI  (日志/停止/启动/重启/更新)         ║"
-    echo "║   6. 完全卸载 FreeLLMAPI  (含镜像/数据卷/配置/Key)       ║"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  ── 其他操作 ──────────────────────────────────────────  ║"
-    echo "║   7. 卸载 One-API / New-API                              ║"
-    echo "║   8. 查看所有容器状态                                     ║"
-    echo "║   0. 退出                                                 ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    read -rp "请输入选项 (0-8)：" ch </dev/tty
-    echo ""
-
+echo ""
+echo "================= Docker 服务管理 ================="
+printf "系统: %-15s 架构: %-10s\n" "$OS" "$ARCH"
+printf "Docker:  %s\n" "$dv"
+printf "Compose: %s\n" "$cv"
+echo "---------------------------------------------------"
+echo " 1) 部署 One-API   (SQLite)"
+echo " 2) 部署 One-API   (MySQL)"
+echo " 3) 部署 New-API   (calciumion)"
+echo " 4) 部署 FreeLLMAPI (聚合 /v1)"
+echo "---------------------------------------------------"
+echo " 5) 管理 FreeLLMAPI   (日志/启停/更新)"
+echo " 6) 卸载 FreeLLMAPI   (含镜像/数据)"
+echo "---------------------------------------------------"
+echo " 7) 卸载 One-API / New-API"
+echo " 8) 查看所有容器状态"
+echo " 0) 退出"
+echo "==================================================="
+read -rp "请输入选项 (0-8): " ch </dev/tty
+echo ""
     case "$ch" in
       1) deploy_one_api_sqlite ;;
       2) deploy_one_api_mysql ;;
