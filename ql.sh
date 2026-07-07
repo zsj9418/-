@@ -1141,7 +1141,7 @@ install_all_deps() {
     local hp; hp=$(get_container_port "$name")
     [[ -z "$hp" ]] && hp="$DEFAULT_PORT"
 
-    echo -e "\n${CYAN}${BOLD}══ 青龙全依赖补全 v4.2 ══${NC}" >&2
+    echo -e "\n${CYAN}${BOLD}══ 青龙全依赖补全 v1.2 ══${NC}" >&2
     echo -e "  容器: $name | 端口: $hp" >&2
 
     # STEP 1：OS检测
