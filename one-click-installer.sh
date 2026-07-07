@@ -66,6 +66,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["43"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/argon_beauty.sh"
     ["44"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/pve_smart_migration.sh"
     ["45"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/uninstall_histb.sh"
+    ["46"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cpu-tool.sh"
 )
 
 DEFAULT_OPTIONS=(
@@ -114,6 +115,7 @@ DEFAULT_OPTIONS=(
     "43. OpenWrt UI 界面美化"
     "44. PVE 智能存储迁移"
     "45. 海纳思内置卸载"
+    "46. CPU频率仪表"
     "98. 快捷键管理"
 )
 
