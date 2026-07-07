@@ -19,24 +19,18 @@ pause() {
 
 # 获取系统信息
 get_system_info() {
-    # 操作系统
     if [ -f /etc/os-release ]; then
         OS_NAME=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d'"' -f2)
     else
         OS_NAME=$(uname -o 2>/dev/null || echo "未知")
     fi
 
-    # 内核版本
     KERNEL_VERSION=$(uname -r)
-
-    # CPU 架构
     CPU_ARCH=$(uname -m)
 
-    # CPU 型号
     if [ -f /proc/cpuinfo ]; then
         CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d':' -f2 | xargs)
         if [ -z "${CPU_MODEL}" ]; then
-            # ARM 处理器可能用 Hardware 或 Processor
             CPU_MODEL=$(grep -m1 "Hardware" /proc/cpuinfo | cut -d':' -f2 | xargs)
         fi
         if [ -z "${CPU_MODEL}" ]; then
@@ -49,28 +43,19 @@ get_system_info() {
         CPU_MODEL="未知"
     fi
 
-    # CPU 核心数
     CPU_CORES=$(nproc 2>/dev/null || echo "未知")
-
-    # 在线核心数
     ONLINE_CORES=$(ls -d /sys/devices/system/cpu/cpu[0-9]*/cpufreq 2>/dev/null | wc -l)
 }
 
-# 获取默认/基准频率 (自动检测最低非超频档位中的最高值)
+# 获取基准频率
 get_base_freq() {
     if [ -f "${CPU0}/base_frequency" ]; then
-        # 部分系统直接提供基准频率
         BASE_FREQ=$(cat "${CPU0}/base_frequency" 2>/dev/null)
     elif [ -f "${CPU0}/scaling_available_frequencies" ]; then
-        # 取可用频率中的中间值作为参考基准
         AVAIL=$(cat "${CPU0}/scaling_available_frequencies" 2>/dev/null)
         FREQ_ARRAY=(${AVAIL})
         FREQ_COUNT=${#FREQ_ARRAY[@]}
         if [ "${FREQ_COUNT}" -gt 0 ]; then
-            # 取第一个频率作为最低，最后一个作为最高
-            MIN_AVAIL=${FREQ_ARRAY[0]}
-            MAX_AVAIL=${FREQ_ARRAY[$((FREQ_COUNT-1))]}
-            # 基准频率估算：取中间偏上的值
             MID_IDX=$(( (FREQ_COUNT * 2) / 3 ))
             BASE_FREQ=${FREQ_ARRAY[${MID_IDX}]}
         else
@@ -115,7 +100,6 @@ show_cpu_info() {
     echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    # 获取系统信息
     get_system_info
     get_base_freq
 
@@ -171,7 +155,6 @@ show_cpu_info() {
         for f in ${AVAIL}; do
             COUNT=$((COUNT+1))
             FORMATTED=$(format_freq ${f})
-            # 高于硬件最高频率80%标记为高频
             THRESHOLD=$(awk "BEGIN{printf \"%.0f\", ${MAX_HW}*0.8}")
             if [ "${f}" -ge "${THRESHOLD}" ] 2>/dev/null; then
                 echo -e "  档位 ${COUNT}: ${f} kHz (${FORMATTED}) ${YELLOW}[高频]${NC}"
@@ -190,8 +173,7 @@ show_cpu_info() {
     echo ""
 
     echo -e "${GREEN}【Boost/睿频 状态】${NC}"
-    # 检查多种 boost 接口
-    BOOST="不支持"
+    BOOST_VAL=""
     BOOST_FILE=""
 
     if [ -f "${CPU0}/boost" ]; then
@@ -201,7 +183,6 @@ show_cpu_info() {
         BOOST_FILE="/sys/devices/system/cpu/cpufreq/boost"
         BOOST_VAL=$(cat "${BOOST_FILE}" 2>/dev/null)
     elif [ -f "/sys/devices/system/cpu/intel_pstate/no_turbo" ]; then
-        # Intel pstate 驱动
         BOOST_FILE="/sys/devices/system/cpu/intel_pstate/no_turbo"
         NO_TURBO=$(cat "${BOOST_FILE}" 2>/dev/null)
         if [ "${NO_TURBO}" = "0" ]; then
@@ -238,7 +219,6 @@ show_cpu_info() {
             gov=$(cat "${cpu}/cpufreq/scaling_governor" 2>/dev/null || echo "N/A")
             if [ "${cur}" != "N/A" ]; then
                 FORMATTED=$(format_freq ${cur})
-                # 检查是否运行在高频
                 if [ "${cur}" -ge "${MAX_SW}" ] 2>/dev/null; then
                     echo -e "  ${name}: ${FORMATTED} [${gov}] ${GREEN}● 最高频运行${NC}"
                 elif [ "${cur}" -le "${MIN_SW}" ] 2>/dev/null; then
@@ -280,7 +260,6 @@ show_cpu_info() {
         echo "  频率            停留时间      占比"
         echo "  ──────────────  ──────────    ────"
 
-        # 计算总时间
         TOTAL_TICKS=$(awk '{sum+=$2} END{print sum}' "${TIS}" 2>/dev/null || echo 1)
         if [ "${TOTAL_TICKS}" -eq 0 ]; then
             TOTAL_TICKS=1
@@ -308,7 +287,6 @@ show_cpu_info() {
             if [ "${temp}" -gt 0 ] 2>/dev/null; then
                 TEMP_FOUND=1
                 celsius=$(awk "BEGIN{printf \"%.1f\", ${temp}/1000}")
-                # 温度等级判断
                 if [ "${temp}" -gt 80000 ] 2>/dev/null; then
                     echo -e "  $(basename ${tz}) (${type}): ${RED}${celsius}°C [危险!]${NC}"
                 elif [ "${temp}" -gt 70000 ] 2>/dev/null; then
@@ -327,6 +305,173 @@ show_cpu_info() {
     echo ""
 
     pause
+}
+
+# 策略说明
+get_gov_desc() {
+    case "$1" in
+        performance)  echo "始终以最高频率运行，性能最强，功耗最高" ;;
+        powersave)    echo "始终以最低频率运行，功耗最低，性能受限" ;;
+        ondemand)     echo "根据负载动态调节，响应较快（较激进）" ;;
+        conservative) echo "根据负载动态调节，升频保守，更省电" ;;
+        schedutil)    echo "由内核调度器控制，推荐现代内核使用" ;;
+        userspace)    echo "由用户手动设置频率，完全自定义" ;;
+        interactive)  echo "交互式调节，响应触摸/输入事件（移动端）" ;;
+        *)            echo "暂无说明" ;;
+    esac
+}
+
+# 策略图标
+get_gov_icon() {
+    case "$1" in
+        performance)  echo "🚀" ;;
+        powersave)    echo "🔋" ;;
+        ondemand)     echo "⚡" ;;
+        conservative) echo "🌿" ;;
+        schedutil)    echo "⚖️ " ;;
+        userspace)    echo "🔧" ;;
+        interactive)  echo "📱" ;;
+        *)            echo "  " ;;
+    esac
+}
+
+# 切换调节策略
+change_governor() {
+    while true; do
+        clear
+        echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗"
+        echo -e "║              切换 CPU 调节策略                             ║"
+        echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        # 当前策略
+        CUR_GOV=$(cat ${CPU0}/scaling_governor 2>/dev/null || echo "未知")
+        echo -e "  当前策略: ${GREEN}${CUR_GOV}${NC}"
+        echo ""
+
+        # 读取可用策略
+        AVAIL_GOV=$(cat ${CPU0}/scaling_available_governors 2>/dev/null || echo "")
+        if [ -z "${AVAIL_GOV}" ]; then
+            echo -e "${RED}❌ 无法获取可用策略列表${NC}"
+            sleep 2
+            return
+        fi
+
+        GOV_ARRAY=(${AVAIL_GOV})
+        GOV_COUNT=${#GOV_ARRAY[@]}
+
+        echo -e "${YELLOW}【可用策略列表】${NC}"
+        echo ""
+
+        for i in "${!GOV_ARRAY[@]}"; do
+            gov="${GOV_ARRAY[$i]}"
+            num=$((i + 1))
+            icon=$(get_gov_icon "${gov}")
+            desc=$(get_gov_desc "${gov}")
+
+            if [ "${gov}" = "${CUR_GOV}" ]; then
+                echo -e "  ${GREEN}${num}. ${icon} ${gov}${NC}"
+                echo -e "     ${GREEN}► 当前使用中${NC}"
+                echo -e "     ${desc}"
+            else
+                echo "  ${num}. ${icon} ${gov}"
+                echo "     ${desc}"
+            fi
+            echo ""
+        done
+
+        echo "  0. 返回上级菜单"
+        echo ""
+        read -rp "请输入选项 [0-${GOV_COUNT}]: " choice
+
+        # 返回
+        if [ "${choice}" = "0" ]; then
+            return
+        fi
+
+        # 验证输入是否为正整数
+        if ! echo "${choice}" | grep -qE '^[0-9]+$'; then
+            echo -e "${RED}❌ 请输入有效数字${NC}"
+            sleep 1
+            continue
+        fi
+
+        # 范围检查
+        if [ "${choice}" -lt 1 ] || [ "${choice}" -gt "${GOV_COUNT}" ]; then
+            echo -e "${RED}❌ 选项超出范围，请输入 1 ~ ${GOV_COUNT}${NC}"
+            sleep 1
+            continue
+        fi
+
+        new_gov="${GOV_ARRAY[$((choice - 1))]}"
+
+        # 已在使用
+        if [ "${new_gov}" = "${CUR_GOV}" ]; then
+            echo ""
+            echo -e "${YELLOW}⚠️  当前已在使用 [${new_gov}] 策略，无需切换${NC}"
+            sleep 2
+            continue
+        fi
+
+        # 确认操作
+        echo ""
+        echo -e "${CYAN}【切换确认】${NC}"
+        echo "  当前策略: ${CUR_GOV}"
+        echo "  目标策略: ${new_gov}  $(get_gov_icon ${new_gov})"
+        echo "  策略说明: $(get_gov_desc ${new_gov})"
+        echo ""
+        read -rp "确认切换? [Y/n]: " confirm
+
+        if [ "${confirm}" = "n" ] || [ "${confirm}" = "N" ]; then
+            echo -e "${YELLOW}已取消操作${NC}"
+            sleep 1
+            continue
+        fi
+
+        # 执行切换
+        echo ""
+        echo -e "${CYAN}正在切换所有核心...${NC}"
+
+        SUCCESS=0
+        FAILED=0
+        for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+            if echo "${new_gov}" > "${cpu}" 2>/dev/null; then
+                SUCCESS=$((SUCCESS + 1))
+            else
+                FAILED=$((FAILED + 1))
+            fi
+        done
+
+        echo ""
+        if [ "${SUCCESS}" -gt 0 ] && [ "${FAILED}" -eq 0 ]; then
+            echo -e "${GREEN}╔════════════════════════════════════════╗"
+            echo -e "║  ✅ 切换成功                            ║"
+            echo -e "╚════════════════════════════════════════╝${NC}"
+            echo ""
+            echo "  已切换策略: ${new_gov}"
+            echo "  生效核心数: ${SUCCESS} 个"
+            sleep 3
+            return
+        elif [ "${SUCCESS}" -gt 0 ] && [ "${FAILED}" -gt 0 ]; then
+            echo -e "${YELLOW}╔════════════════════════════════════════╗"
+            echo -e "║  ⚠️  部分核心切换成功                   ║"
+            echo -e "╚════════════════════════════════════════╝${NC}"
+            echo ""
+            echo "  成功核心: ${SUCCESS} 个"
+            echo -e "  失败核心: ${RED}${FAILED} 个${NC}"
+            echo ""
+            echo -e "${YELLOW}提示: 部分核心切换失败，请尝试使用 sudo 运行本脚本${NC}"
+            sleep 3
+        else
+            echo -e "${RED}╔════════════════════════════════════════╗"
+            echo -e "║  ❌ 切换失败                            ║"
+            echo -e "╚════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${YELLOW}原因: 权限不足，请使用以下命令重新运行:${NC}"
+            echo "      sudo $0"
+            sleep 3
+        fi
+    done
 }
 
 # 修改运行模式菜单
@@ -352,7 +497,6 @@ change_mode_menu() {
         echo "  最大频率: $(format_freq ${CUR_MAX})"
         echo "  最小频率: $(format_freq ${CUR_MIN})"
 
-        # Boost 状态
         if [ -f "${CPU0}/boost" ]; then
             BOOST_VAL=$(cat "${CPU0}/boost" 2>/dev/null)
             if [ "${BOOST_VAL}" = "1" ]; then
@@ -382,7 +526,7 @@ change_mode_menu() {
         echo "  1. 切换调节策略 (Governor)"
         echo "  2. 设置最大频率"
         echo "  3. 设置最小频率"
-        echo "  4. 开启/关闭 睿频(Boost)"
+        echo "  4. 开启/关闭 睿频 (Boost)"
         echo ""
         echo -e "  ${CYAN}--- 快捷模式 ---${NC}"
         echo "  5. 🚀 性能模式 (最高频率运行)"
@@ -408,49 +552,6 @@ change_mode_menu() {
                 ;;
         esac
     done
-}
-
-# 切换调节策略
-change_governor() {
-    echo ""
-    echo -e "${GREEN}【可用的调节策略】${NC}"
-    AVAIL_GOV=$(cat ${CPU0}/scaling_available_governors 2>/dev/null || echo "")
-    echo ""
-    echo "  ${AVAIL_GOV}"
-    echo ""
-    echo "策略说明:"
-    echo "  performance  - 始终最高频率运行"
-    echo "  powersave    - 始终最低频率运行"
-    echo "  ondemand     - 根据负载动态调节 (较激进)"
-    echo "  conservative - 根据负载动态调节 (较保守)"
-    echo "  schedutil    - 由调度器控制 (推荐)"
-    echo "  userspace    - 用户手动控制"
-    echo ""
-    read -rp "请输入要切换的策略 (留空取消): " new_gov
-
-    if [ -z "${new_gov}" ]; then
-        echo -e "${YELLOW}已取消${NC}"
-        sleep 1
-        return
-    fi
-
-    SUCCESS=0
-    FAILED=0
-    for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-        if echo "${new_gov}" > "${cpu}" 2>/dev/null; then
-            SUCCESS=$((SUCCESS+1))
-        else
-            FAILED=$((FAILED+1))
-        fi
-    done
-
-    if [ "${SUCCESS}" -gt 0 ]; then
-        echo -e "${GREEN}✅ 成功切换 ${SUCCESS} 个核心到: ${new_gov}${NC}"
-    fi
-    if [ "${FAILED}" -gt 0 ]; then
-        echo -e "${YELLOW}⚠️ ${FAILED} 个核心切换失败 (可能需要 root 权限)${NC}"
-    fi
-    sleep 2
 }
 
 # 设置最大频率
@@ -494,7 +595,7 @@ change_max_freq() {
         echo -e "${GREEN}✅ 成功设置 ${SUCCESS} 个核心最大频率: $(format_freq ${new_max})${NC}"
     fi
     if [ "${FAILED}" -gt 0 ]; then
-        echo -e "${YELLOW}⚠️ ${FAILED} 个核心设置失败${NC}"
+        echo -e "${YELLOW}⚠️  ${FAILED} 个核心设置失败，请尝试使用 sudo 运行本脚本${NC}"
     fi
     sleep 2
 }
@@ -540,7 +641,7 @@ change_min_freq() {
         echo -e "${GREEN}✅ 成功设置 ${SUCCESS} 个核心最小频率: $(format_freq ${new_min})${NC}"
     fi
     if [ "${FAILED}" -gt 0 ]; then
-        echo -e "${YELLOW}⚠️ ${FAILED} 个核心设置失败${NC}"
+        echo -e "${YELLOW}⚠️  ${FAILED} 个核心设置失败，请尝试使用 sudo 运行本脚本${NC}"
     fi
     sleep 2
 }
@@ -549,7 +650,6 @@ change_min_freq() {
 toggle_boost() {
     echo ""
 
-    # 查找可用的 boost 接口
     BOOST_FILE=""
     BOOST_TYPE=""
 
@@ -565,7 +665,7 @@ toggle_boost() {
     fi
 
     if [ -z "${BOOST_FILE}" ]; then
-        echo -e "${YELLOW}⚠️ 此系统不支持睿频控制或接口不可用${NC}"
+        echo -e "${YELLOW}⚠️  此系统不支持睿频控制或接口不可用${NC}"
         sleep 2
         return
     fi
@@ -573,18 +673,16 @@ toggle_boost() {
     if [ "${BOOST_TYPE}" = "intel" ]; then
         CUR_VAL=$(cat "${BOOST_FILE}" 2>/dev/null)
         if [ "${CUR_VAL}" = "0" ]; then
-            # 当前开启，要关闭
             if echo 1 > "${BOOST_FILE}" 2>/dev/null; then
                 echo -e "${YELLOW}🔋 睿频已关闭${NC}"
             else
-                echo -e "${RED}❌ 操作失败 (需要 root 权限)${NC}"
+                echo -e "${RED}❌ 操作失败，请使用 sudo 运行本脚本${NC}"
             fi
         else
-            # 当前关闭，要开启
             if echo 0 > "${BOOST_FILE}" 2>/dev/null; then
                 echo -e "${GREEN}🚀 睿频已开启${NC}"
             else
-                echo -e "${RED}❌ 操作失败 (需要 root 权限)${NC}"
+                echo -e "${RED}❌ 操作失败，请使用 sudo 运行本脚本${NC}"
             fi
         fi
     else
@@ -593,13 +691,13 @@ toggle_boost() {
             if echo 0 > "${BOOST_FILE}" 2>/dev/null; then
                 echo -e "${YELLOW}🔋 睿频已关闭${NC}"
             else
-                echo -e "${RED}❌ 操作失败 (需要 root 权限)${NC}"
+                echo -e "${RED}❌ 操作失败，请使用 sudo 运行本脚本${NC}"
             fi
         else
             if echo 1 > "${BOOST_FILE}" 2>/dev/null; then
                 echo -e "${GREEN}🚀 睿频已开启${NC}"
             else
-                echo -e "${RED}❌ 操作失败 (需要 root 权限)${NC}"
+                echo -e "${RED}❌ 操作失败，请使用 sudo 运行本脚本${NC}"
             fi
         fi
     fi
@@ -614,15 +712,19 @@ set_performance_mode() {
     MAX_FREQ=$(cat ${CPU0}/cpuinfo_max_freq 2>/dev/null || echo "")
 
     SUCCESS=0
+    FAILED=0
     for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
-        echo "performance" > "${cpu}/scaling_governor" 2>/dev/null && SUCCESS=$((SUCCESS+1))
+        if echo "performance" > "${cpu}/scaling_governor" 2>/dev/null; then
+            SUCCESS=$((SUCCESS+1))
+        else
+            FAILED=$((FAILED+1))
+        fi
         if [ -n "${MAX_FREQ}" ]; then
             echo "${MAX_FREQ}" > "${cpu}/scaling_min_freq" 2>/dev/null
             echo "${MAX_FREQ}" > "${cpu}/scaling_max_freq" 2>/dev/null
         fi
     done
 
-    # 开启 boost
     if [ -f "${CPU0}/boost" ]; then
         echo 1 > "${CPU0}/boost" 2>/dev/null
     elif [ -f "/sys/devices/system/cpu/cpufreq/boost" ]; then
@@ -632,15 +734,26 @@ set_performance_mode() {
     fi
 
     echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════╗"
-    echo -e "║  🚀 已切换到性能模式                   ║"
-    echo -e "╚════════════════════════════════════════╝${NC}"
-    echo ""
-    echo "  调节策略: performance"
-    echo "  频率锁定: $(format_freq ${MAX_FREQ})"
-    echo "  睿频状态: 开启"
-    echo ""
-    echo -e "${YELLOW}提示: 此模式功耗较高，发热量增加${NC}"
+    if [ "${FAILED}" -eq 0 ]; then
+        echo -e "${GREEN}╔════════════════════════════════════════╗"
+        echo -e "║  🚀 已切换到性能模式                   ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  调节策略: performance"
+        echo "  频率锁定: $(format_freq ${MAX_FREQ})"
+        echo "  睿频状态: 开启"
+        echo ""
+        echo -e "${YELLOW}提示: 此模式功耗较高，发热量增加${NC}"
+    else
+        echo -e "${YELLOW}╔════════════════════════════════════════╗"
+        echo -e "║  ⚠️  部分设置失败                       ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  成功核心: ${SUCCESS} 个"
+        echo -e "  失败核心: ${RED}${FAILED} 个${NC}"
+        echo ""
+        echo -e "${YELLOW}提示: 请尝试使用 sudo 运行本脚本${NC}"
+    fi
     sleep 3
 }
 
@@ -652,15 +765,19 @@ set_powersave_mode() {
     MIN_FREQ=$(cat ${CPU0}/cpuinfo_min_freq 2>/dev/null || echo "")
 
     SUCCESS=0
+    FAILED=0
     for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
-        echo "powersave" > "${cpu}/scaling_governor" 2>/dev/null && SUCCESS=$((SUCCESS+1))
+        if echo "powersave" > "${cpu}/scaling_governor" 2>/dev/null; then
+            SUCCESS=$((SUCCESS+1))
+        else
+            FAILED=$((FAILED+1))
+        fi
         if [ -n "${MIN_FREQ}" ]; then
             echo "${MIN_FREQ}" > "${cpu}/scaling_min_freq" 2>/dev/null
             echo "${MIN_FREQ}" > "${cpu}/scaling_max_freq" 2>/dev/null
         fi
     done
 
-    # 关闭 boost
     if [ -f "${CPU0}/boost" ]; then
         echo 0 > "${CPU0}/boost" 2>/dev/null
     elif [ -f "/sys/devices/system/cpu/cpufreq/boost" ]; then
@@ -670,15 +787,26 @@ set_powersave_mode() {
     fi
 
     echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════╗"
-    echo -e "║  🔋 已切换到省电模式                   ║"
-    echo -e "╚════════════════════════════════════════╝${NC}"
-    echo ""
-    echo "  调节策略: powersave"
-    echo "  频率锁定: $(format_freq ${MIN_FREQ})"
-    echo "  睿频状态: 关闭"
-    echo ""
-    echo -e "${YELLOW}提示: 此模式性能受限，适合低负载场景${NC}"
+    if [ "${FAILED}" -eq 0 ]; then
+        echo -e "${GREEN}╔════════════════════════════════════════╗"
+        echo -e "║  🔋 已切换到省电模式                   ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  调节策略: powersave"
+        echo "  频率锁定: $(format_freq ${MIN_FREQ})"
+        echo "  睿频状态: 关闭"
+        echo ""
+        echo -e "${YELLOW}提示: 此模式性能受限，适合低负载场景${NC}"
+    else
+        echo -e "${YELLOW}╔════════════════════════════════════════╗"
+        echo -e "║  ⚠️  部分设置失败                       ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  成功核心: ${SUCCESS} 个"
+        echo -e "  失败核心: ${RED}${FAILED} 个${NC}"
+        echo ""
+        echo -e "${YELLOW}提示: 请尝试使用 sudo 运行本脚本${NC}"
+    fi
     sleep 3
 }
 
@@ -691,7 +819,6 @@ set_balanced_mode() {
     MIN_FREQ=$(cat ${CPU0}/cpuinfo_min_freq 2>/dev/null || echo "")
     MAX_FREQ=$(cat ${CPU0}/cpuinfo_max_freq 2>/dev/null || echo "")
 
-    # 优先选择 schedutil，其次 ondemand，再次 conservative
     if echo "${AVAIL_GOV}" | grep -qw "schedutil"; then
         GOV="schedutil"
     elif echo "${AVAIL_GOV}" | grep -qw "ondemand"; then
@@ -703,8 +830,13 @@ set_balanced_mode() {
     fi
 
     SUCCESS=0
+    FAILED=0
     for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
-        echo "${GOV}" > "${cpu}/scaling_governor" 2>/dev/null && SUCCESS=$((SUCCESS+1))
+        if echo "${GOV}" > "${cpu}/scaling_governor" 2>/dev/null; then
+            SUCCESS=$((SUCCESS+1))
+        else
+            FAILED=$((FAILED+1))
+        fi
         if [ -n "${MIN_FREQ}" ]; then
             echo "${MIN_FREQ}" > "${cpu}/scaling_min_freq" 2>/dev/null
         fi
@@ -714,15 +846,26 @@ set_balanced_mode() {
     done
 
     echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════╗"
-    echo -e "║  ⚖️  已切换到平衡模式                   ║"
-    echo -e "╚════════════════════════════════════════╝${NC}"
-    echo ""
-    echo "  调节策略: ${GOV}"
-    echo "  频率范围: $(format_freq ${MIN_FREQ}) ~ $(format_freq ${MAX_FREQ})"
-    echo "  运行方式: 根据负载自动调节"
-    echo ""
-    echo -e "${YELLOW}提示: 推荐日常使用，兼顾性能与功耗${NC}"
+    if [ "${FAILED}" -eq 0 ]; then
+        echo -e "${GREEN}╔════════════════════════════════════════╗"
+        echo -e "║  ⚖️  已切换到平衡模式                   ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  调节策略: ${GOV}"
+        echo "  频率范围: $(format_freq ${MIN_FREQ}) ~ $(format_freq ${MAX_FREQ})"
+        echo "  运行方式: 根据负载自动调节"
+        echo ""
+        echo -e "${YELLOW}提示: 推荐日常使用，兼顾性能与功耗${NC}"
+    else
+        echo -e "${YELLOW}╔════════════════════════════════════════╗"
+        echo -e "║  ⚠️  部分设置失败                       ║"
+        echo -e "╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "  成功核心: ${SUCCESS} 个"
+        echo -e "  失败核心: ${RED}${FAILED} 个${NC}"
+        echo ""
+        echo -e "${YELLOW}提示: 请尝试使用 sudo 运行本脚本${NC}"
+    fi
     sleep 3
 }
 
@@ -733,8 +876,7 @@ realtime_monitor() {
     echo ""
     sleep 1
 
-    # 捕获 Ctrl+C 返回菜单而不是退出
-    trap 'echo ""; echo "正在返回主菜单..."; sleep 1; return' INT
+    trap 'echo ""; echo "正在返回主菜单..."; sleep 1; trap - INT; return' INT
 
     while true; do
         clear
@@ -745,7 +887,6 @@ realtime_monitor() {
         echo "  时间: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
 
-        # 表头
         printf "  %-8s  %-14s  %-12s  %s\n" "核心" "当前频率" "策略" "状态"
         echo "  ────────  ──────────────  ────────────  ──────"
 
@@ -796,8 +937,6 @@ realtime_monitor() {
 
         sleep 1
     done
-
-    trap - INT
 }
 
 # 主菜单
@@ -805,16 +944,14 @@ main_menu() {
     while true; do
         clear
 
-        # 获取基本信息用于显示
         get_system_info
 
         echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗"
         echo -e "║           Linux CPU 频率管理工具                           ║"
-        echo -e "║                 (通用版 v1.0)                              ║"
+        echo -e "║                 (通用版 v1.1)                              ║"
         echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
         echo ""
 
-        # 快速显示当前状态
         if [ -d "${CPU0}" ]; then
             CUR=$(cat ${CPU0}/scaling_cur_freq 2>/dev/null || echo 0)
             MAX=$(cat ${CPU0}/cpuinfo_max_freq 2>/dev/null || echo 0)
