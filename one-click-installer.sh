@@ -1,9 +1,6 @@
 #!/bin/bash
 set -uo pipefail
 
-# ============================================================
-# 全局配置
-# ============================================================
 SCRIPT_VERSION="2.0"
 SCRIPT_DIR="$HOME/one-click-scripts"
 LOG_FILE="$SCRIPT_DIR/installer.log"
@@ -17,9 +14,17 @@ PROXY_PREFIXES=(
     "https://cdn.yyds9527.nyc.mn/"
 )
 
-# ============================================================
-# 菜单数据
-# ============================================================
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_RED=$'\033[31m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_BLUE=$'\033[34m'
+C_MAGENTA=$'\033[35m'
+C_CYAN=$'\033[36m'
+C_WHITE=$'\033[37m'
+C_GRAY=$'\033[90m'
+
 declare -A DEFAULT_SCRIPTS=(
     ["1"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_docker.sh"
     ["2"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install_tools.sh"
@@ -121,14 +126,11 @@ DEFAULT_OPTIONS=(
     "98. 快捷键管理"
 )
 
-# 运行时菜单状态
 declare -A SCRIPTS=()
 declare -A CUSTOM_SCRIPT_NAMES=()
+declare -A MENU_TEXT_MAP=()
+declare -a SORTED_IDS=()
 OPTIONS=()
-
-# ============================================================
-# 基础工具函数
-# ============================================================
 
 is_root()    { [ "$(id -u)" -eq 0 ]; }
 is_openwrt() { [[ -f /etc/openwrt_release ]]; }
@@ -147,10 +149,6 @@ get_real_path() {
 log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
-
-# ============================================================
-# 系统环境检测
-# ============================================================
 
 OS=""
 PKG_MANAGER=""
@@ -173,10 +171,6 @@ detect_os_pkg() {
     fi
 }
 
-# ============================================================
-# 依赖安装
-# ============================================================
-
 NEEDED_CMDS=(wget curl tar)
 MISSING_CMDS=()
 
@@ -185,28 +179,21 @@ check_and_install_deps() {
     for cmd in "${NEEDED_CMDS[@]}"; do
         command -v "$cmd" >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
     done
-
     if is_openwrt; then
         command -v nano >/dev/null 2>&1 || MISSING_CMDS+=(nano)
     fi
-
     [[ ${#MISSING_CMDS[@]} -eq 0 ]] && return 0
-
     detect_os_pkg
     echo "缺少以下依赖：${MISSING_CMDS[*]}"
-
     if [ -z "$PKG_MANAGER" ]; then
         echo "无法自动检测包管理器，请手动安装：${MISSING_CMDS[*]}"
         return 1
     fi
-
     echo "正在使用 $PKG_MANAGER 安装依赖..."
-
     if ! is_root && [[ "$PKG_MANAGER" != "opkg" ]]; then
         echo "需要 root 权限，请使用 sudo 运行本脚本"
         return 1
     fi
-
     case "$PKG_MANAGER" in
         apt-get) apt-get update -qq && apt-get install -y "${MISSING_CMDS[@]}" || return 1 ;;
         yum)     yum install -y "${MISSING_CMDS[@]}" || return 1 ;;
@@ -220,10 +207,6 @@ check_and_install_deps() {
     echo "依赖安装完成"
 }
 
-# ============================================================
-# 初始化目录
-# ============================================================
-
 init_dirs() {
     local dirs=("$SCRIPT_DIR" "$SCRIPT_DIR/core_scripts" "$SCRIPT_DIR/user_scripts")
     for d in "${dirs[@]}"; do
@@ -234,10 +217,6 @@ init_dirs() {
         return 1
     }
 }
-
-# ============================================================
-# 网络检测 & 脚本下载
-# ============================================================
 
 DIRECT_OK=0
 
@@ -254,16 +233,12 @@ check_network() {
 download_script() {
     local choice="$1"
     local url="${DEFAULT_SCRIPTS[$choice]:-}"
-
     if [[ -z "$url" ]]; then
         echo "此选项没有对应的脚本 URL" >&2
         return 1
     fi
-
     local script_name="${choice}-$(basename "$url")"
     local script_path="$SCRIPT_DIR/core_scripts/$script_name"
-
-    # 缓存命中（24小时内）
     if [[ -f "$script_path" ]]; then
         if ! find "$script_path" -mmin +1440 2>/dev/null | grep -q .; then
             echo "使用本地缓存: $script_path" >&2
@@ -273,8 +248,6 @@ download_script() {
         echo "缓存已过期，重新下载..." >&2
         rm -f "$script_path"
     fi
-
-    # 网络检测（只做一次）
     if [[ "$DIRECT_OK" -eq 0 ]]; then
         echo -n "检测网络连通性... " >&2
         if check_network; then
@@ -283,8 +256,6 @@ download_script() {
             echo "直连不可用，将使用代理" >&2
         fi
     fi
-
-    # 组装候选 URL
     local urls_to_try=()
     [[ "$DIRECT_OK" -eq 1 ]] && urls_to_try+=("$url")
     if [[ "$url" == https://raw.githubusercontent.com/* ]]; then
@@ -293,14 +264,11 @@ download_script() {
         done
     fi
     [[ ${#urls_to_try[@]} -eq 0 ]] && urls_to_try+=("$url")
-
-    # 逐一尝试下载
     local attempt=0
     for try_url in "${urls_to_try[@]}"; do
         for ((i=1; i<=RETRY_COUNT; i++)); do
             attempt=$((attempt + 1))
             echo "下载尝试 $attempt/$((${#urls_to_try[@]} * RETRY_COUNT)): $try_url" >&2
-
             if curl -fsSL --connect-timeout 10 --max-time 60 \
                     "$try_url" -o "$script_path" 2>/dev/null; then
                 if [[ -s "$script_path" ]]; then
@@ -317,19 +285,13 @@ download_script() {
                 echo "curl 失败，重试 ($i/$RETRY_COUNT)..." >&2
                 rm -f "$script_path" 2>/dev/null
             fi
-
             [[ $i -lt $RETRY_COUNT ]] && sleep 2
         done
     done
-
     echo "❌ 所有下载均失败，URL: $url" >&2
     log "下载失败: choice=$choice url=$url"
     return 1
 }
-
-# ============================================================
-# 脚本执行
-# ============================================================
 
 run_script() {
     local script_path="$1"
@@ -338,13 +300,10 @@ run_script() {
         log "运行失败，文件不存在: $script_path"
         return 1
     fi
-
     chmod +x "$script_path"
     log "开始运行: $script_path"
-
     bash "$script_path" 2>&1 | tee -a "$LOG_FILE"
     local script_exit="${PIPESTATUS[0]}"
-
     if [[ "$script_exit" -eq 0 ]]; then
         echo ""
         echo "✅ 脚本运行成功"
@@ -357,13 +316,8 @@ run_script() {
     return "$script_exit"
 }
 
-# ============================================================
-# 日志管理
-# ============================================================
-
 manage_logs() {
     [[ -f "$LOG_FILE" ]] || return 0
-
     local log_size=0
     if command -v stat >/dev/null 2>&1; then
         log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
@@ -371,7 +325,6 @@ manage_logs() {
         log_size=$(ls -l "$LOG_FILE" 2>/dev/null | awk '{print $5}' || echo 0)
     fi
     log_size=${log_size:-0}
-
     if [[ "$log_size" -ge "$LOG_MAX_SIZE" ]]; then
         local keep_size=$((LOG_MAX_SIZE / 2))
         tail -c "$keep_size" "$LOG_FILE" > "${LOG_FILE}.tmp" && \
@@ -380,25 +333,17 @@ manage_logs() {
     fi
 }
 
-# ============================================================
-# 快捷键管理
-# ============================================================
-
-# 首次运行自动创建快捷键 'a'
 add_script_shortcut() {
     [[ -f "$FIRST_RUN_FLAG" ]] && return 0
-
     local cur_path
     cur_path="$(get_real_path "$0")"
     local symlink_name="a"
-
     local symlink_dirs=()
     if is_openwrt; then
         symlink_dirs=("/usr/bin" "/bin" "$HOME/.local/bin")
     else
         symlink_dirs=("/usr/local/bin" "/usr/bin" "/bin" "$HOME/.local/bin")
     fi
-
     local chosen_dir=""
     for d in "${symlink_dirs[@]}"; do
         mkdir -p "$d" 2>/dev/null || continue
@@ -407,15 +352,12 @@ add_script_shortcut() {
             break
         fi
     done
-
     if [[ -z "$chosen_dir" ]]; then
         echo "没有可写目录，跳过快捷键设置"
         touch "$FIRST_RUN_FLAG"
         return 0
     fi
-
     local link="${chosen_dir}/${symlink_name}"
-
     if [[ -L "$link" ]]; then
         local existing_target
         existing_target="$(readlink -f "$link" 2>/dev/null)"
@@ -425,7 +367,6 @@ add_script_shortcut() {
             return 0
         fi
     fi
-
     echo ""
     echo -ne "是否创建快捷键 '$symlink_name' 到 $chosen_dir？（回车=是，n=跳过）: "
     read -r ans
@@ -436,18 +377,15 @@ add_script_shortcut() {
             return 0
             ;;
     esac
-
     if ln -sf "$cur_path" "$link" 2>/dev/null && chmod +x "$cur_path"; then
         echo "快捷键 '$symlink_name' 创建成功，后续直接输入 '$symlink_name' 即可启动"
     else
         echo "快捷键创建失败（可能权限不足），可手动执行："
         echo "  ln -sf '$cur_path' '$link'"
     fi
-
     touch "$FIRST_RUN_FLAG"
 }
 
-# 探测可写的快捷键目录
 get_symlink_dir() {
     local dirs=()
     if is_openwrt; then
@@ -465,7 +403,6 @@ get_symlink_dir() {
     return 1
 }
 
-# 快捷键管理主菜单
 manage_symlink() {
     local current_script
     current_script="$(get_real_path "$0")"
@@ -479,7 +416,6 @@ manage_symlink() {
         echo "0. 返回主菜单"
         echo "----------------------------------------"
         read -rp "请输入选项编号: " choice
-
         case "$choice" in
             1) manage_current_script_symlink "$current_script" ;;
             2) bind_script_to_shortcut ;;
@@ -489,7 +425,6 @@ manage_symlink() {
     done
 }
 
-# 管理当前脚本快捷键（增/删）
 manage_current_script_symlink() {
     local current_script="$1"
     local symlink_dir
@@ -498,7 +433,6 @@ manage_current_script_symlink() {
         read -rp "按回车键返回..."
         return 1
     }
-
     while true; do
         clear
         echo "========================================"
@@ -518,13 +452,11 @@ manage_current_script_symlink() {
             fi
         done < <(find "$symlink_dir" -maxdepth 1 -type l -print0 2>/dev/null)
         [[ $found -eq 0 ]] && echo "  （暂无）"
-
         echo ""
         echo "1. 创建新快捷键"
         echo "2. 删除快捷键"
         echo "0. 返回上级"
         read -rp "请输入选项编号: " choice
-
         case "$choice" in
             1)
                 read -rp "请输入快捷键名称（仅字母数字）: " shortcut
@@ -565,7 +497,6 @@ manage_current_script_symlink() {
     done
 }
 
-# 绑定任意脚本到快捷键
 bind_script_to_shortcut() {
     while true; do
         clear
@@ -574,12 +505,10 @@ bind_script_to_shortcut() {
         echo "========================================"
         read -rp "请输入脚本的完整路径（0=返回）: " script_path
         [[ "$script_path" == "0" ]] && break
-
         script_path="$(get_real_path "$script_path")"
         if [[ ! -f "$script_path" ]]; then
             echo "文件不存在: $script_path"; sleep 1; continue
         fi
-
         local first_line
         first_line=$(head -1 "$script_path" 2>/dev/null)
         if [[ ! "$first_line" =~ ^#! ]]; then
@@ -587,35 +516,26 @@ bind_script_to_shortcut() {
             read -rp "仍然继续？[y/N]: " ans
             [[ "${ans:-n}" != [yY] ]] && continue
         fi
-
         read -rp "请输入快捷键名称（仅字母数字）: " shortcut
         if [[ ! "$shortcut" =~ ^[a-zA-Z0-9]+$ ]]; then
             echo "快捷键只能含字母和数字"; sleep 1; continue
         fi
-
         local symlink_dir
         symlink_dir="$(get_symlink_dir)" || { echo "未找到可写目录"; sleep 1; continue; }
-
         local link="$symlink_dir/$shortcut"
         if [[ -e "$link" ]]; then
             echo "快捷键 '$shortcut' 已存在"; sleep 1; continue
         fi
-
         if ln -sf "$script_path" "$link" && chmod +x "$script_path"; then
             echo "✅ 成功: $link -> $script_path"
         else
             echo "❌ 创建失败，可尝试手动执行："
             echo "   ln -sf '$script_path' '$link'"
         fi
-
         read -rp "按回车键继续..."
         break
     done
 }
-
-# ============================================================
-# 菜单逻辑
-# ============================================================
 
 get_next_custom_menu_id() {
     local max_id=0
@@ -633,13 +553,17 @@ load_menu() {
     OPTIONS=()
     SCRIPTS=()
     CUSTOM_SCRIPT_NAMES=()
+    MENU_TEXT_MAP=()
+    SORTED_IDS=()
     declare -A seen_ids=()
+    local all_ids=()
 
     for opt in "${DEFAULT_OPTIONS[@]}"; do
         local num="${opt%%.*}"
         [[ -n "${seen_ids[$num]+_}" ]] && continue
         seen_ids["$num"]=1
         OPTIONS+=("$opt")
+        all_ids+=("$num")
         if [[ -v DEFAULT_SCRIPTS["$num"] ]]; then
             SCRIPTS["$num"]="${DEFAULT_SCRIPTS[$num]}"
             CUSTOM_SCRIPT_NAMES["$num"]="$(basename "${DEFAULT_SCRIPTS[$num]}")"
@@ -653,17 +577,30 @@ load_menu() {
         [[ -n "${seen_ids[$id]+_}" ]] && continue
         seen_ids["$id"]=1
         OPTIONS+=("${id}. ${name}")
+        all_ids+=("$id")
         SCRIPTS["$id"]="$url"
         CUSTOM_SCRIPT_NAMES["$id"]="$script_name"
     done < <(grep -v '^#' "$CUSTOM_MENU_FILE" 2>/dev/null | grep -v '^$')
 
-    IFS=$'\n' OPTIONS=($(
-        for opt in "${OPTIONS[@]}"; do echo "$opt"; done | sort -t. -k1 -n
-    ))
-    unset IFS
+    [[ -z "${seen_ids[99]+_}" ]] && OPTIONS+=("99. 管理自定义菜单") && all_ids+=("99") && SCRIPTS["99"]=""
+    [[ -z "${seen_ids[0]+_}" ]]  && OPTIONS+=("0. 退出")            && all_ids+=("0")  && SCRIPTS["0"]=""
 
-    [[ -z "${seen_ids[99]+_}" ]] && OPTIONS+=("99. 管理自定义菜单") && SCRIPTS["99"]=""
-    [[ -z "${seen_ids[0]+_}" ]]  && OPTIONS+=("0. 退出")            && SCRIPTS["0"]=""
+    for opt in "${OPTIONS[@]}"; do
+        local num="${opt%%.*}"
+        num="${num// /}"
+        local text="${opt#*. }"
+        [[ "$text" == "$opt" ]] && text="${opt#*.}"
+        text="${text# }"
+        MENU_TEXT_MAP["$num"]="$text"
+    done
+
+    local normal_ids=()
+    for id in "${all_ids[@]}"; do
+        [[ "$id" == "0" || "$id" == "98" || "$id" == "99" ]] && continue
+        normal_ids+=("$id")
+    done
+    IFS=$'\n' SORTED_IDS=($(printf '%s\n' "${normal_ids[@]}" | sort -n))
+    unset IFS
 }
 
 manage_custom_menu() {
@@ -680,7 +617,6 @@ manage_custom_menu() {
             count=$((count + 1))
         done < <(grep -v '^#' "$CUSTOM_MENU_FILE" 2>/dev/null | grep -v '^$')
         [[ $count -eq 0 ]] && echo "  （暂无自定义菜单项）"
-
         echo "----------------------------------------"
         echo "1. 添加菜单选项"
         echo "2. 删除菜单选项"
@@ -693,17 +629,13 @@ manage_custom_menu() {
                 next_id="$(get_next_custom_menu_id)"
                 read -rp "请输入菜单名称: " name
                 [[ -z "$name" ]] && echo "名称不能为空" && sleep 1 && continue
-
                 read -rp "请输入脚本 URL 或本地路径: " url
                 [[ -z "$url" ]] && echo "URL不能为空" && sleep 1 && continue
-
                 name="${name//|/／}"
-
                 local script_name
                 script_name="$(echo "$name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]').sh"
                 [[ -z "$script_name" || "$script_name" == ".sh" ]] && \
                     script_name="custom_${next_id}.sh"
-
                 echo "${next_id}|${name}|${url}|${script_name}" >> "$CUSTOM_MENU_FILE"
                 echo "✅ 已添加菜单项 $next_id: $name"
                 ;;
@@ -725,20 +657,61 @@ manage_custom_menu() {
 
 print_menu() {
     clear
-    echo "========================================"
-    echo "       🚀 一键脚本管理平台 v${SCRIPT_VERSION} 🚀"
-    echo "========================================"
-    echo "请输入选项编号并按回车键执行："
-    echo "----------------------------------------"
-    for opt in "${OPTIONS[@]}"; do
-        echo "  $opt"
-    done
-    echo "----------------------------------------"
-}
 
-# ============================================================
-# 主函数
-# ============================================================
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 80)
+
+    local line_width="$term_width"
+    [[ "$line_width" -gt 70 ]] && line_width=70
+    [[ "$line_width" -lt 40 ]] && line_width=40
+
+    local line
+    line=$(printf '%*s' "$line_width" '' | tr ' ' '=')
+
+    local total=${#SORTED_IDS[@]}
+
+    local max_text_len=0
+    for id in "${SORTED_IDS[@]}"; do
+        local t="${MENU_TEXT_MAP[$id]}"
+        local tlen=${#t}
+        [[ "$tlen" -gt "$max_text_len" ]] && max_text_len="$tlen"
+    done
+
+    local cell_width=$((max_text_len + 5))
+    [[ "$cell_width" -lt 12 ]] && cell_width=12
+
+    local col_count=1
+    local c=2
+    while [[ $c -le 4 ]]; do
+        if [[ $((cell_width * c + (c - 1) * 2)) -le "$term_width" ]]; then
+            col_count=$c
+        else
+            break
+        fi
+        c=$((c + 1))
+    done
+
+    echo -e "${C_BOLD}${line}${C_RESET}"
+    echo -e "${C_BOLD}     🚀 一键脚本管理平台 v${SCRIPT_VERSION} 🚀${C_RESET}"
+    echo -e "${C_BOLD}${line}${C_RESET}"
+
+    local idx=0
+    while [[ $idx -lt $total ]]; do
+        local row=""
+        for ((c=0; c<col_count && idx<total; c++, idx++)); do
+            local id="${SORTED_IDS[$idx]}"
+            local text="${MENU_TEXT_MAP[$id]}"
+            local cell
+            printf -v cell "%2s. %-${max_text_len}s" "$id" "$text"
+            row+="  ${cell}"
+        done
+        echo "$row"
+    done
+
+    echo -e "${C_BOLD}${line}${C_RESET}"
+    echo -e "  ${C_YELLOW}98.${C_RESET} 快捷键管理  ${C_YELLOW}99.${C_RESET} 自定义菜单  ${C_RED}0.${C_RESET} 退出"
+    echo -e "${C_BOLD}${line}${C_RESET}"
+}
 
 main() {
     init_dirs              || exit 1
@@ -774,13 +747,10 @@ main() {
                         sleep 1
                         continue
                     fi
-
                     manage_logs
-
                     local script_path
                     script_path="$(download_script "$choice")"
                     local dl_ret=$?
-
                     if [[ $dl_ret -eq 0 && -f "$script_path" ]]; then
                         run_script "$script_path"
                     else
@@ -788,7 +758,6 @@ main() {
                         echo "❌ 下载失败，请检查以上错误信息或网络状态"
                         log "下载失败: choice=$choice"
                     fi
-
                     echo ""
                     read -rp "按回车键返回主菜单..."
                 else
