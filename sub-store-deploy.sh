@@ -24,6 +24,11 @@ NC='\033[0m'
 # 候选镜像源（含直连）
 MIRROR_CANDIDATES=(
   "direct"
+  "https://docker.1ms.run"
+  "https://docker.xuanyuan.me"
+  "https://docker.m.daocloud.io"
+  "https://docker.imgdb.de"
+  "https://docker.actima.top"
 )
 
 # 日志
@@ -70,13 +75,21 @@ detect_system() {
 }
 
 check_network() {
-  for i in {1..3}; do
-    if curl -s -m 5 https://hub.docker.com >/dev/null; then
-      return 0
-    fi
-    sleep 2
+  local test_urls=(
+    "https://www.baidu.com"
+    "https://registry.npmmirror.com"
+    "https://hub.docker.com"
+  )
+  for url in "${test_urls[@]}"; do
+    for i in {1..2}; do
+      if curl -sk -m 5 "$url" >/dev/null 2>&1; then
+        log "INFO" "网络检测通过: $url"
+        return 0
+      fi
+      sleep 1
+    done
   done
-  log "ERROR" "无法连接到网络，请检查网络"
+  log "ERROR" "无法连接到网络,请检查网络"
   exit 1
 }
 
