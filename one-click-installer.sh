@@ -150,6 +150,42 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
+str_display_width() {
+    local s="$1"
+    local len=${#s}
+    local i ch code w=0
+    for ((i=0; i<len; i++)); do
+        ch="${s:i:1}"
+        printf -v code '%d' "'$ch"
+        if (( code >= 0x1100 && (
+              code <= 0x115F ||
+              (code >= 0x2E80 && code <= 0xA4CF) ||
+              (code >= 0xAC00 && code <= 0xD7A3) ||
+              (code >= 0xF900 && code <= 0xFAFF) ||
+              (code >= 0xFE30 && code <= 0xFE4F) ||
+              (code >= 0xFF00 && code <= 0xFF60) ||
+              (code >= 0xFFE0 && code <= 0xFFE6) ||
+              (code >= 0x20000 && code <= 0x2FFFD) ||
+              (code >= 0x30000 && code <= 0x3FFFD)
+              ) )); then
+            w=$((w + 2))
+        else
+            w=$((w + 1))
+        fi
+    done
+    echo "$w"
+}
+
+pad_right() {
+    local s="$1"
+    local width="$2"
+    local cur
+    cur=$(str_display_width "$s")
+    local pad=$((width - cur))
+    (( pad < 0 )) && pad=0
+    printf '%s%*s' "$s" "$pad" ''
+}
+
 OS=""
 PKG_MANAGER=""
 
@@ -662,7 +698,7 @@ print_menu() {
     term_width=$(tput cols 2>/dev/null || echo 80)
 
     local line_width="$term_width"
-    [[ "$line_width" -gt 70 ]] && line_width=70
+    [[ "$line_width" -gt 100 ]] && line_width=100
     [[ "$line_width" -lt 40 ]] && line_width=40
 
     local line
@@ -670,20 +706,21 @@ print_menu() {
 
     local total=${#SORTED_IDS[@]}
 
-    local max_text_len=0
+    local max_text_w=0
     for id in "${SORTED_IDS[@]}"; do
-        local t="${MENU_TEXT_MAP[$id]}"
-        local tlen=${#t}
-        [[ "$tlen" -gt "$max_text_len" ]] && max_text_len="$tlen"
+        local w
+        w=$(str_display_width "${MENU_TEXT_MAP[$id]}")
+        (( w > max_text_w )) && max_text_w=$w
     done
 
-    local cell_width=$((max_text_len + 5))
-    [[ "$cell_width" -lt 12 ]] && cell_width=12
+    local id_w=3
+    local cell_width=$((id_w + 2 + max_text_w))
+    local gap=3
 
     local col_count=1
     local c=2
-    while [[ $c -le 4 ]]; do
-        if [[ $((cell_width * c + (c - 1) * 2)) -le "$term_width" ]]; then
+    while [[ $c -le 5 ]]; do
+        if [[ $((cell_width * c + gap * (c - 1) + 2)) -le "$term_width" ]]; then
             col_count=$c
         else
             break
@@ -697,13 +734,18 @@ print_menu() {
 
     local idx=0
     while [[ $idx -lt $total ]]; do
-        local row=""
+        local row=" "
         for ((c=0; c<col_count && idx<total; c++, idx++)); do
             local id="${SORTED_IDS[$idx]}"
             local text="${MENU_TEXT_MAP[$id]}"
-            local cell
-            printf -v cell "%2s. %-${max_text_len}s" "$id" "$text"
-            row+="  ${cell}"
+            local id_part
+            printf -v id_part '%2s.' "$id"
+            local text_part
+            text_part=$(pad_right "$text" "$max_text_w")
+            if [[ $c -gt 0 ]]; then
+                row+="$(printf '%*s' "$gap" '')"
+            fi
+            row+="${id_part} ${text_part}"
         done
         echo "$row"
     done
