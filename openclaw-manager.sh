@@ -25,18 +25,29 @@ LOBSTER="🦞"; DOCKER="🐳"; PLUGIN="🔌"
 # ─────────────────────────────────────────
 OPENCLAW_PORT=18789
 OPENCLAW_SERVICE="openclaw"
+OPENCLAW_SERVICE_CANDIDATES=("openclaw" "openclaw-gateway")
 OPENCLAW_CONFIG_DIR="$HOME/.openclaw"
 OPENCLAW_JSON="$OPENCLAW_CONFIG_DIR/openclaw.json"
 OPENCLAW_API_JSON="$OPENCLAW_CONFIG_DIR/config.json"
 OPENCLAW_LOG_DIR="$OPENCLAW_CONFIG_DIR/logs"
-SCRIPT_VERSION="v2.0.0"
-NODE_MIN_VERSION=20
+SCRIPT_VERSION="v2.1.0"
+NODE_MIN_VERSION=22
+NODE_RECOMMENDED_VERSION=24
 LOG_FILE="/tmp/openclaw_install_$(date +%Y%m%d_%H%M%S).log"
 
+GITHUB_REPO="https://github.com/openclaw/openclaw"
+OPENCLAW_INSTALL_URL="https://openclaw.ai/install.sh"
+
 # Docker 相关
-DOCKER_IMAGE="openclaw/openclaw"
+DOCKER_IMAGE="ghcr.io/openclaw/openclaw"
+DOCKER_IMAGE_MIRROR="openclaw/openclaw"
 DOCKER_CONTAINER="openclaw-core"
 DOCKER_DATA_DIR="$HOME/openclaw"
+DOCKER_UID=1000
+
+# 官方文档记录在案的第三方消息插件
+WECHAT_PLUGIN_PKG="@tencent-weixin/openclaw-weixin"
+FEISHU_PLUGIN_PKG="@m1heng-clawd/feishu"
 
 # 动态版本缓存
 _NVM_LATEST=""
@@ -91,6 +102,15 @@ confirm() {
 log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 has_cmd() { command -v "$1" &>/dev/null; }
 
+get_local_ip() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$ip" ]] && ip=$(ipconfig getifaddr en0 2>/dev/null)
+    [[ -z "$ip" ]] && ip=$(ipconfig getifaddr en1 2>/dev/null)
+    [[ -z "$ip" ]] && ip="127.0.0.1"
+    echo "$ip"
+}
+
 safe_run() {
     local desc="$1"; shift
     if "$@" >> "$LOG_FILE" 2>&1; then
@@ -141,7 +161,7 @@ get_node_lts_versions() {
         | grep -o '"version":"v[0-9]*\.[0-9]*\.[0-9]*","[^}]*"lts":"[^f][^"]*"' \
         | grep -o '"version":"v[0-9]*' | grep -o '[0-9]*$' \
         | sort -rn | awk '!seen[$0]++' | head -5 | tr '\n' ' ')
-    _NODE_LTS_VERSIONS="${v:-22 20 18}"
+    _NODE_LTS_VERSIONS="${v:-24 22 20}"
     echo "$_NODE_LTS_VERSIONS"
 }
 
@@ -150,7 +170,7 @@ get_node_latest_major() {
     local v
     v=$(curl -s --max-time 8 "https://nodejs.org/dist/index.json" 2>/dev/null \
         | grep -o '"version":"v[0-9]*' | head -1 | grep -o '[0-9]*$')
-    _NODE_LATEST_VERSION="${v:-23}"
+    _NODE_LATEST_VERSION="${v:-$NODE_RECOMMENDED_VERSION}"
     echo "$_NODE_LATEST_VERSION"
 }
 
@@ -283,6 +303,8 @@ try:
         cfg = json.load(f)
     gw = cfg.get("gateway", {})
     print(f"  bind       : {gw.get('bind', '未设置')}")
+    print(f"  mode       : {gw.get('mode', '未设置')}")
+    print(f"  auth.mode  : {gw.get('auth', {}).get('mode', '未设置')}")
     ui = gw.get("controlUi", {})
     print(f"  controlUi  : {json.dumps(ui, ensure_ascii=False)}")
 except Exception as e:
@@ -295,12 +317,16 @@ PYEOF
     echo ""
     print_line
     echo -e "${BOLD}将要执行的修改:${NC}"
+    echo -e "  ${CYAN}gateway.mode${NC} → ${GREEN}\"local\"${NC} (若未设置)"
     echo -e "  ${CYAN}gateway.bind${NC} → ${GREEN}\"lan\"${NC} (0.0.0.0 监听)"
+    echo -e "  ${CYAN}gateway.auth.token${NC} → ${GREEN}自动生成${NC} (若未设置，绑定非 loopback 必须有认证)"
     echo -e "  ${CYAN}gateway.controlUi.allowInsecureAuth${NC} → ${GREEN}true${NC}"
     echo -e "  ${CYAN}gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback${NC} → ${GREEN}true${NC}"
     echo -e "  ${CYAN}gateway.controlUi.dangerouslyDisableDeviceAuth${NC} → ${GREEN}true${NC}"
     echo ""
     echo -e "${RED}${WARN} 安全提示: 启用局域网访问后请勿将端口暴露到公网！${NC}"
+    echo -e "${DIM}已知问题: 部分版本设置上述标志后仍可能提示 device identity required，${NC}"
+    echo -e "${DIM}此时请用 openclaw devices list / openclaw devices pair 手动完成设备配对。${NC}"
     echo ""
 
     if ! confirm "确认应用局域网配置?"; then
@@ -317,9 +343,11 @@ PYEOF
 
     # 写入配置
     mkdir -p "$(dirname "$cfg_file")"
+    local gw_token=""
     if has_cmd python3; then
-        python3 - "$cfg_file" << 'PYEOF'
-import json, sys, os
+        local py_result
+        py_result=$(python3 - "$cfg_file" << 'PYEOF'
+import json, sys, os, secrets
 
 cfg_path = sys.argv[1]
 os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
@@ -330,9 +358,16 @@ try:
 except Exception:
     cfg = {}
 
-# 写入 gateway 配置
-cfg.setdefault("gateway", {})["bind"] = "lan"
-cfg["gateway"].setdefault("controlUi", {}).update({
+gw = cfg.setdefault("gateway", {})
+gw.setdefault("mode", "local")
+gw["bind"] = "lan"
+
+auth = gw.setdefault("auth", {})
+if not auth.get("token"):
+    auth["token"] = secrets.token_hex(24)
+auth.setdefault("mode", "token")
+
+gw.setdefault("controlUi", {}).update({
     "allowInsecureAuth": True,
     "dangerouslyAllowHostHeaderOriginFallback": True,
     "dangerouslyDisableDeviceAuth": True
@@ -341,9 +376,11 @@ cfg["gateway"].setdefault("controlUi", {}).update({
 with open(cfg_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-print("配置写入成功")
+print(f"TOKEN={auth['token']}")
 PYEOF
+)
         if [[ $? -eq 0 ]]; then
+            gw_token=$(echo "$py_result" | grep '^TOKEN=' | cut -d= -f2)
             msg_ok "局域网配置已写入"
         else
             msg_fail "配置写入失败"
@@ -351,7 +388,8 @@ PYEOF
         fi
     else
         # bash fallback：使用 sed/awk 或重新生成
-        _write_lan_config_bash "$cfg_file"
+        gw_token=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null | tr -d '\n' || date +%s%N)
+        _write_lan_config_bash "$cfg_file" "$gw_token"
     fi
 
     # 重启 Gateway
@@ -395,15 +433,19 @@ PYEOF
     fi
 
     # 显示访问信息
-    local local_ip
-    local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+    local local_ip; local_ip=$(get_local_ip)
+    local token_qs=""
+    [[ -n "$gw_token" ]] && token_qs="?token=${gw_token}"
     echo ""
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}${BOLD}║             ${LOBSTER} 局域网访问信息                          ║${NC}"
     echo -e "${GREEN}${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}本机:${NC}    ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${NC}                      ${GREEN}${BOLD}║${NC}"
-    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${NC}                    ${GREEN}${BOLD}║${NC}"
+    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC}"
+    if [[ -n "$gw_token" ]]; then
+    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}Token:${NC}   ${YELLOW}${gw_token}${NC}"
+    fi
     echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}  ${RED}⚠️  勿将端口暴露到公网！${NC}                              ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}  ${DIM}可用 Nginx 反代 + 认证 或 Tailscale VPN${NC}            ${GREEN}${BOLD}║${NC}"
@@ -417,12 +459,15 @@ PYEOF
 
 _write_lan_config_bash() {
     local cfg_file="$1"
+    local token="$2"
     # 如果没有 python3，生成最小配置
     if [[ ! -f "$cfg_file" ]]; then
-        cat > "$cfg_file" << 'EOF'
+        cat > "$cfg_file" << EOF
 {
   "gateway": {
+    "mode": "local",
     "bind": "lan",
+    "auth": { "mode": "token", "token": "${token}" },
     "controlUi": {
       "allowInsecureAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true,
@@ -435,7 +480,8 @@ EOF
     else
         msg_warn "无 python3，请手动编辑 $cfg_file"
         msg_info "需要在 gateway 下设置:"
-        echo '    "bind": "lan"'
+        echo '    "mode": "local", "bind": "lan"'
+        echo "    \"auth\": { \"mode\": \"token\", \"token\": \"${token}\" }"
         echo '    "controlUi": { "allowInsecureAuth": true, ... }'
     fi
 }
@@ -447,20 +493,20 @@ EOF
 install_plugins() {
     msg_title "${PLUGIN} 安装消息平台插件"
 
-    if ! has_cmd npx; then
-        msg_fail "npx 未找到，请先安装 Node.js"
+    if ! is_openclaw_installed; then
+        msg_fail "OpenClaw 未安装，请先安装"
         press_any_key; return 0
     fi
 
     echo -e "${CYAN}可用插件:${NC}"
     echo ""
     echo -e "  ${BOLD}1)${NC} ${LOBSTER} 微信插件"
-    echo -e "     ${DIM}包名: @tencent-weixin/openclaw-weixin-cli${NC}"
-    echo -e "     ${DIM}功能: 将微信作为 OpenClaw 的消息频道${NC}"
+    echo -e "     ${DIM}包名: ${WECHAT_PLUGIN_PKG}${NC}"
+    echo -e "     ${DIM}功能: 将微信作为 OpenClaw 的消息频道（腾讯云团队维护，支持扫码登录）${NC}"
     echo ""
-    echo -e "  ${BOLD}2)${NC} ${LOBSTER} 飞书插件"
-    echo -e "     ${DIM}包名: @larksuite/openclaw-lark-tools${NC}"
-    echo -e "     ${DIM}功能: 将飞书作为 OpenClaw 的消息频道${NC}"
+    echo -e "  ${BOLD}2)${NC} ${LOBSTER} 飞书 / Lark 插件"
+    echo -e "     ${DIM}包名: ${FEISHU_PLUGIN_PKG}${NC}"
+    echo -e "     ${DIM}功能: 将飞书/Lark 作为 OpenClaw 的消息频道（社区 @m1heng 维护，官方文档收录）${NC}"
     echo ""
     echo -e "  ${BOLD}3)${NC} 安装全部插件"
     echo -e "  ${BOLD}0)${NC} 返回"
@@ -470,11 +516,11 @@ install_plugins() {
     read -r choice </dev/tty || choice="0"
 
     case "$choice" in
-        1) _install_single_plugin "weixin" "@tencent-weixin/openclaw-weixin-cli" ;;
-        2) _install_single_plugin "lark"   "@larksuite/openclaw-lark-tools" ;;
+        1) _install_single_plugin "微信" "$WECHAT_PLUGIN_PKG" ;;
+        2) _install_single_plugin "飞书" "$FEISHU_PLUGIN_PKG" ;;
         3)
-            _install_single_plugin "weixin" "@tencent-weixin/openclaw-weixin-cli"
-            _install_single_plugin "lark"   "@larksuite/openclaw-lark-tools"
+            _install_single_plugin "微信" "$WECHAT_PLUGIN_PKG"
+            _install_single_plugin "飞书" "$FEISHU_PLUGIN_PKG"
             ;;
         0) return 0 ;;
         *) msg_warn "无效选项" ;;
@@ -490,20 +536,22 @@ _install_single_plugin() {
 
     echo ""
     msg_step "安装 ${name} 插件 (${pkg})..."
-    echo -e "${DIM}执行: npx -y ${pkg} install${NC}"
+    echo -e "${DIM}执行: openclaw plugins install \"${pkg}\" --force${NC}"
     echo ""
 
-    if npx -y "${pkg}" install 2>&1 | tee -a "$LOG_FILE"; then
+    if openclaw_cmd plugins install "${pkg}" --force 2>&1 | tee -a "$LOG_FILE"; then
         echo ""
         msg_ok "${name} 插件安装成功！"
         echo ""
-        echo -e "${CYAN}下一步: 添加频道${NC}"
-        echo -e "  ${DIM}openclaw channels add${NC}"
-        echo -e "  ${DIM}openclaw channels list${NC}"
+        echo -e "${CYAN}下一步:${NC}"
+        echo -e "  ${DIM}openclaw config set channels.<channel>.enabled true${NC}"
+        echo -e "  ${DIM}openclaw channels login   # 微信等需扫码登录的频道${NC}"
         echo -e "  ${DIM}openclaw channels status${NC}"
+        echo -e "  ${DIM}openclaw gateway restart${NC}"
     else
         echo ""
         msg_fail "${name} 插件安装失败，详见: $LOG_FILE"
+        msg_info "可尝试: openclaw plugins install \"${pkg}\" --force 手动重试"
     fi
 }
 
@@ -598,12 +646,23 @@ _docker_run() {
     local port="${1:-$OPENCLAW_PORT}"
     local data_dir="${2:-$DOCKER_DATA_DIR}"
     local extra="${3:-}"
+    local image="$DOCKER_IMAGE"
 
-    msg_step "拉取最新镜像..."
-    if docker pull "${DOCKER_IMAGE}:latest" 2>&1 | tail -3; then
+    mkdir -p "${data_dir}/.openclaw" "${data_dir}/workspace"
+    chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null \
+        || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
+
+    msg_step "拉取最新镜像 (${image})..."
+    if docker pull "${image}:latest" 2>&1 | tail -3; then
         msg_ok "镜像拉取成功"
     else
-        msg_warn "镜像拉取失败，尝试使用本地镜像..."
+        msg_warn "GHCR 镜像拉取失败，尝试 Docker Hub 镜像 ${DOCKER_IMAGE_MIRROR}..."
+        if docker pull "${DOCKER_IMAGE_MIRROR}:latest" 2>&1 | tail -3; then
+            image="$DOCKER_IMAGE_MIRROR"
+            msg_ok "镜像拉取成功 (${DOCKER_IMAGE_MIRROR})"
+        else
+            msg_warn "镜像拉取失败，尝试使用本地缓存镜像..."
+        fi
     fi
 
     msg_step "启动容器..."
@@ -612,8 +671,10 @@ _docker_run() {
         --name "$DOCKER_CONTAINER"
         --restart unless-stopped
         -p "${port}:18789"
-        -v "${data_dir}:/data"
-        "${DOCKER_IMAGE}:latest"
+        -v "${data_dir}/.openclaw:/home/node/.openclaw"
+        -v "${data_dir}/workspace:/home/node/workspace"
+        --add-host=host.docker.internal:host-gateway
+        "${image}:latest"
     )
 
     if "${run_cmd[@]}" 2>&1 | tail -2; then
@@ -622,30 +683,51 @@ _docker_run() {
         # 等待健康检查
         echo -ne "  等待服务就绪"
         local i=0
-        while (( i < 15 )); do
+        while (( i < 20 )); do
             sleep 1; echo -ne "."
-            if curl -s --max-time 2 "http://127.0.0.1:${port}/health" &>/dev/null; then
+            if curl -s --max-time 2 "http://127.0.0.1:${port}/healthz" &>/dev/null \
+               || curl -s --max-time 2 "http://127.0.0.1:${port}" &>/dev/null; then
                 break
             fi
             ((i++))
         done
         echo ""
 
+        if [[ ! -f "${data_dir}/.openclaw/openclaw.json" ]]; then
+            echo ""
+            msg_warn "未检测到配置文件，需完成首次引导 (API Key / 频道 / 工作区)"
+            if confirm "现在交互式运行 onboard 向导?"; then
+                docker exec -it "$DOCKER_CONTAINER" openclaw onboard --install-daemon || true
+            else
+                msg_info "稍后运行: docker exec -it ${DOCKER_CONTAINER} openclaw onboard --install-daemon"
+            fi
+        fi
+
+        if [[ "$extra" == "--lan" ]]; then
+            msg_step "配置局域网访问..."
+            docker exec "$DOCKER_CONTAINER" openclaw config set gateway.mode local >/dev/null 2>&1 || true
+            docker exec "$DOCKER_CONTAINER" openclaw config set gateway.bind lan >/dev/null 2>&1 || true
+            docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.allowInsecureAuth true >/dev/null 2>&1 || true
+            docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true >/dev/null 2>&1 || true
+            docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.dangerouslyDisableDeviceAuth true >/dev/null 2>&1 || true
+            docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+            msg_ok "局域网模式已启用（请确保 gateway.auth.token 已配置）"
+        fi
+
         echo ""
         echo -e "${GREEN}${BOLD}Docker 部署完成！${NC}"
         echo ""
         echo -e "  ${BOLD}访问地址:${NC} ${CYAN}http://127.0.0.1:${port}${NC}"
-        local local_ip
-        local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "server_ip")
+        local local_ip; local_ip=$(get_local_ip)
         echo -e "  ${BOLD}局域网:${NC}   ${CYAN}http://${local_ip}:${port}${NC}"
         echo ""
         echo -e "  ${DIM}常用命令:${NC}"
         echo -e "  ${DIM}  docker ps                              # 查看状态${NC}"
         echo -e "  ${DIM}  docker logs ${DOCKER_CONTAINER}       # 查看日志${NC}"
-        echo -e "  ${DIM}  docker exec ${DOCKER_CONTAINER} openclaw status${NC}"
+        echo -e "  ${DIM}  docker exec -it ${DOCKER_CONTAINER} openclaw status${NC}"
         echo -e "  ${DIM}  docker stop ${DOCKER_CONTAINER}       # 停止${NC}"
 
-        log "Docker deployed on port $port"
+        log "Docker deployed on port $port using ${image}"
     else
         msg_fail "容器启动失败，请检查: docker logs ${DOCKER_CONTAINER}"
     fi
@@ -734,6 +816,7 @@ show_command_reference() {
     _cmd_row "${prefix}openclaw doctor"                  "诊断配置问题"
     _cmd_row "${prefix}openclaw doctor --fix"            "自动修复常见问题"
     _cmd_row "${prefix}openclaw logs"                    "查看 Gateway 日志"
+    _cmd_row "${prefix}openclaw security audit"          "安全风险审计"
     echo ""
 
     echo -e "${CYAN}${BOLD}⚙️  配置管理${NC}"
@@ -788,8 +871,8 @@ show_command_reference() {
 
     echo -e "${CYAN}${BOLD}${PLUGIN} 插件安装${NC}"
     print_line
-    _cmd_row "npx -y @tencent-weixin/openclaw-weixin-cli install" "微信插件"
-    _cmd_row "npx -y @larksuite/openclaw-lark-tools install"      "飞书插件"
+    _cmd_row "openclaw plugins install \"${WECHAT_PLUGIN_PKG}\""  "微信插件"
+    _cmd_row "openclaw plugins install \"${FEISHU_PLUGIN_PKG}\""  "飞书/Lark 插件"
     echo ""
 
     if $use_docker; then
@@ -851,6 +934,7 @@ quick_commands() {
     echo -e "  ${BOLD}14)${NC} openclaw backup create   ${DIM}备份数据${NC}"
     echo -e "  ${BOLD}15)${NC} openclaw tui             ${DIM}终端UI${NC}"
     echo -e "  ${BOLD}16)${NC} openclaw dashboard       ${DIM}Web 控制台${NC}"
+    echo -e "  ${BOLD}17)${NC} openclaw security audit  ${DIM}安全审计${NC}"
     echo -e "  ${BOLD}0)${NC}  返回"
     echo ""
     echo -ne "${BOLD}请选择: ${NC}"
@@ -880,6 +964,7 @@ quick_commands() {
         14) openclaw_cmd backup create ;;
         15) openclaw_cmd tui ;;
         16) openclaw_cmd dashboard ;;
+        17) openclaw_cmd security audit ;;
         0)  return 0 ;;
         *)  msg_warn "无效选项" ;;
     esac
@@ -1128,7 +1213,7 @@ pick_node_version() {
     local latest_major; latest_major=$(get_node_latest_major)
     local first_lts; first_lts=$(echo "$lts_list" | awk '{print $1}')
 
-    echo -e "\n${CYAN}选择 Node.js 版本:${NC}" >&2
+    echo -e "\n${CYAN}选择 Node.js 版本 (最低要求 v${NODE_MIN_VERSION}+):${NC}" >&2
     local idx=1
     declare -a vmap=()
 
@@ -1178,7 +1263,7 @@ install_nodejs() {
     if has_cmd node; then
         local ver; ver=$(node -v | sed 's/v//' | cut -d. -f1)
         if [[ "$ver" -ge "$NODE_MIN_VERSION" ]]; then
-            msg_ok "Node.js $(node -v) 满足要求 (v${NODE_MIN_VERSION}+)"
+            msg_ok "Node.js $(node -v) 满足要求 (v${NODE_MIN_VERSION}+，推荐 v${NODE_RECOMMENDED_VERSION})"
             return 0
         fi
         msg_warn "当前 $(node -v) 低于 v${NODE_MIN_VERSION}+"
@@ -1197,10 +1282,10 @@ install_nodejs() {
     local nc; read -r nc </dev/tty || nc="1"
     nc=${nc:-1}
 
-    local tv="$NODE_MIN_VERSION"
+    local tv="$NODE_RECOMMENDED_VERSION"
     if [[ "$nc" -eq 1 || "$nc" -eq 2 ]]; then
         tv=$(pick_node_version)
-        [[ -z "$tv" ]] && tv="$NODE_MIN_VERSION"
+        [[ -z "$tv" ]] && tv="$NODE_RECOMMENDED_VERSION"
         msg_info "目标: v${tv}"
     fi
 
@@ -1678,6 +1763,40 @@ _cfg_custom() {
 #  服务管理
 # ═══════════════════════════════════════════════════════════
 
+_try_systemd() {
+    local svc
+    for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+        if sudo systemctl "$@" "$svc" 2>/dev/null; then return 0; fi
+        if systemctl --user "$@" "$svc" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+_try_openrc() {
+    local svc
+    for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+        if sudo rc-service "$svc" "$1" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+_try_launchd() {
+    local action="$1"
+    local plist
+    for plist in "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" \
+                 "$HOME/Library/LaunchAgents/com.openclaw.gateway.plist"; do
+        [[ ! -f "$plist" ]] && continue
+        case "$action" in
+            start)  launchctl load   "$plist" 2>/dev/null && return 0 ;;
+            stop)   launchctl unload "$plist" 2>/dev/null && return 0 ;;
+            restart) launchctl unload "$plist" 2>/dev/null
+                     launchctl load   "$plist" 2>/dev/null && return 0 ;;
+            status) launchctl list 2>/dev/null | grep -i openclaw && return 0 ;;
+        esac
+    done
+    return 1
+}
+
 service_action() {
     local action="$1"
     detect_system
@@ -1698,35 +1817,20 @@ service_action() {
     case "$SERVICE_MANAGER" in
         systemd)
             case "$action" in
-                start)   sudo systemctl start   "$OPENCLAW_SERVICE" 2>/dev/null \
-                             || systemctl --user start   "$OPENCLAW_SERVICE" 2>/dev/null || true ;;
-                stop)    sudo systemctl stop    "$OPENCLAW_SERVICE" 2>/dev/null \
-                             || systemctl --user stop    "$OPENCLAW_SERVICE" 2>/dev/null || true ;;
-                restart) sudo systemctl restart "$OPENCLAW_SERVICE" 2>/dev/null \
-                             || systemctl --user restart "$OPENCLAW_SERVICE" 2>/dev/null || true ;;
-                enable)  sudo systemctl enable --now "$OPENCLAW_SERVICE" 2>/dev/null \
-                             || systemctl --user enable --now "$OPENCLAW_SERVICE" 2>/dev/null || true ;;
-                status)  sudo systemctl status  "$OPENCLAW_SERVICE" --no-pager 2>/dev/null \
-                             || systemctl --user status  "$OPENCLAW_SERVICE" --no-pager 2>/dev/null || true ;;
+                start)   _try_systemd start ;;
+                stop)    _try_systemd stop ;;
+                restart) _try_systemd restart ;;
+                enable)  _try_systemd enable --now ;;
+                status)  _try_systemd status --no-pager ;;
             esac ;;
         openrc)
-            case "$action" in
-                start)   sudo rc-service openclaw start   2>/dev/null || true ;;
-                stop)    sudo rc-service openclaw stop    2>/dev/null || true ;;
-                restart) sudo rc-service openclaw restart 2>/dev/null || true ;;
-                enable)  sudo rc-update add openclaw      2>/dev/null || true ;;
-                status)  sudo rc-service openclaw status  2>/dev/null || true ;;
-            esac ;;
+            _try_openrc "$action" || {
+                case "$action" in
+                    enable) sudo rc-update add openclaw 2>/dev/null || true ;;
+                esac
+            } ;;
         launchd)
-            local plist="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
-            case "$action" in
-                start)   launchctl load   "$plist" 2>/dev/null || true ;;
-                stop)    launchctl unload "$plist" 2>/dev/null || true ;;
-                restart) launchctl unload "$plist" 2>/dev/null
-                         launchctl load   "$plist" 2>/dev/null || true ;;
-                enable)  launchctl load   "$plist" 2>/dev/null || true ;;
-                status)  launchctl list 2>/dev/null | grep -i openclaw || echo "未运行" ;;
-            esac ;;
+            _try_launchd "$action" ;;
         *)
             case "$action" in
                 start)   openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
@@ -1744,9 +1848,7 @@ service_action() {
 # ─────────────────────────────────────────
 
 show_dashboard_info() {
-    local local_ip
-    local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' \
-             || ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")
+    local local_ip; local_ip=$(get_local_ip)
     local public_ip
     public_ip=$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null \
              || curl -s --max-time 4 https://ifconfig.me 2>/dev/null || echo "无法获取")
@@ -1837,7 +1939,7 @@ install_openclaw() {
     echo ""
     echo "  1) 官方脚本 [推荐]"
     echo "  2) npm"
-    echo "  3) GitHub 源码"
+    echo "  3) GitHub 源码 (pnpm)"
     echo ""
     echo -ne "${BOLD}选择 [1-3] (默认:1): ${NC}"
     local ic; read -r ic </dev/tty || ic="1"
@@ -1845,8 +1947,8 @@ install_openclaw() {
 
     case "$ic" in
         1)
-            msg_info "下载官方脚本..."
-            if curl -fsSL https://openclaw.ai/install.sh | bash >> "$LOG_FILE" 2>&1; then
+            msg_info "下载官方脚本 (${OPENCLAW_INSTALL_URL})..."
+            if curl -fsSL --proto '=https' --tlsv1.2 "$OPENCLAW_INSTALL_URL" | bash >> "$LOG_FILE" 2>&1; then
                 msg_ok "官方脚本安装成功"
             else
                 msg_warn "官方脚本失败，npm 回退..."
@@ -1855,15 +1957,16 @@ install_openclaw() {
         2)
             npm install -g openclaw@latest 2>&1 | tee -a "$LOG_FILE" || true ;;
         3)
-            echo -ne "${BOLD}仓库 (默认: https://github.com/openclaw-ai/openclaw): ${NC}"
+            echo -ne "${BOLD}仓库 (默认: ${GITHUB_REPO}): ${NC}"
             local repo; read -r repo </dev/tty || repo=""
-            repo=${repo:-"https://github.com/openclaw-ai/openclaw"}
+            repo=${repo:-"$GITHUB_REPO"}
             local tmp="/tmp/oc_src_$$"
             git clone "$repo" "$tmp" >> "$LOG_FILE" 2>&1 || { msg_fail "clone失败"; press_any_key; return 1; }
             pushd "$tmp" > /dev/null
-            npm install >> "$LOG_FILE" 2>&1 || true
-            npm run build >> "$LOG_FILE" 2>&1 || true
-            npm install -g . >> "$LOG_FILE" 2>&1 || true
+            has_cmd pnpm || npm install -g pnpm >> "$LOG_FILE" 2>&1 || true
+            pnpm install >> "$LOG_FILE" 2>&1 || true
+            pnpm run build >> "$LOG_FILE" 2>&1 || true
+            pnpm install -g . >> "$LOG_FILE" 2>&1 || true
             popd > /dev/null; rm -rf "$tmp" ;;
     esac
 
@@ -2162,8 +2265,13 @@ except: print('unknown')
     # 7. 自启动
     _chk "7/9" "自启动"
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
-        if systemctl is-enabled "$OPENCLAW_SERVICE" &>/dev/null \
-           || systemctl --user is-enabled "$OPENCLAW_SERVICE" &>/dev/null; then
+        local svc_enabled=false svc
+        for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+            if systemctl is-enabled "$svc" &>/dev/null || systemctl --user is-enabled "$svc" &>/dev/null; then
+                svc_enabled=true; break
+            fi
+        done
+        if $svc_enabled; then
             _pass "已启用"
         else
             echo -e "${YELLOW}${WARN} 未设置${NC}"; ((issues++))
@@ -2244,9 +2352,14 @@ view_logs() {
         2)
             detect_system
             [[ "$SERVICE_MANAGER" == "systemd" ]] && {
-                sudo journalctl -u "$OPENCLAW_SERVICE" -n 100 --no-pager 2>/dev/null \
-                    || journalctl --user -u "$OPENCLAW_SERVICE" -n 100 --no-pager 2>/dev/null \
-                    || msg_fail "不可用" || true
+                local svc found=false
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    if sudo journalctl -u "$svc" -n 100 --no-pager 2>/dev/null \
+                       || journalctl --user -u "$svc" -n 100 --no-pager 2>/dev/null; then
+                        found=true; break
+                    fi
+                done
+                $found || msg_fail "不可用"
             } || msg_warn "非 systemd" ;;
         3)
             [[ -d "$OPENCLAW_LOG_DIR" ]] && {
@@ -2304,6 +2417,7 @@ uninstall_openclaw() {
         fi
         if confirm "删除 Docker 镜像?"; then
             docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true
+            docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true
             msg_ok "镜像已删除"
         fi
     fi
@@ -2311,21 +2425,28 @@ uninstall_openclaw() {
     # 本地卸载
     if has_cmd openclaw; then
         msg_step "停止服务..."
+        openclaw gateway uninstall >> "$LOG_FILE" 2>&1 || true
         service_action stop 2>/dev/null || true; sleep 1
 
         msg_step "禁用自启..."
         case "$SERVICE_MANAGER" in
             systemd)
-                sudo systemctl disable "$OPENCLAW_SERVICE" 2>/dev/null \
-                    || systemctl --user disable "$OPENCLAW_SERVICE" 2>/dev/null || true
-                sudo rm -f "/etc/systemd/system/${OPENCLAW_SERVICE}.service" 2>/dev/null || true
+                local svc
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    sudo systemctl disable "$svc" 2>/dev/null || true
+                    systemctl --user disable "$svc" 2>/dev/null || true
+                    sudo rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
+                done
                 sudo systemctl daemon-reload 2>/dev/null || true ;;
             launchd)
-                local plist="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
-                launchctl unload "$plist" 2>/dev/null || true
-                rm -f "$plist" 2>/dev/null || true ;;
+                _try_launchd stop 2>/dev/null || true
+                rm -f "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" \
+                      "$HOME/Library/LaunchAgents/com.openclaw.gateway.plist" 2>/dev/null || true ;;
             openrc)
-                sudo rc-update del openclaw 2>/dev/null || true ;;
+                local svc
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    sudo rc-update del "$svc" 2>/dev/null || true
+                done ;;
         esac
 
         msg_step "卸载 npm 包..."
