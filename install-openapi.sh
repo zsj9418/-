@@ -20,6 +20,13 @@ FREELLMAPI_IMAGE_BASE="ghcr.io/tashfeenahmed/freellmapi"
 FREELLMAPI_COMPOSE_DIR="$HOME/freellmapi"
 COMPOSE_FALLBACK_VERSION="v2.39.1"
 
+DOCKER_MIRRORS=(
+  "https://docker.1ms.run"
+  "https://dockerproxy.com"
+  "https://hub.rat.dev"
+  "https://mirror.baidubce.com"
+)
+
 function green()  { echo -e "\e[32m$1\e[0m"; }
 function red()    { echo -e "\e[31m$1\e[0m"; }
 function yellow() { echo -e "\e[33m$1\e[0m"; }
@@ -346,6 +353,432 @@ function pull_image_with_retry() {
   fi
 }
 
+# ──────────────────────────────────────────────
+# Docker 镜像加速器管理
+# ──────────────────────────────────────────────
+function _get_daemon_json_path() {
+  echo "/etc/docker/daemon.json"
+}
+
+function _read_current_mirrors() {
+  local daemon_json
+  daemon_json=$(_get_daemon_json_path)
+  [[ ! -f "$daemon_json" ]] && { echo ""; return; }
+  grep -o '"registry-mirrors":\s*\[[^]]*\]' "$daemon_json" 2>/dev/null \
+    | grep -o '"https://[^"]*"' \
+    | tr -d '"' || echo ""
+}
+
+function _write_mirrors_to_daemon() {
+  local daemon_json
+  daemon_json=$(_get_daemon_json_path)
+  local mirrors_json="$1"
+
+  local write_cmd=""
+  if [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null; then
+    write_cmd="sudo tee"
+  else
+    write_cmd="tee"
+  fi
+
+  local existing_content="{}"
+  [[ -f "$daemon_json" ]] && existing_content=$(cat "$daemon_json" 2>/dev/null || echo "{}")
+
+  if echo "$existing_content" | grep -q '"registry-mirrors"'; then
+    local new_content
+    new_content=$(echo "$existing_content" | \
+      sed 's|"registry-mirrors":\s*\[[^]]*\]|"registry-mirrors": '"$mirrors_json"'|')
+    echo "$new_content" | $write_cmd "$daemon_json" >/dev/null
+  else
+    local stripped
+    stripped=$(echo "$existing_content" | sed 's/^{//' | sed 's/}$//' | sed 's/^\s*//' | sed 's/\s*$//')
+    if [[ -z "$stripped" || "$stripped" == $'\n' ]]; then
+      printf '{\n  "registry-mirrors": %s\n}\n' "$mirrors_json" | $write_cmd "$daemon_json" >/dev/null
+    else
+      printf '{\n  "registry-mirrors": %s,\n%s}\n' "$mirrors_json" "$stripped" | $write_cmd "$daemon_json" >/dev/null
+    fi
+  fi
+}
+
+function _restart_docker_daemon() {
+  yellow "重启 Docker 守护进程以应用加速器配置..."
+  if command -v systemctl &>/dev/null; then
+    local cmd="systemctl restart docker"
+    [[ "$EUID" -ne 0 ]] && cmd="sudo $cmd"
+    eval "$cmd" && green "✅ Docker 已重启。" || { red "❌ Docker 重启失败，请手动：sudo systemctl restart docker"; return 1; }
+  elif [[ "$OS" == "openwrt" ]]; then
+    /etc/init.d/dockerd restart && green "✅ Docker 已重启。" || red "❌ 请手动：/etc/init.d/dockerd restart"
+  else
+    yellow "请手动重启 Docker 服务以使配置生效。"
+  fi
+}
+
+function _test_mirror_speed() {
+  local mirror="$1"
+  local timeout=8
+  local start end elapsed
+  start=$(date +%s%3N 2>/dev/null || date +%s)
+  if command -v curl &>/dev/null; then
+    curl -sSL --connect-timeout "$timeout" --max-time "$timeout" \
+      "${mirror}/v2/" -o /dev/null 2>/dev/null
+    local rc=$?
+  else
+    wget -qO /dev/null --timeout="$timeout" "${mirror}/v2/" 2>/dev/null
+    local rc=$?
+  fi
+  end=$(date +%s%3N 2>/dev/null || date +%s)
+  elapsed=$(( end - start ))
+  if [[ $rc -eq 0 ]]; then
+    echo "${elapsed}ms"
+  else
+    echo "超时/不可达"
+  fi
+}
+
+function configure_docker_mirror() {
+  while true; do
+    echo ""
+    cyan "╔══════════════════════════════════════════════════════════╗"
+    cyan "║  Docker 镜像加速器配置                                     ║"
+    cyan "║  解决国内拉取 Docker Hub 镜像缓慢/卡住问题                  ║"
+    cyan "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    local current_mirrors
+    current_mirrors=$(_read_current_mirrors)
+    if [[ -n "$current_mirrors" ]]; then
+      green "── 当前已配置的加速器 ──────────────────────"
+      echo "$current_mirrors" | while read -r m; do
+        [[ -n "$m" ]] && echo "  ✅ $m"
+      done
+      echo ""
+    else
+      yellow "── 当前未配置任何加速器 ────────────────────"
+      echo ""
+    fi
+
+    echo "  1. 🚀 一键配置推荐加速器（自动测速选最快）"
+    echo "  2. 📋 查看预设加速器列表并测速"
+    echo "  3. ✏️  手动添加自定义加速器地址"
+    echo "  4. 🗑️  清除所有加速器配置"
+    echo "  5. 📄 查看当前 daemon.json 内容"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -rp "选项 (0-5)：" ch </dev/tty
+
+    case "$ch" in
+      1) _mirror_auto_setup;       press_any_key ;;
+      2) _mirror_test_all;         press_any_key ;;
+      3) _mirror_add_custom;       press_any_key ;;
+      4) _mirror_clear_all;        press_any_key ;;
+      5) _mirror_show_daemon_json; press_any_key ;;
+      0) return 0 ;;
+      *) red "无效选项，请输入 0-5。" ;;
+    esac
+  done
+}
+
+function _mirror_auto_setup() {
+  echo ""
+  yellow "正在测试各加速器连通性和速度，请稍候..."
+  echo ""
+
+  local best_mirror="" best_time=99999
+  local mirror_results=()
+
+  for mirror in "${DOCKER_MIRRORS[@]}"; do
+    printf "  测试 %-40s ..." "$mirror"
+    local result
+    result=$(_test_mirror_speed "$mirror")
+    printf " %s\n" "$result"
+    mirror_results+=("$result|$mirror")
+    if [[ "$result" != "超时/不可达" ]]; then
+      local ms
+      ms=$(echo "$result" | tr -d 'ms')
+      if [[ "$ms" =~ ^[0-9]+$ ]] && [[ "$ms" -lt "$best_time" ]]; then
+        best_time="$ms"
+        best_mirror="$mirror"
+      fi
+    fi
+  done
+
+  echo ""
+  if [[ -z "$best_mirror" ]]; then
+    red "❌ 所有预设加速器均不可达，请检查网络或手动输入加速器地址（选项3）。"
+    return 1
+  fi
+
+  green "最快可用加速器：$best_mirror（${best_time}ms）"
+  echo ""
+
+  local selected_mirrors=()
+  for entry in "${mirror_results[@]}"; do
+    local rt="${entry%%|*}"
+    local url="${entry##*|}"
+    [[ "$rt" != "超时/不可达" ]] && selected_mirrors+=("$url")
+  done
+
+  local mirrors_json="["
+  local first=true
+  for m in "${selected_mirrors[@]}"; do
+    [[ "$first" == true ]] && mirrors_json+="\"$m\"" || mirrors_json+=", \"$m\""
+    first=false
+  done
+  mirrors_json+="]"
+
+  yellow "将配置以下可用加速器："
+  for m in "${selected_mirrors[@]}"; do echo "  ✅ $m"; done
+  echo ""
+  read -rp "确认写入 /etc/docker/daemon.json 并重启 Docker？(y/n，默认 y)：" cf </dev/tty
+  [[ ! "${cf:-y}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
+
+  _write_mirrors_to_daemon "$mirrors_json" || { red "❌ 写入配置失败。"; return 1; }
+  green "✅ 加速器配置已写入"
+  _restart_docker_daemon || return 1
+
+  echo ""
+  yellow "验证配置："
+  docker info 2>/dev/null | grep -A5 "Registry Mirrors" || yellow "运行 docker info 查看加速器状态"
+}
+
+function _mirror_test_all() {
+  echo ""
+  cyan "── 预设加速器测速结果 ──────────────────────────────"
+  printf "  %-45s %s\n" "加速器地址" "延迟"
+  printf "  %-45s %s\n" "─────────────────────────────────────────────" "──────────"
+  for mirror in "${DOCKER_MIRRORS[@]}"; do
+    printf "  %-45s" "$mirror"
+    local result
+    result=$(_test_mirror_speed "$mirror")
+    if [[ "$result" == "超时/不可达" ]]; then
+      printf " \e[31m%s\e[0m\n" "$result"
+    else
+      printf " \e[32m%s\e[0m\n" "$result"
+    fi
+  done
+  cyan "────────────────────────────────────────────────────"
+  echo ""
+  yellow "提示：延迟越低越好，超时/不可达表示该加速器当前不可用。"
+  yellow "可通过选项1自动选择最优加速器，或选项3手动添加其他地址。"
+}
+
+function _mirror_add_custom() {
+  echo ""
+  yellow "请输入自定义加速器地址（格式：https://your-mirror.example.com）"
+  yellow "多个地址用空格分隔，留空取消："
+  read -rp "加速器地址：" custom_input </dev/tty
+  [[ -z "$custom_input" ]] && { yellow "已取消。"; return 0; }
+
+  local new_mirrors=()
+  for addr in $custom_input; do
+    if [[ "$addr" =~ ^https?:// ]]; then
+      new_mirrors+=("$addr")
+      green "  ✅ 添加：$addr"
+    else
+      yellow "  ⚠️  格式不正确，跳过：$addr（需以 http:// 或 https:// 开头）"
+    fi
+  done
+
+  [[ ${#new_mirrors[@]} -eq 0 ]] && { red "无有效地址，取消。"; return 1; }
+
+  local existing=()
+  while IFS= read -r m; do
+    [[ -n "$m" ]] && existing+=("$m")
+  done < <(_read_current_mirrors)
+
+  local all_mirrors=("${existing[@]}" "${new_mirrors[@]}")
+  local seen=()
+  local unique_mirrors=()
+  for m in "${all_mirrors[@]}"; do
+    local dup=false
+    for s in "${seen[@]:-}"; do [[ "$s" == "$m" ]] && dup=true && break; done
+    [[ "$dup" == false ]] && unique_mirrors+=("$m") && seen+=("$m")
+  done
+
+  local mirrors_json="["
+  local first=true
+  for m in "${unique_mirrors[@]}"; do
+    [[ "$first" == true ]] && mirrors_json+="\"$m\"" || mirrors_json+=", \"$m\""
+    first=false
+  done
+  mirrors_json+="]"
+
+  _write_mirrors_to_daemon "$mirrors_json" || { red "❌ 写入配置失败。"; return 1; }
+  green "✅ 自定义加速器已添加"
+  _restart_docker_daemon || return 1
+}
+
+function _mirror_clear_all() {
+  echo ""
+  red "⚠️  将清除所有镜像加速器配置！"
+  read -rp "确认清除？(y/n，默认 n)：" cf </dev/tty
+  [[ ! "${cf:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
+  _write_mirrors_to_daemon "[]" || { red "❌ 写入配置失败。"; return 1; }
+  green "✅ 加速器已清除"
+  _restart_docker_daemon || return 1
+}
+
+function _mirror_show_daemon_json() {
+  local daemon_json
+  daemon_json=$(_get_daemon_json_path)
+  echo ""
+  cyan "── /etc/docker/daemon.json 内容 ────────────────────"
+  if [[ -f "$daemon_json" ]]; then
+    cat "$daemon_json"
+  else
+    yellow "文件不存在（尚未配置任何自定义选项）"
+  fi
+  cyan "────────────────────────────────────────────────────"
+}
+
+# ──────────────────────────────────────────────
+# 数据卷备份核心函数（三级降级策略）
+# ──────────────────────────────────────────────
+function _copy_volume_to_dir() {
+  local volume_name="$1"
+  local dest_dir="$2"
+
+  mkdir -p "$dest_dir"
+
+  yellow "  [策略1] 尝试直接读取卷挂载路径（无需网络）..."
+  local vol_path
+  vol_path=$(docker volume inspect "$volume_name" --format '{{.Mountpoint}}' 2>/dev/null || echo "")
+
+  if [[ -n "$vol_path" && -d "$vol_path" ]]; then
+    local cp_cmd="cp -a \"$vol_path/.\" \"$dest_dir/\""
+    if [[ "$EUID" -ne 0 ]]; then
+      if command -v sudo &>/dev/null; then
+        cp_cmd="sudo cp -a \"$vol_path/.\" \"$dest_dir/\""
+        local chown_cmd="sudo chown -R $(id -u):$(id -g) \"$dest_dir\""
+      fi
+    fi
+    if eval "$cp_cmd" 2>/dev/null; then
+      [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && eval "${chown_cmd:-true}" 2>/dev/null || true
+      green "  ✅ 策略1 成功：直接路径复制完成（$vol_path）"
+      return 0
+    else
+      yellow "  ⚠️  策略1 失败（权限不足），尝试下一策略..."
+    fi
+  else
+    yellow "  ⚠️  策略1 失败（路径不可访问），尝试下一策略..."
+  fi
+
+  yellow "  [策略2] 检测本地可用的轻量镜像..."
+  local helper_img=""
+  for candidate in "alpine:latest" "alpine" "busybox:latest" "busybox"; do
+    if docker image inspect "$candidate" &>/dev/null 2>&1; then
+      helper_img="$candidate"
+      green "  ✅ 发现本地镜像：$helper_img，直接使用"
+      break
+    fi
+  done
+
+  if [[ -n "$helper_img" ]]; then
+    if docker run --rm \
+      -v "${volume_name}:/source:ro" \
+      -v "${dest_dir}:/backup" \
+      "$helper_img" sh -c "cp -a /source/. /backup/" 2>/dev/null; then
+      green "  ✅ 策略2 成功：使用本地镜像 $helper_img 完成"
+      return 0
+    else
+      yellow "  ⚠️  策略2 失败，尝试下一策略..."
+    fi
+  else
+    yellow "  本地无可用轻量镜像，跳过策略2..."
+  fi
+
+  yellow "  [策略3] 尝试使用 tar 流式复制（利用已有容器）..."
+  local running_container
+  running_container=$(docker ps --format '{{.Names}}' | head -n1 || echo "")
+
+  if [[ -n "$running_container" ]]; then
+    if docker run --rm \
+      -v "${volume_name}:/source:ro" \
+      --volumes-from "$running_container" \
+      "$running_container" sh -c "tar cf - -C /source ." 2>/dev/null \
+      | tar xf - -C "$dest_dir" 2>/dev/null; then
+      green "  ✅ 策略3 成功：tar 流式复制完成"
+      return 0
+    fi
+  fi
+
+  yellow "  [策略4] 尝试拉取 alpine 镜像（需要网络）..."
+  yellow "  当前 Docker 加速器："
+  docker info 2>/dev/null | grep -A3 "Registry Mirrors" | tail -n3 || yellow "  未配置加速器"
+  echo ""
+  yellow "  提示：若拉取缓慢，可按 Ctrl+C 中断，然后通过主菜单选项10配置加速器后重试。"
+  echo ""
+
+  if docker pull alpine:latest 2>/dev/null; then
+    if docker run --rm \
+      -v "${volume_name}:/source:ro" \
+      -v "${dest_dir}:/backup" \
+      alpine sh -c "cp -a /source/. /backup/" 2>/dev/null; then
+      green "  ✅ 策略4 成功：使用 alpine 完成"
+      return 0
+    fi
+  fi
+
+  red "  ❌ 所有备份策略均失败！"
+  red "  建议：通过主菜单选项10配置 Docker 加速器后重试备份。"
+  return 1
+}
+
+function _copy_dir_to_volume() {
+  local src_dir="$1"
+  local volume_name="$2"
+
+  yellow "  [策略1] 尝试直接写入卷挂载路径..."
+  local vol_path
+  vol_path=$(docker volume inspect "$volume_name" --format '{{.Mountpoint}}' 2>/dev/null || echo "")
+
+  if [[ -n "$vol_path" && -d "$vol_path" ]]; then
+    local cp_cmd="cp -a \"$src_dir/.\" \"$vol_path/\""
+    [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && cp_cmd="sudo cp -a \"$src_dir/.\" \"$vol_path/\""
+    if eval "$cp_cmd" 2>/dev/null; then
+      green "  ✅ 策略1 成功：直接路径写入完成"
+      return 0
+    else
+      yellow "  ⚠️  策略1 失败，尝试下一策略..."
+    fi
+  fi
+
+  yellow "  [策略2] 检测本地可用的轻量镜像..."
+  local helper_img=""
+  for candidate in "alpine:latest" "alpine" "busybox:latest" "busybox"; do
+    if docker image inspect "$candidate" &>/dev/null 2>&1; then
+      helper_img="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$helper_img" ]]; then
+    if docker run --rm \
+      -v "${volume_name}:/target" \
+      -v "${src_dir}:/source:ro" \
+      "$helper_img" sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null; then
+      green "  ✅ 策略2 成功"
+      return 0
+    fi
+  fi
+
+  yellow "  [策略3] 尝试拉取 alpine 镜像..."
+  yellow "  提示：若拉取缓慢，按 Ctrl+C 后通过主菜单选项10配置加速器重试。"
+  if docker pull alpine:latest 2>/dev/null; then
+    if docker run --rm \
+      -v "${volume_name}:/target" \
+      -v "${src_dir}:/source:ro" \
+      alpine sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null; then
+      green "  ✅ 策略3 成功"
+      return 0
+    fi
+  fi
+
+  red "  ❌ 所有恢复策略均失败！"
+  red "  建议：通过主菜单选项10配置 Docker 加速器后重试。"
+  return 1
+}
+
 function _fetch_versions_github() {
   local repo="$1"
   local limit="${2:-8}"
@@ -521,11 +954,7 @@ function deploy_one_api_sqlite() {
   check_existing_container "$cname" || return 1
 
   select_image_version \
-    "One-API" \
-    "$ONE_API_IMAGE_BASE" \
-    "github" \
-    "songquanpeng/one-api" \
-    8
+    "One-API" "$ONE_API_IMAGE_BASE" "github" "songquanpeng/one-api" 8
 
   deploy_service_sqlite "$cname" "$SELECTED_IMAGE" 3000 "one-api-data"
 }
@@ -544,11 +973,7 @@ function deploy_one_api_mysql() {
   check_existing_container "$cname" || return 1
 
   select_image_version \
-    "One-API" \
-    "$ONE_API_IMAGE_BASE" \
-    "github" \
-    "songquanpeng/one-api" \
-    8
+    "One-API" "$ONE_API_IMAGE_BASE" "github" "songquanpeng/one-api" 8
 
   local sel_image="$SELECTED_IMAGE"
 
@@ -609,11 +1034,7 @@ function deploy_new_api() {
   check_existing_container "$cname" || return 1
 
   select_image_version \
-    "New-API" \
-    "$NEW_API_IMAGE_BASE" \
-    "dockerhub" \
-    "calciumion/new-api" \
-    8
+    "New-API" "$NEW_API_IMAGE_BASE" "dockerhub" "calciumion/new-api" 8
 
   local sel_image="$SELECTED_IMAGE"
 
@@ -682,11 +1103,7 @@ function deploy_freellmapi() {
   command -v openssl &>/dev/null || install_dependency "openssl" "openssl" || true
 
   select_image_version \
-    "FreeLLMAPI" \
-    "$FREELLMAPI_IMAGE_BASE" \
-    "github" \
-    "tashfeenahmed/freellmapi" \
-    8
+    "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
 
   local sel_image="$SELECTED_IMAGE"
 
@@ -814,7 +1231,7 @@ EOF
   green  "╚══════════════════════════════════════════════════════════╝"
   echo ""
   yellow "【远程设备首次登录提示】"
-  yellow "如从其他设备打开 Dashboard 提示需要 Setup Code，请通过："
+  yellow "如从其他设备打开 Dashboard 提示需要 Setup Code："
   yellow "主菜单 → 选项5（管理）→ 选项8 查看。"
 }
 
@@ -840,11 +1257,7 @@ function _freellmapi_upgrade_version() {
   _prompt_backup_before_action "版本切换" || return 0
 
   select_image_version \
-    "FreeLLMAPI" \
-    "$FREELLMAPI_IMAGE_BASE" \
-    "github" \
-    "tashfeenahmed/freellmapi" \
-    8
+    "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
 
   local new_image="$SELECTED_IMAGE"
 
@@ -864,10 +1277,7 @@ function _freellmapi_upgrade_version() {
     docker compose up -d --no-deps freellmapi || true
     cd - >/dev/null
   else
-    yellow "未找到 docker-compose.yml，使用 docker run 方式重启..."
-    docker stop freellmapi &>/dev/null || true
-    docker rm   freellmapi &>/dev/null || true
-    yellow "请通过主菜单选项4重新部署（数据卷已保留）。"
+    yellow "未找到 docker-compose.yml，请通过主菜单选项4重新部署（数据卷已保留）。"
     return 0
   fi
 
@@ -983,13 +1393,15 @@ function freellmapi_backup() {
       yellow "  暂停容器以确保数据一致性..."
       docker stop freellmapi &>/dev/null || true
     fi
+
     mkdir -p "$backup_tmp/data"
-    docker run --rm \
-      -v freellmapi-data:/source:ro \
-      -v "$backup_tmp/data":/backup \
-      alpine sh -c "cp -a /source/. /backup/" \
-      && green "  ✅ 数据卷已备份" \
-      || { red "  ❌ 数据卷备份失败"; rm -rf "$backup_tmp"; return 1; }
+    if ! _copy_volume_to_dir "freellmapi-data" "$backup_tmp/data"; then
+      red "  ❌ 数据卷备份失败"
+      [[ "$was_running" == true ]] && docker start freellmapi &>/dev/null || true
+      rm -rf "$backup_tmp"
+      return 1
+    fi
+
     if [[ "$was_running" == true ]]; then
       yellow "  重新启动容器..."
       if [[ -f "$compose_dir/docker-compose.yml" ]]; then
@@ -1086,12 +1498,13 @@ function freellmapi_restore() {
         local i=1
         for f in "${found_files[@]}"; do
           local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
-          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' || echo "")
+          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
           printf "  %d. %-55s  [%s]  %s\n" "$i" "$f" "$sz" "$ts"
           ((i++))
         done
         echo ""
-        read -rp "请输入编号选择备份文件（留空手动输入路径）：" fc </dev/tty
+        read -rp "请输入编号选择（留空手动输入路径）：" fc </dev/tty
         if [[ -z "$fc" ]]; then
           read -rp "请输入备份文件路径：" backup_tar </dev/tty
         elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
@@ -1123,26 +1536,22 @@ function freellmapi_restore() {
     rm -rf "$restore_tmp"; return 1
   fi
   local restore_base; restore_base=$(dirname "$restore_inner")
-  green "  ✅ 解压成功，备份根目录：$restore_base"
+  green "  ✅ 解压成功"
 
+  local bak_image=""
   if [[ -f "$restore_base/backup_info.txt" ]]; then
     echo ""
     cyan "── 备份信息 ────────────────────────────────"
     cat "$restore_base/backup_info.txt"
     cyan "────────────────────────────────────────────"
     echo ""
-    local bak_image=""
     bak_image=$(grep "^镜像版本：" "$restore_base/backup_info.txt" | cut -d'：' -f2 || true)
     if [[ -n "$bak_image" ]]; then
       yellow "备份时使用的镜像版本：$bak_image"
-      read -rp "恢复后是否使用此版本启动？(y=使用备份版本 / n=拉取最新)  [默认 y]：" use_bak_ver </dev/tty
+      read -rp "恢复后是否使用此版本启动？(y=使用备份版本 / n=重新选择)  [默认 y]：" use_bak_ver </dev/tty
       if [[ ! "${use_bak_ver:-y}" =~ ^[Yy]$ ]]; then
         select_image_version \
-          "FreeLLMAPI" \
-          "$FREELLMAPI_IMAGE_BASE" \
-          "github" \
-          "tashfeenahmed/freellmapi" \
-          8
+          "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
         bak_image="$SELECTED_IMAGE"
       fi
     fi
@@ -1169,9 +1578,8 @@ function freellmapi_restore() {
   fi
   if [[ -f "$restore_base/docker-compose.yml" ]]; then
     cp "$restore_base/docker-compose.yml" "$compose_dir/docker-compose.yml"
-    if [[ -n "${bak_image:-}" ]]; then
+    [[ -n "$bak_image" ]] && \
       sed -i "s|image:.*freellmapi.*|image: ${bak_image}|" "$compose_dir/docker-compose.yml" || true
-    fi
     green "  ✅ docker-compose.yml 已恢复"
   else
     yellow "  ⚠️  备份中无 docker-compose.yml，跳过"
@@ -1184,12 +1592,10 @@ function freellmapi_restore() {
     docker volume inspect freellmapi-data &>/dev/null \
       && yellow "  发现已有数据卷，将覆盖..." \
       || docker volume create freellmapi-data &>/dev/null
-    docker run --rm \
-      -v freellmapi-data:/target \
-      -v "$restore_base/data":/source:ro \
-      alpine sh -c "rm -rf /target/* && cp -a /source/. /target/" \
-      && green "  ✅ 数据卷已恢复" \
-      || { red "  ❌ 数据卷恢复失败"; rm -rf "$restore_tmp"; return 1; }
+    if ! _copy_dir_to_volume "$restore_base/data" "freellmapi-data"; then
+      red "  ❌ 数据卷恢复失败"; rm -rf "$restore_tmp"; return 1
+    fi
+    green "  ✅ 数据卷已恢复"
   fi
 
   rm -rf "$restore_tmp"
@@ -1240,8 +1646,7 @@ function freellmapi_list_backups() {
     while IFS= read -r f; do
       local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
       local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
-        sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' \
-        || echo "")
+        sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
       printf "  📦 %-50s  [%s]  %s\n" "$f" "$sz" "$ts"
       found=true
     done < <(find "$d" -maxdepth 3 -name "freellmapi-backup-*.tar.gz" 2>/dev/null | sort -r)
@@ -1634,12 +2039,17 @@ function main_menu() {
       fllm_status="已停止"
     fi
 
+    local mirror_status="未配置"
+    local cur_mirrors
+    cur_mirrors=$(_read_current_mirrors)
+    [[ -n "$cur_mirrors" ]] && mirror_status="已配置 $(echo "$cur_mirrors" | wc -l | tr -d ' ') 个"
+
     echo ""
     echo "================= Docker 服务管理 ================="
     printf "系统: %-15s 架构: %-10s\n" "$OS" "$ARCH"
     printf "Docker:  %s\n" "$dv"
     printf "Compose: %s\n" "$cv"
-    printf "FreeLLMAPI: %s\n" "$fllm_status"
+    printf "FreeLLMAPI: %-20s 加速器: %s\n" "$fllm_status" "$mirror_status"
     echo "---------------------------------------------------"
     echo " 1) 部署 One-API   (SQLite)         [版本可选]"
     echo " 2) 部署 One-API   (MySQL)           [版本可选]"
@@ -1652,24 +2062,26 @@ function main_menu() {
     echo " 7) 卸载 One-API / New-API"
     echo " 8) 查看所有容器状态"
     echo " 9) 备份 / 恢复 FreeLLMAPI 数据"
+    echo "10) 🚀 Docker 镜像加速器配置（解决国内拉取慢）"
     echo "---------------------------------------------------"
     echo " 0) 退出"
     echo "==================================================="
-    read -rp "请输入选项 (0-9): " ch </dev/tty
+    read -rp "请输入选项 (0-10): " ch </dev/tty
     echo ""
 
     case "$ch" in
-      1) deploy_one_api_sqlite        || true; press_any_key ;;
-      2) deploy_one_api_mysql         || true; press_any_key ;;
-      3) deploy_new_api               || true; press_any_key ;;
-      4) deploy_freellmapi            || true; press_any_key ;;
-      5) manage_freellmapi            || true ;;
-      6) uninstall_freellmapi         || true; press_any_key ;;
-      7) uninstall_menu               || true ;;
-      8) view_container_status        || true; press_any_key ;;
-      9) freellmapi_backup_menu       || true ;;
-      0) green "感谢使用，脚本退出。"; exit 0 ;;
-      *) red "无效选项 '$ch'，请输入 0-9。" ;;
+      1)  deploy_one_api_sqlite        || true; press_any_key ;;
+      2)  deploy_one_api_mysql         || true; press_any_key ;;
+      3)  deploy_new_api               || true; press_any_key ;;
+      4)  deploy_freellmapi            || true; press_any_key ;;
+      5)  manage_freellmapi            || true ;;
+      6)  uninstall_freellmapi         || true; press_any_key ;;
+      7)  uninstall_menu               || true ;;
+      8)  view_container_status        || true; press_any_key ;;
+      9)  freellmapi_backup_menu       || true ;;
+      10) configure_docker_mirror      || true ;;
+      0)  green "感谢使用，脚本退出。"; exit 0 ;;
+      *)  red "无效选项 '$ch'，请输入 0-10。" ;;
     esac
   done
 }
