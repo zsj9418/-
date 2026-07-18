@@ -354,28 +354,15 @@ function pull_image_with_retry() {
 }
 
 # ──────────────────────────────────────────────
-# 打包工具检测与降级
+# 打包工具检测
 # ──────────────────────────────────────────────
 function _check_pack_tools() {
-  local has_tar=false has_gzip=false has_bzip2=false has_xz=false has_zip=false
-  command -v tar   &>/dev/null && has_tar=true
-  command -v gzip  &>/dev/null && has_gzip=true
-  command -v bzip2 &>/dev/null && has_bzip2=true
-  command -v xz    &>/dev/null && has_xz=true
-  command -v zip   &>/dev/null && has_zip=true
-
-  if [[ "$has_tar" == true && "$has_gzip" == true ]]; then
-    echo "tar.gz"
-  elif [[ "$has_tar" == true && "$has_bzip2" == true ]]; then
-    echo "tar.bz2"
-  elif [[ "$has_tar" == true && "$has_xz" == true ]]; then
-    echo "tar.xz"
-  elif [[ "$has_tar" == true ]]; then
-    echo "tar"
-  elif [[ "$has_zip" == true ]]; then
-    echo "zip"
-  else
-    echo "none"
+  if   command -v tar &>/dev/null && command -v gzip  &>/dev/null; then echo "tar.gz"
+  elif command -v tar &>/dev/null && command -v bzip2 &>/dev/null; then echo "tar.bz2"
+  elif command -v tar &>/dev/null && command -v xz    &>/dev/null; then echo "tar.xz"
+  elif command -v tar &>/dev/null;                                  then echo "tar"
+  elif command -v zip &>/dev/null;                                  then echo "zip"
+  else echo "none"
   fi
 }
 
@@ -384,51 +371,35 @@ function _do_pack() {
   local src_base="$2"
   local out_file="$3"
   local pack_type="$4"
-
   local err_file="/tmp/_pack_err_$$"
 
   case "$pack_type" in
-    tar.gz)
-      tar -czf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file"
-      ;;
-    tar.bz2)
-      tar -cjf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file"
-      ;;
-    tar.xz)
-      tar -cJf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file"
-      ;;
-    tar)
-      tar -cf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file"
-      ;;
-    zip)
-      cd "$src_dir" && zip -qr "$out_file" "$src_base" 2>"$err_file"; cd - >/dev/null
-      ;;
+    tar.gz)  tar -czf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file" ;;
+    tar.bz2) tar -cjf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file" ;;
+    tar.xz)  tar -cJf "$out_file" -C "$src_dir" "$src_base" 2>"$err_file" ;;
+    tar)     tar -cf  "$out_file" -C "$src_dir" "$src_base" 2>"$err_file" ;;
+    zip)     cd "$src_dir" && zip -qr "$out_file" "$src_base" 2>"$err_file"; cd - >/dev/null ;;
   esac
 
   local rc=$?
   if [[ $rc -ne 0 ]]; then
-    local err_msg
-    err_msg=$(cat "$err_file" 2>/dev/null || true)
+    local err_msg; err_msg=$(cat "$err_file" 2>/dev/null || true)
     rm -f "$err_file"
     [[ -n "$err_msg" ]] && red "  打包错误：$err_msg"
     return 1
   fi
-
   rm -f "$err_file"
 
   if [[ ! -f "$out_file" ]]; then
-    red "  打包命令返回成功但文件未生成：$out_file"
-    return 1
+    red "  打包命令执行成功但文件未生成：$out_file"; return 1
   fi
 
   local fsize
   fsize=$(stat -c%s "$out_file" 2>/dev/null || stat -f%z "$out_file" 2>/dev/null || echo 0)
   if [[ "$fsize" -lt 10 ]]; then
-    red "  打包文件大小异常（${fsize} 字节），可能为空包。"
-    rm -f "$out_file"
-    return 1
+    red "  打包文件大小异常（${fsize} 字节）。"
+    rm -f "$out_file"; return 1
   fi
-
   return 0
 }
 
@@ -438,24 +409,17 @@ function _do_unpack() {
   local err_file="/tmp/_unpack_err_$$"
 
   case "$archive" in
-    *.tar.gz|*.tgz)
-      tar -xzf "$archive" -C "$dest_dir" 2>"$err_file" ;;
-    *.tar.bz2)
-      tar -xjf "$archive" -C "$dest_dir" 2>"$err_file" ;;
-    *.tar.xz)
-      tar -xJf "$archive" -C "$dest_dir" 2>"$err_file" ;;
-    *.tar)
-      tar -xf  "$archive" -C "$dest_dir" 2>"$err_file" ;;
-    *.zip)
-      unzip -q "$archive" -d "$dest_dir" 2>"$err_file" ;;
-    *)
-      red "未知备份格式：$archive"; rm -f "$err_file"; return 1 ;;
+    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dest_dir" 2>"$err_file" ;;
+    *.tar.bz2)       tar -xjf "$archive" -C "$dest_dir" 2>"$err_file" ;;
+    *.tar.xz)        tar -xJf "$archive" -C "$dest_dir" 2>"$err_file" ;;
+    *.tar)           tar -xf  "$archive" -C "$dest_dir" 2>"$err_file" ;;
+    *.zip)           unzip -q  "$archive" -d "$dest_dir" 2>"$err_file" ;;
+    *) red "未知备份格式：$archive"; rm -f "$err_file"; return 1 ;;
   esac
 
   local rc=$?
   if [[ $rc -ne 0 ]]; then
-    local err_msg
-    err_msg=$(cat "$err_file" 2>/dev/null || true)
+    local err_msg; err_msg=$(cat "$err_file" 2>/dev/null || true)
     rm -f "$err_file"
     [[ -n "$err_msg" ]] && red "  解压错误：$err_msg"
     return 1
@@ -465,38 +429,91 @@ function _do_unpack() {
 }
 
 # ──────────────────────────────────────────────
-# Docker 镜像加速器管理
+# 备份位置选择（核心修复：所有展示输出走 stderr）
 # ──────────────────────────────────────────────
-function _get_daemon_json_path() {
-  echo "/etc/docker/daemon.json"
+function _select_backup_root() {
+  local default_dir="$HOME"
+  echo ""                                                        >&2
+  echo "请选择备份存储位置："                                     >&2
+  echo "  1. 当前用户主目录     ($HOME)"                          >&2
+  echo "  2. /tmp 目录          (重启后丢失，仅临时使用)"          >&2
+  echo "  3. 手动输入目录路径"                                     >&2
+  read -rp "选项 (1-3，默认 1)：" bc </dev/tty
+  local backup_root=""
+  case "${bc:-1}" in
+    2) backup_root="/tmp" ;;
+    3)
+      read -rp "请输入目标目录（如 /mnt/usb / /data/backup）：" custom_dir </dev/tty
+      backup_root="${custom_dir:-$default_dir}"
+      ;;
+    *) backup_root="$default_dir" ;;
+  esac
+
+  if ! mkdir -p "$backup_root" 2>/dev/null; then
+    echo -e "\e[31m❌ 目录 $backup_root 无法创建，请检查权限。\e[0m" >&2
+    return 1
+  fi
+  if ! touch "$backup_root/.wtest" 2>/dev/null; then
+    echo -e "\e[31m❌ 目录 $backup_root 不可写，请检查权限。\e[0m" >&2
+    return 1
+  fi
+  rm -f "$backup_root/.wtest"
+
+  echo -e "\e[32m备份目录：$backup_root\e[0m" >&2
+  echo "$backup_root"
 }
 
+function _check_disk_space() {
+  local target_dir="$1"
+  local min_kb="${2:-51200}"
+  local avail_kb
+  avail_kb=$(df -k "$target_dir" 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
+  if [[ "$avail_kb" -lt "$min_kb" ]]; then
+    yellow "⚠️  目标目录可用空间不足（当前：${avail_kb}KB，建议：${min_kb}KB）"
+    read -rp "是否继续？(y/n，默认 n)：" sc </dev/tty
+    [[ ! "${sc:-n}" =~ ^[Yy]$ ]] && return 1
+  fi
+  return 0
+}
+
+function _scan_backup_files() {
+  local prefix="$1"
+  local scan_dirs=("$HOME" "/tmp" "/mnt" "/data" "/backup")
+  for d in "${scan_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    find "$d" -maxdepth 3 \
+      \( -name "${prefix}-*.tar.gz" \
+      -o -name "${prefix}-*.tar.bz2" \
+      -o -name "${prefix}-*.tar.xz" \
+      -o -name "${prefix}-*.tar" \
+      -o -name "${prefix}-*.zip" \) \
+      2>/dev/null | sort -r
+  done
+}
+
+# ──────────────────────────────────────────────
+# Docker 镜像加速器管理
+# ──────────────────────────────────────────────
+function _get_daemon_json_path() { echo "/etc/docker/daemon.json"; }
+
 function _read_current_mirrors() {
-  local daemon_json
-  daemon_json=$(_get_daemon_json_path)
+  local daemon_json; daemon_json=$(_get_daemon_json_path)
   [[ ! -f "$daemon_json" ]] && { echo ""; return; }
   grep -o '"registry-mirrors":\s*\[[^]]*\]' "$daemon_json" 2>/dev/null \
-    | grep -o '"https://[^"]*"' \
-    | tr -d '"' || echo ""
+    | grep -o '"https://[^"]*"' | tr -d '"' || echo ""
 }
 
 function _write_mirrors_to_daemon() {
-  local daemon_json
-  daemon_json=$(_get_daemon_json_path)
+  local daemon_json; daemon_json=$(_get_daemon_json_path)
   local mirrors_json="$1"
   local write_cmd=""
-  if [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null; then
-    write_cmd="sudo tee"
-  else
-    write_cmd="tee"
-  fi
+  [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && write_cmd="sudo tee" || write_cmd="tee"
   local existing_content="{}"
   [[ -f "$daemon_json" ]] && existing_content=$(cat "$daemon_json" 2>/dev/null || echo "{}")
   if echo "$existing_content" | grep -q '"registry-mirrors"'; then
-    local new_content
-    new_content=$(echo "$existing_content" | \
-      sed 's|"registry-mirrors":\s*\[[^]]*\]|"registry-mirrors": '"$mirrors_json"'|')
-    echo "$new_content" | $write_cmd "$daemon_json" >/dev/null
+    echo "$existing_content" | \
+      sed 's|"registry-mirrors":\s*\[[^]]*\]|"registry-mirrors": '"$mirrors_json"'|' \
+      | $write_cmd "$daemon_json" >/dev/null
   else
     local stripped
     stripped=$(echo "$existing_content" | sed 's/^{//' | sed 's/}$//' | sed 's/^\s*//' | sed 's/\s*$//')
@@ -527,8 +544,7 @@ function _test_mirror_speed() {
   local start end elapsed
   start=$(date +%s%3N 2>/dev/null || date +%s)
   if command -v curl &>/dev/null; then
-    curl -sSL --connect-timeout "$timeout" --max-time "$timeout" \
-      "${mirror}/v2/" -o /dev/null 2>/dev/null
+    curl -sSL --connect-timeout "$timeout" --max-time "$timeout" "${mirror}/v2/" -o /dev/null 2>/dev/null
     local rc=$?
   else
     wget -qO /dev/null --timeout="$timeout" "${mirror}/v2/" 2>/dev/null
@@ -536,11 +552,7 @@ function _test_mirror_speed() {
   fi
   end=$(date +%s%3N 2>/dev/null || date +%s)
   elapsed=$(( end - start ))
-  if [[ $rc -eq 0 ]]; then
-    echo "${elapsed}ms"
-  else
-    echo "超时/不可达"
-  fi
+  [[ $rc -eq 0 ]] && echo "${elapsed}ms" || echo "超时/不可达"
 }
 
 function configure_docker_mirror() {
@@ -548,16 +560,12 @@ function configure_docker_mirror() {
     echo ""
     cyan "╔══════════════════════════════════════════════════════════╗"
     cyan "║  Docker 镜像加速器配置                                     ║"
-    cyan "║  解决国内拉取 Docker Hub 镜像缓慢/卡住问题                  ║"
     cyan "╚══════════════════════════════════════════════════════════╝"
     echo ""
-    local current_mirrors
-    current_mirrors=$(_read_current_mirrors)
+    local current_mirrors; current_mirrors=$(_read_current_mirrors)
     if [[ -n "$current_mirrors" ]]; then
       green "── 当前已配置的加速器 ──────────────────────"
-      echo "$current_mirrors" | while read -r m; do
-        [[ -n "$m" ]] && echo "  ✅ $m"
-      done
+      echo "$current_mirrors" | while read -r m; do [[ -n "$m" ]] && echo "  ✅ $m"; done
       echo ""
     else
       yellow "── 当前未配置任何加速器 ────────────────────"
@@ -591,34 +599,27 @@ function _mirror_auto_setup() {
   local mirror_results=()
   for mirror in "${DOCKER_MIRRORS[@]}"; do
     printf "  测试 %-40s ..." "$mirror"
-    local result
-    result=$(_test_mirror_speed "$mirror")
+    local result; result=$(_test_mirror_speed "$mirror")
     printf " %s\n" "$result"
     mirror_results+=("$result|$mirror")
     if [[ "$result" != "超时/不可达" ]]; then
-      local ms
-      ms=$(echo "$result" | tr -d 'ms')
+      local ms; ms=$(echo "$result" | tr -d 'ms')
       if [[ "$ms" =~ ^[0-9]+$ ]] && [[ "$ms" -lt "$best_time" ]]; then
-        best_time="$ms"
-        best_mirror="$mirror"
+        best_time="$ms"; best_mirror="$mirror"
       fi
     fi
   done
   echo ""
   if [[ -z "$best_mirror" ]]; then
-    red "❌ 所有预设加速器均不可达，请检查网络或手动输入加速器地址（选项3）。"
-    return 1
+    red "❌ 所有预设加速器均不可达。"; return 1
   fi
   green "最快可用加速器：$best_mirror（${best_time}ms）"
-  echo ""
   local selected_mirrors=()
   for entry in "${mirror_results[@]}"; do
-    local rt="${entry%%|*}"
-    local url="${entry##*|}"
+    local rt="${entry%%|*}"; local url="${entry##*|}"
     [[ "$rt" != "超时/不可达" ]] && selected_mirrors+=("$url")
   done
-  local mirrors_json="["
-  local first=true
+  local mirrors_json="["; local first=true
   for m in "${selected_mirrors[@]}"; do
     [[ "$first" == true ]] && mirrors_json+="\"$m\"" || mirrors_json+=", \"$m\""
     first=false
@@ -627,14 +628,13 @@ function _mirror_auto_setup() {
   yellow "将配置以下可用加速器："
   for m in "${selected_mirrors[@]}"; do echo "  ✅ $m"; done
   echo ""
-  read -rp "确认写入 /etc/docker/daemon.json 并重启 Docker？(y/n，默认 y)：" cf </dev/tty
+  read -rp "确认写入并重启 Docker？(y/n，默认 y)：" cf </dev/tty
   [[ ! "${cf:-y}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
   _write_mirrors_to_daemon "$mirrors_json" || { red "❌ 写入配置失败。"; return 1; }
   green "✅ 加速器配置已写入"
   _restart_docker_daemon || return 1
   echo ""
-  yellow "验证配置："
-  docker info 2>/dev/null | grep -A5 "Registry Mirrors" || yellow "运行 docker info 查看加速器状态"
+  docker info 2>/dev/null | grep -A5 "Registry Mirrors" || true
 }
 
 function _mirror_test_all() {
@@ -644,8 +644,7 @@ function _mirror_test_all() {
   printf "  %-45s %s\n" "─────────────────────────────────────────────" "──────────"
   for mirror in "${DOCKER_MIRRORS[@]}"; do
     printf "  %-45s" "$mirror"
-    local result
-    result=$(_test_mirror_speed "$mirror")
+    local result; result=$(_test_mirror_speed "$mirror")
     if [[ "$result" == "超时/不可达" ]]; then
       printf " \e[31m%s\e[0m\n" "$result"
     else
@@ -653,40 +652,32 @@ function _mirror_test_all() {
     fi
   done
   cyan "────────────────────────────────────────────────────"
-  echo ""
-  yellow "提示：延迟越低越好，超时/不可达表示该加速器当前不可用。"
 }
 
 function _mirror_add_custom() {
   echo ""
-  yellow "请输入自定义加速器地址（格式：https://your-mirror.example.com）"
-  yellow "多个地址用空格分隔，留空取消："
+  yellow "请输入自定义加速器地址（多个用空格分隔，留空取消）："
   read -rp "加速器地址：" custom_input </dev/tty
   [[ -z "$custom_input" ]] && { yellow "已取消。"; return 0; }
   local new_mirrors=()
   for addr in $custom_input; do
     if [[ "$addr" =~ ^https?:// ]]; then
-      new_mirrors+=("$addr")
-      green "  ✅ 添加：$addr"
+      new_mirrors+=("$addr"); green "  ✅ 添加：$addr"
     else
       yellow "  ⚠️  格式不正确，跳过：$addr"
     fi
   done
   [[ ${#new_mirrors[@]} -eq 0 ]] && { red "无有效地址，取消。"; return 1; }
   local existing=()
-  while IFS= read -r m; do
-    [[ -n "$m" ]] && existing+=("$m")
-  done < <(_read_current_mirrors)
+  while IFS= read -r m; do [[ -n "$m" ]] && existing+=("$m"); done < <(_read_current_mirrors)
   local all_mirrors=("${existing[@]}" "${new_mirrors[@]}")
-  local seen=()
-  local unique_mirrors=()
+  local seen=(); local unique_mirrors=()
   for m in "${all_mirrors[@]}"; do
     local dup=false
     for s in "${seen[@]:-}"; do [[ "$s" == "$m" ]] && dup=true && break; done
     [[ "$dup" == false ]] && unique_mirrors+=("$m") && seen+=("$m")
   done
-  local mirrors_json="["
-  local first=true
+  local mirrors_json="["; local first=true
   for m in "${unique_mirrors[@]}"; do
     [[ "$first" == true ]] && mirrors_json+="\"$m\"" || mirrors_json+=", \"$m\""
     first=false
@@ -708,53 +699,37 @@ function _mirror_clear_all() {
 }
 
 function _mirror_show_daemon_json() {
-  local daemon_json
-  daemon_json=$(_get_daemon_json_path)
+  local daemon_json; daemon_json=$(_get_daemon_json_path)
   echo ""
   cyan "── /etc/docker/daemon.json 内容 ────────────────────"
-  if [[ -f "$daemon_json" ]]; then
-    cat "$daemon_json"
-  else
-    yellow "文件不存在（尚未配置任何自定义选项）"
-  fi
+  if [[ -f "$daemon_json" ]]; then cat "$daemon_json"; else yellow "文件不存在"; fi
   cyan "────────────────────────────────────────────────────"
 }
 
 # ──────────────────────────────────────────────
-# 数据卷备份/恢复（四级降级，修复权限问题）
+# FreeLLMAPI 数据卷操作（四级降级策略）
 # ──────────────────────────────────────────────
 function _copy_volume_to_dir() {
   local volume_name="$1"
   local dest_dir="$2"
-
   mkdir -p "$dest_dir"
 
   yellow "  [策略1] 直接读取卷挂载路径（无需网络/镜像）..."
   local vol_path
   vol_path=$(docker volume inspect "$volume_name" --format '{{.Mountpoint}}' 2>/dev/null || echo "")
-
   if [[ -n "$vol_path" && -d "$vol_path" ]]; then
     local copy_ok=false
     if [[ "$EUID" -eq 0 ]]; then
-      if cp -a "$vol_path/." "$dest_dir/" 2>/dev/null; then
-        copy_ok=true
-      fi
-    else
-      if command -v sudo &>/dev/null; then
-        if sudo cp -a "$vol_path/." "$dest_dir/" 2>/dev/null; then
-          sudo chown -R "$(id -u):$(id -g)" "$dest_dir" 2>/dev/null || true
-          copy_ok=true
-        fi
-      fi
+      cp -a "$vol_path/." "$dest_dir/" 2>/dev/null && copy_ok=true
+    elif command -v sudo &>/dev/null; then
+      sudo cp -a "$vol_path/." "$dest_dir/" 2>/dev/null && \
+        sudo chown -R "$(id -u):$(id -g)" "$dest_dir" 2>/dev/null && copy_ok=true || true
     fi
     if [[ "$copy_ok" == true ]]; then
-      local file_count
-      file_count=$(find "$dest_dir" -type f 2>/dev/null | wc -l || echo 0)
-      green "  ✅ 策略1 成功（复制 $file_count 个文件，路径：$vol_path）"
-      return 0
-    else
-      yellow "  ⚠️  策略1 失败（权限不足或路径无效），尝试下一策略..."
+      local fc; fc=$(find "$dest_dir" -type f 2>/dev/null | wc -l || echo 0)
+      green "  ✅ 策略1 成功（$fc 个文件）"; return 0
     fi
+    yellow "  ⚠️  策略1 失败，尝试下一策略..."
   else
     yellow "  ⚠️  策略1 失败（路径不可访问），尝试下一策略..."
   fi
@@ -762,66 +737,39 @@ function _copy_volume_to_dir() {
   yellow "  [策略2] 检测本地可用的轻量镜像..."
   local helper_img=""
   for candidate in "alpine:latest" "alpine" "busybox:latest" "busybox"; do
-    if docker image inspect "$candidate" &>/dev/null 2>&1; then
-      helper_img="$candidate"
-      green "  ✅ 发现本地镜像：$helper_img"
-      break
-    fi
+    docker image inspect "$candidate" &>/dev/null 2>&1 && { helper_img="$candidate"; break; }
   done
-
   if [[ -n "$helper_img" ]]; then
-    local err2
-    err2=$(docker run --rm \
-      -v "${volume_name}:/source:ro" \
-      -v "${dest_dir}:/backup" \
-      "$helper_img" sh -c "cp -a /source/. /backup/ && chown -R $(id -u):$(id -g) /backup" 2>&1) || true
-    if [[ -z "$err2" ]] || docker run --rm \
+    if docker run --rm \
       -v "${volume_name}:/source:ro" \
       -v "${dest_dir}:/backup" \
       "$helper_img" sh -c "cp -a /source/. /backup/" 2>/dev/null; then
-      local file_count
-      file_count=$(find "$dest_dir" -type f 2>/dev/null | wc -l || echo 0)
-      if [[ "$file_count" -gt 0 ]]; then
-        green "  ✅ 策略2 成功（复制 $file_count 个文件）"
-        return 0
-      fi
+      local fc; fc=$(find "$dest_dir" -type f 2>/dev/null | wc -l || echo 0)
+      [[ "$fc" -gt 0 ]] && { green "  ✅ 策略2 成功（$fc 个文件）"; return 0; }
     fi
     yellow "  ⚠️  策略2 失败，尝试下一策略..."
-  else
-    yellow "  本地无轻量镜像，跳过策略2..."
   fi
 
-  yellow "  [策略3] 尝试 tar 流式导出卷内容..."
+  yellow "  [策略3] tar 流式导出卷内容..."
   local tar_out="$dest_dir/_volume_export.tar"
-  if docker run --rm \
-    -v "${volume_name}:/source:ro" \
-    busybox sh -c "tar cf - -C /source ." > "$tar_out" 2>/dev/null \
-    || docker run --rm \
-    -v "${volume_name}:/source:ro" \
-    alpine sh -c "tar cf - -C /source ." > "$tar_out" 2>/dev/null; then
-    if [[ -f "$tar_out" ]] && [[ $(stat -c%s "$tar_out" 2>/dev/null || echo 0) -gt 10 ]]; then
+  if docker run --rm -v "${volume_name}:/source:ro" busybox sh -c "tar cf - -C /source ." > "$tar_out" 2>/dev/null \
+    || docker run --rm -v "${volume_name}:/source:ro" alpine sh -c "tar cf - -C /source ." > "$tar_out" 2>/dev/null; then
+    local fsz; fsz=$(stat -c%s "$tar_out" 2>/dev/null || echo 0)
+    if [[ -f "$tar_out" && "$fsz" -gt 10 ]]; then
       tar -xf "$tar_out" -C "$dest_dir" 2>/dev/null && rm -f "$tar_out"
-      green "  ✅ 策略3 成功（tar 流式导出）"
-      return 0
+      green "  ✅ 策略3 成功"; return 0
     fi
   fi
   rm -f "$tar_out" 2>/dev/null || true
-  yellow "  ⚠️  策略3 失败，尝试下一策略..."
 
   yellow "  [策略4] 尝试拉取 alpine 镜像（需要网络）..."
-  yellow "  当前 Docker 加速器："
-  docker info 2>/dev/null | grep -A3 "Registry Mirrors" | tail -n3 || yellow "  未配置加速器（可通过主菜单选项10配置）"
-  echo ""
   yellow "  提示：若拉取缓慢，可按 Ctrl+C 中断后配置加速器再重试。"
-  echo ""
-
   if docker pull alpine:latest 2>/dev/null; then
     if docker run --rm \
       -v "${volume_name}:/source:ro" \
       -v "${dest_dir}:/backup" \
       alpine sh -c "cp -a /source/. /backup/" 2>/dev/null; then
-      green "  ✅ 策略4 成功"
-      return 0
+      green "  ✅ 策略4 成功"; return 0
     fi
   fi
 
@@ -837,7 +785,6 @@ function _copy_dir_to_volume() {
   yellow "  [策略1] 直接写入卷挂载路径..."
   local vol_path
   vol_path=$(docker volume inspect "$volume_name" --format '{{.Mountpoint}}' 2>/dev/null || echo "")
-
   if [[ -n "$vol_path" && -d "$vol_path" ]]; then
     local copy_ok=false
     if [[ "$EUID" -eq 0 ]]; then
@@ -845,95 +792,64 @@ function _copy_dir_to_volume() {
     elif command -v sudo &>/dev/null; then
       sudo cp -a "$src_dir/." "$vol_path/" 2>/dev/null && copy_ok=true
     fi
-    if [[ "$copy_ok" == true ]]; then
-      green "  ✅ 策略1 成功"
-      return 0
-    fi
+    [[ "$copy_ok" == true ]] && { green "  ✅ 策略1 成功"; return 0; }
     yellow "  ⚠️  策略1 失败，尝试下一策略..."
   fi
 
   yellow "  [策略2] 检测本地可用的轻量镜像..."
   local helper_img=""
   for candidate in "alpine:latest" "alpine" "busybox:latest" "busybox"; do
-    if docker image inspect "$candidate" &>/dev/null 2>&1; then
-      helper_img="$candidate"; break
-    fi
+    docker image inspect "$candidate" &>/dev/null 2>&1 && { helper_img="$candidate"; break; }
   done
-
   if [[ -n "$helper_img" ]]; then
-    if docker run --rm \
+    docker run --rm \
       -v "${volume_name}:/target" \
       -v "${src_dir}:/source:ro" \
-      "$helper_img" sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null; then
-      green "  ✅ 策略2 成功"
-      return 0
-    fi
+      "$helper_img" sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null \
+      && { green "  ✅ 策略2 成功"; return 0; }
     yellow "  ⚠️  策略2 失败，尝试下一策略..."
   fi
 
   yellow "  [策略3] 尝试拉取 alpine 镜像..."
   yellow "  提示：若拉取缓慢，按 Ctrl+C 后通过主菜单选项10配置加速器重试。"
   if docker pull alpine:latest 2>/dev/null; then
-    if docker run --rm \
+    docker run --rm \
       -v "${volume_name}:/target" \
       -v "${src_dir}:/source:ro" \
-      alpine sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null; then
-      green "  ✅ 策略3 成功"
-      return 0
-    fi
+      alpine sh -c "rm -rf /target/* && cp -a /source/. /target/" 2>/dev/null \
+      && { green "  ✅ 策略3 成功"; return 0; }
   fi
 
-  red "  ❌ 所有恢复策略均失败！"
-  return 1
+  red "  ❌ 所有恢复策略均失败！"; return 1
 }
 
 function _fetch_versions_github() {
-  local repo="$1"
-  local limit="${2:-8}"
+  local repo="$1"; local limit="${2:-8}"
   local resp=""
-  if command -v curl &>/dev/null; then
-    resp=$(curl -sSL --connect-timeout 10 \
-      "https://api.github.com/repos/${repo}/releases?per_page=20" 2>/dev/null || true)
-  elif command -v wget &>/dev/null; then
-    resp=$(wget -qO- --timeout=10 \
-      "https://api.github.com/repos/${repo}/releases?per_page=20" 2>/dev/null || true)
-  fi
+  command -v curl &>/dev/null \
+    && resp=$(curl -sSL --connect-timeout 10 "https://api.github.com/repos/${repo}/releases?per_page=20" 2>/dev/null || true) \
+    || resp=$(wget -qO- --timeout=10 "https://api.github.com/repos/${repo}/releases?per_page=20" 2>/dev/null || true)
   [[ -z "$resp" ]] && return 1
   echo "$resp" | grep '"tag_name"' | cut -d'"' -f4 | head -n"$limit"
 }
 
 function _fetch_versions_dockerhub() {
-  local repo="$1"
-  local limit="${2:-8}"
+  local repo="$1"; local limit="${2:-8}"
   local resp=""
-  if command -v curl &>/dev/null; then
-    resp=$(curl -sSL --connect-timeout 10 \
-      "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50&ordering=last_updated" 2>/dev/null || true)
-  elif command -v wget &>/dev/null; then
-    resp=$(wget -qO- --timeout=10 \
-      "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50&ordering=last_updated" 2>/dev/null || true)
-  fi
+  command -v curl &>/dev/null \
+    && resp=$(curl -sSL --connect-timeout 10 "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50&ordering=last_updated" 2>/dev/null || true) \
+    || resp=$(wget -qO- --timeout=10 "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=50&ordering=last_updated" 2>/dev/null || true)
   [[ -z "$resp" ]] && return 1
-  echo "$resp" \
-    | grep -o '"name":"[^"]*"' \
-    | cut -d'"' -f4 \
-    | grep -E '^v[0-9]' \
-    | head -n"$limit"
+  echo "$resp" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -E '^v[0-9]' | head -n"$limit"
 }
 
 function select_image_version() {
-  local svc_name="$1"
-  local img_base="$2"
-  local fetch_type="$3"
-  local fetch_src="$4"
-  local limit="${5:-8}"
-
+  local svc_name="$1"; local img_base="$2"; local fetch_type="$3"
+  local fetch_src="$4"; local limit="${5:-8}"
   SELECTED_IMAGE="${img_base}:latest"
   yellow "正在获取 ${svc_name} 最近 ${limit} 个版本，请稍候..."
 
-  local versions=()
-  local fetch_ok=false
-
+  local versions=(); local fetch_ok=false
   if [[ "$fetch_type" == "github" ]]; then
     mapfile -t versions < <(_fetch_versions_github "$fetch_src" "$limit" 2>/dev/null) && fetch_ok=true
   elif [[ "$fetch_type" == "dockerhub" ]]; then
@@ -941,39 +857,29 @@ function select_image_version() {
   fi
 
   local clean_versions=()
-  for v in "${versions[@]:-}"; do
-    [[ -n "$v" ]] && clean_versions+=("$v")
-  done
+  for v in "${versions[@]:-}"; do [[ -n "$v" ]] && clean_versions+=("$v"); done
   versions=("${clean_versions[@]:-}")
 
   echo ""
   cyan "┌──────────────────────────────────────────────────────────┐"
   cyan "│  请选择 ${svc_name} 版本                                    │"
-  cyan "│  · latest = 始终拉取最新，适合跟随官方更新                  │"
-  cyan "│  · 指定版本 = 生产环境推荐，避免未测试的破坏性更新           │"
+  cyan "│  · latest = 始终拉取最新  · 指定版本 = 生产环境推荐         │"
   cyan "└──────────────────────────────────────────────────────────┘"
   echo "  1. latest（自动跟随最新）"
-
   local i=2
   if [[ ${#versions[@]} -gt 0 ]]; then
     for v in "${versions[@]}"; do
-      local tag_label=""
-      [[ "$i" -eq 2 ]] && tag_label="  ← 当前最新 Release"
+      local tag_label=""; [[ "$i" -eq 2 ]] && tag_label="  ← 当前最新 Release"
       printf "  %d. %-20s%s\n" "$i" "$v" "$tag_label"
       ((i++))
     done
   fi
-
   local manual_idx=$i
   printf "  %d. 手动输入版本号\n" "$manual_idx"
   echo ""
-
-  if [[ "$fetch_ok" == false || ${#versions[@]} -eq 0 ]]; then
-    yellow "（网络不可达或无版本数据，仅可选 latest 或手动输入）"
-  fi
+  [[ "$fetch_ok" == false || ${#versions[@]} -eq 0 ]] && yellow "（网络不可达，仅可选 latest 或手动输入）"
 
   read -rp "请输入版本编号（留空使用 latest）：" vc </dev/tty
-
   if [[ -z "$vc" || "$vc" == "1" ]]; then
     SELECTED_IMAGE="${img_base}:latest"
   elif [[ "$vc" =~ ^[0-9]+$ ]] && [[ "$vc" -ge 2 && "$vc" -lt "$manual_idx" ]]; then
@@ -981,17 +887,11 @@ function select_image_version() {
     SELECTED_IMAGE="${img_base}:${versions[$idx]}"
   elif [[ "$vc" == "$manual_idx" ]]; then
     read -rp "请输入版本号（如 v0.6.11）：" mv </dev/tty
-    if [[ -z "$mv" ]]; then
-      yellow "未输入，使用 latest。"
-      SELECTED_IMAGE="${img_base}:latest"
-    else
-      SELECTED_IMAGE="${img_base}:${mv}"
-    fi
+    SELECTED_IMAGE="${img_base}:${mv:-latest}"
   else
     yellow "无效选项，使用 latest。"
     SELECTED_IMAGE="${img_base}:latest"
   fi
-
   green "已选择版本：$SELECTED_IMAGE"
 }
 
@@ -999,7 +899,7 @@ function _prompt_backup_before_action() {
   local action_desc="${1:-此操作}"
   echo ""
   yellow "┌──────────────────────────────────────────────────────────┐"
-  yellow "│  ⚠️  建议在${action_desc}前先备份 FreeLLMAPI 数据           │"
+  yellow "│  ⚠️  建议在${action_desc}前先完成备份                       │"
   yellow "│  备份入口：主菜单 → 选项9（备份/恢复）                      │"
   yellow "└──────────────────────────────────────────────────────────┘"
   read -rp "是否继续${action_desc}？(y/n，默认 y)：" pc </dev/tty
@@ -1007,12 +907,679 @@ function _prompt_backup_before_action() {
   return 0
 }
 
+# ──────────────────────────────────────────────
+# 通用绑定挂载服务备份/恢复（One-API / New-API）
+# ──────────────────────────────────────────────
+function _backup_bind_service() {
+  local svc_label="$1"
+  local container_name="$2"
+  local data_dir="$3"
+  local backup_prefix="$4"
+
+  echo ""
+  cyan "╔══════════════════════════════════════════════════════════╗"
+  cyan "║  备份 ${svc_label}"
+  cyan "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+
+  if [[ ! -d "$data_dir" ]]; then
+    red "❌ 数据目录不存在：$data_dir"
+    red "   请确认 ${svc_label} 已正确部署并产生过数据。"
+    return 1
+  fi
+
+  local file_count
+  file_count=$(find "$data_dir" -type f 2>/dev/null | wc -l || echo 0)
+  green "数据目录：$data_dir（共 $file_count 个文件）"
+
+  local pack_type; pack_type=$(_check_pack_tools)
+  if [[ "$pack_type" == "none" ]]; then
+    red "❌ 未找到任何打包工具，无法生成备份文件！"; return 1
+  fi
+  green "打包格式：$pack_type"
+
+  local backup_root
+  backup_root=$(_select_backup_root) || return 1
+
+  _check_disk_space "$backup_root" 51200 || return 1
+
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  local backup_name="${backup_prefix}-${stamp}"
+  local backup_tmp="${backup_root}/${backup_name}"
+  local backup_archive="${backup_root}/${backup_name}.${pack_type}"
+
+  mkdir -p "$backup_tmp"
+
+  yellow "[1/3] 暂停容器以确保数据一致性..."
+  local was_running=false
+  if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    was_running=true
+    docker stop "$container_name" &>/dev/null || true
+    green "  ✅ 容器已暂停"
+  else
+    yellow "  容器未运行，直接备份"
+  fi
+
+  yellow "[2/3] 复制数据目录..."
+  mkdir -p "$backup_tmp/data"
+  if cp -a "$data_dir/." "$backup_tmp/data/" 2>/dev/null; then
+    local copied
+    copied=$(find "$backup_tmp/data" -type f 2>/dev/null | wc -l || echo 0)
+    green "  ✅ 数据复制完成（$copied 个文件）"
+  else
+    red "  ❌ 数据复制失败"
+    [[ "$was_running" == true ]] && docker start "$container_name" &>/dev/null || true
+    rm -rf "$backup_tmp"
+    return 1
+  fi
+
+  local cur_image=""
+  cur_image=$(docker inspect "$container_name" --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
+  cat > "$backup_tmp/backup_info.txt" << EOF
+服务名称：${svc_label}
+容器名称：${container_name}
+备份时间：$(date '+%Y-%m-%d %H:%M:%S')
+主机名：$(hostname)
+系统：${OS} / ${ARCH}
+镜像版本：${cur_image}
+数据目录：${data_dir}
+打包格式：${pack_type}
+恢复工具：部署脚本 → 选项9 → 备份/恢复
+EOF
+
+  if [[ "$was_running" == true ]]; then
+    yellow "  重新启动容器..."
+    docker start "$container_name" &>/dev/null \
+      && green "  ✅ 容器已恢复运行" \
+      || yellow "  ⚠️  请手动启动：docker start $container_name"
+  fi
+
+  yellow "[3/3] 打包压缩（格式：$pack_type）..."
+  yellow "  正在打包：$backup_archive"
+
+  if _do_pack "$backup_root" "$backup_name" "$backup_archive" "$pack_type"; then
+    rm -rf "$backup_tmp"
+    local size; size=$(du -sh "$backup_archive" 2>/dev/null | cut -f1 || echo "未知")
+    echo ""
+    green "╔══════════════════════════════════════════════════════════╗"
+    green "║  ✅  ${svc_label} 备份完成！"
+    green "╠══════════════════════════════════════════════════════════╣"
+    green "║  备份文件：${backup_archive}"
+    green "║  文件大小：${size}"
+    green "║  打包格式：${pack_type}"
+    green "╠══════════════════════════════════════════════════════════╣"
+    yellow "║  ⚠️  请将此文件复制到安全位置（U盘/NAS/云盘）              ║"
+    green  "╚══════════════════════════════════════════════════════════╝"
+  else
+    red "❌ 打包失败！临时目录保留在：$backup_tmp"
+    red "手动修复：tar -czf ${backup_archive} -C ${backup_root} ${backup_name}"
+    return 1
+  fi
+}
+
+function _restore_bind_service() {
+  local svc_label="$1"
+  local container_name="$2"
+  local data_dir="$3"
+  local backup_prefix="$4"
+
+  echo ""
+  cyan "╔══════════════════════════════════════════════════════════╗"
+  cyan "║  恢复 ${svc_label}"
+  cyan "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+
+  echo "请选择备份文件来源："
+  echo "  1. 手动输入备份文件完整路径"
+  echo "  2. 扫描常用目录自动列出备份文件"
+  read -rp "选项 (1-2，默认 2)：" sc </dev/tty
+
+  local backup_archive=""
+  case "${sc:-2}" in
+    1)
+      read -rp "请输入备份文件路径：" backup_archive </dev/tty
+      ;;
+    *)
+      echo ""
+      yellow "正在扫描备份文件..."
+      local found_files=()
+      while IFS= read -r f; do
+        found_files+=("$f")
+      done < <(_scan_backup_files "$backup_prefix")
+
+      if [[ ${#found_files[@]} -eq 0 ]]; then
+        yellow "未找到备份文件。"
+        read -rp "请手动输入备份文件路径：" backup_archive </dev/tty
+      else
+        echo ""
+        local i=1
+        for f in "${found_files[@]}"; do
+          local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+          printf "  %d. %-55s  [%s]  %s\n" "$i" "$f" "$sz" "$ts"
+          ((i++))
+        done
+        echo ""
+        read -rp "请输入编号选择（留空手动输入路径）：" fc </dev/tty
+        if [[ -z "$fc" ]]; then
+          read -rp "请输入备份文件路径：" backup_archive </dev/tty
+        elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
+          backup_archive="${found_files[$((fc-1))]}"
+        else
+          red "无效选项。"; return 1
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ -z "$backup_archive" || ! -f "$backup_archive" ]]; then
+    red "❌ 备份文件不存在：$backup_archive"; return 1
+  fi
+  green "使用备份文件：$backup_archive"
+
+  local restore_tmp="/tmp/${backup_prefix}_restore_$$"
+  mkdir -p "$restore_tmp"
+
+  yellow "[1/4] 解压备份文件..."
+  if ! _do_unpack "$backup_archive" "$restore_tmp"; then
+    red "❌ 解压失败，文件可能已损坏。"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  local restore_info
+  restore_info=$(find "$restore_tmp" -maxdepth 3 -name "backup_info.txt" | head -n1)
+  if [[ -z "$restore_info" ]]; then
+    red "❌ 备份包格式不正确，未找到 backup_info.txt！"
+    rm -rf "$restore_tmp"; return 1
+  fi
+  local restore_base; restore_base=$(dirname "$restore_info")
+
+  if [[ -f "$restore_base/backup_info.txt" ]]; then
+    echo ""
+    cyan "── 备份信息 ────────────────────────────────"
+    cat "$restore_base/backup_info.txt"
+    cyan "────────────────────────────────────────────"
+    echo ""
+  fi
+
+  if [[ ! -d "$restore_base/data" ]]; then
+    red "❌ 备份包中无 data 目录，备份可能不完整！"
+    rm -rf "$restore_tmp"; return 1
+  fi
+
+  yellow "[2/4] 停止现有容器..."
+  if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    docker stop "$container_name" &>/dev/null || true
+    green "  ✅ 容器已停止"
+  else
+    yellow "  容器未运行，跳过"
+  fi
+
+  yellow "[3/4] 恢复数据目录..."
+  if [[ -d "$data_dir" ]]; then
+    local bak_old="${data_dir}_old_$(date +%Y%m%d_%H%M%S)"
+    yellow "  当前数据目录已存在，备份为：$bak_old"
+    mv "$data_dir" "$bak_old" 2>/dev/null || { red "  ❌ 无法移动旧数据目录"; rm -rf "$restore_tmp"; return 1; }
+    green "  ✅ 旧数据目录已保留：$bak_old"
+  fi
+
+  mkdir -p "$data_dir"
+  if cp -a "$restore_base/data/." "$data_dir/" 2>/dev/null; then
+    local fc; fc=$(find "$data_dir" -type f 2>/dev/null | wc -l || echo 0)
+    green "  ✅ 数据恢复完成（$fc 个文件）"
+  else
+    red "  ❌ 数据恢复失败"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  rm -rf "$restore_tmp"
+
+  yellow "[4/4] 启动容器..."
+  if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    docker start "$container_name" &>/dev/null \
+      && green "  ✅ 容器已启动" \
+      || red "  ❌ 请手动：docker start $container_name"
+  else
+    yellow "  容器不存在，请通过主菜单重新部署（数据目录已恢复）。"
+  fi
+
+  echo ""
+  green "╔══════════════════════════════════════════════════════════╗"
+  green "║  ✅  ${svc_label} 恢复完成！"
+  green "╚══════════════════════════════════════════════════════════╝"
+}
+
+function _list_bind_service_backups() {
+  local svc_label="$1"
+  local backup_prefix="$2"
+  echo ""
+  cyan "── ${svc_label} 备份文件列表 ─────────────────────────────"
+  local found=false
+  while IFS= read -r f; do
+    local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+    local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+      sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+    printf "  📦 %-50s  [%s]  %s\n" "$f" "$sz" "$ts"
+    found=true
+  done < <(_scan_backup_files "$backup_prefix")
+  [[ "$found" == false ]] && yellow "  未找到任何备份文件。"
+  cyan "────────────────────────────────────────────────────"
+}
+
+function general_backup_menu() {
+  while true; do
+    echo ""
+    cyan "╔══════════════════════════════════════════════════════════╗"
+    cyan "║  One-API / New-API 备份 / 恢复                            ║"
+    cyan "╠══════════════════════════════════════════════════════════╣"
+    cyan "║  数据存储方式：绑定挂载目录（~/xxx-data）                   ║"
+    cyan "║  MySQL 模式：数据库需另行使用 mysqldump 备份                ║"
+    cyan "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    local oneapi_sqlite_status="未部署"
+    local oneapi_mysql_status="未部署"
+    local newapi_status="未部署"
+    docker ps -a --format '{{.Names}}' | grep -q "^one-api$"       && oneapi_sqlite_status="已部署"
+    docker ps -a --format '{{.Names}}' | grep -q "^one-api-mysql$" && oneapi_mysql_status="已部署"
+    docker ps -a --format '{{.Names}}' | grep -q "^new-api$"       && newapi_status="已部署"
+    [[ -d "$HOME/one-api-data" ]]       && oneapi_sqlite_status+=" [数据目录存在]"
+    [[ -d "$HOME/one-api-mysql-logs" ]] && oneapi_mysql_status+=" [日志目录存在]"
+    [[ -d "$HOME/new-api-data" ]]       && newapi_status+=" [数据目录存在]"
+
+    echo "  ── One-API SQLite  [$oneapi_sqlite_status]"
+    echo "  1. 📦 备份 One-API SQLite 数据"
+    echo "  2. 📂 恢复 One-API SQLite 数据"
+    echo "  3. 🔍 查看 One-API SQLite 备份列表"
+    echo ""
+    echo "  ── One-API MySQL   [$oneapi_mysql_status]"
+    echo "  4. 📦 备份 One-API MySQL 日志目录"
+    echo "  5. 📂 恢复 One-API MySQL 日志目录"
+    echo "  6. 🔍 查看 One-API MySQL 备份列表"
+    echo "  ℹ️  MySQL 数据库本身请使用：mysqldump -u用户 -p 数据库名 > backup.sql"
+    echo ""
+    echo "  ── New-API         [$newapi_status]"
+    echo "  7. 📦 备份 New-API 数据"
+    echo "  8. 📂 恢复 New-API 数据"
+    echo "  9. 🔍 查看 New-API 备份列表"
+    echo ""
+    echo "  0. 返回主菜单"
+    echo ""
+    read -rp "选项 (0-9)：" ch </dev/tty
+
+    case "$ch" in
+      1) _backup_bind_service  "One-API SQLite"    "one-api"       "$HOME/one-api-data"       "oneapi-sqlite-backup" || true; press_any_key ;;
+      2) _restore_bind_service "One-API SQLite"    "one-api"       "$HOME/one-api-data"       "oneapi-sqlite-backup" || true; press_any_key ;;
+      3) _list_bind_service_backups "One-API SQLite" "oneapi-sqlite-backup"; press_any_key ;;
+      4) _backup_bind_service  "One-API MySQL 日志" "one-api-mysql" "$HOME/one-api-mysql-logs" "oneapi-mysql-backup"  || true; press_any_key ;;
+      5) _restore_bind_service "One-API MySQL 日志" "one-api-mysql" "$HOME/one-api-mysql-logs" "oneapi-mysql-backup"  || true; press_any_key ;;
+      6) _list_bind_service_backups "One-API MySQL 日志" "oneapi-mysql-backup"; press_any_key ;;
+      7) _backup_bind_service  "New-API"           "new-api"       "$HOME/new-api-data"       "newapi-backup"        || true; press_any_key ;;
+      8) _restore_bind_service "New-API"           "new-api"       "$HOME/new-api-data"       "newapi-backup"        || true; press_any_key ;;
+      9) _list_bind_service_backups "New-API" "newapi-backup"; press_any_key ;;
+      0) return 0 ;;
+      *) red "无效选项，请输入 0-9。" ;;
+    esac
+  done
+}
+
+# ──────────────────────────────────────────────
+# FreeLLMAPI 备份/恢复
+# ──────────────────────────────────────────────
+function freellmapi_backup() {
+  local key_file="$HOME/.freellmapi_encryption_key"
+  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
+
+  echo ""
+  cyan "╔══════════════════════════════════════════════════════════╗"
+  cyan "║  FreeLLMAPI 数据备份                                       ║"
+  cyan "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+
+  if [[ ! -f "$key_file" ]]; then
+    red "❌ 未找到 ENCRYPTION_KEY（$key_file），备份中止！"; return 1
+  fi
+
+  local pack_type; pack_type=$(_check_pack_tools)
+  if [[ "$pack_type" == "none" ]]; then
+    red "❌ 未找到任何打包工具，无法生成备份文件！"; return 1
+  fi
+  green "打包格式：$pack_type"
+
+  local backup_root
+  backup_root=$(_select_backup_root) || return 1
+  _check_disk_space "$backup_root" 51200 || return 1
+
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  local backup_name="freellmapi-backup-${stamp}"
+  local backup_tmp="${backup_root}/${backup_name}"
+  local backup_archive="${backup_root}/${backup_name}.${pack_type}"
+
+  mkdir -p "$backup_tmp"
+
+  yellow "[1/4] 备份 ENCRYPTION_KEY..."
+  if ! cp "$key_file" "$backup_tmp/.freellmapi_encryption_key"; then
+    red "  ❌ ENCRYPTION_KEY 复制失败"; rm -rf "$backup_tmp"; return 1
+  fi
+  chmod 600 "$backup_tmp/.freellmapi_encryption_key"
+  green "  ✅ ENCRYPTION_KEY 已备份"
+
+  yellow "[2/4] 备份配置文件..."
+  local conf_ok=false
+  if [[ -f "$compose_dir/.env" ]]; then
+    cp "$compose_dir/.env" "$backup_tmp/env_config" && green "  ✅ .env 已备份（重命名为 env_config）" || true
+    conf_ok=true
+  fi
+  if [[ -f "$compose_dir/docker-compose.yml" ]]; then
+    cp "$compose_dir/docker-compose.yml" "$backup_tmp/docker-compose.yml" && green "  ✅ docker-compose.yml 已备份" || true
+    conf_ok=true
+  fi
+  [[ "$conf_ok" == false ]] && yellow "  ⚠️  未找到配置文件，跳过"
+
+  yellow "[3/4] 备份 SQLite 数据卷..."
+  if ! docker volume inspect freellmapi-data &>/dev/null; then
+    yellow "  ⚠️  未找到 freellmapi-data 数据卷，跳过。"
+  else
+    local was_running=false
+    docker ps --format '{{.Names}}' | grep -q "^freellmapi$" && was_running=true
+    if [[ "$was_running" == true ]]; then
+      yellow "  暂停容器以确保数据一致性..."
+      docker stop freellmapi &>/dev/null || true
+    fi
+    mkdir -p "$backup_tmp/data"
+    if ! _copy_volume_to_dir "freellmapi-data" "$backup_tmp/data"; then
+      red "  ❌ 数据卷备份失败"
+      [[ "$was_running" == true ]] && docker start freellmapi &>/dev/null || true
+      rm -rf "$backup_tmp"; return 1
+    fi
+    if [[ "$was_running" == true ]]; then
+      yellow "  重新启动容器..."
+      if [[ -f "$compose_dir/docker-compose.yml" ]]; then
+        cd "$compose_dir" && docker compose up -d &>/dev/null && cd - >/dev/null || true
+      else
+        docker start freellmapi &>/dev/null || true
+      fi
+      green "  ✅ 容器已恢复运行"
+    fi
+  fi
+
+  yellow "[4/4] 打包压缩（格式：$pack_type）..."
+  local cur_image=""
+  cur_image=$(docker inspect freellmapi --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
+  cat > "$backup_tmp/backup_info.txt" << EOF
+服务名称：FreeLLMAPI
+备份时间：$(date '+%Y-%m-%d %H:%M:%S')
+主机名：$(hostname)
+系统：${OS} / ${ARCH}
+镜像版本：${cur_image}
+打包格式：${pack_type}
+Docker卷：freellmapi-data
+KEY文件：.freellmapi_encryption_key
+恢复工具：部署脚本 → 选项9 → 恢复备份
+EOF
+
+  yellow "  正在打包：$backup_archive"
+  if _do_pack "$backup_root" "$backup_name" "$backup_archive" "$pack_type"; then
+    rm -rf "$backup_tmp"
+    local size; size=$(du -sh "$backup_archive" 2>/dev/null | cut -f1 || echo "未知")
+    echo ""
+    green "╔══════════════════════════════════════════════════════════╗"
+    green "║  ✅  FreeLLMAPI 备份完成！                                  ║"
+    green "╠══════════════════════════════════════════════════════════╣"
+    green "║  备份文件：${backup_archive}"
+    green "║  文件大小：${size}"
+    green "║  打包格式：${pack_type}"
+    green "╠══════════════════════════════════════════════════════════╣"
+    yellow "║  ⚠️  请将此文件复制到安全位置（U盘/NAS/云盘）              ║"
+    green  "╚══════════════════════════════════════════════════════════╝"
+  else
+    red "❌ 打包失败！临时目录保留在：$backup_tmp"
+    red "手动修复：tar -czf ${backup_archive} -C ${backup_root} ${backup_name}"
+    return 1
+  fi
+}
+
+function freellmapi_restore() {
+  local key_file="$HOME/.freellmapi_encryption_key"
+  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
+
+  echo ""
+  cyan "╔══════════════════════════════════════════════════════════╗"
+  cyan "║  FreeLLMAPI 数据恢复                                       ║"
+  cyan "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+
+  if docker ps -a --format '{{.Names}}' | grep -q "^freellmapi$"; then
+    yellow "⚠️  检测到 freellmapi 容器已存在，恢复将覆盖现有数据！"
+    read -rp "确认继续？(y/n，默认 n)：" cc </dev/tty
+    [[ ! "${cc:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
+    yellow "停止并移除现有容器..."
+    if [[ -f "$compose_dir/docker-compose.yml" ]]; then
+      cd "$compose_dir" && docker compose down 2>/dev/null || true && cd - >/dev/null
+    fi
+    docker stop freellmapi &>/dev/null || true
+    docker rm   freellmapi &>/dev/null || true
+    green "✅ 现有容器已清理"
+  fi
+
+  echo ""
+  echo "请选择备份文件来源："
+  echo "  1. 手动输入备份文件完整路径"
+  echo "  2. 扫描常用目录自动列出备份文件"
+  read -rp "选项 (1-2，默认 2)：" sc </dev/tty
+
+  local backup_archive=""
+  case "${sc:-2}" in
+    1) read -rp "请输入备份文件路径：" backup_archive </dev/tty ;;
+    *)
+      echo ""
+      yellow "正在扫描备份文件..."
+      local found_files=()
+      while IFS= read -r f; do found_files+=("$f"); done < <(_scan_backup_files "freellmapi-backup")
+      if [[ ${#found_files[@]} -eq 0 ]]; then
+        yellow "未找到备份文件。"
+        read -rp "请手动输入备份文件路径：" backup_archive </dev/tty
+      else
+        echo ""
+        local i=1
+        for f in "${found_files[@]}"; do
+          local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+          printf "  %d. %-55s  [%s]  %s\n" "$i" "$f" "$sz" "$ts"
+          ((i++))
+        done
+        echo ""
+        read -rp "请输入编号选择（留空手动输入路径）：" fc </dev/tty
+        if [[ -z "$fc" ]]; then
+          read -rp "请输入备份文件路径：" backup_archive </dev/tty
+        elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
+          backup_archive="${found_files[$((fc-1))]}"
+        else
+          red "无效选项。"; return 1
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ -z "$backup_archive" || ! -f "$backup_archive" ]]; then
+    red "❌ 备份文件不存在：$backup_archive"; return 1
+  fi
+  green "使用备份文件：$backup_archive"
+
+  local restore_tmp="/tmp/freellmapi_restore_$$"
+  mkdir -p "$restore_tmp"
+
+  yellow "[1/5] 解压备份文件..."
+  if ! _do_unpack "$backup_archive" "$restore_tmp"; then
+    red "❌ 解压失败，文件可能已损坏。"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  local restore_inner
+  restore_inner=$(find "$restore_tmp" -maxdepth 2 -name ".freellmapi_encryption_key" | head -n1)
+  if [[ -z "$restore_inner" ]]; then
+    red "❌ 备份中未找到 ENCRYPTION_KEY，备份包不完整！"
+    rm -rf "$restore_tmp"; return 1
+  fi
+  local restore_base; restore_base=$(dirname "$restore_inner")
+  green "  ✅ 解压成功"
+
+  local bak_image=""
+  if [[ -f "$restore_base/backup_info.txt" ]]; then
+    echo ""
+    cyan "── 备份信息 ────────────────────────────────"
+    cat "$restore_base/backup_info.txt"
+    cyan "────────────────────────────────────────────"
+    echo ""
+    bak_image=$(grep "^镜像版本：" "$restore_base/backup_info.txt" | cut -d'：' -f2 || true)
+    if [[ -n "$bak_image" ]]; then
+      read -rp "恢复后是否使用备份版本启动？(y=使用备份版本 / n=重新选择)  [默认 y]：" use_bak_ver </dev/tty
+      if [[ ! "${use_bak_ver:-y}" =~ ^[Yy]$ ]]; then
+        select_image_version "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
+        bak_image="$SELECTED_IMAGE"
+      fi
+    fi
+  fi
+
+  yellow "[2/5] 恢复 ENCRYPTION_KEY..."
+  if [[ -f "$key_file" ]]; then
+    read -rp "  当前已有 KEY，确认覆盖？(y/n，默认 y)：" ok </dev/tty
+    [[ ! "${ok:-y}" =~ ^[Yy]$ ]] && { yellow "已取消恢复。"; rm -rf "$restore_tmp"; return 0; }
+  fi
+  cp "$restore_base/.freellmapi_encryption_key" "$key_file"
+  chmod 600 "$key_file"
+  green "  ✅ ENCRYPTION_KEY 已恢复"
+
+  yellow "[3/5] 恢复配置文件..."
+  mkdir -p "$compose_dir"
+  if [[ -f "$restore_base/env_config" ]]; then
+    cp "$restore_base/env_config" "$compose_dir/.env"
+    chmod 600 "$compose_dir/.env"
+    green "  ✅ .env 已恢复"
+  fi
+  if [[ -f "$restore_base/docker-compose.yml" ]]; then
+    cp "$restore_base/docker-compose.yml" "$compose_dir/docker-compose.yml"
+    [[ -n "$bak_image" ]] && \
+      sed -i "s|image:.*freellmapi.*|image: ${bak_image}|" "$compose_dir/docker-compose.yml" || true
+    green "  ✅ docker-compose.yml 已恢复"
+  fi
+
+  yellow "[4/5] 恢复 SQLite 数据卷..."
+  if [[ ! -d "$restore_base/data" ]]; then
+    yellow "  ⚠️  备份中无数据卷内容，跳过"
+  else
+    docker volume inspect freellmapi-data &>/dev/null \
+      && yellow "  发现已有数据卷，将覆盖..." \
+      || docker volume create freellmapi-data &>/dev/null
+    if ! _copy_dir_to_volume "$restore_base/data" "freellmapi-data"; then
+      red "  ❌ 数据卷恢复失败"; rm -rf "$restore_tmp"; return 1
+    fi
+    green "  ✅ 数据卷已恢复"
+  fi
+
+  rm -rf "$restore_tmp"
+
+  yellow "[5/5] 启动 FreeLLMAPI..."
+  if [[ -f "$compose_dir/docker-compose.yml" ]]; then
+    cd "$compose_dir"
+    if docker compose up -d; then
+      cd - >/dev/null
+      yellow "等待服务启动（10 秒）..."
+      sleep 10
+      if docker ps --format '{{.Names}}' | grep -q "^freellmapi$"; then
+        local ip; ip=$(get_local_ip)
+        local port=""
+        [[ -f "$compose_dir/.env" ]] && port=$(grep '^PORT=' "$compose_dir/.env" | cut -d= -f2 | tr -d ' ' || true)
+        [[ -z "$port" ]] && port="3001"
+        local actual_image
+        actual_image=$(docker inspect freellmapi --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
+        echo ""
+        green "╔══════════════════════════════════════════════════════════╗"
+        green "║  ✅  FreeLLMAPI 恢复并启动成功！                            ║"
+        green "╠══════════════════════════════════════════════════════════╣"
+        green "║  Dashboard   : http://$ip:$port"
+        green "║  /v1 端点    : http://$ip:$port/v1/chat/completions"
+        green "║  运行版本    : $actual_image"
+        green "╚══════════════════════════════════════════════════════════╝"
+      else
+        red "❌ 容器启动后异常退出："
+        docker compose -f "$compose_dir/docker-compose.yml" logs --tail=30 2>/dev/null || true
+      fi
+    else
+      cd - >/dev/null
+      red "❌ docker compose up -d 失败，请通过主菜单选项4重新部署。"
+    fi
+  else
+    yellow "⚠️  未找到 docker-compose.yml，请通过主菜单选项4重新部署。"
+  fi
+}
+
+function freellmapi_list_backups() {
+  echo ""
+  cyan "── FreeLLMAPI 备份文件列表 ──────────────────────────────"
+  local found=false
+  while IFS= read -r f; do
+    local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+    local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+      sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+    printf "  📦 %-50s  [%s]  %s\n" "$f" "$sz" "$ts"
+    found=true
+  done < <(_scan_backup_files "freellmapi-backup")
+  [[ "$found" == false ]] && yellow "  未找到任何备份文件。"
+  cyan "────────────────────────────────────────────────────"
+}
+
+function freellmapi_backup_menu() {
+  while true; do
+    echo ""
+    cyan "╔══════════════════════════════════════════════════════════╗"
+    cyan "║  FreeLLMAPI 备份 / 恢复                                    ║"
+    cyan "╠══════════════════════════════════════════════════════════╣"
+    cyan "║  ⚠️  ENCRYPTION_KEY + 数据卷 缺一不可，必须同时迁移        ║"
+    cyan "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  1. 📦 立即备份        (KEY + 数据卷 + 配置打包)"
+    echo "  2. 📂 从备份恢复      (覆盖当前数据并自动启动)"
+    echo "  3. 🔍 查看本机备份文件列表"
+    echo "  0. 返回"
+    echo ""
+    read -rp "选项 (0-3)：" ch </dev/tty
+    case "$ch" in
+      1) freellmapi_backup  || true; press_any_key ;;
+      2) freellmapi_restore || true; press_any_key ;;
+      3) freellmapi_list_backups;    press_any_key ;;
+      0) return 0 ;;
+      *) red "无效选项，请输入 0-3。" ;;
+    esac
+  done
+}
+
+function backup_restore_menu() {
+  while true; do
+    echo ""
+    cyan "╔══════════════════════════════════════════════════════════╗"
+    cyan "║  备份 / 恢复 管理中心                                      ║"
+    cyan "╠══════════════════════════════════════════════════════════╣"
+    cyan "║  One-API/New-API：备份绑定挂载目录（tar 打包）              ║"
+    cyan "║  FreeLLMAPI：备份 ENCRYPTION_KEY + Docker 命名卷           ║"
+    cyan "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  1. 🗄️  One-API / New-API 备份与恢复"
+    echo "  2. 🔐 FreeLLMAPI 备份与恢复"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -rp "选项 (0-2)：" ch </dev/tty
+    case "$ch" in
+      1) general_backup_menu    || true ;;
+      2) freellmapi_backup_menu || true ;;
+      0) return 0 ;;
+      *) red "无效选项，请输入 0-2。" ;;
+    esac
+  done
+}
+
 function deploy_service_sqlite() {
-  local cname="$1"
-  local image="$2"
-  local int_port="$3"
-  local data_name="$4"
-  local data_dir="$HOME/$data_name"
+  local cname="$1"; local image="$2"; local int_port="$3"
+  local data_name="$4"; local data_dir="$HOME/$data_name"
 
   check_existing_container "$cname" || return 1
   validate_port "$int_port"
@@ -1029,8 +1596,7 @@ function deploy_service_sqlite() {
   local cmd=()
   cmd+=(docker run -d --name "$cname" --restart unless-stopped)
   if [[ "$NETWORK_MODE" == "host" ]]; then
-    cmd+=(--network host)
-    yellow "host 模式，监听端口 $int_port。"
+    cmd+=(--network host); yellow "host 模式，监听端口 $int_port。"
   else
     cmd+=(--network bridge -p "$PORT:$int_port")
   fi
@@ -1046,7 +1612,6 @@ function deploy_service_sqlite() {
   green "✅ $cname 部署成功！"
   green "   访问地址：http://$ip:$ap"
   green "   数据目录：$data_dir"
-  green "   查看日志：docker logs -f $cname"
   green "   初始账号：root / 123456"
 }
 
@@ -1063,8 +1628,7 @@ function deploy_one_api_sqlite() {
 }
 
 function deploy_one_api_mysql() {
-  local cname="one-api-mysql"
-  local int_port="3000"
+  local cname="one-api-mysql"; local int_port="3000"
   local data_dir="$HOME/one-api-mysql-logs"
 
   echo ""
@@ -1075,13 +1639,11 @@ function deploy_one_api_mysql() {
   check_existing_container "$cname" || return 1
   select_image_version "One-API" "$ONE_API_IMAGE_BASE" "github" "songquanpeng/one-api" 8
   local sel_image="$SELECTED_IMAGE"
-  validate_port "$int_port"
-  choose_network_mode
+  validate_port "$int_port"; choose_network_mode
 
   yellow "请输入 MySQL 连接信息："
-  read -rp "  主机（如 localhost / 192.168.1.10）：" db_host </dev/tty
-  read -rp "  端口（默认 3306）：" db_port </dev/tty
-  db_port=${db_port:-3306}
+  read -rp "  主机：" db_host </dev/tty
+  read -rp "  端口（默认 3306）：" db_port </dev/tty; db_port=${db_port:-3306}
   read -rp "  用户名：" db_user </dev/tty
   read -rsp "  密码：" db_pass </dev/tty; echo
   read -rp "  数据库名：" db_name </dev/tty
@@ -1115,9 +1677,7 @@ function deploy_one_api_mysql() {
 }
 
 function deploy_new_api() {
-  local cname="new-api"
-  local int_port="3000"
-  local data_name="new-api-data"
+  local cname="new-api"; local int_port="3000"; local data_name="new-api-data"
 
   echo ""
   bold "══════════════════════════════════════════"
@@ -1133,14 +1693,12 @@ function deploy_new_api() {
   db_mode=${db_mode:-1}
 
   if [[ "$db_mode" == "2" ]]; then
-    validate_port "$int_port"
-    choose_network_mode
+    validate_port "$int_port"; choose_network_mode
     pull_image_with_retry "$sel_image" || return 1
 
     yellow "请输入 MySQL 连接信息："
     read -rp "  主机：" db_host </dev/tty
-    read -rp "  端口（默认 3306）：" db_port </dev/tty
-    db_port=${db_port:-3306}
+    read -rp "  端口（默认 3306）：" db_port </dev/tty; db_port=${db_port:-3306}
     read -rp "  用户名：" db_user </dev/tty
     read -rsp "  密码：" db_pass </dev/tty; echo
     read -rp "  数据库名：" db_name </dev/tty
@@ -1175,8 +1733,7 @@ function deploy_new_api() {
 }
 
 function deploy_freellmapi() {
-  local cname="freellmapi"
-  local int_port="3001"
+  local cname="freellmapi"; local int_port="3001"
   local compose_dir="$FREELLMAPI_COMPOSE_DIR"
 
   echo ""
@@ -1193,8 +1750,7 @@ function deploy_freellmapi() {
   select_image_version "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
   local sel_image="$SELECTED_IMAGE"
 
-  validate_port "$int_port"
-  local chosen_port="$PORT"
+  validate_port "$int_port"; local chosen_port="$PORT"
 
   local host_bind="127.0.0.1"
   echo ""
@@ -1212,15 +1768,12 @@ function deploy_freellmapi() {
   read -rp "每分钟最大请求数（默认 120，0=禁用）：" ri </dev/tty
   [[ "$ri" =~ ^[0-9]+$ ]] && rpm="$ri"
 
-  local key_file="$HOME/.freellmapi_encryption_key"
-  local enc_key=""
+  local key_file="$HOME/.freellmapi_encryption_key"; local enc_key=""
   if [[ -f "$key_file" ]]; then
-    enc_key=$(cat "$key_file")
-    green "复用已有 ENCRYPTION_KEY：$key_file"
+    enc_key=$(cat "$key_file"); green "复用已有 ENCRYPTION_KEY：$key_file"
   else
     enc_key=$(openssl rand -hex 32)
-    echo "$enc_key" > "$key_file"
-    chmod 600 "$key_file"
+    echo "$enc_key" > "$key_file"; chmod 600 "$key_file"
     green "已生成新 ENCRYPTION_KEY：$key_file"
     red   "⚠️  请备份此文件，升级/迁移时必须保留！"
   fi
@@ -1241,8 +1794,7 @@ PROXY_RATE_LIMIT_RPM=${rpm}
 REQUEST_ANALYTICS_RETENTION_DAYS=90
 REQUEST_ANALYTICS_MAX_ROWS=100000
 EOF
-  chmod 600 "$compose_dir/.env"
-  green ".env 已写入：$compose_dir/.env"
+  chmod 600 "$compose_dir/.env"; green ".env 已写入：$compose_dir/.env"
 
   cat > "$compose_dir/docker-compose.yml" << EOF
 # FreeLLMAPI docker-compose.yml — $(date '+%Y-%m-%d %H:%M:%S')
@@ -1301,13 +1853,9 @@ EOF
   green "╠══════════════════════════════════════════════════════════╣"
   green "║  Dashboard : $url"
   green "║  /v1 端点  : $url/v1/chat/completions"
-  green "║  数据卷    : freellmapi-data"
-  green "║  Key 备份  : $key_file"
-  green "╠══════════════════════════════════════════════════════════╣"
   yellow "║  添加 Key 后建议立即备份：主菜单 → 选项9                   ║"
   green  "╚══════════════════════════════════════════════════════════╝"
   echo ""
-  yellow "【远程设备首次登录提示】"
   yellow "如从其他设备打开 Dashboard 提示需要 Setup Code："
   yellow "主菜单 → 选项5（管理）→ 选项8 查看。"
 }
@@ -1336,7 +1884,7 @@ function _freellmapi_upgrade_version() {
   local new_image="$SELECTED_IMAGE"
 
   if [[ "$new_image" == "$cur_image" ]]; then
-    yellow "所选版本与当前版本相同（$cur_image）。"
+    yellow "所选版本与当前版本相同。"
     read -rp "是否强制重新拉取并重启？(y/n，默认 n)：" fr </dev/tty
     [[ ! "${fr:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
   fi
@@ -1344,15 +1892,11 @@ function _freellmapi_upgrade_version() {
   pull_image_with_retry "$new_image" || return 1
 
   if [[ -f "$compose_file" ]]; then
-    yellow "更新 docker-compose.yml 中的镜像版本..."
     sed -i "s|image:.*freellmapi.*|image: ${new_image}|" "$compose_file" || true
     green "  ✅ docker-compose.yml 已更新"
-    cd "$compose_dir"
-    docker compose up -d --no-deps freellmapi || true
-    cd - >/dev/null
+    cd "$compose_dir"; docker compose up -d --no-deps freellmapi || true; cd - >/dev/null
   else
-    yellow "未找到 docker-compose.yml，请通过主菜单选项4重新部署（数据卷已保留）。"
-    return 0
+    yellow "未找到 docker-compose.yml，请通过主菜单选项4重新部署。"; return 0
   fi
 
   sleep 8
@@ -1362,7 +1906,7 @@ function _freellmapi_upgrade_version() {
     actual_image=$(docker inspect freellmapi --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
     green "✅ 版本切换成功！当前运行版本：$actual_image"
   else
-    red "❌ 容器启动异常，查看日志："
+    red "❌ 容器启动异常："
     docker compose -f "$compose_file" logs --tail=30 2>/dev/null || true
   fi
 }
@@ -1375,8 +1919,7 @@ function _freellmapi_show_setup_code() {
   local result
   result=$(docker logs freellmapi 2>&1 | grep -iE "code|setup|one.time|one-time|pin" || true)
   if [[ -n "$result" ]]; then
-    green "已找到相关日志："
-    echo "$result"
+    green "已找到相关日志："; echo "$result"
   else
     yellow "关键词未匹配，显示启动前 80 行日志："
     docker logs freellmapi 2>&1 | head -80 || true
@@ -1389,424 +1932,6 @@ function _freellmapi_show_setup_code() {
   echo ""
   yellow "提示：若未找到 code，可重启容器使其重新打印："
   yellow "  docker compose -f ~/freellmapi/docker-compose.yml restart"
-}
-
-# ──────────────────────────────────────────────
-# 备份核心（含打包预检和降级）
-# ──────────────────────────────────────────────
-function freellmapi_backup() {
-  local key_file="$HOME/.freellmapi_encryption_key"
-  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
-
-  echo ""
-  cyan "╔══════════════════════════════════════════════════════════╗"
-  cyan "║  FreeLLMAPI 数据备份                                       ║"
-  cyan "╚══════════════════════════════════════════════════════════╝"
-  echo ""
-
-  if [[ ! -f "$key_file" ]]; then
-    red "❌ 未找到 ENCRYPTION_KEY（$key_file），备份中止！"
-    return 1
-  fi
-
-  yellow "正在检测可用的打包工具..."
-  local pack_type
-  pack_type=$(_check_pack_tools)
-  if [[ "$pack_type" == "none" ]]; then
-    red "❌ 未找到任何打包工具（tar/gzip/bzip2/xz/zip），无法生成备份文件！"
-    local pkg_hint="tar gzip"
-    [[ "$PACKAGE_MANAGER" == "apt" ]] && pkg_hint="tar gzip"
-    [[ "$PACKAGE_MANAGER" == "yum" || "$PACKAGE_MANAGER" == "dnf" ]] && pkg_hint="tar gzip"
-    yellow "请先安装：${PACKAGE_MANAGER} install -y $pkg_hint"
-    return 1
-  fi
-  green "可用打包格式：$pack_type"
-
-  local default_dir="$HOME"
-  echo ""
-  echo "请选择备份存储位置："
-  echo "  1. 当前用户主目录     ($HOME)"
-  echo "  2. /tmp 目录          (重启后丢失，仅临时使用)"
-  echo "  3. 手动输入目录路径"
-  read -rp "选项 (1-3，默认 1)：" bc </dev/tty
-  local backup_root=""
-  case "${bc:-1}" in
-    2) backup_root="/tmp" ;;
-    3)
-      read -rp "请输入目标目录（如 /mnt/usb / /data/backup）：" custom_dir </dev/tty
-      backup_root="${custom_dir:-$default_dir}"
-      ;;
-    *) backup_root="$default_dir" ;;
-  esac
-
-  if ! mkdir -p "$backup_root" 2>/dev/null || ! touch "$backup_root/.wtest" 2>/dev/null; then
-    red "❌ 目录 $backup_root 不可写或无法创建。"; return 1
-  fi
-  rm -f "$backup_root/.wtest"
-
-  local avail_kb
-  avail_kb=$(df -k "$backup_root" 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
-  if [[ "$avail_kb" -lt 51200 ]]; then
-    yellow "⚠️  目标目录可用空间不足 50MB（当前：${avail_kb}KB），备份可能失败。"
-    read -rp "是否继续？(y/n，默认 n)：" sc </dev/tty
-    [[ ! "${sc:-n}" =~ ^[Yy]$ ]] && { yellow "已取消，请释放空间后重试。"; return 1; }
-  fi
-
-  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
-  local backup_name="freellmapi-backup-${stamp}"
-  local backup_tmp="${backup_root}/${backup_name}"
-  local backup_archive="${backup_root}/${backup_name}.${pack_type}"
-
-  mkdir -p "$backup_tmp"
-  green "临时目录：$backup_tmp"
-
-  yellow "[1/4] 备份 ENCRYPTION_KEY..."
-  if ! cp "$key_file" "$backup_tmp/.freellmapi_encryption_key"; then
-    red "  ❌ ENCRYPTION_KEY 复制失败"; rm -rf "$backup_tmp"; return 1
-  fi
-  chmod 600 "$backup_tmp/.freellmapi_encryption_key"
-  green "  ✅ ENCRYPTION_KEY 已备份"
-
-  yellow "[2/4] 备份配置文件..."
-  local conf_ok=false
-  if [[ -f "$compose_dir/.env" ]]; then
-    cp "$compose_dir/.env" "$backup_tmp/env_config" && green "  ✅ .env 已备份（重命名为 env_config）" || true
-    conf_ok=true
-  fi
-  if [[ -f "$compose_dir/docker-compose.yml" ]]; then
-    cp "$compose_dir/docker-compose.yml" "$backup_tmp/docker-compose.yml" && green "  ✅ docker-compose.yml 已备份" || true
-    conf_ok=true
-  fi
-  [[ "$conf_ok" == false ]] && yellow "  ⚠️  未找到配置文件，跳过"
-
-  yellow "[3/4] 备份 SQLite 数据卷..."
-  if ! docker volume inspect freellmapi-data &>/dev/null; then
-    yellow "  ⚠️  未找到 freellmapi-data 数据卷，跳过。"
-  else
-    local was_running=false
-    docker ps --format '{{.Names}}' | grep -q "^freellmapi$" && was_running=true
-    if [[ "$was_running" == true ]]; then
-      yellow "  暂停容器以确保数据一致性..."
-      docker stop freellmapi &>/dev/null || true
-    fi
-
-    mkdir -p "$backup_tmp/data"
-    if ! _copy_volume_to_dir "freellmapi-data" "$backup_tmp/data"; then
-      red "  ❌ 数据卷备份失败，清理临时目录..."
-      [[ "$was_running" == true ]] && docker start freellmapi &>/dev/null || true
-      rm -rf "$backup_tmp"
-      return 1
-    fi
-
-    local data_file_count
-    data_file_count=$(find "$backup_tmp/data" -type f 2>/dev/null | wc -l || echo 0)
-    if [[ "$data_file_count" -eq 0 ]]; then
-      yellow "  ⚠️  数据目录为空（容器可能尚未写入数据），继续备份..."
-    fi
-
-    if [[ "$was_running" == true ]]; then
-      yellow "  重新启动容器..."
-      if [[ -f "$compose_dir/docker-compose.yml" ]]; then
-        cd "$compose_dir" && docker compose up -d &>/dev/null && cd - >/dev/null || true
-      else
-        docker start freellmapi &>/dev/null || true
-      fi
-      green "  ✅ 容器已恢复运行"
-    fi
-  fi
-
-  yellow "[4/4] 打包压缩（格式：$pack_type）..."
-
-  local cur_image=""
-  cur_image=$(docker inspect freellmapi --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
-  cat > "$backup_tmp/backup_info.txt" << EOF
-备份时间：$(date '+%Y-%m-%d %H:%M:%S')
-主机名：$(hostname)
-系统：${OS} / ${ARCH}
-镜像版本：${cur_image}
-打包格式：${pack_type}
-Docker卷：freellmapi-data
-KEY文件：.freellmapi_encryption_key
-恢复工具：部署脚本 → 选项9 → 恢复备份
-EOF
-
-  yellow "  正在打包：$backup_archive"
-  if _do_pack "$backup_root" "$backup_name" "$backup_archive" "$pack_type"; then
-    rm -rf "$backup_tmp"
-    local size; size=$(du -sh "$backup_archive" 2>/dev/null | cut -f1 || echo "未知")
-    echo ""
-    green "╔══════════════════════════════════════════════════════════╗"
-    green "║  ✅  备份完成！                                             ║"
-    green "╠══════════════════════════════════════════════════════════╣"
-    green "║  备份文件：$backup_archive"
-    green "║  文件大小：$size"
-    green "║  打包格式：$pack_type"
-    green "╠══════════════════════════════════════════════════════════╣"
-    yellow "║  ⚠️  请将此文件复制到安全位置（U盘/NAS/云盘）              ║"
-    yellow "║  恢复方法：部署脚本 → 选项9（备份/恢复）→ 恢复备份         ║"
-    green  "╚══════════════════════════════════════════════════════════╝"
-  else
-    red "❌ 打包失败！临时目录保留在：$backup_tmp"
-    red ""
-    red "可能原因："
-    red "  1. 磁盘空间不足（当前可用：${avail_kb}KB）"
-    red "  2. 目录权限问题（临时目录内有 root 属主文件）"
-    red "  3. 打包工具异常"
-    echo ""
-    yellow "手动修复方案："
-    yellow "  sudo chown -R $(id -u):$(id -g) $backup_tmp"
-    yellow "  tar -czf $backup_archive -C $backup_root $backup_name"
-    yellow "  rm -rf $backup_tmp"
-    return 1
-  fi
-}
-
-function freellmapi_restore() {
-  local key_file="$HOME/.freellmapi_encryption_key"
-  local compose_dir="$FREELLMAPI_COMPOSE_DIR"
-
-  echo ""
-  cyan "╔══════════════════════════════════════════════════════════╗"
-  cyan "║  FreeLLMAPI 数据恢复                                       ║"
-  cyan "╚══════════════════════════════════════════════════════════╝"
-  echo ""
-
-  if docker ps -a --format '{{.Names}}' | grep -q "^freellmapi$"; then
-    yellow "⚠️  检测到 freellmapi 容器已存在，恢复将覆盖现有数据！"
-    read -rp "确认继续？(y/n，默认 n)：" cc </dev/tty
-    [[ ! "${cc:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }
-    yellow "停止并移除现有容器..."
-    if [[ -f "$compose_dir/docker-compose.yml" ]]; then
-      cd "$compose_dir" && docker compose down 2>/dev/null || true && cd - >/dev/null
-    fi
-    docker stop freellmapi &>/dev/null || true
-    docker rm   freellmapi &>/dev/null || true
-    green "✅ 现有容器已清理"
-  fi
-
-  echo ""
-  echo "请选择备份文件来源："
-  echo "  1. 手动输入备份文件完整路径"
-  echo "  2. 扫描常用目录自动列出备份文件"
-  read -rp "选项 (1-2，默认 2)：" sc </dev/tty
-
-  local backup_archive=""
-  case "${sc:-2}" in
-    1)
-      read -rp "请输入备份文件路径：" backup_archive </dev/tty
-      ;;
-    *)
-      echo ""
-      yellow "正在扫描备份文件..."
-      local scan_dirs=("$HOME" "/tmp" "/mnt" "/data" "/backup")
-      local found_files=()
-      for d in "${scan_dirs[@]}"; do
-        [[ -d "$d" ]] || continue
-        while IFS= read -r f; do
-          found_files+=("$f")
-        done < <(find "$d" -maxdepth 3 \
-          \( -name "freellmapi-backup-*.tar.gz" \
-          -o -name "freellmapi-backup-*.tar.bz2" \
-          -o -name "freellmapi-backup-*.tar.xz" \
-          -o -name "freellmapi-backup-*.tar" \
-          -o -name "freellmapi-backup-*.zip" \) \
-          2>/dev/null | sort -r)
-      done
-      if [[ ${#found_files[@]} -eq 0 ]]; then
-        yellow "未在常用目录找到备份文件。"
-        read -rp "请手动输入备份文件路径：" backup_archive </dev/tty
-      else
-        echo ""
-        local i=1
-        for f in "${found_files[@]}"; do
-          local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
-          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
-            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
-          printf "  %d. %-55s  [%s]  %s\n" "$i" "$f" "$sz" "$ts"
-          ((i++))
-        done
-        echo ""
-        read -rp "请输入编号选择（留空手动输入路径）：" fc </dev/tty
-        if [[ -z "$fc" ]]; then
-          read -rp "请输入备份文件路径：" backup_archive </dev/tty
-        elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
-          backup_archive="${found_files[$((fc-1))]}"
-        else
-          red "无效选项。"; return 1
-        fi
-      fi
-      ;;
-  esac
-
-  if [[ -z "$backup_archive" || ! -f "$backup_archive" ]]; then
-    red "❌ 备份文件不存在：$backup_archive"; return 1
-  fi
-  green "使用备份文件：$backup_archive"
-
-  local restore_tmp="/tmp/freellmapi_restore_$$"
-  mkdir -p "$restore_tmp"
-
-  yellow "[1/5] 解压备份文件..."
-  if ! _do_unpack "$backup_archive" "$restore_tmp"; then
-    red "❌ 解压失败，文件可能已损坏。"; rm -rf "$restore_tmp"; return 1
-  fi
-
-  local restore_inner
-  restore_inner=$(find "$restore_tmp" -maxdepth 2 -name ".freellmapi_encryption_key" | head -n1)
-  if [[ -z "$restore_inner" ]]; then
-    red "❌ 备份中未找到 ENCRYPTION_KEY，备份包不完整！"
-    rm -rf "$restore_tmp"; return 1
-  fi
-  local restore_base; restore_base=$(dirname "$restore_inner")
-  green "  ✅ 解压成功"
-
-  local bak_image=""
-  if [[ -f "$restore_base/backup_info.txt" ]]; then
-    echo ""
-    cyan "── 备份信息 ────────────────────────────────"
-    cat "$restore_base/backup_info.txt"
-    cyan "────────────────────────────────────────────"
-    echo ""
-    bak_image=$(grep "^镜像版本：" "$restore_base/backup_info.txt" | cut -d'：' -f2 || true)
-    if [[ -n "$bak_image" ]]; then
-      yellow "备份时使用的镜像版本：$bak_image"
-      read -rp "恢复后是否使用此版本启动？(y=使用备份版本 / n=重新选择)  [默认 y]：" use_bak_ver </dev/tty
-      if [[ ! "${use_bak_ver:-y}" =~ ^[Yy]$ ]]; then
-        select_image_version "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8
-        bak_image="$SELECTED_IMAGE"
-      fi
-    fi
-  fi
-
-  yellow "[2/5] 恢复 ENCRYPTION_KEY..."
-  if [[ -f "$key_file" ]]; then
-    yellow "  当前已有 KEY，将覆盖（现有：$(cut -c1-8 "$key_file")...）"
-    read -rp "  确认覆盖？(y/n，默认 y)：" ok </dev/tty
-    [[ ! "${ok:-y}" =~ ^[Yy]$ ]] && { yellow "已取消恢复。"; rm -rf "$restore_tmp"; return 0; }
-  fi
-  cp "$restore_base/.freellmapi_encryption_key" "$key_file"
-  chmod 600 "$key_file"
-  green "  ✅ ENCRYPTION_KEY 已恢复"
-
-  yellow "[3/5] 恢复配置文件..."
-  mkdir -p "$compose_dir"
-  if [[ -f "$restore_base/env_config" ]]; then
-    cp "$restore_base/env_config" "$compose_dir/.env"
-    chmod 600 "$compose_dir/.env"
-    green "  ✅ .env 已恢复"
-  else
-    yellow "  ⚠️  备份中无 .env，跳过"
-  fi
-  if [[ -f "$restore_base/docker-compose.yml" ]]; then
-    cp "$restore_base/docker-compose.yml" "$compose_dir/docker-compose.yml"
-    [[ -n "$bak_image" ]] && \
-      sed -i "s|image:.*freellmapi.*|image: ${bak_image}|" "$compose_dir/docker-compose.yml" || true
-    green "  ✅ docker-compose.yml 已恢复"
-  else
-    yellow "  ⚠️  备份中无 docker-compose.yml，跳过"
-  fi
-
-  yellow "[4/5] 恢复 SQLite 数据卷..."
-  if [[ ! -d "$restore_base/data" ]]; then
-    yellow "  ⚠️  备份中无数据卷内容，跳过"
-  else
-    docker volume inspect freellmapi-data &>/dev/null \
-      && yellow "  发现已有数据卷，将覆盖..." \
-      || docker volume create freellmapi-data &>/dev/null
-    if ! _copy_dir_to_volume "$restore_base/data" "freellmapi-data"; then
-      red "  ❌ 数据卷恢复失败"; rm -rf "$restore_tmp"; return 1
-    fi
-    green "  ✅ 数据卷已恢复"
-  fi
-
-  rm -rf "$restore_tmp"
-
-  yellow "[5/5] 启动 FreeLLMAPI..."
-  if [[ -f "$compose_dir/docker-compose.yml" ]]; then
-    cd "$compose_dir"
-    if docker compose up -d; then
-      cd - >/dev/null
-      yellow "等待服务启动（10 秒）..."
-      sleep 10
-      if docker ps --format '{{.Names}}' | grep -q "^freellmapi$"; then
-        local ip; ip=$(get_local_ip)
-        local port=""
-        [[ -f "$compose_dir/.env" ]] && port=$(grep '^PORT=' "$compose_dir/.env" | cut -d= -f2 | tr -d ' ' || true)
-        [[ -z "$port" ]] && port="3001"
-        local actual_image
-        actual_image=$(docker inspect freellmapi --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
-        echo ""
-        green "╔══════════════════════════════════════════════════════════╗"
-        green "║  ✅  恢复并启动成功！所有数据已还原                         ║"
-        green "╠══════════════════════════════════════════════════════════╣"
-        green "║  Dashboard   : http://$ip:$port"
-        green "║  /v1 端点    : http://$ip:$port/v1/chat/completions"
-        green "║  运行版本    : $actual_image"
-        green "╚══════════════════════════════════════════════════════════╝"
-      else
-        red "❌ 容器启动后异常退出，请查看日志："
-        docker compose -f "$compose_dir/docker-compose.yml" logs --tail=30 2>/dev/null || true
-      fi
-    else
-      cd - >/dev/null
-      red "❌ docker compose up -d 失败，请通过主菜单选项4重新部署。"
-    fi
-  else
-    yellow "⚠️  未找到 docker-compose.yml，请通过主菜单选项4重新部署。"
-    yellow "   ENCRYPTION_KEY 和数据卷已就绪，部署时会自动关联。"
-  fi
-}
-
-function freellmapi_list_backups() {
-  echo ""
-  cyan "── 本机备份文件列表 ─────────────────────────────────"
-  local scan_dirs=("$HOME" "/tmp" "/mnt" "/data" "/backup")
-  local found=false
-  for d in "${scan_dirs[@]}"; do
-    [[ -d "$d" ]] || continue
-    while IFS= read -r f; do
-      local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
-      local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
-        sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
-      printf "  📦 %-50s  [%s]  %s\n" "$f" "$sz" "$ts"
-      found=true
-    done < <(find "$d" -maxdepth 3 \
-      \( -name "freellmapi-backup-*.tar.gz" \
-      -o -name "freellmapi-backup-*.tar.bz2" \
-      -o -name "freellmapi-backup-*.tar.xz" \
-      -o -name "freellmapi-backup-*.tar" \
-      -o -name "freellmapi-backup-*.zip" \) \
-      2>/dev/null | sort -r)
-  done
-  if [[ "$found" == false ]]; then
-    yellow "  未在常用目录找到任何备份文件。"
-  fi
-  cyan "────────────────────────────────────────────────────"
-}
-
-function freellmapi_backup_menu() {
-  while true; do
-    echo ""
-    cyan "╔══════════════════════════════════════════════════════════╗"
-    cyan "║  FreeLLMAPI 备份 / 恢复                                    ║"
-    cyan "╠══════════════════════════════════════════════════════════╣"
-    cyan "║  ⚠️  ENCRYPTION_KEY + 数据卷 缺一不可，必须同时迁移        ║"
-    cyan "╚══════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "  1. 📦 立即备份        (KEY + 数据卷 + 配置打包)"
-    echo "  2. 📂 从备份恢复      (覆盖当前数据并自动启动)"
-    echo "  3. 🔍 查看本机备份文件列表"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -rp "选项 (0-3)：" ch </dev/tty
-    case "$ch" in
-      1) freellmapi_backup  || true; press_any_key ;;
-      2) freellmapi_restore || true; press_any_key ;;
-      3) freellmapi_list_backups;    press_any_key ;;
-      0) return 0 ;;
-      *) red "无效选项，请输入 0-3。" ;;
-    esac
-  done
 }
 
 function manage_freellmapi() {
@@ -1839,8 +1964,7 @@ function manage_freellmapi() {
     echo "  7. 查看数据卷信息"
     echo "  8. 🔑 查看远程初始化 Setup Code"
     echo "  0. 返回主菜单"
-    read -rp "选项 (0-8)：" mc </dev/tty
-    echo ""
+    read -rp "选项 (0-8)：" mc </dev/tty; echo ""
 
     local use_compose=false
     [[ -f "$compose_file" ]] && use_compose=true
@@ -1861,51 +1985,23 @@ function manage_freellmapi() {
     }
 
     case "$mc" in
-      1)
-        green "实时日志（Ctrl+C 退出）..."
-        _compose_or_docker logs -f freellmapi || true
-        ;;
-      2)
-        green "最近 100 行日志："
-        _compose_or_docker logs --tail=100 freellmapi || true
-        press_any_key
-        ;;
-      3)
-        yellow "停止服务..."
-        _compose_or_docker stop freellmapi && green "✅ 已停止。" || red "停止失败。"
-        press_any_key
-        ;;
-      4)
-        yellow "启动服务..."
-        _compose_or_docker start freellmapi && green "✅ 已启动。" || red "启动失败。"
-        press_any_key
-        ;;
+      1) green "实时日志（Ctrl+C 退出）..."; _compose_or_docker logs -f freellmapi || true ;;
+      2) green "最近 100 行日志："; _compose_or_docker logs --tail=100 freellmapi || true; press_any_key ;;
+      3) yellow "停止服务..."; _compose_or_docker stop freellmapi && green "✅ 已停止。" || red "停止失败。"; press_any_key ;;
+      4) yellow "启动服务..."; _compose_or_docker start freellmapi && green "✅ 已启动。" || red "启动失败。"; press_any_key ;;
       5)
-        yellow "重启服务..."
-        _compose_or_docker restart freellmapi || true
-        sleep 5
+        yellow "重启服务..."; _compose_or_docker restart freellmapi || true; sleep 5
         green "重启后状态："
-        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
-          | grep -E "NAMES|freellmapi" || true
-        press_any_key
-        ;;
-      6)
-        _freellmapi_upgrade_version || true
-        press_any_key
-        ;;
+        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAMES|freellmapi" || true
+        press_any_key ;;
+      6) _freellmapi_upgrade_version || true; press_any_key ;;
       7)
         green "── freellmapi-data 数据卷信息 ──"
-        if docker volume inspect freellmapi-data &>/dev/null; then
-          docker volume inspect freellmapi-data
-        else
-          yellow "未找到 freellmapi-data 卷。"
-        fi
-        press_any_key
-        ;;
-      8)
-        _freellmapi_show_setup_code
-        press_any_key
-        ;;
+        docker volume inspect freellmapi-data &>/dev/null \
+          && docker volume inspect freellmapi-data \
+          || yellow "未找到 freellmapi-data 卷。"
+        press_any_key ;;
+      8) _freellmapi_show_setup_code; press_any_key ;;
       0) return 0 ;;
       *) red "无效选项，请输入 0-8。" ;;
     esac
@@ -1932,9 +2028,7 @@ function uninstall_freellmapi() {
   echo ""
   yellow "[1/6] 停止并删除容器..."
   if docker ps -a --format '{{.Names}}' | grep -q "^freellmapi$"; then
-    if [[ -f "$compose_file" ]]; then
-      cd "$compose_dir"; docker compose down freellmapi 2>/dev/null || true; cd - >/dev/null
-    fi
+    [[ -f "$compose_file" ]] && { cd "$compose_dir"; docker compose down freellmapi 2>/dev/null || true; cd - >/dev/null; }
     docker stop freellmapi &>/dev/null || true
     docker rm   freellmapi &>/dev/null || true
     green "  ✅ 容器已删除。"
@@ -1945,15 +2039,13 @@ function uninstall_freellmapi() {
   echo ""
   yellow "[2/6] 删除 Docker 镜像..."
   local imgs
-  imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-    | grep "^ghcr.io/tashfeenahmed/freellmapi" || true)
+  imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^ghcr.io/tashfeenahmed/freellmapi" || true)
   if [[ -n "$imgs" ]]; then
     echo "  发现镜像："; echo "$imgs" | while read -r i; do echo "    - $i"; done
     read -rp "  是否删除？(y/n，默认 y)：" di </dev/tty
     if [[ "${di:-y}" =~ ^[Yy]$ ]]; then
       echo "$imgs" | xargs docker rmi 2>/dev/null \
-        && green "  ✅ 镜像已删除。" \
-        || yellow "  ⚠️  部分镜像删除失败。"
+        && green "  ✅ 镜像已删除。" || yellow "  ⚠️  部分镜像删除失败。"
     fi
   else
     yellow "  未发现相关镜像，跳过。"
@@ -1966,8 +2058,7 @@ function uninstall_freellmapi() {
     read -rp "  确认删除数据卷？(y/n，默认 n)：" bv </dev/tty
     if [[ "${bv:-n}" =~ ^[Yy]$ ]]; then
       docker volume rm freellmapi-data \
-        && green "  ✅ 数据卷已删除。" \
-        || yellow "  ⚠️  请手动：docker volume rm freellmapi-data"
+        && green "  ✅ 数据卷已删除。" || yellow "  ⚠️  请手动：docker volume rm freellmapi-data"
     else
       yellow "  已保留数据卷 freellmapi-data。"
     fi
@@ -2012,8 +2103,7 @@ function uninstall_freellmapi() {
     local cnt; cnt=$(echo "$dangling" | wc -l)
     read -rp "  发现 ${cnt} 个悬空镜像，是否清理？(y/n，默认 n)：" cd2 </dev/tty
     [[ "${cd2:-n}" =~ ^[Yy]$ ]] \
-      && docker image prune -f && green "  ✅ 已清理。" \
-      || yellow "  跳过清理。"
+      && docker image prune -f && green "  ✅ 已清理。" || yellow "  跳过清理。"
   else
     green "  ✅ 无悬空镜像。"
   fi
@@ -2025,9 +2115,7 @@ function uninstall_freellmapi() {
 }
 
 function uninstall_general_service() {
-  local cname="$1"
-  local data_name="$2"
-  local img_pat="$3"
+  local cname="$1"; local data_name="$2"; local img_pat="$3"
   local data_dir="$HOME/$data_name"
 
   yellow "── 卸载 $cname ──"
@@ -2035,8 +2123,7 @@ function uninstall_general_service() {
   if docker ps -a --format '{{.Names}}' | grep -Eq "^${cname}$"; then
     yellow "停止并删除容器 $cname ..."
     docker stop "$cname" && docker rm "$cname" \
-      && green "  ✅ 容器已删除。" \
-      || red "  ❌ 请手动：docker rm -f $cname"
+      && green "  ✅ 容器已删除。" || red "  ❌ 请手动：docker rm -f $cname"
   else
     yellow "  未发现容器 $cname，跳过。"
   fi
@@ -2048,8 +2135,7 @@ function uninstall_general_service() {
     read -rp "  是否删除镜像？(y/n，默认 n)：" di </dev/tty
     if [[ "${di:-n}" =~ ^[Yy]$ ]]; then
       echo "$imgs" | xargs docker rmi 2>/dev/null \
-        && green "  ✅ 镜像已删除。" \
-        || yellow "  ⚠️  部分镜像删除失败。"
+        && green "  ✅ 镜像已删除。" || yellow "  ⚠️  部分镜像删除失败。"
     fi
   else
     yellow "  未发现相关镜像，跳过。"
@@ -2059,7 +2145,7 @@ function uninstall_general_service() {
     yellow "  数据目录：$data_dir"
     read -rp "  是否删除（不可逆）？(y/n，默认 n)：" dd </dev/tty
     if [[ "${dd:-n}" =~ ^[Yy]$ ]]; then
-      read -rp "  是否先备份到 ${data_dir}-backup？(y/n，默认 n)：" bk </dev/tty
+      read -rp "  是否先备份？(y/n，默认 n)：" bk </dev/tty
       local do_del=true
       if [[ "${bk:-n}" =~ ^[Yy]$ ]]; then
         local bdir="${data_dir}-backup-$(date +%Y%m%d_%H%M%S)"
@@ -2152,12 +2238,10 @@ function main_menu() {
     fi
 
     local mirror_status="未配置"
-    local cur_mirrors
-    cur_mirrors=$(_read_current_mirrors)
+    local cur_mirrors; cur_mirrors=$(_read_current_mirrors)
     [[ -n "$cur_mirrors" ]] && mirror_status="已配置 $(echo "$cur_mirrors" | grep -c 'https' || echo 0) 个"
 
-    local pack_type
-    pack_type=$(_check_pack_tools)
+    local pack_type; pack_type=$(_check_pack_tools)
 
     echo ""
     echo "================= Docker 服务管理 ================="
@@ -2177,7 +2261,7 @@ function main_menu() {
     echo "---------------------------------------------------"
     echo " 7) 卸载 One-API / New-API"
     echo " 8) 查看所有容器状态"
-    echo " 9) 备份 / 恢复 FreeLLMAPI 数据"
+    echo " 9) 💾 备份 / 恢复（One-API / New-API / FreeLLMAPI）"
     echo "10) 🚀 Docker 镜像加速器配置（解决国内拉取慢）"
     echo "---------------------------------------------------"
     echo " 0) 退出"
@@ -2194,7 +2278,7 @@ function main_menu() {
       6)  uninstall_freellmapi         || true; press_any_key ;;
       7)  uninstall_menu               || true ;;
       8)  view_container_status        || true; press_any_key ;;
-      9)  freellmapi_backup_menu       || true ;;
+      9)  backup_restore_menu          || true ;;
       10) configure_docker_mirror      || true ;;
       0)  green "感谢使用，脚本退出。"; exit 0 ;;
       *)  red "无效选项 '$ch'，请输入 0-10。" ;;
