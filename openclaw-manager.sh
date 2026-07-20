@@ -181,12 +181,7 @@ backup_config() {
     local cfg="${1:-$(get_active_config_path)}"
     [[ ! -f "$cfg" ]] && return 0
     local backup="${cfg}.bak.$(date +%Y%m%d_%H%M%S)"
-    if cp "$cfg" "$backup" 2>/dev/null; then
-        echo "$backup"
-    else
-        echo ""
-        return 1
-    fi
+    cp "$cfg" "$backup" 2>/dev/null && echo "$backup"
 }
 
 atomic_write_json() {
@@ -233,7 +228,7 @@ if gw.get("bind") == "localhost":
     changed.append("gateway.bind: localhost -> loopback")
 elif gw.get("bind") not in VALID_BIND:
     gw["bind"] = "loopback"
-    changed.append("gateway.bind: 无效值 -> loopback")
+    changed.append(f"gateway.bind: invalid -> loopback")
 
 if not gw.get("mode"):
     gw["mode"] = "local"
@@ -242,14 +237,14 @@ if not gw.get("mode"):
 for bad_key in BAD_ROOT_KEYS:
     if bad_key in cfg:
         del cfg[bad_key]
-        changed.append(f"已删除 {bad_key}")
+        changed.append(f"removed {bad_key}")
 
 if "agents" in cfg and isinstance(cfg["agents"], dict):
     defaults = cfg["agents"].get("defaults", {})
     if isinstance(defaults, dict):
         if "model" in defaults:
             del defaults["model"]
-            changed.append("已删除 agents.defaults.model")
+            changed.append("removed agents.defaults.model")
         if not defaults:
             del cfg["agents"]["defaults"]
     if not cfg.get("agents"):
@@ -309,7 +304,7 @@ for name, p in providers.items():
         new_url = pattern.sub(r'\1host.docker.internal', url)
         if new_url != url:
             p["baseUrl"] = new_url
-            changed.append(f"providers.{name}: 局域网URL -> host.docker.internal")
+            changed.append(f"providers.{name}: LAN URL -> host.docker.internal")
 
 if changed:
     tmp = cfg_path + ".tmp"
@@ -404,100 +399,100 @@ detect_system() {
 
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64|amd64)   ARCH_LABEL="x86_64 (64位)"   ;;
-        aarch64|arm64)  ARCH_LABEL="ARM64 (64位)"    ;;
-        armv7l|armv6l)  ARCH_LABEL="ARMv7/v6 (32位)" ;;
-        i386|i686)      ARCH_LABEL="x86 (32位)"      ;;
-        *)              ARCH_LABEL="$ARCH"            ;;
+        x86_64|amd64)   ARCH_LABEL="x86_64 (64-bit)"   ;;
+        aarch64|arm64)  ARCH_LABEL="ARM64 (64-bit)"    ;;
+        armv7l|armv6l)  ARCH_LABEL="ARMv7/v6 (32-bit)" ;;
+        i386|i686)      ARCH_LABEL="x86 (32-bit)"      ;;
+        *)              ARCH_LABEL="$ARCH"             ;;
     esac
 }
 
 print_sysinfo() {
     detect_system
-    echo -e "${CYAN}${BOLD}系统信息${NC}"
+    echo -e "${CYAN}${BOLD}System Info${NC}"
     print_line
-    echo -e "  ${BOLD}操作系统${NC}    : $(echo "${OS}" | tr '[:lower:]' '[:upper:]') (${PRETTY_NAME})"
-    echo -e "  ${BOLD}架构${NC}        : ${ARCH_LABEL}"
-    echo -e "  ${BOLD}包管理器${NC}    : ${PKG_MANAGER}"
-    echo -e "  ${BOLD}服务管理器${NC}  : ${SERVICE_MANAGER}"
-    echo -e "  ${BOLD}主机名${NC}      : $(hostname)"
-    echo -e "  ${BOLD}内存${NC}        : $(free -h 2>/dev/null | awk '/^Mem:/{print $2}' \
+    echo -e "  ${BOLD}OS${NC}          : $(echo "${OS}" | tr '[:lower:]' '[:upper:]') (${PRETTY_NAME})"
+    echo -e "  ${BOLD}Arch${NC}        : ${ARCH_LABEL}"
+    echo -e "  ${BOLD}Package Mgr${NC} : ${PKG_MANAGER}"
+    echo -e "  ${BOLD}Service Mgr${NC} : ${SERVICE_MANAGER}"
+    echo -e "  ${BOLD}Hostname${NC}    : $(hostname)"
+    echo -e "  ${BOLD}Memory${NC}      : $(free -h 2>/dev/null | awk '/^Mem:/{print $2}' \
                              || sysctl hw.memsize 2>/dev/null | awk '{printf "%.1fGB",$2/1073741824}' \
-                             || echo '未知')"
-    echo -e "  ${BOLD}CPU${NC}         : $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '?') 核"
-    echo -e "  ${BOLD}磁盘可用${NC}    : $(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo '未知')"
-    echo -e "  ${BOLD}Node.js${NC}     : $(node -v 2>/dev/null || echo '未安装')"
-    echo -e "  ${BOLD}npm${NC}         : $(npm -v 2>/dev/null | sed 's/^/v/' || echo '未安装')"
-    echo -e "  ${BOLD}Docker${NC}      : $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo '未安装')"
-    echo -e "  ${BOLD}OpenClaw${NC}    : $(openclaw_cmd --version 2>/dev/null || echo '未安装')"
-    echo -e "  ${BOLD}部署方式${NC}    : $(_detect_deploy_mode)"
-    echo -e "  ${BOLD}配置路径${NC}    : $(get_active_config_path)"
+                             || echo 'N/A')"
+    echo -e "  ${BOLD}CPU${NC}         : $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '?') cores"
+    echo -e "  ${BOLD}Disk Free${NC}   : $(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo 'N/A')"
+    echo -e "  ${BOLD}Node.js${NC}     : $(node -v 2>/dev/null || echo 'Not installed')"
+    echo -e "  ${BOLD}npm${NC}         : $(npm -v 2>/dev/null | sed 's/^/v/' || echo 'Not installed')"
+    echo -e "  ${BOLD}Docker${NC}      : $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo 'Not installed')"
+    echo -e "  ${BOLD}OpenClaw${NC}    : $(openclaw_cmd --version 2>/dev/null || echo 'Not installed')"
+    echo -e "  ${BOLD}Deploy Mode${NC} : $(_detect_deploy_mode)"
+    echo -e "  ${BOLD}Config Path${NC} : $(get_active_config_path)"
     local cfg_path
     cfg_path=$(get_active_config_path)
-    echo -e "  ${BOLD}配置状态${NC}    : $([[ -f "$cfg_path" ]] && (json_is_valid "$cfg_path" && echo "${GREEN}有效${NC}" || echo "${RED}损坏${NC}") || echo '未创建')"
+    echo -e "  ${BOLD}Config${NC}      : $([[ -f "$cfg_path" ]] && (json_is_valid "$cfg_path" && echo "${GREEN}Valid${NC}" || echo "${RED}Corrupted${NC}") || echo 'Not created')"
     if [[ -n "${G_DEFAULT_PROVIDER:-}" ]]; then
-        echo -e "  ${BOLD}默认 AI${NC}     : ${GREEN}${G_DEFAULT_PROVIDER}${NC}"
+        echo -e "  ${BOLD}Default AI${NC}  : ${GREEN}${G_DEFAULT_PROVIDER}${NC}"
     fi
     print_line
 }
 
 _detect_deploy_mode() {
     if is_docker_mode; then
-        echo "Docker 容器"
+        echo "Docker Container"
     elif has_cmd openclaw; then
-        echo "本地安装 (npm)"
+        echo "Local Install (npm)"
     else
-        echo "未部署"
+        echo "Not Deployed"
     fi
 }
 
 repair_broken_config() {
-    msg_title "🛠️  修复损坏配置"
+    msg_title "Repair Config"
 
     local cfg
     cfg=$(get_active_config_path)
 
     if [[ ! -f "$cfg" ]]; then
-        msg_info "配置不存在，创建最小配置"
+        msg_info "Config does not exist, creating minimal config"
         _create_minimal_config
         wait_and_return 2
         return 0
     fi
 
     if json_is_valid; then
-        msg_ok "JSON 格式有效"
+        msg_ok "JSON is valid"
         echo ""
-        msg_step "执行 schema 兼容清理..."
+        msg_step "Running schema cleanup..."
         local result
         result=$(sanitize_config_for_schema 2>&1)
         if [[ "$result" == "NOCHANGE" ]]; then
-            msg_ok "无需修改"
+            msg_ok "No changes needed"
         else
             echo "$result" | sed 's/^/  /'
-            msg_ok "已清理完成"
+            msg_ok "Cleaned up"
         fi
         wait_and_return 3
         return 0
     fi
 
-    msg_fail "JSON 格式损坏"
-    echo -e "${CYAN}文件路径:${NC} $cfg"
+    msg_fail "JSON format is corrupted"
+    echo -e "${CYAN}File:${NC} $cfg"
     echo ""
 
     if has_cmd python3; then
         local err
         err=$(python3 -c "import json; json.load(open('$cfg'))" 2>&1 | tail -1)
-        echo -e "${YELLOW}错误信息:${NC} $err"
+        echo -e "${YELLOW}Error:${NC} $err"
         echo ""
     fi
 
-    echo -e "${BOLD}修复方案:${NC}"
-    echo -e "  ${BOLD}1)${NC} 备份并重建 ${GREEN}(推荐)${NC}"
-    echo -e "  ${BOLD}2)${NC} 手动编辑"
-    echo -e "  ${BOLD}3)${NC} 智能修剪"
-    echo -e "  ${BOLD}0)${NC} 取消"
+    echo -e "${BOLD}Options:${NC}"
+    echo -e "  ${BOLD}1)${NC} Backup and rebuild ${GREEN}(recommended)${NC}"
+    echo -e "  ${BOLD}2)${NC} Manual edit"
+    echo -e "  ${BOLD}3)${NC} Smart repair"
+    echo -e "  ${BOLD}0)${NC} Cancel"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local rc
     read -r rc </dev/tty || rc="0"
 
@@ -505,27 +500,27 @@ repair_broken_config() {
         1)
             local backup
             backup=$(backup_config)
-            [[ -n "$backup" ]] && msg_ok "已备份: $backup"
+            [[ -n "$backup" ]] && msg_ok "Backed up: $backup"
             _create_minimal_config
-            msg_ok "已重建"
+            msg_ok "Rebuilt"
             ;;
         2)
             local backup
             backup=$(backup_config)
-            [[ -n "$backup" ]] && msg_ok "已备份: $backup"
+            [[ -n "$backup" ]] && msg_ok "Backed up: $backup"
             local editor="${EDITOR:-nano}"
             has_cmd "$editor" || editor="vi"
             $editor "$cfg" </dev/tty
             if json_is_valid; then
-                msg_ok "修复成功"
+                msg_ok "Repair successful"
                 sanitize_config_for_schema
             else
-                msg_fail "仍然无效"
+                msg_fail "Still invalid"
             fi
             ;;
         3) _smart_repair_config ;;
-        0) msg_info "已取消" ;;
-        *) msg_warn "无效选项" ;;
+        0) msg_info "Cancelled" ;;
+        *) msg_warn "Invalid choice" ;;
     esac
 
     wait_and_return 3
@@ -534,7 +529,7 @@ repair_broken_config() {
 
 _smart_repair_config() {
     if ! has_cmd python3; then
-        msg_fail "需要 python3"
+        msg_fail "Requires python3"
         return 1
     fi
 
@@ -542,7 +537,7 @@ _smart_repair_config() {
     cfg=$(get_active_config_path)
     local backup
     backup=$(backup_config)
-    [[ -n "$backup" ]] && msg_ok "已备份: $backup"
+    [[ -n "$backup" ]] && msg_ok "Backed up: $backup"
 
     python3 - "$cfg" << 'PYEOF'
 import json, re, sys
@@ -581,9 +576,9 @@ PYEOF
     if json_is_valid; then
         sanitize_config_for_schema
         fix_docker_ownership
-        msg_ok "修复完成"
+        msg_ok "Completed"
     else
-        msg_fail "仍然无效"
+        msg_fail "Still invalid"
     fi
 }
 
@@ -675,10 +670,10 @@ except: pass
 }
 
 show_token_manager() {
-    msg_title "${KEY} 网关令牌管理"
+    msg_title "${KEY} Gateway Token Manager"
 
     if ! json_is_valid; then
-        msg_fail "配置无效，请使用菜单 [16] 修复"
+        msg_fail "Config invalid, please repair with menu [16]"
         wait_and_return 3
         return 0
     fi
@@ -687,48 +682,48 @@ show_token_manager() {
     token=$(get_gateway_token)
     local_ip=$(get_local_ip)
 
-    echo -e "${CYAN}${BOLD}令牌状态${NC}"
+    echo -e "${CYAN}${BOLD}Token Status${NC}"
     print_line
     if [[ -n "$token" ]]; then
-        echo -e "  ${BOLD}状态:${NC}   ${GREEN}已设置${NC}"
-        echo -e "  ${BOLD}令牌:${NC}   ${YELLOW}${token}${NC}"
+        echo -e "  ${BOLD}Status:${NC}  ${GREEN}Set${NC}"
+        echo -e "  ${BOLD}Token:${NC}   ${YELLOW}${token}${NC}"
         echo ""
-        echo -e "  ${BOLD}访问地址:${NC}"
+        echo -e "  ${BOLD}Access URL:${NC}"
         echo -e "  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}?token=${token}${NC}"
     else
-        echo -e "  ${BOLD}状态:${NC}   ${DIM}未设置${NC}"
+        echo -e "  ${BOLD}Status:${NC}  ${DIM}Not set${NC}"
         echo -e "  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${NC}"
     fi
     print_line
     echo ""
 
-    echo -e "  ${BOLD}1)${NC} 查看令牌"
-    echo -e "  ${BOLD}2)${NC} 生成新令牌"
-    echo -e "  ${BOLD}3)${NC} 手动设置"
-    echo -e "  ${BOLD}4)${NC} 删除令牌"
-    echo -e "  ${BOLD}5)${NC} 查看控制台地址"
-    echo -e "  ${BOLD}0)${NC} 返回"
+    echo -e "  ${BOLD}1)${NC} View token"
+    echo -e "  ${BOLD}2)${NC} Generate new token"
+    echo -e "  ${BOLD}3)${NC} Set manually"
+    echo -e "  ${BOLD}4)${NC} Remove token"
+    echo -e "  ${BOLD}5)${NC} dashboard --no-open"
+    echo -e "  ${BOLD}0)${NC} Return"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local tc
     read -r tc </dev/tty || tc="0"
 
     case "$tc" in
-        1) [[ -n "$token" ]] && echo -e "\n${YELLOW}${token}${NC}" || msg_warn "未设置" ;;
+        1) [[ -n "$token" ]] && echo -e "\n${YELLOW}${token}${NC}" || msg_warn "Not set" ;;
         2)
             local new_token
             new_token=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null | tr -d '\n' || echo "$(date +%s%N)")
             _set_gateway_token "$new_token"
             ;;
         3)
-            echo -ne "\n${BOLD}令牌 (至少 16 位): ${NC}"
+            echo -ne "\n${BOLD}Token (min 16 chars): ${NC}"
             local ct; read -r ct </dev/tty || ct=""
-            [[ ${#ct} -lt 16 ]] && msg_fail "令牌太短" || _set_gateway_token "$ct"
+            [[ ${#ct} -lt 16 ]] && msg_fail "Too short" || _set_gateway_token "$ct"
             ;;
-        4) confirm "确认删除令牌?" && _remove_gateway_token ;;
-        5) is_openclaw_installed && openclaw_cmd dashboard --no-open 2>&1 | tail -20 || msg_fail "未安装" ;;
+        4) confirm "Confirm delete?" && _remove_gateway_token ;;
+        5) is_openclaw_installed && openclaw_cmd dashboard --no-open 2>&1 | tail -20 || msg_fail "Not installed" ;;
         0) return 0 ;;
-        *) msg_warn "无效选项" ;;
+        *) msg_warn "Invalid" ;;
     esac
 
     wait_and_return 3
@@ -765,9 +760,9 @@ print("OK")
 PYEOF
         chmod 600 "$cfg"
         fix_docker_ownership
-        msg_ok "令牌已更新"
-        echo -e "\n${GREEN}${BOLD}新令牌:${NC} ${YELLOW}${new_token}${NC}"
-        confirm "立即重启 Gateway?" && manage_service restart >/dev/null 2>&1
+        msg_ok "Token updated"
+        echo -e "\n${GREEN}${BOLD}New Token:${NC} ${YELLOW}${new_token}${NC}"
+        confirm "Restart Gateway?" && manage_service restart >/dev/null 2>&1
     fi
 }
 
@@ -798,7 +793,7 @@ with open(cfg_path, "w") as f:
 PYEOF
         chmod 600 "$cfg"
         fix_docker_ownership
-        msg_ok "令牌已删除"
+        msg_ok "Token removed"
     fi
 }
 
@@ -809,10 +804,10 @@ sync_agent_auth() {
     local api_type="$4"
     local agent_name="${5:-main}"
 
-    msg_step "同步认证到 Agent [${agent_name}] provider=${provider_name}..."
+    msg_step "Syncing auth to Agent [${agent_name}] provider=${provider_name}..."
 
     if ! is_openclaw_installed; then
-        msg_warn "未安装，跳过"
+        msg_warn "Not installed, skipping"
         return 1
     fi
 
@@ -826,7 +821,7 @@ sync_agent_auth() {
         msg_ok "Agent [${agent_name}] <- ${provider_name}"
         return 0
     else
-        msg_warn "注入失败 (${provider_name})"
+        msg_warn "Injection failed (${provider_name})"
         return 1
     fi
 }
@@ -896,16 +891,16 @@ PYEOF
 }
 
 fix_agent_auth_menu() {
-    msg_title "${LINK} 修复 Agent 认证"
+    msg_title "${LINK} Fix Agent Auth"
 
     if ! is_openclaw_installed; then
-        msg_fail "未安装"
+        msg_fail "Not installed"
         wait_and_return 2
         return 0
     fi
 
     if ! json_is_valid; then
-        msg_fail "配置损坏，请先修复"
+        msg_fail "Config corrupted, please repair first"
         wait_and_return 3
         return 0
     fi
@@ -913,40 +908,40 @@ fix_agent_auth_menu() {
     load_config_from_file
 
     if [[ ${#G_API_URLS[@]} -eq 0 && ${#G_API_KEYS[@]} -eq 0 ]]; then
-        msg_fail "未配置任何 Provider"
+        msg_fail "No Provider configured"
         wait_and_return 3
         return 0
     fi
 
-    echo -e "${CYAN}当前 Agents:${NC}"
-    openclaw_cmd agents list 2>&1 | head -15 | sed 's/^/  /' || echo "  (无法列出)"
+    echo -e "${CYAN}Current Agents:${NC}"
+    openclaw_cmd agents list 2>&1 | head -15 | sed 's/^/  /' || echo "  (cannot list)"
     echo ""
 
-    echo -ne "${BOLD}Agent 名称 (默认: main): ${NC}"
+    echo -ne "${BOLD}Agent name (default: main): ${NC}"
     local agent_name
     read -r agent_name </dev/tty || agent_name="main"
     agent_name=${agent_name:-main}
 
     echo ""
-    echo -e "${CYAN}将同步以下 Provider:${NC}"
+    echo -e "${CYAN}Will sync:${NC}"
     for p in "${!G_API_URLS[@]}"; do
         [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
         echo -e "  * ${BOLD}$p${NC} -> ${DIM}${G_API_URLS[$p]}${NC}"
     done
     for p in anthropic openai google deepseek groq mistral; do
         [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
-        echo -e "  * ${BOLD}$p${NC} ${DIM}(内置)${NC}"
+        echo -e "  * ${BOLD}$p${NC} ${DIM}(builtin)${NC}"
     done
     echo ""
 
     local inject_openai_alias=false
     if [[ ${#G_API_URLS[@]} -gt 0 ]] && [[ -z "${G_API_KEYS[openai]:-}" ]]; then
-        echo -e "${YELLOW}检测到自定义 Provider 但未配置 openai${NC}"
-        confirm "以 openai 别名注入 (推荐，解决前端默认调用问题)?" && inject_openai_alias=true
+        echo -e "${YELLOW}Detected custom Provider but no openai${NC}"
+        confirm "Inject as openai alias (recommended)?" && inject_openai_alias=true
         echo ""
     fi
 
-    confirm "确认执行?" || { wait_and_return 2; return 0; }
+    confirm "Confirm?" || { wait_and_return 2; return 0; }
 
     local ok=0 fail=0
     local first_custom=""
@@ -988,16 +983,16 @@ fix_agent_auth_menu() {
     done
 
     echo ""
-    msg_step "重启 Gateway..."
+    msg_step "Restarting Gateway..."
     manage_service restart >/dev/null 2>&1
     sleep 3
 
     echo ""
     print_line
-    echo -e "${BOLD}执行结果:${NC}  成功 ${GREEN}${ok}${NC}  失败 ${RED}${fail}${NC}"
+    echo -e "${BOLD}Result:${NC}  Success ${GREEN}${ok}${NC}  Failed ${RED}${fail}${NC}"
     print_line
 
-    echo -e "\n${YELLOW}提示: 浏览器按 Ctrl+Shift+R 硬刷新${NC}"
+    echo -e "\n${YELLOW}Browser Ctrl+Shift+R to hard refresh${NC}"
 
     wait_and_return 5
     return 0
@@ -1045,7 +1040,7 @@ _persist_default_agent_model() {
     fi
 
     local full_model="${provider}/${model}"
-    msg_info "设置默认模型: $full_model"
+    msg_info "Setting default model: $full_model"
 
     if has_cmd python3; then
         local cfg
@@ -1074,23 +1069,23 @@ print("OK")
 PYEOF
             chmod 600 "$cfg"
             fix_docker_ownership
-            msg_ok "默认模型已固化"
+            msg_ok "Default model persisted"
             return 0
         fi
     fi
 
-    msg_warn "无法固化默认模型，请在 UI 手动选择"
+    msg_warn "Cannot persist default model, please select in UI"
     return 1
 }
 
 configure_custom_api() {
-    msg_title "🔧 自定义 API 一键部署"
+    msg_title "Custom API One-Click Deploy"
 
     local cfg
     cfg=$(get_active_config_path)
 
     if [[ -f "$cfg" ]] && ! json_is_valid; then
-        msg_fail "配置损坏，请先使用菜单 [16] 修复"
+        msg_fail "Config corrupted, please repair with menu [16]"
         wait_and_return 3
         return 1
     fi
@@ -1098,24 +1093,24 @@ configure_custom_api() {
     local docker_mode=false
     is_docker_mode && docker_mode=true
 
-    echo -e "${CYAN}${BOLD}配置 + Agent 认证 + 启动 Gateway${NC}"
+    echo -e "${CYAN}${BOLD}Config + Agent Auth + Gateway Start${NC}"
     if $docker_mode; then
-        echo -e "${YELLOW}检测到 Docker 部署模式${NC}"
-        echo -e "${DIM}   局域网 IP 将自动转换为 host.docker.internal${NC}"
+        echo -e "${YELLOW}Detected Docker deploy mode${NC}"
+        echo -e "${DIM}   LAN IP will auto-convert to host.docker.internal${NC}"
     fi
     echo ""
 
-    echo -ne "${CYAN}Provider 名称 (推荐: openai / new-api / ollama): ${NC}"
+    echo -ne "${CYAN}Provider name (recommend: openai / new-api / ollama): ${NC}"
     local provider_name
     read -r provider_name </dev/tty || provider_name=""
     provider_name=${provider_name:-openai}
     provider_name=$(echo "$provider_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
 
     echo ""
-    echo -e "${YELLOW}OpenAI 兼容 API 推荐命名为 openai${NC}"
+    echo -e "${YELLOW}OpenAI compatible API recommended name: openai${NC}"
     echo ""
 
-    echo -e "${DIM}URL 示例:${NC}"
+    echo -e "${DIM}URL examples:${NC}"
     echo -e "  ${DIM}* http://192.168.x.x:xxxx${NC}"
     echo -e "  ${DIM}* https://api.deepseek.com/v1${NC}"
     echo -e "  ${DIM}* http://127.0.0.1:11434${NC}"
@@ -1124,7 +1119,7 @@ configure_custom_api() {
     local base_url
     read -r base_url </dev/tty || base_url=""
 
-    [[ -z "$base_url" ]] && { msg_warn "URL 不能为空"; return 1; }
+    [[ -z "$base_url" ]] && { msg_warn "URL cannot be empty"; return 1; }
 
     local final_url="$base_url"
     if $docker_mode && is_lan_url "$base_url"; then
@@ -1132,31 +1127,31 @@ configure_custom_api() {
         converted=$(convert_url_for_docker "$base_url")
         if [[ "$converted" != "$base_url" ]]; then
             echo ""
-            msg_warn "Docker 模式检测到局域网 URL"
-            echo -e "  ${DIM}原始:${NC} $base_url"
-            echo -e "  ${DIM}转换:${NC} ${GREEN}$converted${NC}"
+            msg_warn "Docker mode detected LAN URL"
+            echo -e "  ${DIM}Original:${NC} $base_url"
+            echo -e "  ${DIM}Converted:${NC} ${GREEN}$converted${NC}"
             echo ""
-            if confirm "使用转换后的 URL?"; then
+            if confirm "Use converted URL?"; then
                 final_url="$converted"
             fi
         fi
     fi
 
     echo ""
-    echo -ne "${CYAN}API Key (本地服务请输入 'local'): ${NC}"
+    echo -ne "${CYAN}API Key (enter 'local' for local service): ${NC}"
     local api_key
     read -rs api_key </dev/tty || api_key=""
     echo ""
     api_key=${api_key:-local}
 
     echo ""
-    echo -e "${CYAN}${BOLD}API 类型:${NC}"
+    echo -e "${CYAN}${BOLD}API Type:${NC}"
     echo -e "  ${BOLD}1)${NC} openai-completions"
     echo -e "  ${BOLD}2)${NC} openai-responses"
     echo -e "  ${BOLD}3)${NC} ollama"
     echo -e "  ${BOLD}4)${NC} anthropic-messages"
     echo ""
-    echo -ne "${CYAN}请选择 [1-4] (默认: 1): ${NC}"
+    echo -ne "${CYAN}Choose [1-4] (default: 1): ${NC}"
     local api_choice
     read -r api_choice </dev/tty || api_choice="1"
 
@@ -1169,18 +1164,18 @@ configure_custom_api() {
     esac
 
     echo ""
-    echo -ne "${CYAN}模型 ID (多个用英文逗号分隔): ${NC}"
+    echo -ne "${CYAN}Model ID (comma separated for multiple): ${NC}"
     local model_ids
     read -r model_ids </dev/tty || model_ids=""
 
-    [[ -z "$model_ids" ]] && { msg_warn "模型 ID 不能为空"; return 1; }
+    [[ -z "$model_ids" ]] && { msg_warn "Model ID cannot be empty"; return 1; }
 
     echo ""
     local default_model
     if [[ "$model_ids" == *","* ]]; then
-        echo -e "${CYAN}检测到多个模型，请选择默认模型:${NC}"
+        echo -e "${CYAN}Multiple models, select default:${NC}"
         local i=1
-        local -a m_arr=()
+        declare -a m_arr=()
         IFS=',' read -ra m_arr <<< "$model_ids"
         for m in "${m_arr[@]}"; do
             m=$(echo "$m" | xargs)
@@ -1188,7 +1183,7 @@ configure_custom_api() {
             ((i++))
         done
         echo ""
-        echo -ne "${CYAN}请选择 [1-$((i-1))] (默认: 1): ${NC}"
+        echo -ne "${CYAN}Choose [1-$((i-1))] (default: 1): ${NC}"
         local dc
         read -r dc </dev/tty || dc="1"
         [[ "$dc" =~ ^[0-9]+$ ]] && (( dc >= 1 && dc <= ${#m_arr[@]} )) || dc=1
@@ -1200,7 +1195,7 @@ configure_custom_api() {
     local inject_openai_alias=false
     if [[ "$provider_name" != "openai" ]]; then
         echo ""
-        confirm "同时以 openai 别名注入认证 (强烈推荐)?" && inject_openai_alias=true
+        confirm "Also inject as openai alias (strongly recommended)?" && inject_openai_alias=true
     fi
 
     G_API_URLS["$provider_name"]="$final_url"
@@ -1211,36 +1206,36 @@ configure_custom_api() {
 
     echo ""
     print_line
-    echo -e "${GREEN}${BOLD}开始一键部署...${NC}"
+    echo -e "${GREEN}${BOLD}Starting one-click deploy...${NC}"
     print_line
 
     echo ""
-    msg_step "步骤 1/6: 写入配置..."
+    msg_step "Step 1/6: Writing config..."
     _write_custom_provider_config "$provider_name" "$default_model"
 
     echo ""
-    msg_step "步骤 2/6: 同步认证到 main Agent..."
+    msg_step "Step 2/6: Syncing auth to main Agent..."
     sync_agent_auth "$provider_name" "$final_url" "$api_key" "$api_type" "main" || true
 
     if $inject_openai_alias; then
         echo ""
-        msg_step "步骤 3/6: 注入 openai 别名..."
+        msg_step "Step 3/6: Injecting openai alias..."
         sync_agent_auth "openai" "$final_url" "$api_key" "$api_type" "main" || true
     fi
 
     echo ""
-    msg_step "步骤 4/6: schema 兼容清理..."
+    msg_step "Step 4/6: Schema cleanup..."
     sanitize_config_for_schema | sed 's/^/  /'
 
     echo ""
-    msg_step "步骤 5/6: 固化默认模型..."
+    msg_step "Step 5/6: Persisting default model..."
     _persist_default_agent_model "$provider_name" "$default_model"
 
     echo ""
-    msg_step "步骤 6/6: 重启 Gateway..."
+    msg_step "Step 6/6: Restarting Gateway..."
     manage_service restart >/dev/null 2>&1 || true
 
-    echo -ne "  等待服务就绪"
+    echo -ne "  Waiting for ready"
     local i=0
     local started=false
     while (( i < 30 )); do
@@ -1254,11 +1249,11 @@ configure_custom_api() {
     echo ""
 
     if $started; then
-        msg_ok "Gateway 已启动并可访问"
+        msg_ok "Gateway started and accessible"
     else
-        msg_warn "健康检测未通过"
+        msg_warn "Health check failed"
         echo ""
-        echo -e "${CYAN}日志尾部:${NC}"
+        echo -e "${CYAN}Log tail:${NC}"
         if $docker_mode; then
             docker logs --tail 15 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
         else
@@ -1266,28 +1261,28 @@ configure_custom_api() {
         fi
         echo ""
         if docker logs --tail 30 "$DOCKER_CONTAINER" 2>&1 | grep -qE "\[gateway\] ready|http server listening" 2>/dev/null; then
-            msg_ok "日志显示 Gateway 已就绪，可能为防火墙问题，请直接尝试浏览器访问"
+            msg_ok "Log shows Gateway ready - may be firewall issue, try browser access"
         fi
     fi
 
     echo ""
-    echo -e "${GREEN}${BOLD}一键部署完成！${NC}"
+    echo -e "${GREEN}${BOLD}One-Click Deploy Complete!${NC}"
     echo ""
-    echo -e "  ${BOLD}Provider:${NC}    ${CYAN}${provider_name}${NC}"
-    echo -e "  ${BOLD}Base URL:${NC}    ${final_url}"
-    echo -e "  ${BOLD}API 类型:${NC}    ${CYAN}${api_type}${NC}"
-    echo -e "  ${BOLD}默认模型:${NC}    ${GREEN}${provider_name}/${default_model}${NC}"
-    $inject_openai_alias && echo -e "  ${BOLD}openai 别名:${NC} ${GREEN}已注入${NC}"
-    $docker_mode && [[ "$final_url" != "$base_url" ]] && echo -e "  ${BOLD}URL 已转换:${NC}  ${GREEN}是${NC}"
+    echo -e "  ${BOLD}Provider:${NC}  ${CYAN}${provider_name}${NC}"
+    echo -e "  ${BOLD}Base URL:${NC}  ${final_url}"
+    echo -e "  ${BOLD}API Type:${NC}  ${CYAN}${api_type}${NC}"
+    echo -e "  ${BOLD}Default Model:${NC}  ${GREEN}${provider_name}/${default_model}${NC}"
+    $inject_openai_alias && echo -e "  ${BOLD}openai alias:${NC} ${GREEN}Injected${NC}"
+    $docker_mode && [[ "$final_url" != "$base_url" ]] && echo -e "  ${BOLD}URL Converted:${NC}  ${GREEN}Yes${NC}"
     echo ""
 
     show_dashboard_info
 
     echo ""
-    echo -e "${YELLOW}${BOLD}使用说明:${NC}"
-    echo -e "  1. 打开控制台地址"
-    echo -e "  2. 硬刷新: ${BOLD}Ctrl+Shift+R${NC}"
-    echo -e "  3. 在模型选择器中选择: ${CYAN}${provider_name}/${default_model}${NC}"
+    echo -e "${YELLOW}${BOLD}Usage:${NC}"
+    echo -e "  1. Open Dashboard URL"
+    echo -e "  2. Hard refresh: ${BOLD}Ctrl+Shift+R${NC}"
+    echo -e "  3. Select model: ${CYAN}${provider_name}/${default_model}${NC}"
     echo ""
 
     return 0
@@ -1375,7 +1370,7 @@ print("OK")
 PYEOF
         chmod 600 "$cfg"
         fix_docker_ownership
-        msg_ok "配置已写入"
+        msg_ok "Config written"
     else
         _write_custom_provider_bash "$provider_name"
     fi
@@ -1423,22 +1418,22 @@ _write_custom_provider_bash() {
 }
 EOF
 )
-    atomic_write_json "$cfg" "$content" && msg_ok "配置已创建" || msg_fail "创建失败"
+    atomic_write_json "$cfg" "$content" && msg_ok "Config created" || msg_fail "Failed"
 }
 
 validate_config() {
     local cfg
     cfg=$(get_active_config_path)
 
-    msg_step "验证配置..."
+    msg_step "Validating config..."
 
     if [[ ! -f "$cfg" ]]; then
-        msg_fail "配置文件不存在"
+        msg_fail "Config does not exist"
         return 1
     fi
 
     if ! json_is_valid; then
-        msg_fail "JSON 无效，请使用菜单 [16] 修复"
+        msg_fail "JSON invalid, please repair with menu [16]"
         return 1
     fi
 
@@ -1446,26 +1441,26 @@ validate_config() {
         local out
         out=$(openclaw_cmd config validate 2>&1)
         if echo "$out" | grep -qiE "Invalid input|invalid config"; then
-            msg_fail "Schema 验证失败:"
+            msg_fail "Schema validation failed:"
             echo "$out" | grep -iE "×|invalid|allowed" | head -10 | sed 's/^/  /'
             echo ""
-            if confirm "自动清理不兼容字段?"; then
+            if confirm "Auto cleanup incompatible fields?"; then
                 sanitize_config_for_schema | sed 's/^/  /'
                 echo ""
-                msg_info "重新验证..."
+                msg_info "Re-validating..."
                 out=$(openclaw_cmd config validate 2>&1)
                 if echo "$out" | grep -qiE "Invalid input"; then
-                    msg_fail "验证仍然失败:"
+                    msg_fail "Still failed:"
                     echo "$out" | head -20 | sed 's/^/  /'
                     return 1
                 else
-                    msg_ok "验证通过"
+                    msg_ok "Passed"
                     return 0
                 fi
             fi
             return 1
         else
-            msg_ok "openclaw config validate 通过"
+            msg_ok "openclaw config validate passed"
             return 0
         fi
     fi
@@ -1483,7 +1478,7 @@ ensure_minimal_config() {
     fi
 
     if ! json_is_valid; then
-        msg_warn "配置损坏，备份并重建"
+        msg_warn "Config corrupted, backup and rebuild"
         backup_config
         _create_minimal_config
         return
@@ -1506,19 +1501,19 @@ _create_minimal_config() {
     "providers": {}
   }
 }'
-    atomic_write_json "$cfg" "$content" && msg_ok "最小配置已创建" || msg_fail "创建失败"
+    atomic_write_json "$cfg" "$content" && msg_ok "Minimal config created" || msg_fail "Failed"
 }
 
 configure_lan_access() {
-    msg_title "${LOBSTER} 局域网 UI 访问"
+    msg_title "${LOBSTER} LAN UI Access"
 
     if ! is_openclaw_installed; then
-        msg_fail "OpenClaw 未安装"
+        msg_fail "OpenClaw not installed"
         wait_and_return 2; return 0
     fi
 
     if ! json_is_valid; then
-        msg_fail "配置损坏，请先使用菜单 [16] 修复"
+        msg_fail "Config corrupted, please repair with menu [16]"
         wait_and_return 3
         return 0
     fi
@@ -1526,10 +1521,10 @@ configure_lan_access() {
     local cfg
     cfg=$(get_active_config_path)
 
-    echo -e "${CYAN}配置文件:${NC} ${DIM}${cfg}${NC}"
+    echo -e "${CYAN}Config file:${NC} ${DIM}${cfg}${NC}"
     echo ""
 
-    echo -e "${CYAN}当前 gateway 配置:${NC}"
+    echo -e "${CYAN}Current gateway config:${NC}"
     if [[ -f "$cfg" ]] && has_cmd python3; then
         python3 - "$cfg" << 'PYEOF'
 import json, sys
@@ -1537,33 +1532,33 @@ try:
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
     gw = cfg.get("gateway", {})
-    print(f"  bind       : {gw.get('bind', '未设置')}")
-    print(f"  mode       : {gw.get('mode', '未设置')}")
+    print(f"  bind       : {gw.get('bind', 'not set')}")
+    print(f"  mode       : {gw.get('mode', 'not set')}")
     auth = gw.get("auth", {})
-    print(f"  auth.mode  : {auth.get('mode', '未设置')}")
-    print(f"  auth.token : {'已设置' if auth.get('token') else '未设置'}")
+    print(f"  auth.mode  : {auth.get('mode', 'not set')}")
+    print(f"  auth.token : {'set' if auth.get('token') else 'not set'}")
     ui = gw.get("controlUi", {})
     print(f"  controlUi  : {json.dumps(ui, ensure_ascii=False)}")
 except Exception as e:
-    print(f"  读取失败: {e}")
+    print(f"  Read failed: {e}")
 PYEOF
     fi
 
     echo ""
     print_line
-    echo -e "${BOLD}将执行以下修改:${NC}"
-    echo -e "  ${CYAN}gateway.bind${NC} -> ${GREEN}\"lan\"${NC}  ${DIM}(局域网监听)${NC}"
-    echo -e "  ${CYAN}gateway.auth.token${NC} -> ${GREEN}自动生成${NC}"
-    echo -e "  ${CYAN}gateway.controlUi.*${NC} -> ${GREEN}放宽认证限制${NC}"
+    echo -e "${BOLD}Changes to apply:${NC}"
+    echo -e "  ${CYAN}gateway.bind${NC} -> ${GREEN}\"lan\"${NC}  ${DIM}(LAN listen)${NC}"
+    echo -e "  ${CYAN}gateway.auth.token${NC} -> ${GREEN}auto-generate${NC}"
+    echo -e "  ${CYAN}gateway.controlUi.*${NC} -> ${GREEN}relaxed auth${NC}"
     echo ""
-    echo -e "${RED}${WARN} 请勿将端口暴露至公网!${NC}"
+    echo -e "${RED}${WARN} Do not expose port to public internet!${NC}"
     echo ""
 
-    confirm "确认执行?" || { msg_info "已取消"; wait_and_return 2; return 0; }
+    confirm "Confirm?" || { msg_info "Cancelled"; wait_and_return 2; return 0; }
 
     local backup
     backup=$(backup_config)
-    [[ -n "$backup" ]] && msg_ok "已备份: $backup"
+    [[ -n "$backup" ]] && msg_ok "Backed up: $backup"
 
     mkdir -p "$(dirname "$cfg")"
     local gw_token=""
@@ -1618,29 +1613,29 @@ PYEOF
         if [[ $? -eq 0 ]]; then
             gw_token=$(echo "$py_result" | grep '^TOKEN=' | cut -d= -f2)
             fix_docker_ownership
-            msg_ok "局域网配置已写入"
+            msg_ok "LAN config written"
         else
-            msg_fail "写入失败"
+            msg_fail "Write failed"
             wait_and_return 2; return 0
         fi
     fi
 
     echo ""
-    msg_step "验证配置..."
+    msg_step "Validating..."
     local vout
     vout=$(openclaw_cmd config validate 2>&1)
     if echo "$vout" | grep -qiE "Invalid input"; then
-        msg_fail "验证失败，执行清理..."
+        msg_fail "Validation failed, cleaning..."
         sanitize_config_for_schema | sed 's/^/  /'
     else
-        msg_ok "验证通过"
+        msg_ok "Passed"
     fi
 
     echo ""
-    msg_step "重启 Gateway..."
+    msg_step "Restarting Gateway..."
     manage_service restart >/dev/null 2>&1
 
-    echo -ne "  等待服务就绪"
+    echo -ne "  Waiting for ready"
     local i=0
     local started=false
     while (( i < 20 )); do
@@ -1654,34 +1649,34 @@ PYEOF
     echo ""
 
     if $started; then
-        msg_ok "Gateway 已启动"
+        msg_ok "Gateway started"
     else
-        msg_warn "服务未响应"
+        msg_warn "No response"
     fi
 
     local local_ip; local_ip=$(get_local_ip)
     local token_qs=""
     [[ -n "$gw_token" ]] && token_qs="?token=${gw_token}"
     echo ""
-    echo -e "${GREEN}${BOLD}局域网 UI 访问信息${NC}"
+    echo -e "${GREEN}${BOLD}LAN UI Access Info${NC}"
     print_line
-    echo -e "  ${BOLD}本机:${NC}    ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${NC}"
-    echo -e "  ${BOLD}局域网:${NC}  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC}"
+    echo -e "  ${BOLD}Local:${NC}    ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${NC}"
+    echo -e "  ${BOLD}LAN:${NC}      ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC}"
     if [[ -n "$gw_token" ]]; then
         echo ""
         echo -e "  ${BOLD}WebSocket:${NC}    ${YELLOW}ws://${local_ip}:${OPENCLAW_PORT}${NC}"
-        echo -e "  ${BOLD}网关令牌:${NC}     ${YELLOW}${gw_token}${NC}"
+        echo -e "  ${BOLD}Token:${NC}        ${YELLOW}${gw_token}${NC}"
     fi
     echo ""
-    echo -e "  ${RED}请勿暴露至公网!${NC}"
+    echo -e "  ${RED}Do not expose to public internet!${NC}"
     print_line
     echo ""
-    echo -e "${CYAN}${BOLD}浏览器登录方式:${NC}"
-    echo -e "  1. 直接打开: ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC}"
-    echo -e "  2. 或手动填写:"
+    echo -e "${CYAN}${BOLD}Browser login:${NC}"
+    echo -e "  1. Open: ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC}"
+    echo -e "  2. Or manually:"
     echo -e "     ${DIM}WebSocket:${NC} ${YELLOW}ws://${local_ip}:${OPENCLAW_PORT}${NC}"
-    echo -e "     ${DIM}令牌:${NC}      ${YELLOW}${gw_token}${NC}"
-    echo -e "  3. 点击 ${BOLD}[连接]${NC}"
+    echo -e "     ${DIM}Token:${NC}      ${YELLOW}${gw_token}${NC}"
+    echo -e "  3. Click ${BOLD}[Connect]${NC}"
     echo ""
 
     log "LAN configured"
@@ -1689,31 +1684,31 @@ PYEOF
 }
 
 install_plugins() {
-    msg_title "${PLUGIN} 安装插件"
+    msg_title "${PLUGIN} Install Plugins"
 
     if ! is_openclaw_installed; then
-        msg_fail "未安装"
+        msg_fail "Not installed"
         wait_and_return 2; return 0
     fi
 
-    echo -e "  ${BOLD}1)${NC} ${LOBSTER} 微信"
-    echo -e "  ${BOLD}2)${NC} ${LOBSTER} 飞书"
-    echo -e "  ${BOLD}3)${NC} 全部安装"
-    echo -e "  ${BOLD}0)${NC} 返回"
+    echo -e "  ${BOLD}1)${NC} ${LOBSTER} WeChat"
+    echo -e "  ${BOLD}2)${NC} ${LOBSTER} Feishu"
+    echo -e "  ${BOLD}3)${NC} All"
+    echo -e "  ${BOLD}0)${NC} Return"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local choice
     read -r choice </dev/tty || choice="0"
 
     case "$choice" in
-        1) _install_single_plugin "微信" "$WECHAT_PLUGIN_PKG" ;;
-        2) _install_single_plugin "飞书" "$FEISHU_PLUGIN_PKG" ;;
+        1) _install_single_plugin "WeChat" "$WECHAT_PLUGIN_PKG" ;;
+        2) _install_single_plugin "Feishu" "$FEISHU_PLUGIN_PKG" ;;
         3)
-            _install_single_plugin "微信" "$WECHAT_PLUGIN_PKG"
-            _install_single_plugin "飞书" "$FEISHU_PLUGIN_PKG"
+            _install_single_plugin "WeChat" "$WECHAT_PLUGIN_PKG"
+            _install_single_plugin "Feishu" "$FEISHU_PLUGIN_PKG"
             ;;
         0) return 0 ;;
-        *) msg_warn "无效选项" ;;
+        *) msg_warn "Invalid" ;;
     esac
 
     wait_and_return 3; return 0
@@ -1722,65 +1717,65 @@ install_plugins() {
 _install_single_plugin() {
     local name="$1" pkg="$2"
     echo ""
-    msg_step "安装 ${name}..."
+    msg_step "Installing ${name}..."
     if openclaw_cmd plugins install "${pkg}" --force 2>&1 | tee -a "$LOG_FILE"; then
-        msg_ok "${name} 安装成功"
+        msg_ok "${name} success"
     else
-        msg_fail "${name} 安装失败"
+        msg_fail "${name} failed"
     fi
 }
 
 deploy_docker() {
-    msg_title "${DOCKER} Docker 部署"
+    msg_title "${DOCKER} Docker Deploy"
 
     if ! has_cmd docker; then
-        msg_warn "未检测到 Docker，开始安装..."
+        msg_warn "Docker not detected, installing..."
         _install_docker || { wait_and_return 3; return 0; }
     fi
 
-    echo -e "${CYAN}Docker 版本:${NC} $(docker --version 2>/dev/null || echo '未知')"
+    echo -e "${CYAN}Docker:${NC} $(docker --version 2>/dev/null || echo 'unknown')"
     echo ""
 
     if docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
         local container_status
         container_status=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null || echo "unknown")
-        echo -e "${CYAN}已有容器，状态:${NC} ${BOLD}${container_status}${NC}"
+        echo -e "${CYAN}Existing container:${NC} ${BOLD}${container_status}${NC}"
         echo ""
-        echo -e "  ${BOLD}1)${NC} 启动  ${BOLD}2)${NC} 停止  ${BOLD}3)${NC} 重启"
-        echo -e "  ${BOLD}4)${NC} 删除并重新部署  ${BOLD}5)${NC} 查看日志  ${BOLD}6)${NC} 进入容器"
-        echo -e "  ${BOLD}0)${NC} 返回"
+        echo -e "  ${BOLD}1)${NC} Start  ${BOLD}2)${NC} Stop  ${BOLD}3)${NC} Restart"
+        echo -e "  ${BOLD}4)${NC} Delete and redeploy  ${BOLD}5)${NC} Logs  ${BOLD}6)${NC} Shell"
+        echo -e "  ${BOLD}0)${NC} Return"
         echo ""
-        echo -ne "${BOLD}请选择: ${NC}"
+        echo -ne "${BOLD}Choose: ${NC}"
         local dc
         read -r dc </dev/tty || dc="0"
 
         case "$dc" in
-            1) docker start "$DOCKER_CONTAINER" && msg_ok "已启动" ;;
-            2) docker stop  "$DOCKER_CONTAINER" && msg_ok "已停止" ;;
-            3) docker restart "$DOCKER_CONTAINER" && msg_ok "已重启" ;;
-            4) confirm "确认删除并重新部署?" && { docker rm -f "$DOCKER_CONTAINER"; _docker_run; } ;;
-            5) trap 'echo ""; msg_info "已退出"' INT; docker logs -f "$DOCKER_CONTAINER" || true; trap - INT ;;
+            1) docker start "$DOCKER_CONTAINER" && msg_ok "Started" ;;
+            2) docker stop  "$DOCKER_CONTAINER" && msg_ok "Stopped" ;;
+            3) docker restart "$DOCKER_CONTAINER" && msg_ok "Restarted" ;;
+            4) confirm "Confirm?" && { docker rm -f "$DOCKER_CONTAINER"; _docker_run; } ;;
+            5) trap 'echo ""; msg_info "Exit"' INT; docker logs -f "$DOCKER_CONTAINER" || true; trap - INT ;;
             6) docker exec -it "$DOCKER_CONTAINER" /bin/sh 2>/dev/null || docker exec -it "$DOCKER_CONTAINER" /bin/bash 2>/dev/null ;;
             0) return 0 ;;
         esac
     else
-        echo -ne "  端口 (默认: ${OPENCLAW_PORT}): "
+        echo -ne "  Port (default: ${OPENCLAW_PORT}): "
         local port; read -r port </dev/tty || port=""; port=${port:-$OPENCLAW_PORT}
-        echo -ne "  数据目录 (默认: ${DOCKER_DATA_DIR}): "
+        echo -ne "  Data dir (default: ${DOCKER_DATA_DIR}): "
         local data_dir; read -r data_dir </dev/tty || data_dir=""; data_dir=${data_dir:-$DOCKER_DATA_DIR}
 
         echo ""
-        echo -e "${CYAN}${BOLD}网络模式:${NC}"
-        echo -e "  ${BOLD}1)${NC} bridge + host.docker.internal ${DIM}(默认，自动映射宿主机)${NC}"
-        echo -e "  ${BOLD}2)${NC} host                          ${DIM}(容器共享宿主机网络)${NC}"
+        echo -e "${CYAN}${BOLD}Network mode:${NC}"
+        echo -e "  ${BOLD}1)${NC} bridge + host.docker.internal ${DIM}(default, auto map host)${NC}"
+        echo -e "  ${BOLD}2)${NC} host                          ${DIM}(container shares host network)${NC}"
         echo ""
-        echo -ne "${CYAN}请选择 [1-2] (默认: 1): ${NC}"
+        echo -ne "${CYAN}Choose [1-2] (default: 1): ${NC}"
         local nm; read -r nm </dev/tty || nm="1"
         local network_mode="bridge"
         [[ "$nm" == "2" ]] && network_mode="host"
 
         local extra_opts=""
-        confirm "  启用局域网 UI 访问?" && extra_opts="--lan"
+        confirm "  Enable LAN UI access?" && extra_opts="--lan"
         mkdir -p "$data_dir"
         _docker_run "$port" "$data_dir" "$extra_opts" "$network_mode"
     fi
@@ -1799,11 +1794,11 @@ _docker_run() {
     chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null \
         || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
 
-    msg_step "拉取镜像..."
+    msg_step "Pulling image..."
     if docker pull "${image}:latest" 2>&1 | tail -3; then
-        msg_ok "拉取成功"
+        msg_ok "Pull success"
     else
-        msg_warn "GHCR 拉取失败，尝试 Docker Hub..."
+        msg_warn "GHCR failed, trying Docker Hub..."
         if docker pull "${DOCKER_IMAGE_MIRROR}:latest" 2>&1 | tail -3; then
             image="$DOCKER_IMAGE_MIRROR"
         fi
@@ -1813,7 +1808,7 @@ _docker_run() {
     local bind_v="loopback"
     [[ "$extra" == "--lan" ]] && bind_v="lan"
 
-    msg_info "准备初始配置 (bind: $bind_v)..."
+    msg_info "Preparing initial config (bind: $bind_v)..."
     local need_create=true
     if [[ -f "$container_config" ]] && has_cmd python3; then
         if python3 -c "
@@ -1822,7 +1817,7 @@ c=json.load(open('$container_config'))
 assert c.get('gateway',{}).get('bind') in ['auto','lan','loopback','custom','tailnet']
 assert c.get('gateway',{}).get('mode') == 'local'
 " 2>/dev/null; then
-            msg_info "现有配置有效，保留"
+            msg_info "Existing config valid, keeping"
             need_create=false
             if [[ "$extra" == "--lan" ]]; then
                 python3 - "$container_config" << 'PYEOF'
@@ -1834,7 +1829,7 @@ json.dump(c, open(p, "w"), indent=2, ensure_ascii=False)
 PYEOF
             fi
         else
-            msg_warn "现有配置无效，备份后覆盖"
+            msg_warn "Existing config invalid, backup and overwrite"
             cp "$container_config" "${container_config}.bak.$(date +%s)" 2>/dev/null || true
         fi
     fi
@@ -1860,7 +1855,7 @@ EOF
     chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}/.openclaw" 2>/dev/null \
         || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}/.openclaw" 2>/dev/null || true
 
-    msg_step "启动容器 (网络模式: ${network_mode})..."
+    msg_step "Starting container (network: ${network_mode})..."
     local run_cmd=(
         docker run -d
         --name "$DOCKER_CONTAINER"
@@ -1887,23 +1882,23 @@ EOF
         status=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null || echo "unknown")
 
         if [[ "$status" != "running" ]]; then
-            msg_fail "容器启动后立即退出 (状态: $status)"
+            msg_fail "Container exited after start (status: $status)"
             echo ""
-            echo -e "${YELLOW}${BOLD}容器日志:${NC}"
+            echo -e "${YELLOW}${BOLD}Container logs:${NC}"
             print_line
             docker logs --tail 30 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
             print_line
             echo ""
-            echo -e "${CYAN}常见原因:${NC}"
-            echo -e "  * 配置格式错误 (${container_config})"
-            echo -e "  * 端口冲突"
-            echo -e "  * 镜像损坏"
+            echo -e "${CYAN}Common causes:${NC}"
+            echo -e "  * Config format error (${container_config})"
+            echo -e "  * Port conflict"
+            echo -e "  * Image corrupted"
             return 1
         fi
 
-        msg_ok "容器已启动"
+        msg_ok "Container started"
 
-        echo -ne "  等待服务就绪"
+        echo -ne "  Waiting for service ready"
         local i=0
         local ready=false
         while (( i < 25 )); do
@@ -1916,100 +1911,100 @@ EOF
         echo ""
 
         if ! $ready; then
-            msg_warn "端口未响应，查看日志:"
+            msg_warn "Port not responding, logs:"
             docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
         fi
 
         if [[ "$extra" == "--lan" ]]; then
-            msg_step "配置局域网 controlUi..."
+            msg_step "Configuring LAN controlUi..."
             docker exec "$DOCKER_CONTAINER" openclaw config set gateway.bind lan >/dev/null 2>&1 || true
             docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.allowInsecureAuth true >/dev/null 2>&1 || true
             docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true >/dev/null 2>&1 || true
             docker exec "$DOCKER_CONTAINER" openclaw config set gateway.controlUi.dangerouslyDisableDeviceAuth true >/dev/null 2>&1 || true
             docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
             sleep 3
-            msg_ok "局域网模式已启用"
+            msg_ok "LAN mode enabled"
         fi
 
         echo ""
         local local_ip; local_ip=$(get_local_ip)
-        echo -e "${GREEN}${BOLD}部署完成!${NC}"
-        echo -e "  ${BOLD}本机:${NC}   ${CYAN}http://127.0.0.1:${port}${NC}"
-        echo -e "  ${BOLD}局域网:${NC} ${CYAN}http://${local_ip}:${port}${NC}"
-        echo -e "  ${BOLD}网络模式:${NC} ${network_mode}"
+        echo -e "${GREEN}${BOLD}Deploy complete!${NC}"
+        echo -e "  ${BOLD}Local:${NC}   ${CYAN}http://127.0.0.1:${port}${NC}"
+        echo -e "  ${BOLD}LAN:${NC}     ${CYAN}http://${local_ip}:${port}${NC}"
+        echo -e "  ${BOLD}Network:${NC} ${network_mode}"
         echo ""
-        echo -e "${CYAN}提示:${NC}"
-        echo -e "  ${DIM}* 访问宿主机服务: host.docker.internal:端口${NC}"
-        echo -e "  ${DIM}* 菜单 [4] 配置自定义 API 会自动转换局域网 URL${NC}"
+        echo -e "${CYAN}Tips:${NC}"
+        echo -e "  ${DIM}* Access host services: host.docker.internal:port${NC}"
+        echo -e "  ${DIM}* Menu [4] configure custom API auto-converts LAN URLs${NC}"
 
         log "Docker deployed (network: $network_mode)"
     else
-        msg_fail "容器启动失败"
+        msg_fail "Start failed"
     fi
 }
 
 _install_docker() {
     detect_system
-    msg_step "安装 Docker..."
+    msg_step "Installing Docker..."
     case "$OS" in
         debian)
             safe_run "apt update"   sudo apt-get update -qq
-            safe_run "安装依赖"    sudo apt-get install -y ca-certificates curl gnupg lsb-release
-            safe_run "安装 Docker" bash -c "curl -fsSL https://get.docker.com | sh" ;;
+            safe_run "deps"         sudo apt-get install -y ca-certificates curl gnupg lsb-release
+            safe_run "Docker"       bash -c "curl -fsSL https://get.docker.com | sh" ;;
         rhel|fedora)
-            safe_run "安装 Docker" bash -c "curl -fsSL https://get.docker.com | sh" ;;
+            safe_run "Docker"       bash -c "curl -fsSL https://get.docker.com | sh" ;;
         arch)
-            safe_run "安装 Docker" sudo pacman -S --noconfirm docker ;;
+            safe_run "Docker"       sudo pacman -S --noconfirm docker ;;
         alpine)
-            safe_run "安装 Docker" sudo apk add docker ;;
+            safe_run "Docker"       sudo apk add docker ;;
         macos)
-            msg_info "请手动安装 Docker Desktop"
+            msg_info "Please install Docker Desktop manually"
             return 1 ;;
         *)
-            safe_run "安装 Docker" bash -c "curl -fsSL https://get.docker.com | sh" ;;
+            safe_run "Docker"       bash -c "curl -fsSL https://get.docker.com | sh" ;;
     esac
     case "$SERVICE_MANAGER" in
         systemd) sudo systemctl enable --now docker 2>/dev/null || true; sudo usermod -aG docker "$USER" 2>/dev/null || true ;;
         openrc)  sudo rc-update add docker 2>/dev/null || true; sudo service docker start 2>/dev/null || true ;;
     esac
-    has_cmd docker && msg_ok "Docker 安装成功" || { msg_fail "安装失败"; return 1; }
+    has_cmd docker && msg_ok "Docker installed" || { msg_fail "Failed"; return 1; }
 }
 
 show_command_reference() {
-    msg_title "${LOBSTER} 命令速查"
+    msg_title "${LOBSTER} Command Reference"
 
     local use_docker=false
     is_docker_mode && use_docker=true
     local prefix=""
     $use_docker && prefix="docker exec ${DOCKER_CONTAINER} "
 
-    echo -e "${CYAN}${BOLD}服务管理${NC}"; print_line
-    _cmd_row "${prefix}openclaw setup"               "初始化"
-    _cmd_row "${prefix}openclaw gateway run"         "前台调试运行"
-    _cmd_row "${prefix}openclaw gateway restart"     "重启"
-    _cmd_row "${prefix}openclaw gateway status"      "查看状态"
-    _cmd_row "${prefix}openclaw dashboard --no-open" "获取控制台 URL"
+    echo -e "${CYAN}${BOLD}Service${NC}"; print_line
+    _cmd_row "${prefix}openclaw setup"               "Initialize"
+    _cmd_row "${prefix}openclaw gateway run"         "Foreground debug"
+    _cmd_row "${prefix}openclaw gateway restart"     "Restart"
+    _cmd_row "${prefix}openclaw gateway status"      "Status"
+    _cmd_row "${prefix}openclaw dashboard --no-open" "Get URL"
     echo ""
 
     if $use_docker; then
-        echo -e "${CYAN}${BOLD}Docker 专属${NC}"; print_line
-        _cmd_row "docker logs -f ${DOCKER_CONTAINER}"      "实时日志"
-        _cmd_row "docker restart ${DOCKER_CONTAINER}"      "重启容器"
-        _cmd_row "docker exec -it ${DOCKER_CONTAINER} sh"  "进入容器"
-        _cmd_row "cat ${DOCKER_DATA_DIR}/.openclaw/openclaw.json"  "查看配置"
+        echo -e "${CYAN}${BOLD}Docker Specific${NC}"; print_line
+        _cmd_row "docker logs -f ${DOCKER_CONTAINER}"      "Live logs"
+        _cmd_row "docker restart ${DOCKER_CONTAINER}"      "Restart container"
+        _cmd_row "docker exec -it ${DOCKER_CONTAINER} sh"  "Enter container"
+        _cmd_row "cat ${DOCKER_DATA_DIR}/.openclaw/openclaw.json"  "View config"
         echo ""
     fi
 
-    echo -e "${CYAN}${BOLD}Agent 管理${NC}"; print_line
-    _cmd_row "${prefix}openclaw agents list"              "列出 Agent"
-    _cmd_row "${prefix}openclaw agents auth list main"    "查看认证列表"
-    _cmd_row "${prefix}openclaw agents login main"        "交互式登录"
+    echo -e "${CYAN}${BOLD}Agent${NC}"; print_line
+    _cmd_row "${prefix}openclaw agents list"              "List"
+    _cmd_row "${prefix}openclaw agents auth list main"    "Auth list"
+    _cmd_row "${prefix}openclaw agents login main"        "Interactive login"
     echo ""
 
-    echo -e "${RED}${BOLD}Schema 说明${NC}"; print_line
-    _cmd_row "gateway.bind 允许值"                             "auto/lan/loopback/custom/tailnet"
-    _cmd_row "${prefix}openclaw config set gateway.bind lan"   "启用局域网访问"
-    _cmd_row "${prefix}openclaw doctor --fix"                  "自动修复"
+    echo -e "${RED}${BOLD}Schema${NC}"; print_line
+    _cmd_row "gateway.bind allowed"                             "auto/lan/loopback/custom/tailnet"
+    _cmd_row "${prefix}openclaw config set gateway.bind lan"   "Enable LAN"
+    _cmd_row "${prefix}openclaw doctor --fix"                  "Auto fix"
     echo ""
 
     wait_and_return 3; return 0
@@ -2020,37 +2015,37 @@ _cmd_row() {
 }
 
 run_setup_wizard() {
-    msg_title "🔧 setup 向导"
+    msg_title "Setup Wizard"
 
     if ! is_openclaw_installed; then
-        msg_fail "未安装"
+        msg_fail "Not installed"
         wait_and_return 2; return 0
     fi
 
     if ! json_is_valid; then
-        msg_fail "配置损坏，请先修复"
+        msg_fail "Config corrupted, please repair first"
         wait_and_return 3
         return 0
     fi
 
     ensure_minimal_config
 
-    if ! confirm "运行 openclaw setup?"; then
+    if ! confirm "Run openclaw setup?"; then
         wait_and_return 2; return 0
     fi
 
-    openclaw_cmd setup </dev/tty && msg_ok "完成" || msg_warn "已退出"
+    openclaw_cmd setup </dev/tty && msg_ok "Complete" || msg_warn "Exited"
 
-    confirm "立即重启?" && manage_service restart >/dev/null 2>&1
+    confirm "Restart?" && manage_service restart >/dev/null 2>&1
 
     wait_and_return 3; return 0
 }
 
 quick_commands() {
-    msg_title "${GEAR} 快捷命令"
+    msg_title "${GEAR} Quick Commands"
 
     if ! is_openclaw_installed; then
-        msg_fail "未安装"
+        msg_fail "Not installed"
         wait_and_return 2; return 0
     fi
 
@@ -2064,12 +2059,12 @@ quick_commands() {
     echo -e "  ${BOLD}8)${NC}  openclaw config validate"
     echo -e "  ${BOLD}9)${NC}  openclaw dashboard --no-open"
     echo -e "  ${BOLD}10)${NC} openclaw agents list"
-    echo -e "  ${BOLD}11)${NC} openclaw gateway run (前台)"
-    echo -e "  ${BOLD}12)${NC} 验证配置"
-    echo -e "  ${BOLD}13)${NC} 配置自定义 API"
-    echo -e "  ${BOLD}0)${NC}  返回"
+    echo -e "  ${BOLD}11)${NC} openclaw gateway run (foreground)"
+    echo -e "  ${BOLD}12)${NC} Validate config"
+    echo -e "  ${BOLD}13)${NC} Configure custom API"
+    echo -e "  ${BOLD}0)${NC}  Return"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local qc
     read -r qc </dev/tty || qc="0"
 
@@ -2079,27 +2074,27 @@ quick_commands() {
         2)  openclaw_cmd status ;;
         3)  openclaw_cmd health ;;
         4)  openclaw_cmd doctor --fix ;;
-        5)  trap 'echo ""; msg_info "已退出"' INT; openclaw_cmd logs 2>&1 || true; trap - INT ;;
+        5)  trap 'echo ""; msg_info "Exit"' INT; openclaw_cmd logs 2>&1 || true; trap - INT ;;
         6)  openclaw_cmd models status ;;
         7)  openclaw_cmd models list ;;
         8)  openclaw_cmd config validate ;;
         9)  openclaw_cmd dashboard --no-open ;;
         10) openclaw_cmd agents list ;;
-        11) msg_info "按 Ctrl+C 退出"; trap 'echo ""; msg_info "已退出"' INT; openclaw_cmd gateway run 2>&1; trap - INT ;;
+        11) msg_info "Ctrl+C to exit"; trap 'echo ""; msg_info "Exit"' INT; openclaw_cmd gateway run 2>&1; trap - INT ;;
         12) validate_config ;;
         13) configure_custom_api ;;
         0)  return 0 ;;
-        *)  msg_warn "无效选项" ;;
+        *)  msg_warn "Invalid" ;;
     esac
 
     wait_and_return 2; return 0
 }
 
 configure_api_keys() {
-    msg_title "🔑 内置 Provider API 密钥"
+    msg_title "Builtin Provider API Keys"
 
     if [[ -f "$(get_active_config_path)" ]] && ! json_is_valid; then
-        msg_fail "配置损坏"
+        msg_fail "Config corrupted"
         wait_and_return 3
         return 1
     fi
@@ -2108,21 +2103,21 @@ configure_api_keys() {
     mkdir -p "$(dirname "$(get_active_config_path)")"
 
     if [[ ${#G_API_KEYS[@]} -gt 0 ]]; then
-        echo -e "${CYAN}已有配置:${NC}"
+        echo -e "${CYAN}Existing config:${NC}"
         for p in anthropic openai google deepseek groq mistral; do
             [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
-            local dt=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && dt=" ${GREEN}[默认]${NC}"
+            local dt=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && dt=" ${GREEN}[default]${NC}"
             echo -e "  ${BOLD}${p}${NC}: ${DIM}${G_API_KEYS[$p]:0:8}****${NC} -> ${G_API_MODELS[$p]%%,*}${dt}"
         done
         echo ""
     fi
 
     echo "  1) Anthropic   2) OpenAI   3) Google   4) DeepSeek"
-    echo "  5) Groq        6) Mistral  7) 自定义 API  0) 保存"
+    echo "  5) Groq        6) Mistral  7) Custom API  0) Save"
     echo ""
 
     while true; do
-        echo -ne "${BOLD}编号 (0 完成): ${NC}"; local c; read -r c </dev/tty || c="0"
+        echo -ne "${BOLD}Number (0 to finish): ${NC}"; local c; read -r c </dev/tty || c="0"
         case "$c" in
             0) break ;;
             1) _cfg_builtin_provider anthropic "sk-ant-..." "claude-sonnet-4-5" ;;
@@ -2132,23 +2127,23 @@ configure_api_keys() {
             5) _cfg_builtin_provider groq "gsk_..." "llama-3.3-70b-versatile" ;;
             6) _cfg_builtin_provider mistral "" "mistral-large-latest" ;;
             7) configure_custom_api ;;
-            *) msg_warn "请输入 0-7" ;;
+            *) msg_warn "0-7" ;;
         esac
     done
 
     if [[ ${#G_API_KEYS[@]} -eq 0 && ${#G_API_URLS[@]} -eq 0 ]]; then
-        msg_warn "未配置任何内容"
+        msg_warn "Nothing configured"
         return 0
     fi
 
-    msg_step "保存配置..."
+    msg_step "Saving..."
     ensure_minimal_config
     _write_builtin_providers_config
     _show_config_summary
 
     if is_openclaw_installed; then
         echo ""
-        if confirm "同步认证到 main Agent?"; then
+        if confirm "Sync auth to main Agent?"; then
             for p in anthropic openai google deepseek groq mistral; do
                 [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
                 local built_url=""
@@ -2162,7 +2157,7 @@ configure_api_keys() {
                 esac
                 sync_agent_auth "$p" "$built_url" "${G_API_KEYS[$p]}" "openai-completions" "main" || true
             done
-            msg_step "重启中..."
+            msg_step "Restarting..."
             manage_service restart >/dev/null 2>&1
         fi
     fi
@@ -2216,7 +2211,7 @@ with open(cfg_path, "w") as f:
     python3 -c "$py_code" "$cfg"
     chmod 600 "$cfg"
     fix_docker_ownership
-    msg_ok "配置已保存"
+    msg_ok "Config saved"
 }
 
 _cfg_builtin_provider() {
@@ -2224,20 +2219,20 @@ _cfg_builtin_provider() {
     echo ""
     echo -e "${CYAN}${BOLD}--- ${p} ---${NC}"
     local ek="${G_API_KEYS[$p]:-}"
-    [[ -n "$ek" ]] && echo -e "  ${DIM}已有: ${ek:0:8}****${NC}"
+    [[ -n "$ek" ]] && echo -e "  ${DIM}Existing: ${ek:0:8}****${NC}"
     echo -ne "  Key${hint:+ ($hint)}: "
     local nk
     read -rs nk </dev/tty
     echo ""
 
     if [[ -z "$nk" ]]; then
-        [[ -n "$ek" ]] && msg_info "已保留" || msg_warn "已跳过"
+        [[ -n "$ek" ]] && msg_info "Kept" || msg_warn "Skipped"
         return
     fi
 
     G_API_KEYS["$p"]="$nk"
 
-    echo -ne "  模型 (默认: $rec): "
+    echo -ne "  Model (default: $rec): "
     local sm
     read -r sm </dev/tty || sm=""
     sm=${sm:-$rec}
@@ -2249,7 +2244,7 @@ _cfg_builtin_provider() {
 
 _show_config_summary() {
     print_line
-    echo -e "${BOLD}配置摘要${NC}"
+    echo -e "${BOLD}Summary${NC}"
     for p in anthropic openai google deepseek groq mistral; do
         [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
         echo -e "  ${BOLD}${p}${NC}  ${DIM}${G_API_KEYS[$p]:0:10}****${NC} -> ${CYAN}${G_API_MODELS[$p]:-}${NC}"
@@ -2303,11 +2298,11 @@ service_action() {
             stop)    docker stop  "$DOCKER_CONTAINER" 2>/dev/null || true ;;
             restart) docker restart "$DOCKER_CONTAINER" 2>/dev/null || true ;;
             status)
-                docker inspect --format='状态: {{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null
+                docker inspect --format='Status: {{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null
                 echo ""
                 docker logs --tail 15 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
                 ;;
-            enable)  msg_info "Docker restart=unless-stopped 已启用" ;;
+            enable)  msg_info "Docker restart=unless-stopped enabled" ;;
         esac
         return 0
     fi
@@ -2334,7 +2329,7 @@ service_action() {
                 start)   openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
                 stop)    openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true ;;
                 restart) openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true; sleep 1; openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
-                status)  openclaw gateway status 2>/dev/null || echo "未知" ;;
+                status)  openclaw gateway status 2>/dev/null || echo "Unknown" ;;
             esac ;;
     esac
     return 0
@@ -2345,7 +2340,7 @@ show_dashboard_info() {
     local_ip=$(get_local_ip)
     local public_ip
     public_ip=$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null \
-             || curl -s --max-time 4 https://ifconfig.me 2>/dev/null || echo "无法获取")
+             || curl -s --max-time 4 https://ifconfig.me 2>/dev/null || echo "N/A")
 
     [[ -z "$G_DEFAULT_PROVIDER" ]] && load_config_from_file
 
@@ -2368,78 +2363,78 @@ except: print('loopback')
     [[ -n "$token" ]] && token_qs="?token=${token}"
 
     echo ""
-    echo -e "${GREEN}${BOLD}OpenClaw 访问信息${NC}"
+    echo -e "${GREEN}${BOLD}OpenClaw Access Info${NC}"
     print_line
-    echo -e "  ${BOLD}本机:${NC}     ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${token_qs}${NC}"
+    echo -e "  ${BOLD}Local:${NC}    ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${token_qs}${NC}"
     if [[ "$bind_mode" == "lan" ]]; then
-        echo -e "  ${BOLD}局域网:${NC}   ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC} ${GREEN}(已启用)${NC}"
+        echo -e "  ${BOLD}LAN:${NC}      ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${token_qs}${NC} ${GREEN}(enabled)${NC}"
     else
-        echo -e "  ${BOLD}局域网:${NC}   ${DIM}未启用 (菜单 [5] 启用)${NC}"
+        echo -e "  ${BOLD}LAN:${NC}      ${DIM}Not enabled (menu[5] to enable)${NC}"
     fi
-    echo -e "  ${BOLD}SSH 隧道:${NC} ${YELLOW}ssh -L ${OPENCLAW_PORT}:localhost:${OPENCLAW_PORT} user@${public_ip}${NC}"
-    echo -e "  ${BOLD}bind 模式:${NC} ${bind_mode}"
+    echo -e "  ${BOLD}SSH Tunnel:${NC} ${YELLOW}ssh -L ${OPENCLAW_PORT}:localhost:${OPENCLAW_PORT} user@${public_ip}${NC}"
+    echo -e "  ${BOLD}bind:${NC}    ${bind_mode}"
     if [[ -n "$token" ]]; then
-        echo -e "  ${BOLD}令牌:${NC}     ${YELLOW}${token}${NC}"
+        echo -e "  ${BOLD}Token:${NC}   ${YELLOW}${token}${NC}"
     fi
     if [[ -n "$G_DEFAULT_PROVIDER" ]]; then
         local dm="${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"
         dm="${dm%%,*}"
-        echo -e "  ${BOLD}默认 AI:${NC}  ${CYAN}${G_DEFAULT_PROVIDER}${NC} -> ${dm}"
+        echo -e "  ${BOLD}Default AI:${NC}  ${CYAN}${G_DEFAULT_PROVIDER}${NC} -> ${dm}"
     fi
-    echo -e "  ${RED}请勿暴露至公网!${NC}"
+    echo -e "  ${RED}Do not expose to public internet!${NC}"
     print_line
     echo ""
 
     if [[ -n "$token" ]] && [[ "$bind_mode" == "lan" ]]; then
-        echo -e "${CYAN}${BOLD}浏览器 UI 登录信息:${NC}"
+        echo -e "${CYAN}${BOLD}Browser UI Login:${NC}"
         echo -e "  ${BOLD}WebSocket:${NC} ${YELLOW}ws://${local_ip}:${OPENCLAW_PORT}${NC}"
-        echo -e "  ${BOLD}令牌:${NC}      ${YELLOW}${token}${NC}"
+        echo -e "  ${BOLD}Token:${NC}     ${YELLOW}${token}${NC}"
         echo ""
     fi
 }
 
 install_openclaw() {
-    msg_title "${ROCKET} 安装 OpenClaw"
+    msg_title "${ROCKET} Install OpenClaw"
     detect_system
-    echo -e "${CYAN}环境:${NC} ${BOLD}${OS} ${ARCH_LABEL}${NC}"
+    echo -e "${CYAN}Environment:${NC} ${BOLD}${OS} ${ARCH_LABEL}${NC}"
     echo ""
 
     if has_cmd openclaw; then
         local iv
-        iv=$(openclaw --version 2>/dev/null || echo "未知")
-        msg_warn "已安装 ($iv)"
-        confirm "重新安装?" || return 0
+        iv=$(openclaw --version 2>/dev/null || echo "unknown")
+        msg_warn "Already installed ($iv)"
+        confirm "Reinstall?" || return 0
     fi
 
-    msg_step "步骤 1/5: 系统依赖..."
+    msg_step "Step 1/5: System dependencies..."
     case "$OS" in
         debian)
             safe_run "apt update" sudo apt-get update -qq
-            safe_run "安装依赖" sudo apt-get install -y curl wget git build-essential ca-certificates gnupg python3 jq ;;
+            safe_run "deps" sudo apt-get install -y curl wget git build-essential ca-certificates gnupg python3 jq ;;
         rhel|fedora)
-            safe_run "更新" bash -c "$UPDATE_CMD"
-            safe_run "安装依赖" bash -c "$INSTALL_CMD curl wget git gcc gcc-c++ make python3 jq" ;;
+            safe_run "update" bash -c "$UPDATE_CMD"
+            safe_run "deps" bash -c "$INSTALL_CMD curl wget git gcc gcc-c++ make python3 jq" ;;
         arch)
-            safe_run "pacman 更新" sudo pacman -Sy --noconfirm
-            safe_run "安装依赖" sudo pacman -S --noconfirm curl wget git base-devel python jq ;;
+            safe_run "pacman" sudo pacman -Sy --noconfirm
+            safe_run "deps" sudo pacman -S --noconfirm curl wget git base-devel python jq ;;
         alpine)
             safe_run "apk update" sudo apk update
-            safe_run "安装依赖" sudo apk add curl wget git build-base python3 jq ;;
+            safe_run "deps" sudo apk add curl wget git build-base python3 jq ;;
         macos)
-            has_cmd brew || safe_run "安装 Homebrew" bash -c '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-            safe_run "安装工具" brew install curl wget git jq ;;
+            has_cmd brew || safe_run "Homebrew" bash -c '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+            safe_run "tools" brew install curl wget git jq ;;
     esac
-    msg_ok "依赖安装完成"
+    msg_ok "Dependencies complete"
 
-    msg_step "步骤 2/5: 安装 Node.js..."
-    install_nodejs || { msg_fail "Node.js 安装失败"; wait_and_return 3; return 1; }
+    msg_step "Step 2/5: Node.js..."
+    install_nodejs || { msg_fail "Node.js failed"; wait_and_return 3; return 1; }
 
-    msg_step "步骤 3/5: 安装 OpenClaw..."
-    echo "  1) 官方脚本 [推荐]"
-    echo "  2) npm 安装"
-    echo "  3) GitHub 源码编译"
+    msg_step "Step 3/5: Installing OpenClaw..."
+    echo "  1) Official script [recommended]"
+    echo "  2) npm"
+    echo "  3) GitHub source"
     echo ""
-    echo -ne "${BOLD}请选择 [1-3] (默认:1): ${NC}"
+    echo -ne "${BOLD}Choose [1-3] (default:1): ${NC}"
     local ic
     read -r ic </dev/tty || ic="1"
     ic=${ic:-1}
@@ -2447,20 +2442,20 @@ install_openclaw() {
     case "$ic" in
         1)
             if curl -fsSL --proto '=https' --tlsv1.2 "$OPENCLAW_INSTALL_URL" | bash >> "$LOG_FILE" 2>&1; then
-                msg_ok "官方脚本安装成功"
+                msg_ok "Official success"
             else
-                msg_warn "官方脚本失败，使用 npm 安装..."
+                msg_warn "npm fallback..."
                 npm install -g openclaw@latest >> "$LOG_FILE" 2>&1 || true
             fi ;;
         2)
             npm install -g openclaw@latest 2>&1 | tee -a "$LOG_FILE" || true ;;
         3)
-            echo -ne "${BOLD}仓库地址: ${NC}"
+            echo -ne "${BOLD}Repo: ${NC}"
             local repo
             read -r repo </dev/tty || repo=""
             repo=${repo:-"$GITHUB_REPO"}
             local tmp="/tmp/oc_src_$$"
-            git clone "$repo" "$tmp" >> "$LOG_FILE" 2>&1 || { msg_fail "clone 失败"; return 1; }
+            git clone "$repo" "$tmp" >> "$LOG_FILE" 2>&1 || { msg_fail "clone failed"; return 1; }
             pushd "$tmp" > /dev/null
             has_cmd pnpm || npm install -g pnpm >> "$LOG_FILE" 2>&1 || true
             pnpm install >> "$LOG_FILE" 2>&1 || true
@@ -2471,19 +2466,19 @@ install_openclaw() {
     esac
 
     _refresh_node_path
-    has_cmd openclaw || { msg_fail "安装失败"; wait_and_return 3; return 1; }
-    msg_ok "OpenClaw $(openclaw --version 2>/dev/null) 安装成功"
+    has_cmd openclaw || { msg_fail "Install failed"; wait_and_return 3; return 1; }
+    msg_ok "OpenClaw $(openclaw --version 2>/dev/null) success"
 
-    msg_step "步骤 4/5: 初始化配置..."
+    msg_step "Step 4/5: Config..."
     ensure_minimal_config
 
     echo ""
-    echo -e "${CYAN}下一步:${NC}"
-    echo -e "  ${BOLD}1)${NC} 配置自定义 API ${GREEN}(推荐)${NC}"
-    echo -e "  ${BOLD}2)${NC} 配置内置 Provider"
-    echo -e "  ${BOLD}3)${NC} 跳过"
+    echo -e "${CYAN}Next step:${NC}"
+    echo -e "  ${BOLD}1)${NC} Configure custom API ${GREEN}(recommended)${NC}"
+    echo -e "  ${BOLD}2)${NC} Configure builtin Provider"
+    echo -e "  ${BOLD}3)${NC} Skip"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local next
     read -r next </dev/tty || next="3"
     case "$next" in
@@ -2491,18 +2486,18 @@ install_openclaw() {
         2) configure_api_keys ;;
     esac
 
-    msg_step "步骤 5/5: 启动服务..."
+    msg_step "Step 5/5: Starting..."
     manage_service start >/dev/null 2>&1
     sleep 3
 
     if curl -s --max-time 5 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
-        msg_ok "Gateway 已启动!"
+        msg_ok "Gateway started!"
     else
-        msg_warn "服务未响应"
+        msg_warn "No response"
     fi
 
     echo ""
-    if confirm "配置局域网访问 (让其他设备可打开 UI)?"; then
+    if confirm "Configure LAN access (other devices open UI)?"; then
         configure_lan_access
     else
         show_dashboard_info
@@ -2514,7 +2509,7 @@ install_openclaw() {
 }
 
 pick_node_version() {
-    echo -e "\n${CYAN}获取版本列表...${NC}" >&2
+    echo -e "\n${CYAN}Getting version list...${NC}" >&2
     local lts_list
     lts_list=$(get_node_lts_versions)
     local latest_major
@@ -2522,12 +2517,12 @@ pick_node_version() {
     local first_lts
     first_lts=$(echo "$lts_list" | awk '{print $1}')
 
-    echo -e "\n${CYAN}请选择 Node.js 版本:${NC}" >&2
+    echo -e "\n${CYAN}Select version:${NC}" >&2
     local idx=1
     declare -a vmap=()
 
     if [[ "$latest_major" != "$first_lts" ]]; then
-        printf "  %2d) Node.js %-4s (最新)\n" "$idx" "$latest_major" >&2
+        printf "  %2d) Node.js %-4s (Current)\n" "$idx" "$latest_major" >&2
         vmap[$idx]="$latest_major"
         ((idx++))
     fi
@@ -2535,7 +2530,7 @@ pick_node_version() {
     local is_first=true
     for v in $lts_list; do
         if $is_first; then
-            printf "  %2d) Node.js %-4s (LTS 推荐)\n" "$idx" "$v" >&2
+            printf "  %2d) Node.js %-4s (LTS *)\n" "$idx" "$v" >&2
             is_first=false
         else
             printf "  %2d) Node.js %-4s (LTS)\n" "$idx" "$v" >&2
@@ -2545,17 +2540,17 @@ pick_node_version() {
     done
 
     local mi=$idx
-    printf "  %2d) 手动输入\n" "$mi" >&2
+    printf "  %2d) Manual\n" "$mi" >&2
     echo "" >&2
     local dc
     [[ "$latest_major" != "$first_lts" ]] && dc=2 || dc=1
-    echo -ne "  请选择 [默认:${dc}]: " >&2
+    echo -ne "  Choose [default:${dc}]: " >&2
     local vc
     read -r vc </dev/tty || vc=""
     vc=${vc:-$dc}
 
     if [[ "$vc" -eq "$mi" ]] 2>/dev/null; then
-        echo -ne "  主版本号: " >&2
+        echo -ne "  Major version: " >&2
         local mv
         read -r mv </dev/tty || mv=""
         echo "$(echo "${mv:-$NODE_MIN_VERSION}" | tr -d 'vV ')"
@@ -2565,7 +2560,7 @@ pick_node_version() {
 }
 
 install_nodejs() {
-    msg_step "检测 Node.js..."
+    msg_step "Checking Node.js..."
 
     if has_cmd node; then
         local ver
@@ -2577,12 +2572,12 @@ install_nodejs() {
     fi
 
     echo ""
-    echo "  1) NodeSource (推荐)"
+    echo "  1) NodeSource (recommended)"
     echo "  2) nvm"
-    echo "  3) 系统包管理器"
-    echo "  4) 手动安装"
+    echo "  3) System package"
+    echo "  4) Manual"
     echo ""
-    echo -ne "${BOLD}请选择 [1-4] (默认: 1): ${NC}"
+    echo -ne "${BOLD}Choose [1-4] (default: 1): ${NC}"
     local nc
     read -r nc </dev/tty || nc="1"
     nc=${nc:-1}
@@ -2597,7 +2592,7 @@ install_nodejs() {
         1) _install_node_nodesource "$tv" ;;
         2) _install_node_nvm "$tv" ;;
         3) _install_node_native ;;
-        4) msg_info "请访问 https://nodejs.org/en/download/ 手动安装"; return 1 ;;
+        4) msg_info "https://nodejs.org/en/download/"; return 1 ;;
     esac
 
     _refresh_node_path
@@ -2607,7 +2602,7 @@ install_nodejs() {
         iv=$(node -v | sed 's/v//' | cut -d. -f1)
         [[ "$iv" -ge "$NODE_MIN_VERSION" ]] && { msg_ok "Node.js $(node -v)"; return 0; }
     fi
-    msg_fail "安装失败"
+    msg_fail "Failed"
     return 1
 }
 
@@ -2625,7 +2620,7 @@ _install_node_nodesource() {
         alpine)
             safe_run "nodejs" sudo apk add nodejs npm ;;
         macos)
-            has_cmd brew || { msg_fail "需要 Homebrew"; return 1; }
+            has_cmd brew || { msg_fail "Need Homebrew"; return 1; }
             safe_run "node@${version}" brew install "node@${version}"
             brew link --force --overwrite "node@${version}" 2>/dev/null || true ;;
     esac
@@ -2638,7 +2633,7 @@ _install_node_nvm() {
     safe_run "nvm" bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_ver}/install.sh | bash"
     export NVM_DIR="$HOME/.nvm"
     [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" || return 1
-    safe_run "安装 $version" nvm install "$version"
+    safe_run "install $version" nvm install "$version"
     nvm use "$version" >> "$LOG_FILE" 2>&1 || true
     nvm alias default "$version" >> "$LOG_FILE" 2>&1 || true
 }
@@ -2646,7 +2641,7 @@ _install_node_nvm() {
 _install_node_native() {
     case "$OS" in
         debian)
-            safe_run "apt update" sudo apt-get update -qq
+            safe_run "apt" sudo apt-get update -qq
             safe_run "nodejs" sudo apt-get install -y nodejs npm ;;
         rhel)
             safe_run "nodejs" sudo yum install -y nodejs npm ;;
@@ -2672,34 +2667,34 @@ _refresh_node_path() {
 }
 
 show_version() {
-    msg_title "📦 版本信息"
-    is_openclaw_installed || { msg_fail "未安装"; wait_and_return 2; return 0; }
+    msg_title "Version Info"
+    is_openclaw_installed || { msg_fail "Not installed"; wait_and_return 2; return 0; }
     print_line
-    echo -e "  ${BOLD}OpenClaw${NC}    : $(openclaw_cmd --version 2>/dev/null || echo '未知')"
-    echo -e "  ${BOLD}Node.js${NC}     : $(node -v 2>/dev/null || echo '未安装')"
-    echo -e "  ${BOLD}npm${NC}         : v$(npm -v 2>/dev/null || echo '未安装')"
-    echo -e "  ${BOLD}Docker${NC}      : $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo '未安装')"
-    echo -e "  ${BOLD}部署方式${NC}    : $(_detect_deploy_mode)"
-    echo -e "  ${BOLD}脚本版本${NC}    : ${SCRIPT_VERSION}"
+    echo -e "  ${BOLD}OpenClaw${NC}    : $(openclaw_cmd --version 2>/dev/null || echo 'unknown')"
+    echo -e "  ${BOLD}Node.js${NC}     : $(node -v 2>/dev/null || echo 'not installed')"
+    echo -e "  ${BOLD}npm${NC}         : v$(npm -v 2>/dev/null || echo 'not installed')"
+    echo -e "  ${BOLD}Docker${NC}      : $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo 'not installed')"
+    echo -e "  ${BOLD}Deploy${NC}      : $(_detect_deploy_mode)"
+    echo -e "  ${BOLD}Script${NC}      : ${SCRIPT_VERSION}"
     print_line
     echo ""
 
-    msg_info "检查最新版本..."
+    msg_info "Checking latest..."
     local latest current
     latest=$(get_openclaw_latest_version)
     current=$(openclaw_cmd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
-    echo -e "  当前版本: ${current}  最新版本: ${latest:-无法获取}"
+    echo -e "  Current: ${current}  Latest: ${latest:-N/A}"
 
     if [[ -n "$latest" && "$latest" != "$current" ]]; then
-        confirm "是否升级?" && {
+        confirm "Upgrade?" && {
             if is_docker_mode; then
                 docker pull "${DOCKER_IMAGE}:latest" && docker rm -f "$DOCKER_CONTAINER" && _docker_run "$OPENCLAW_PORT" "$DOCKER_DATA_DIR"
             else
-                npm install -g openclaw@latest 2>&1 | tail -5 && msg_ok "已升级" || msg_fail "升级失败"
+                npm install -g openclaw@latest 2>&1 | tail -5 && msg_ok "Upgraded" || msg_fail "Failed"
             fi
         }
     else
-        msg_ok "已是最新版本"
+        msg_ok "Already latest"
     fi
 
     wait_and_return 3
@@ -2715,10 +2710,10 @@ manage_service() {
 
     case "$action" in
         start)
-            msg_step "启动 Gateway..."
+            msg_step "Starting Gateway..."
 
             if $docker_mode; then
-                msg_info "Docker 模式启动..."
+                msg_info "Docker mode starting..."
 
                 if ! docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
                     docker start "$DOCKER_CONTAINER" >/dev/null 2>&1
@@ -2729,7 +2724,7 @@ manage_service() {
                 status=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null || echo "unknown")
 
                 if [[ "$status" == "running" ]]; then
-                    echo -ne "  等待服务就绪"
+                    echo -ne "  Waiting for ready"
                     local i=0
                     local ok=false
                     while (( i < 20 )); do
@@ -2741,24 +2736,24 @@ manage_service() {
                     done
                     echo ""
                     if $ok; then
-                        msg_ok "容器启动成功"
+                        msg_ok "Container started"
                         show_dashboard_info
                     else
-                        msg_warn "端口无响应，容器日志:"
+                        msg_warn "Port not responding, container logs:"
                         docker logs --tail 25 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
                     fi
                 else
-                    msg_fail "容器状态: $status"
+                    msg_fail "Container status: $status"
                     echo ""
-                    echo -e "${YELLOW}${BOLD}容器日志:${NC}"
+                    echo -e "${YELLOW}${BOLD}Container logs:${NC}"
                     print_line
                     docker logs --tail 30 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
                     print_line
                     echo ""
-                    echo -e "${CYAN}排查建议:${NC}"
-                    echo -e "  ${DIM}配置文件: ${DOCKER_DATA_DIR}/.openclaw/openclaw.json${NC}"
-                    echo -e "  ${DIM}菜单 [24] 清理不兼容字段${NC}"
-                    echo -e "  ${DIM}菜单 [16] 修复配置${NC}"
+                    echo -e "${CYAN}Troubleshoot:${NC}"
+                    echo -e "  ${DIM}Config: ${DOCKER_DATA_DIR}/.openclaw/openclaw.json${NC}"
+                    echo -e "  ${DIM}Menu [24] cleanup incompatible fields${NC}"
+                    echo -e "  ${DIM}Menu [16] repair config${NC}"
                 fi
                 wait_and_return 5
                 return 0
@@ -2777,60 +2772,60 @@ manage_service() {
                 port_pid=$(ss -lntp 2>/dev/null | grep ":$OPENCLAW_PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
             fi
             if [[ -n "$port_pid" ]]; then
-                msg_warn "端口 $OPENCLAW_PORT 被 PID $port_pid 占用，正在释放..."
+                msg_warn "Port $OPENCLAW_PORT occupied by PID $port_pid, releasing..."
                 kill -9 "$port_pid" 2>/dev/null || sudo kill -9 "$port_pid" 2>/dev/null || true
                 sleep 2
             fi
 
             if ! has_cmd openclaw; then
-                msg_fail "宿主机未安装 openclaw"
+                msg_fail "Host openclaw not installed"
                 echo ""
-                echo -e "  ${BOLD}A)${NC} 安装 npm 版本 -> 菜单 [1]"
-                echo -e "  ${BOLD}B)${NC} 使用 Docker  -> 菜单 [2]"
+                echo -e "  ${BOLD}A)${NC} Install npm version -> Menu [1]"
+                echo -e "  ${BOLD}B)${NC} Use Docker -> Menu [2]"
                 wait_and_return 5
                 return 0
             fi
 
             if ! json_is_valid; then
-                msg_fail "配置损坏，请使用菜单 [16] 修复"
+                msg_fail "Config corrupted, please repair with menu [16]"
                 wait_and_return 3
                 return 0
             fi
 
-            msg_step "验证配置..."
+            msg_step "Validating config..."
             local validate_out
             validate_out=$(openclaw config validate 2>&1)
             if echo "$validate_out" | grep -qiE "Invalid input|invalid config"; then
-                msg_warn "验证失败:"
+                msg_warn "Validation failed:"
                 echo "$validate_out" | grep -iE "×|invalid|allowed" | head -8 | sed 's/^/  /'
                 echo ""
-                msg_step "自动清理..."
+                msg_step "Auto cleanup..."
                 sanitize_config_for_schema | sed 's/^/  /'
                 sleep 1
             else
-                msg_ok "配置有效"
+                msg_ok "Config valid"
             fi
 
             mkdir -p "$OPENCLAW_LOG_DIR"
             local out_log="$OPENCLAW_LOG_DIR/gateway.out"
             > "$out_log"
 
-            msg_info "尝试通过 systemd 启动..."
+            msg_info "Trying systemd start..."
             service_action start
             sleep 3
 
             if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
-                msg_ok "启动成功"
+                msg_ok "Started successfully"
                 show_dashboard_info
                 wait_and_return 3
                 return 0
             fi
 
-            msg_warn "systemd 未响应，切换后台运行..."
+            msg_warn "systemd not responding, running background..."
             local openclaw_bin
             openclaw_bin=$(command -v openclaw)
             if [[ -z "$openclaw_bin" ]]; then
-                msg_fail "找不到 openclaw 可执行文件"
+                msg_fail "Cannot find openclaw"
                 wait_and_return 3
                 return 0
             fi
@@ -2840,26 +2835,26 @@ manage_service() {
             sleep 6
 
             if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
-                msg_ok "后台运行成功 (PID: $bg_pid)"
+                msg_ok "Background running (PID: $bg_pid)"
                 show_dashboard_info
             else
-                msg_fail "Gateway 启动失败"
+                msg_fail "Gateway start failed"
                 echo ""
-                echo -e "${YELLOW}${BOLD}错误日志:${NC}"
+                echo -e "${YELLOW}${BOLD}Error log:${NC}"
                 print_line
-                tail -25 "$out_log" 2>/dev/null | sed 's/^/  /' || echo "  (无日志)"
+                tail -25 "$out_log" 2>/dev/null | sed 's/^/  /' || echo "  (no log)"
                 print_line
                 echo ""
-                echo -e "${CYAN}修复建议:${NC}"
-                echo -e "  ${BOLD}1)${NC} 菜单 [16] 修复配置"
-                echo -e "  ${BOLD}2)${NC} 菜单 [24] 清理字段"
-                echo -e "  ${BOLD}3)${NC} 手动执行: ${YELLOW}openclaw gateway run${NC}"
+                echo -e "${CYAN}Fix:${NC}"
+                echo -e "  ${BOLD}1)${NC} Menu [16] repair config"
+                echo -e "  ${BOLD}2)${NC} Menu [24] cleanup fields"
+                echo -e "  ${BOLD}3)${NC} Manual: ${YELLOW}openclaw gateway run${NC}"
             fi
             ;;
         stop)
-            confirm "确认停止服务?" && {
+            confirm "Confirm stop?" && {
                 if $docker_mode; then
-                    docker stop "$DOCKER_CONTAINER" 2>/dev/null && msg_ok "容器已停止" || msg_warn "停止失败"
+                    docker stop "$DOCKER_CONTAINER" 2>/dev/null && msg_ok "Container stopped" || msg_warn "Failed"
                 else
                     if json_is_valid && has_cmd openclaw; then
                         service_action stop 2>/dev/null || true
@@ -2867,11 +2862,11 @@ manage_service() {
                     fi
                     pkill -9 -f "openclaw.*gateway" 2>/dev/null || true
                     sleep 1
-                    msg_ok "已停止"
+                    msg_ok "Stopped"
                 fi
-            } || msg_info "已取消" ;;
+            } || msg_info "Cancelled" ;;
         restart)
-            msg_step "重启中..."
+            msg_step "Restarting..."
             if $docker_mode; then
                 docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
                 sleep 5
@@ -2879,7 +2874,7 @@ manage_service() {
                 local st
                 st=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null || echo "unknown")
                 if [[ "$st" == "running" ]]; then
-                    echo -ne "  等待服务就绪"
+                    echo -ne "  Waiting for ready"
                     local i=0
                     while (( i < 20 )); do
                         sleep 1; echo -ne "."
@@ -2887,10 +2882,10 @@ manage_service() {
                         ((i++))
                     done
                     echo ""
-                    msg_ok "重启成功"
+                    msg_ok "Restarted"
                     show_dashboard_info
                 else
-                    msg_fail "重启失败，状态: $st"
+                    msg_fail "Restart failed, status: $st"
                     docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
                 fi
             else
@@ -2903,23 +2898,23 @@ manage_service() {
                 return 0
             fi ;;
         status)
-            msg_step "查看状态:"
+            msg_step "Status:"
             echo ""
             if $docker_mode; then
-                echo -e "${CYAN}Docker 容器:${NC}"
-                docker ps -a --filter "name=$DOCKER_CONTAINER" --format "  名称: {{.Names}}\n  状态: {{.Status}}\n  端口: {{.Ports}}"
+                echo -e "${CYAN}Docker container:${NC}"
+                docker ps -a --filter "name=$DOCKER_CONTAINER" --format "  Name: {{.Names}}\n  Status: {{.Status}}\n  Ports: {{.Ports}}"
                 echo ""
-                echo -e "${CYAN}容器日志:${NC}"
+                echo -e "${CYAN}Container logs:${NC}"
                 docker logs --tail 15 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
             else
                 service_action status
                 echo ""
-                echo -e "${CYAN}运行进程:${NC}"
-                ps aux | grep -iE "openclaw" | grep -v grep | grep -v "openclaw-manager" | head -5 | sed 's/^/  /' || echo "  (无)"
+                echo -e "${CYAN}Processes:${NC}"
+                ps aux | grep -iE "openclaw" | grep -v grep | grep -v "openclaw-manager" | head -5 | sed 's/^/  /' || echo "  (none)"
             fi
             echo ""
-            echo -e "${CYAN}端口 ($OPENCLAW_PORT):${NC}"
-            ss -lntp 2>/dev/null | grep ":$OPENCLAW_PORT" | sed 's/^/  /' || echo "  未监听"
+            echo -e "${CYAN}Port ($OPENCLAW_PORT):${NC}"
+            ss -lntp 2>/dev/null | grep ":$OPENCLAW_PORT" | sed 's/^/  /' || echo "  Not listening"
 
             load_config_from_file
             show_dashboard_info ;;
@@ -2929,48 +2924,48 @@ manage_service() {
 }
 
 diagnose_and_fix() {
-    msg_title "${DOCTOR} 诊断与修复"
+    msg_title "${DOCTOR} Diagnose and Fix"
     detect_system
     local issues=0 fixed=0
     local cfg
     cfg=$(get_active_config_path)
 
-    echo -e "${CYAN}${BOLD}检测中...${NC}"
-    echo -e "${DIM}部署方式: $(_detect_deploy_mode)  配置: $cfg${NC}"
+    echo -e "${CYAN}${BOLD}Checking...${NC}"
+    echo -e "${DIM}Mode: $(_detect_deploy_mode)  Config: $cfg${NC}"
     echo ""
 
     _chk() { echo -ne "  [${1}] ${2}...  "; }
     _pass() { echo -e "${GREEN}${OK} $*${NC}"; }
     _fail_msg() { echo -e "${RED}${FAIL} $*${NC}"; }
 
-    _chk "1/10" "OpenClaw 安装"
+    _chk "1/10" "OpenClaw"
     if is_openclaw_installed; then
         _pass "$(openclaw_cmd --version 2>/dev/null)"
     else
-        _fail_msg "未安装"
+        _fail_msg "Not installed"
         ((issues++))
     fi
 
-    _chk "2/10" "配置文件"
+    _chk "2/10" "Config exists"
     if [[ -f "$cfg" ]]; then
-        _pass "已存在"
+        _pass "Exists"
     else
-        _fail_msg "不存在"
+        _fail_msg "Not exists"
         ((issues++))
-        confirm "  创建?" && { _create_minimal_config; ((fixed++)); }
+        confirm "  Create?" && { _create_minimal_config; ((fixed++)); }
     fi
 
-    _chk "3/10" "JSON 格式"
+    _chk "3/10" "JSON valid"
     if [[ -f "$cfg" ]]; then
         if json_is_valid; then
-            _pass "有效"
+            _pass "Valid"
         else
-            _fail_msg "损坏!"
+            _fail_msg "Corrupted!"
             ((issues++))
-            confirm "  修复?" && { backup_config; _create_minimal_config; ((fixed++)); }
+            confirm "  Repair?" && { backup_config; _create_minimal_config; ((fixed++)); }
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
     _chk "4/10" "gateway.bind"
@@ -2986,15 +2981,15 @@ except: print('')
         if [[ "$bind_v" =~ ^(auto|lan|loopback|custom|tailnet)$ ]]; then
             _pass "bind=$bind_v"
         else
-            _fail_msg "bind='$bind_v' 无效"
+            _fail_msg "bind='$bind_v' invalid"
             ((issues++))
-            confirm "  修复?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
+            confirm "  Fix?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
-    _chk "5/10" "非法根字段"
+    _chk "5/10" "Illegal root fields"
     if [[ -f "$cfg" ]] && json_is_valid && has_cmd python3; then
         local bad_keys
         bad_keys=$(python3 -c "
@@ -3009,14 +3004,14 @@ try:
 except: print('')
 " 2>/dev/null || echo "")
         if [[ -z "$bad_keys" ]]; then
-            _pass "无"
+            _pass "None"
         else
-            _fail_msg "存在: $bad_keys"
+            _fail_msg "Exists: $bad_keys"
             ((issues++))
-            confirm "  清理?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
+            confirm "  Cleanup?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
     _chk "6/10" "openclaw schema"
@@ -3024,19 +3019,19 @@ except: print('')
         local schema_out
         schema_out=$(openclaw_cmd config validate 2>&1)
         if echo "$schema_out" | grep -qiE "Invalid input"; then
-            _fail_msg "失败"
+            _fail_msg "Failed"
             ((issues++))
             echo ""
             echo "$schema_out" | grep -iE "×|invalid|allowed" | head -5 | sed 's/^/    /'
-            confirm "  自动清理?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
+            confirm "  Auto cleanup?" && { sanitize_config_for_schema | sed 's/^/    /'; ((fixed++)); }
         else
-            _pass "通过"
+            _pass "Passed"
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
-    _chk "7/10" "Docker URL 兼容"
+    _chk "7/10" "Docker URL compatible"
     if is_docker_mode && [[ -f "$cfg" ]] && json_is_valid && has_cmd python3; then
         local lan_urls
         lan_urls=$(python3 -c "
@@ -3053,17 +3048,17 @@ try:
 except: print('')
 " 2>/dev/null || echo "")
         if [[ -z "$lan_urls" ]]; then
-            _pass "无需转换"
+            _pass "No conversion needed"
         else
-            _fail_msg "局域网 URL: $lan_urls (容器无法访问)"
+            _fail_msg "LAN URL: $lan_urls (container cannot access)"
             ((issues++))
-            confirm "  转换为 host.docker.internal?" && { convert_urls_for_docker_mode | sed 's/^/    /'; ((fixed++)); }
+            confirm "  Convert to host.docker.internal?" && { convert_urls_for_docker_mode | sed 's/^/    /'; ((fixed++)); }
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
-    _chk "8/10" "Agent 认证"
+    _chk "8/10" "Agent auth"
     if is_openclaw_installed; then
         local agent_base
         if is_docker_mode; then
@@ -3074,29 +3069,29 @@ except: print('')
         local auth_file="$agent_base/main/agent/auth-profiles.json"
         local sqlite_file="$agent_base/main/agent/openclaw-agent.sqlite"
         if [[ -f "$auth_file" ]] || [[ -f "$sqlite_file" ]]; then
-            _pass "已存在"
+            _pass "Exists"
         else
-            _fail_msg "缺失"
+            _fail_msg "Missing"
             ((issues++))
-            confirm "  修复 (菜单[23])?" && { fix_agent_auth_menu; ((fixed++)); }
+            confirm "  Fix (menu[23])?" && { fix_agent_auth_menu; ((fixed++)); }
         fi
     else
-        echo -e "${DIM}跳过${NC}"
+        echo -e "${DIM}Skip${NC}"
     fi
 
-    _chk "9/10" "Gateway 端口"
+    _chk "9/10" "Gateway port"
     if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
-        _pass "正常响应"
+        _pass "Responding"
     else
-        echo -e "${YELLOW}${WARN} 无响应${NC}"
+        echo -e "${YELLOW}${WARN} No response${NC}"
         ((issues++))
-        confirm "  启动?" && { manage_service start >/dev/null; ((fixed++)); }
+        confirm "  Start?" && { manage_service start >/dev/null; ((fixed++)); }
     fi
 
-    _chk "10/10" "磁盘空间"
+    _chk "10/10" "Disk"
     local da
     da=$(df "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo "9999999")
-    [[ "$da" -gt 1048576 ]] && _pass "$(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}')" || { _fail_msg "空间不足"; ((issues++)); }
+    [[ "$da" -gt 1048576 ]] && _pass "$(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}')" || { _fail_msg "Low"; ((issues++)); }
 
     if is_openclaw_installed; then
         echo ""
@@ -3106,7 +3101,7 @@ except: print('')
 
     echo ""
     print_line
-    echo -e "${BOLD}诊断结果:${NC}  问题 ${RED}${issues}${NC}  已修复 ${GREEN}${fixed}${NC}"
+    echo -e "${BOLD}Result:${NC}  Issues ${RED}${issues}${NC}  Fixed ${GREEN}${fixed}${NC}"
     print_line
 
     wait_and_return 3
@@ -3114,23 +3109,23 @@ except: print('')
 }
 
 view_logs() {
-    msg_title "📋 日志查看"
-    echo "  1) 实时 Gateway 日志  2) systemd 日志  3) 日志文件  4) Docker 日志  5) 脚本日志  6) gateway.out  0) 返回"
+    msg_title "Logs"
+    echo "  1) Live Gateway  2) systemd  3) File  4) Docker  5) Script  6) gateway.out  0) Return"
     echo ""
-    echo -ne "${BOLD}请选择: ${NC}"
+    echo -ne "${BOLD}Choose: ${NC}"
     local lc
     read -r lc </dev/tty || lc="0"
 
     case "$lc" in
         1)
-            trap 'echo ""; msg_info "已退出"' INT
+            trap 'echo ""; msg_info "Exit"' INT
             if is_docker_mode; then
                 docker logs -f "$DOCKER_CONTAINER" 2>&1 || true
             else
                 openclaw_cmd gateway logs --follow 2>/dev/null \
                     || openclaw_cmd logs 2>/dev/null \
                     || tail -f "${OPENCLAW_LOG_DIR}/gateway.log" 2>/dev/null \
-                    || msg_fail "无法获取日志"
+                    || msg_fail "Cannot get"
             fi
             trap - INT ;;
         2)
@@ -3146,26 +3141,26 @@ view_logs() {
             is_docker_mode && log_dir="${DOCKER_DATA_DIR}/.openclaw/logs"
             if [[ -d "$log_dir" ]]; then
                 ls -lh "$log_dir" 2>/dev/null
-                echo -ne "${BOLD}文件名 (Enter 查看最新): ${NC}"
+                echo -ne "${BOLD}File (Enter for latest): ${NC}"
                 local lf; read -r lf </dev/tty || lf=""
                 if [[ -n "$lf" ]]; then
                     less "${log_dir}/${lf}" 2>/dev/null
                 else
                     local ll
                     ll=$(ls -t "${log_dir}"/*.log 2>/dev/null | head -1 || echo "")
-                    [[ -n "$ll" ]] && less "$ll" || msg_warn "无日志文件"
+                    [[ -n "$ll" ]] && less "$ll" || msg_warn "No log"
                 fi
             fi ;;
         4)
             if docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
-                trap 'echo ""; msg_info "已退出"' INT
+                trap 'echo ""; msg_info "Exit"' INT
                 docker logs -f "$DOCKER_CONTAINER" 2>&1 || true
                 trap - INT
             fi ;;
         5)
-            [[ -f "$LOG_FILE" ]] && less "$LOG_FILE" || msg_warn "日志文件不存在" ;;
+            [[ -f "$LOG_FILE" ]] && less "$LOG_FILE" || msg_warn "Not exists" ;;
         6)
-            [[ -f "$OPENCLAW_LOG_DIR/gateway.out" ]] && less "$OPENCLAW_LOG_DIR/gateway.out" || msg_warn "文件不存在" ;;
+            [[ -f "$OPENCLAW_LOG_DIR/gateway.out" ]] && less "$OPENCLAW_LOG_DIR/gateway.out" || msg_warn "Not exists" ;;
         0) return 0 ;;
     esac
     wait_and_return 2
@@ -3173,20 +3168,20 @@ view_logs() {
 }
 
 uninstall_openclaw() {
-    msg_title "${TRASH} 卸载 OpenClaw"
-    echo -e "${RED}${BOLD}即将卸载 OpenClaw${NC}"
+    msg_title "${TRASH} Uninstall"
+    echo -e "${RED}${BOLD}Uninstall OpenClaw${NC}"
     echo ""
-    confirm "确认卸载?" || { wait_and_return 2; return 0; }
+    confirm "Confirm?" || { wait_and_return 2; return 0; }
     detect_system
 
     docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER" && {
         docker stop "$DOCKER_CONTAINER" 2>/dev/null || true
-        confirm "删除容器?" && docker rm -f "$DOCKER_CONTAINER" 2>/dev/null
-        confirm "删除镜像?" && {
+        confirm "Delete container?" && docker rm -f "$DOCKER_CONTAINER" 2>/dev/null
+        confirm "Delete image?" && {
             docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true
             docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true
         }
-        confirm "删除数据目录 (${DOCKER_DATA_DIR})?" && rm -rf "$DOCKER_DATA_DIR"
+        confirm "Delete data dir (${DOCKER_DATA_DIR})?" && rm -rf "$DOCKER_DATA_DIR"
     }
 
     if has_cmd openclaw; then
@@ -3218,7 +3213,7 @@ uninstall_openclaw() {
     fi
 
     echo ""
-    confirm "删除配置目录 ($OPENCLAW_CONFIG_DIR)?" && {
+    confirm "Delete config dir ($OPENCLAW_CONFIG_DIR)?" && {
         rm -rf "$OPENCLAW_CONFIG_DIR"
         G_API_KEYS=()
         G_API_MODELS=()
@@ -3227,7 +3222,7 @@ uninstall_openclaw() {
         G_DEFAULT_PROVIDER=""
     }
 
-    msg_ok "卸载完成"
+    msg_ok "Uninstalled"
     wait_and_return 3
     return 0
 }
@@ -3244,24 +3239,24 @@ show_banner() {
   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
 BANNER
     echo -e "${NC}"
-    echo -e "        ${DIM}${SCRIPT_VERSION} | Docker + 局域网 + Agent 一键部署${NC}"
+    echo -e "        ${DIM}${SCRIPT_VERSION} | Docker+LAN+Agent One-Click Deploy${NC}"
     echo ""
 
     detect_system
     load_config_from_file 2>/dev/null || true
 
-    local sc="${RED}" st="未安装"
+    local sc="${RED}" st="Not Installed"
     if is_openclaw_installed; then
         curl -s --max-time 2 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null \
-            && { sc="${GREEN}"; st="运行中 ●"; } \
-            || { sc="${YELLOW}"; st="未运行"; }
+            && { sc="${GREEN}"; st="Running"; } \
+            || { sc="${YELLOW}"; st="Not Running"; }
     fi
 
-    local cfg_status="${DIM}未创建${NC}"
+    local cfg_status="${DIM}Not created${NC}"
     local cfg
     cfg=$(get_active_config_path)
     if [[ -f "$cfg" ]]; then
-        json_is_valid && cfg_status="${GREEN}有效${NC}" || cfg_status="${RED}${BOLD}损坏!${NC}"
+        json_is_valid && cfg_status="${GREEN}Valid${NC}" || cfg_status="${RED}${BOLD}Corrupted!${NC}"
     fi
 
     local bind_v=""
@@ -3285,48 +3280,48 @@ except: pass
         [[ -n "$dm" ]] && mi="  ${DIM}|${NC} ${CYAN}${G_DEFAULT_PROVIDER}${NC}"
     fi
 
-    echo -e "  ${DIM}系统:${NC} ${OS^^}  ${DIM}|${NC}  ${DIM}网关:${NC} ${sc}${st}${NC}  ${DIM}|${NC}  ${DIM}模式:${NC} ${mode_label}  ${DIM}|${NC}  ${DIM}配置:${NC} ${cfg_status}  ${DIM}|${NC}  ${DIM}bind:${NC} ${bind_v:-?}${mi}"
+    echo -e "  ${DIM}OS:${NC} ${OS^^}  ${DIM}|${NC}  ${DIM}GW:${NC} ${sc}${st}${NC}  ${DIM}|${NC}  ${DIM}Mode:${NC} ${mode_label}  ${DIM}|${NC}  ${DIM}Config:${NC} ${cfg_status}  ${DIM}|${NC}  ${DIM}bind:${NC} ${bind_v:-?}${mi}"
     print_line
 }
 
 main_menu() {
     while true; do
         show_banner
-        echo -e "${WHITE}${BOLD}  主菜单${NC}"
+        echo -e "${WHITE}${BOLD}  Main Menu${NC}"
         echo ""
-        echo -e "${BOLD}  ── 安装 ──${NC}"
-        echo -e "  ${BOLD}${GREEN}[1]${NC}  ${ROCKET} 本地安装 / 重装"
-        echo -e "  ${BOLD}${GREEN}[2]${NC}  ${DOCKER} Docker 部署"
+        echo -e "${BOLD}  -- Install --${NC}"
+        echo -e "  ${BOLD}${GREEN}[1]${NC}  ${ROCKET} Local Install / Reinstall"
+        echo -e "  ${BOLD}${GREEN}[2]${NC}  ${DOCKER} Docker Deploy"
         echo ""
-        echo -e "${BOLD}  ── 配置 ──${NC}"
-        echo -e "  ${BOLD}${CYAN}[3]${NC}  🔑 内置 Provider API 密钥"
-        echo -e "  ${BOLD}${CYAN}[4]${NC}  🔧 自定义 API ${GREEN}(一键部署)${NC}"
-        echo -e "  ${BOLD}${CYAN}[5]${NC}  ${LOBSTER} 局域网 UI 访问"
-        echo -e "  ${BOLD}${CYAN}[6]${NC}  ${PLUGIN} 安装插件"
+        echo -e "${BOLD}  -- Config --${NC}"
+        echo -e "  ${BOLD}${CYAN}[3]${NC}  ${KEY} Builtin Provider API Keys"
+        echo -e "  ${BOLD}${CYAN}[4]${NC}  ${GEAR} Custom API ${GREEN}(One-Click)${NC}"
+        echo -e "  ${BOLD}${CYAN}[5]${NC}  ${LOBSTER} LAN UI Access"
+        echo -e "  ${BOLD}${CYAN}[6]${NC}  ${PLUGIN} Install Plugins"
         echo ""
-        echo -e "${BOLD}  ── 服务 ──${NC}"
-        echo -e "  ${BOLD}${YELLOW}[7]${NC}  ${POWER} 启动    ${BOLD}${YELLOW}[8]${NC} 🔄 重启    ${BOLD}${YELLOW}[9]${NC} ⏹  停止    ${BOLD}${YELLOW}[10]${NC} 📈 状态"
+        echo -e "${BOLD}  -- Service --${NC}"
+        echo -e "  ${BOLD}${YELLOW}[7]${NC}  ${POWER} Start    ${BOLD}${YELLOW}[8]${NC} Restart    ${BOLD}${YELLOW}[9]${NC} Stop    ${BOLD}${YELLOW}[10]${NC} Status"
         echo ""
-        echo -e "${BOLD}  ── 工具 ──${NC}"
-        echo -e "  ${BOLD}${MAGENTA}[11]${NC} ${KEY} 网关令牌管理"
-        echo -e "  ${BOLD}${MAGENTA}[12]${NC} 📊 控制台访问地址"
-        echo -e "  ${BOLD}${MAGENTA}[13]${NC} 📦 版本 / 升级"
-        echo -e "  ${BOLD}${MAGENTA}[14]${NC} 📋 日志查看"
-        echo -e "  ${BOLD}${MAGENTA}[15]${NC} ${GEAR} 快捷命令"
-        echo -e "  ${BOLD}${MAGENTA}[16]${NC} 🛠️  修复损坏配置"
-        echo -e "  ${BOLD}${MAGENTA}[17]${NC} ✅ 验证配置"
-        echo -e "  ${BOLD}${MAGENTA}[18]${NC} ${DOCTOR} 诊断与修复"
-        echo -e "  ${BOLD}${MAGENTA}[19]${NC} 📖 命令速查"
-        echo -e "  ${BOLD}${MAGENTA}[20]${NC} ℹ️  系统信息"
-        echo -e "  ${BOLD}${GREEN}[21]${NC} 🔧 setup 向导"
-        echo -e "  ${BOLD}${RED}[22]${NC} ${TRASH} 卸载"
-        echo -e "  ${BOLD}${YELLOW}[23]${NC} ${LINK} 修复 Agent 认证"
-        echo -e "  ${BOLD}${YELLOW}[24]${NC} 🧹 清理不兼容字段"
-        echo -e "  ${BOLD}${YELLOW}[25]${NC} 🌐 转换 URL (Docker 兼容)"
-        echo -e "  ${BOLD}[0]${NC}  🚪 退出"
+        echo -e "${BOLD}  -- Tools --${NC}"
+        echo -e "  ${BOLD}${MAGENTA}[11]${NC} ${KEY} Gateway Token Manager"
+        echo -e "  ${BOLD}${MAGENTA}[12]${NC} Dashboard URL"
+        echo -e "  ${BOLD}${MAGENTA}[13]${NC} Version / Upgrade"
+        echo -e "  ${BOLD}${MAGENTA}[14]${NC} Logs"
+        echo -e "  ${BOLD}${MAGENTA}[15]${NC} ${GEAR} Quick Commands"
+        echo -e "  ${BOLD}${MAGENTA}[16]${NC} Repair Config"
+        echo -e "  ${BOLD}${MAGENTA}[17]${NC} Validate Config"
+        echo -e "  ${BOLD}${MAGENTA}[18]${NC} ${DOCTOR} Diagnose and Fix"
+        echo -e "  ${BOLD}${MAGENTA}[19]${NC} Command Reference"
+        echo -e "  ${BOLD}${MAGENTA}[20]${NC} System Info"
+        echo -e "  ${BOLD}${GREEN}[21]${NC} Setup Wizard"
+        echo -e "  ${BOLD}${RED}[22]${NC} ${TRASH} Uninstall"
+        echo -e "  ${BOLD}${YELLOW}[23]${NC} ${LINK} Fix Agent Auth"
+        echo -e "  ${BOLD}${YELLOW}[24]${NC} Cleanup Incompatible Fields"
+        echo -e "  ${BOLD}${YELLOW}[25]${NC} Convert URL (Docker Compatible)"
+        echo -e "  ${BOLD}[0]${NC}  Exit"
         echo ""
         print_line
-        echo -ne "  ${BOLD}请输入选项: ${NC}"
+        echo -ne "  ${BOLD}Enter choice: ${NC}"
         local choice
         read -r choice </dev/tty || choice=""
 
@@ -3354,23 +3349,18 @@ main_menu() {
             21) run_setup_wizard ;;
             22) uninstall_openclaw ;;
             23) fix_agent_auth_menu ;;
-            24)
-                confirm "确认清理不兼容字段?" && {
-                    sanitize_config_for_schema | sed 's/^/  /'
-                    msg_ok "已清理"
-                }
-                wait_and_return 3 ;;
+            24) sanitize_config_for_schema | sed 's/^/  /'; msg_ok "Cleaned"; wait_and_return 3 ;;
             25)
                 if is_docker_mode; then
                     convert_urls_for_docker_mode | sed 's/^/  /'
-                    msg_ok "已转换，请重启 Gateway"
-                    confirm "立即重启?" && manage_service restart >/dev/null 2>&1
+                    msg_ok "Converted, please restart Gateway"
+                    confirm "Restart now?" && manage_service restart >/dev/null 2>&1
                 else
-                    msg_warn "非 Docker 模式，无需转换"
+                    msg_warn "Not Docker mode, no conversion needed"
                 fi
                 wait_and_return 3 ;;
-            0)  echo ""; echo -e "${GREEN}${BOLD}再见! 👋${NC}"; echo ""; exit 0 ;;
-            *)  msg_warn "无效选项: ${choice}"; sleep 1 ;;
+            0)  echo ""; echo -e "${GREEN}${BOLD}Goodbye!${NC}"; echo ""; exit 0 ;;
+            *)  msg_warn "Invalid: ${choice}"; sleep 1 ;;
         esac
     done
 }
