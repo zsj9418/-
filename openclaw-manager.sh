@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -uo pipefail
 
 RED='\033[0;31m'
@@ -22,9 +23,8 @@ OPENCLAW_SERVICE="openclaw"
 OPENCLAW_SERVICE_CANDIDATES=("openclaw" "openclaw-gateway")
 OPENCLAW_CONFIG_DIR="$HOME/.openclaw"
 OPENCLAW_JSON="$OPENCLAW_CONFIG_DIR/openclaw.json"
-OPENCLAW_API_JSON="$OPENCLAW_CONFIG_DIR/config.json"
 OPENCLAW_LOG_DIR="$OPENCLAW_CONFIG_DIR/logs"
-SCRIPT_VERSION="v2.2.0"
+SCRIPT_VERSION="v1.0.1"
 NODE_MIN_VERSION=22
 NODE_RECOMMENDED_VERSION=24
 LOG_FILE="/tmp/openclaw_install_$(date +%Y%m%d_%H%M%S).log"
@@ -45,8 +45,13 @@ _NVM_LATEST=""
 _NODE_LTS_VERSIONS=""
 _NODE_LATEST_VERSION=""
 
+# ============================================================
+# 修复：使用正确的数据结构存储配置
+# ============================================================
 declare -gA G_API_KEYS=()
 declare -gA G_API_MODELS=()
+declare -gA G_API_TYPES=()
+declare -gA G_API_URLS=()
 declare -g  G_DEFAULT_PROVIDER=""
 
 print_line() { echo -e "${DIM}$(printf '─%.0s' {1..60})${NC}"; }
@@ -70,8 +75,28 @@ msg_title() {
 }
 
 press_any_key() {
+    local wait_time="${1:-0}"
     echo ""
-    read -rp "$(echo -e "${DIM}按 Enter 返回主菜单...${NC}")" _ </dev/tty 2>/dev/null || true
+    if [[ "$wait_time" -gt 0 ]]; then
+        echo -ne "${DIM}${wait_time} 秒后自动返回...${NC}"
+        sleep "$wait_time"
+        echo ""
+    else
+        read -rp "$(echo -e "${DIM}按 Enter 返回主菜单...${NC}")" _ </dev/tty 2>/dev/null || true
+    fi
+}
+
+# 快速返回（用于简单操作）
+auto_return() {
+    local delay="${1:-2}"
+    echo ""
+    echo -ne "${DIM}${delay} 秒后自动返回...${NC}"
+    local i=0
+    while (( i < delay )); do
+        sleep 1
+        ((i++))
+    done
+    echo ""
 }
 
 confirm() {
@@ -241,12 +266,799 @@ _detect_deploy_mode() {
     fi
 }
 
+# ============================================================
+# 修复：正确的配置文件读取
+# ============================================================
+load_config_from_file() {
+    local cfg="$OPENCLAW_JSON"
+    [[ ! -f "$cfg" ]] && return 0
+    
+    if has_cmd python3; then
+        local result
+        result=$(python3 - "$cfg" << 'PYEOF' 2>/dev/null
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+except:
+    sys.exit(0)
+
+# 读取默认 Provider
+dp = cfg.get("defaultProvider", "")
+if not dp:
+    # 尝试从 agents.defaults.model.primary 获取
+    agents = cfg.get("agents", {})
+    defaults = agents.get("defaults", {})
+    model = defaults.get("model", {})
+    primary = model.get("primary", "")
+    if primary and "/" in primary:
+        dp = primary.split("/")[0]
+
+if dp:
+    print(f'G_DEFAULT_PROVIDER="{dp}"')
+
+# 读取内置 Provider 的 API Key
+for provider in ["anthropic", "openai", "google", "deepseek", "groq", "mistral"]:
+    p_cfg = cfg.get(provider, {})
+    if isinstance(p_cfg, dict):
+        key = p_cfg.get("apiKey", "")
+        model = p_cfg.get("model", "")
+        models = p_cfg.get("models", "")
+        if key:
+            print(f'G_API_KEYS[{provider}]="{key}"')
+        if models:
+            print(f'G_API_MODELS[{provider}]="{models}"')
+        elif model:
+            print(f'G_API_MODELS[{provider}]="{model}"')
+
+# 读取自定义 Provider
+models_cfg = cfg.get("models", {})
+providers = models_cfg.get("providers", {})
+
+for name, p_cfg in providers.items():
+    if not isinstance(p_cfg, dict):
+        continue
+    
+    base_url = p_cfg.get("baseUrl", "")
+    api_key = p_cfg.get("apiKey", "")
+    api_type = p_cfg.get("api", "")
+    
+    # 获取模型列表
+    model_list = p_cfg.get("models", [])
+    if isinstance(model_list, list) and model_list:
+        model_ids = [m.get("id", "") for m in model_list if isinstance(m, dict) and m.get("id")]
+        models_str = ",".join(model_ids)
+    else:
+        models_str = ""
+    
+    if base_url:
+        print(f'G_API_URLS[{name}]="{base_url}"')
+    if api_key:
+        print(f'G_API_KEYS[{name}]="{api_key}"')
+    if api_type:
+        print(f'G_API_TYPES[{name}]="{api_type}"')
+    if models_str:
+        print(f'G_API_MODELS[{name}]="{models_str}"')
+
+PYEOF
+)
+        [[ -n "${result:-}" ]] && eval "$result" 2>/dev/null || true
+    fi
+}
+
+# ============================================================
+# 修复：正确的配置文件写入（核心修复！）
+# ============================================================
+write_config_to_file() {
+    local cfg="$OPENCLAW_JSON"
+    mkdir -p "$OPENCLAW_CONFIG_DIR"
+    
+    if has_cmd python3; then
+        # 使用 Python 安全地处理 JSON
+        python3 - "$cfg" << PYEOF
+import json
+import sys
+import os
+
+cfg_path = sys.argv[1]
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+
+# 加载现有配置
+try:
+    with open(cfg_path, 'r') as f:
+        config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+
+# ============================================================
+# 关键修复 1: 确保 gateway.mode 存在
+# ============================================================
+config.setdefault("gateway", {})
+if not config["gateway"].get("mode"):
+    config["gateway"]["mode"] = "local"
+config["gateway"].setdefault("bind", "localhost")
+
+# ============================================================
+# 关键修复 2: 确保 models.mode = "merge"
+# ============================================================
+config.setdefault("models", {})
+config["models"]["mode"] = "merge"
+config["models"].setdefault("providers", {})
+
+# 读取环境变量中的配置
+env = os.environ
+
+# 处理内置 Provider
+for provider in ["anthropic", "openai", "google", "deepseek", "groq", "mistral"]:
+    key_var = f"OCKEY_{provider.upper()}"
+    model_var = f"OCMODEL_{provider.upper()}"
+    
+    key = env.get(key_var, "")
+    models = env.get(model_var, "")
+    
+    if key:
+        config.setdefault(provider, {})["apiKey"] = key
+    if models:
+        config.setdefault(provider, {})
+        config[provider]["models"] = models
+        config[provider]["model"] = models.split(",")[0]
+
+# 处理自定义 Provider
+custom_providers = {}
+for k, v in env.items():
+    if k.startswith("OCURL_") and v:
+        name = k[6:].lower()
+        custom_providers.setdefault(name, {})["baseUrl"] = v
+    elif k.startswith("OCKEY_") and v and k[6:].lower() not in ["anthropic", "openai", "google", "deepseek", "groq", "mistral"]:
+        name = k[6:].lower()
+        custom_providers.setdefault(name, {})["apiKey"] = v
+    elif k.startswith("OCTYPE_") and v:
+        name = k[7:].lower()
+        custom_providers.setdefault(name, {})["api"] = v
+    elif k.startswith("OCMODEL_") and v and k[8:].lower() not in ["anthropic", "openai", "google", "deepseek", "groq", "mistral"]:
+        name = k[8:].lower()
+        custom_providers.setdefault(name, {})["models_str"] = v
+
+for name, p_cfg in custom_providers.items():
+    if not p_cfg.get("baseUrl"):
+        continue
+    
+    provider_config = {
+        "baseUrl": p_cfg["baseUrl"],
+        "apiKey": p_cfg.get("apiKey", "none"),
+        # ============================================================
+        # 关键修复 3: 确保 api 字段存在
+        # ============================================================
+        "api": p_cfg.get("api", "openai-completions"),
+        "models": []
+    }
+    
+    # 构建模型列表
+    models_str = p_cfg.get("models_str", "")
+    if models_str:
+        for model_id in models_str.split(","):
+            model_id = model_id.strip()
+            if model_id:
+                provider_config["models"].append({
+                    "id": model_id,
+                    "name": model_id,
+                    "reasoning": False,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": 128000,
+                    "maxTokens": 8192
+                })
+    
+    config["models"]["providers"][name] = provider_config
+
+# ============================================================
+# 关键修复 4: 设置默认模型
+# ============================================================
+default_provider = env.get("OC_DEFAULT", "")
+if default_provider:
+    config["defaultProvider"] = default_provider
+    
+    # 同时设置 agents.defaults.model.primary
+    config.setdefault("agents", {})
+    config["agents"].setdefault("defaults", {})
+    config["agents"]["defaults"].setdefault("model", {})
+    config["agents"]["defaults"].setdefault("maxConcurrent", 4)
+    
+    # 获取该 Provider 的第一个模型
+    first_model = ""
+    if default_provider in config["models"]["providers"]:
+        models_list = config["models"]["providers"][default_provider].get("models", [])
+        if models_list:
+            first_model = models_list[0].get("id", "")
+    elif default_provider in config:
+        first_model = config[default_provider].get("model", "")
+    
+    if first_model:
+        config["agents"]["defaults"]["model"]["primary"] = f"{default_provider}/{first_model}"
+
+# 写入配置
+with open(cfg_path, 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print("OK")
+PYEOF
+        msg_ok "配置已写入 $cfg"
+    else
+        # Bash 回退方案（确保关键字段存在）
+        _write_config_bash_fallback
+    fi
+    
+    chmod 600 "$cfg"
+}
+
+_write_config_bash_fallback() {
+    local cfg="$OPENCLAW_JSON"
+    local tmp_file="${cfg}.tmp.$$"
+    
+    # 如果配置文件存在且有效，尝试合并
+    if [[ -f "$cfg" ]] && grep -q '"gateway"' "$cfg" 2>/dev/null; then
+        # 简单追加/修复关键字段
+        if ! grep -q '"mode"' "$cfg"; then
+            sed -i 's/"gateway"\s*:\s*{/"gateway": { "mode": "local",/' "$cfg" 2>/dev/null || true
+        fi
+        return
+    fi
+    
+    # 创建新配置
+    cat > "$tmp_file" << 'EOF'
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "localhost"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {}
+  },
+  "agents": {
+    "defaults": {
+      "maxConcurrent": 4,
+      "model": {}
+    }
+  }
+}
+EOF
+    mv "$tmp_file" "$cfg"
+    msg_ok "基础配置已创建"
+}
+
+# ============================================================
+# 修复：通过 openclaw CLI 写入配置
+# ============================================================
+write_config_via_openclaw() {
+    is_openclaw_installed || return 1
+    local any=false
+    
+    _oc() { 
+        if openclaw_cmd config set "$1" "$2" 2>/dev/null; then
+            any=true
+        fi
+    }
+    
+    # 关键修复：确保 gateway.mode 设置
+    _oc "gateway.mode" "local"
+    _oc "models.mode" "merge"
+    
+    # 内置 Provider
+    for p in anthropic openai google deepseek groq mistral; do
+        [[ -n "${G_API_KEYS[$p]:-}" ]] && _oc "${p}.apiKey" "${G_API_KEYS[$p]}"
+        if [[ -n "${G_API_MODELS[$p]:-}" ]]; then
+            _oc "${p}.model" "${G_API_MODELS[$p]%%,*}"
+            _oc "${p}.models" "${G_API_MODELS[$p]}"
+        fi
+    done
+    
+    # 设置默认 Provider
+    if [[ -n "$G_DEFAULT_PROVIDER" ]]; then
+        _oc "defaultProvider" "$G_DEFAULT_PROVIDER"
+        
+        # 设置默认模型
+        local first_model="${G_API_MODELS[$G_DEFAULT_PROVIDER]%%,*}"
+        if [[ -n "$first_model" ]]; then
+            _oc "agents.defaults.model.primary" "${G_DEFAULT_PROVIDER}/${first_model}"
+        fi
+    fi
+    
+    $any && return 0 || return 1
+}
+
+# ============================================================
+# 修复：配置自定义 API（核心功能修复！）
+# ============================================================
+configure_custom_api() {
+    msg_title "🔧 配置自定义 API Provider"
+    
+    echo -e "${CYAN}${BOLD}━━━ 自定义 OpenAI 兼容 API 配置 ━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}${WARN} 重要提示：${NC}"
+    echo -e "  • 必须正确设置 ${BOLD}api${NC} 字段，否则会报 'undefined' 错误"
+    echo -e "  • 必须设置 ${BOLD}models.mode${NC} 为 'merge'"
+    echo -e "  • 必须设置 ${BOLD}默认模型${NC} 才能使用"
+    echo ""
+    
+    # Provider 名称
+    echo -ne "${CYAN}Provider 名称 (例如: deepseek, ollama, lmstudio, my-api): ${NC}"
+    local provider_name
+    read -r provider_name </dev/tty || provider_name=""
+    provider_name=${provider_name:-custom}
+    provider_name=$(echo "$provider_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+    
+    # Base URL
+    echo ""
+    echo -e "${DIM}常见 URL 示例:${NC}"
+    echo -e "  ${DIM}• DeepSeek:   https://api.deepseek.com/v1${NC}"
+    echo -e "  ${DIM}• Ollama:     http://127.0.0.1:11434 (注意：不加 /v1)${NC}"
+    echo -e "  ${DIM}• LM Studio:  http://127.0.0.1:1234/v1${NC}"
+    echo -e "  ${DIM}• vLLM:       http://127.0.0.1:8000/v1${NC}"
+    echo ""
+    echo -ne "${CYAN}API Base URL: ${NC}"
+    local base_url
+    read -r base_url </dev/tty || base_url=""
+    
+    if [[ -z "$base_url" ]]; then
+        msg_warn "URL 不能为空，已取消"
+        return 1
+    fi
+    
+    # API Key
+    echo ""
+    echo -ne "${CYAN}API Key (本地服务输入 'local' 或 'none'): ${NC}"
+    local api_key
+    read -rs api_key </dev/tty || api_key=""
+    echo ""
+    api_key=${api_key:-local}
+    
+    # API 类型（关键！）
+    echo ""
+    echo -e "${CYAN}${BOLD}选择 API 类型（关键！）:${NC}"
+    echo -e "  ${BOLD}1)${NC} openai-completions  ${DIM}(大多数 OpenAI 兼容 API: DeepSeek, LM Studio, vLLM 等)${NC}"
+    echo -e "  ${BOLD}2)${NC} openai-responses    ${DIM}(OpenAI Responses API /v1/responses)${NC}"
+    echo -e "  ${BOLD}3)${NC} ollama              ${DIM}(本地 Ollama，使用原生 API，不加 /v1)${NC}"
+    echo -e "  ${BOLD}4)${NC} anthropic-messages  ${DIM}(Anthropic Claude 兼容 API)${NC}"
+    echo ""
+    echo -ne "${CYAN}选择 [1-4] (默认: 1): ${NC}"
+    local api_choice
+    read -r api_choice </dev/tty || api_choice="1"
+    
+    local api_type
+    case "$api_choice" in
+        2) api_type="openai-responses" ;;
+        3) api_type="ollama" ;;
+        4) api_type="anthropic-messages" ;;
+        *) api_type="openai-completions" ;;
+    esac
+    
+    # 模型 ID
+    echo ""
+    echo -e "${DIM}模型 ID 示例:${NC}"
+    echo -e "  ${DIM}• DeepSeek: deepseek-chat, deepseek-reasoner${NC}"
+    echo -e "  ${DIM}• Ollama:   qwen3:32b, llama3.1:8b${NC}"
+    echo -e "  ${DIM}• 通用:     gpt-4o, claude-3-opus${NC}"
+    echo ""
+    echo -ne "${CYAN}模型 ID (多个用逗号分隔): ${NC}"
+    local model_ids
+    read -r model_ids </dev/tty || model_ids=""
+    
+    if [[ -z "$model_ids" ]]; then
+        msg_warn "模型 ID 不能为空，已取消"
+        return 1
+    fi
+    
+    # 保存配置
+    G_API_URLS["$provider_name"]="$base_url"
+    G_API_KEYS["$provider_name"]="$api_key"
+    G_API_TYPES["$provider_name"]="$api_type"
+    G_API_MODELS["$provider_name"]="$model_ids"
+    
+    # 设置为默认 Provider
+    echo ""
+    if [[ -z "$G_DEFAULT_PROVIDER" ]] || confirm "设置 ${provider_name} 为默认 Provider?"; then
+        G_DEFAULT_PROVIDER="$provider_name"
+        msg_ok "已设置 ${provider_name} 为默认 Provider"
+    fi
+    
+    # 写入配置文件
+    echo ""
+    msg_step "写入配置..."
+    _write_custom_provider_config "$provider_name"
+    
+    # 显示配置摘要
+    echo ""
+    echo -e "${GREEN}${BOLD}✅ 自定义 API 配置完成${NC}"
+    print_line
+    echo -e "  ${BOLD}Provider:${NC}    $provider_name"
+    echo -e "  ${BOLD}Base URL:${NC}    $base_url"
+    echo -e "  ${BOLD}API Type:${NC}    ${CYAN}$api_type${NC}"
+    echo -e "  ${BOLD}Models:${NC}      $model_ids"
+    echo -e "  ${BOLD}默认模型:${NC}    ${provider_name}/${model_ids%%,*}"
+    print_line
+    
+    return 0
+}
+
+_write_custom_provider_config() {
+    local provider_name="$1"
+    local cfg="$OPENCLAW_JSON"
+    
+    mkdir -p "$OPENCLAW_CONFIG_DIR"
+    
+    if has_cmd python3; then
+        local base_url="${G_API_URLS[$provider_name]:-}"
+        local api_key="${G_API_KEYS[$provider_name]:-local}"
+        local api_type="${G_API_TYPES[$provider_name]:-openai-completions}"
+        local models_str="${G_API_MODELS[$provider_name]:-}"
+        local default_provider="${G_DEFAULT_PROVIDER:-}"
+        
+        python3 - "$cfg" "$provider_name" "$base_url" "$api_key" "$api_type" "$models_str" "$default_provider" << 'PYEOF'
+import json
+import sys
+import os
+
+cfg_path = sys.argv[1]
+provider_name = sys.argv[2]
+base_url = sys.argv[3]
+api_key = sys.argv[4]
+api_type = sys.argv[5]
+models_str = sys.argv[6]
+default_provider = sys.argv[7]
+
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+
+# 加载或创建配置
+try:
+    with open(cfg_path, 'r') as f:
+        config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+
+# 关键修复 1: gateway.mode
+config.setdefault("gateway", {})
+config["gateway"].setdefault("mode", "local")
+config["gateway"].setdefault("bind", "localhost")
+
+# 关键修复 2: models.mode = "merge"
+config.setdefault("models", {})
+config["models"]["mode"] = "merge"
+config["models"].setdefault("providers", {})
+
+# 构建模型列表
+models_list = []
+for model_id in models_str.split(","):
+    model_id = model_id.strip()
+    if model_id:
+        models_list.append({
+            "id": model_id,
+            "name": model_id,
+            "reasoning": False,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 128000,
+            "maxTokens": 8192
+        })
+
+# 关键修复 3: 确保 api 字段存在
+config["models"]["providers"][provider_name] = {
+    "baseUrl": base_url,
+    "apiKey": api_key,
+    "api": api_type,  # 这是关键！
+    "models": models_list
+}
+
+# 关键修复 4: 设置默认模型
+if default_provider:
+    config["defaultProvider"] = default_provider
+    
+    config.setdefault("agents", {})
+    config["agents"].setdefault("defaults", {})
+    config["agents"]["defaults"].setdefault("maxConcurrent", 4)
+    config["agents"]["defaults"].setdefault("model", {})
+    
+    if models_list:
+        first_model = models_list[0]["id"]
+        config["agents"]["defaults"]["model"]["primary"] = f"{default_provider}/{first_model}"
+
+# 写入
+with open(cfg_path, 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print("配置写入成功")
+PYEOF
+        msg_ok "配置已写入"
+    else
+        # Bash 回退
+        _write_custom_provider_bash "$provider_name"
+    fi
+    
+    chmod 600 "$cfg"
+}
+
+_write_custom_provider_bash() {
+    local provider_name="$1"
+    local cfg="$OPENCLAW_JSON"
+    local base_url="${G_API_URLS[$provider_name]:-}"
+    local api_key="${G_API_KEYS[$provider_name]:-local}"
+    local api_type="${G_API_TYPES[$provider_name]:-openai-completions}"
+    local models_str="${G_API_MODELS[$provider_name]:-}"
+    local first_model="${models_str%%,*}"
+    
+    # 构建模型 JSON 数组
+    local models_json="["
+    local first=true
+    IFS=',' read -ra model_arr <<< "$models_str"
+    for m in "${model_arr[@]}"; do
+        m=$(echo "$m" | xargs)  # trim
+        [[ -z "$m" ]] && continue
+        $first || models_json+=","
+        first=false
+        models_json+="{\"id\":\"$m\",\"name\":\"$m\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":128000,\"maxTokens\":8192}"
+    done
+    models_json+="]"
+    
+    cat > "$cfg" << EOF
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "localhost"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "${provider_name}": {
+        "baseUrl": "${base_url}",
+        "apiKey": "${api_key}",
+        "api": "${api_type}",
+        "models": ${models_json}
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "maxConcurrent": 4,
+      "model": {
+        "primary": "${provider_name}/${first_model}"
+      }
+    }
+  },
+  "defaultProvider": "${provider_name}"
+}
+EOF
+    msg_ok "配置已创建 (Bash)"
+}
+
+# ============================================================
+# 修复：验证配置（新增功能）
+# ============================================================
+validate_config() {
+    local cfg="$OPENCLAW_JSON"
+    local errors=0
+    
+    msg_step "验证配置文件..."
+    
+    if [[ ! -f "$cfg" ]]; then
+        msg_fail "配置文件不存在: $cfg"
+        echo -e "  ${DIM}运行: openclaw setup 或使用本脚本安装${NC}"
+        return 1
+    fi
+    
+    if has_cmd python3; then
+        local result
+        result=$(python3 - "$cfg" << 'PYEOF' 2>&1
+import json
+import sys
+
+cfg_path = sys.argv[1]
+errors = []
+warnings = []
+
+try:
+    with open(cfg_path, 'r') as f:
+        config = json.load(f)
+except json.JSONDecodeError as e:
+    print(f"FAIL:JSON 解析错误: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"FAIL:无法读取配置: {e}")
+    sys.exit(1)
+
+# 检查 gateway.mode（必须！）
+gateway = config.get("gateway", {})
+if not gateway.get("mode"):
+    errors.append("gateway.mode 未设置 - Gateway 无法启动，会报 'Missing config'")
+else:
+    print(f"PASS:gateway.mode = {gateway['mode']}")
+
+# 检查 models.mode
+models = config.get("models", {})
+if models.get("mode") != "merge":
+    warnings.append(f"models.mode = '{models.get('mode', '未设置')}' - 建议设置为 'merge' 以启用自定义 Provider")
+else:
+    print("PASS:models.mode = merge")
+
+# 检查自定义 providers
+providers = models.get("providers", {})
+if providers:
+    for name, p_cfg in providers.items():
+        if not isinstance(p_cfg, dict):
+            continue
+        
+        # 检查 api 字段（关键！）
+        if not p_cfg.get("api"):
+            errors.append(f"Provider '{name}' 缺少 'api' 字段 - 会导致 'Unhandled API: undefined' 错误")
+        else:
+            print(f"PASS:Provider '{name}' api = {p_cfg['api']}")
+        
+        # 检查 baseUrl
+        if not p_cfg.get("baseUrl"):
+            errors.append(f"Provider '{name}' 缺少 'baseUrl'")
+        
+        # 检查 models
+        model_list = p_cfg.get("models", [])
+        if not model_list:
+            warnings.append(f"Provider '{name}' 没有定义模型")
+        else:
+            print(f"PASS:Provider '{name}' 定义了 {len(model_list)} 个模型")
+
+# 检查默认模型
+agents = config.get("agents", {})
+defaults = agents.get("defaults", {})
+model = defaults.get("model", {})
+primary = model.get("primary", "")
+
+if primary:
+    print(f"PASS:默认模型 = {primary}")
+    if "/" not in primary:
+        warnings.append(f"默认模型格式应为 'provider/model-id'，当前: {primary}")
+else:
+    warnings.append("未设置 agents.defaults.model.primary - 模型可能不会被使用")
+
+# 输出结果
+for w in warnings:
+    print(f"WARN:{w}")
+
+for e in errors:
+    print(f"FAIL:{e}")
+
+if errors:
+    sys.exit(1)
+PYEOF
+)
+        # 解析输出
+        echo "$result" | while IFS= read -r line; do
+            if [[ "$line" == PASS:* ]]; then
+                msg_ok "${line#PASS:}"
+            elif [[ "$line" == WARN:* ]]; then
+                msg_warn "${line#WARN:}"
+            elif [[ "$line" == FAIL:* ]]; then
+                msg_fail "${line#FAIL:}"
+                ((errors++))
+            fi
+        done
+        
+        if echo "$result" | grep -q "^FAIL:"; then
+            echo ""
+            msg_fail "配置存在错误，请修复后重试"
+            return 1
+        else
+            echo ""
+            msg_ok "配置验证通过"
+            return 0
+        fi
+    else
+        # 简单检查
+        if grep -q '"mode"' "$cfg" && grep -q '"gateway"' "$cfg"; then
+            msg_ok "基本检查通过（建议安装 python3 进行完整验证）"
+            return 0
+        else
+            msg_fail "配置缺少必要字段"
+            return 1
+        fi
+    fi
+}
+
+# ============================================================
+# 修复：确保最小配置存在
+# ============================================================
+ensure_minimal_config() {
+    local cfg="$OPENCLAW_JSON"
+    
+    mkdir -p "$OPENCLAW_CONFIG_DIR"
+    
+    # 如果配置不存在或无效，创建最小配置
+    if [[ ! -f "$cfg" ]]; then
+        msg_info "创建最小启动配置..."
+        _create_minimal_config
+        return
+    fi
+    
+    # 检查关键字段
+    if has_cmd python3; then
+        python3 - "$cfg" << 'PYEOF'
+import json
+import sys
+
+cfg_path = sys.argv[1]
+
+try:
+    with open(cfg_path, 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+modified = False
+
+# 确保 gateway.mode 存在
+if not config.get("gateway", {}).get("mode"):
+    config.setdefault("gateway", {})["mode"] = "local"
+    config["gateway"].setdefault("bind", "localhost")
+    modified = True
+
+# 确保 models.mode 存在
+if config.get("models", {}).get("mode") != "merge":
+    config.setdefault("models", {})["mode"] = "merge"
+    config["models"].setdefault("providers", {})
+    modified = True
+
+if modified:
+    with open(cfg_path, 'w') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print("FIXED")
+else:
+    print("OK")
+PYEOF
+        local result=$?
+        if [[ $result -eq 0 ]]; then
+            msg_ok "配置检查完成"
+        fi
+    else
+        # 检查是否有 gateway.mode
+        if ! grep -q '"mode"' "$cfg" 2>/dev/null; then
+            msg_warn "配置可能缺少 gateway.mode，尝试修复..."
+            _create_minimal_config
+        fi
+    fi
+}
+
+_create_minimal_config() {
+    local cfg="$OPENCLAW_JSON"
+    
+    cat > "$cfg" << 'EOF'
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "localhost"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {}
+  },
+  "agents": {
+    "defaults": {
+      "maxConcurrent": 4,
+      "model": {}
+    }
+  }
+}
+EOF
+    chmod 600 "$cfg"
+    msg_ok "最小配置已创建"
+}
+
+# ============================================================
+# 配置局域网访问
+# ============================================================
 configure_lan_access() {
     msg_title "${LOBSTER} 配置局域网访问"
 
     if ! is_openclaw_installed; then
         msg_fail "OpenClaw 未安装，请先安装"
-        press_any_key; return 0
+        auto_return 2; return 0
     fi
 
     local cfg_file="$OPENCLAW_JSON"
@@ -295,7 +1107,7 @@ PYEOF
 
     if ! confirm "确认应用局域网配置?"; then
         msg_info "已取消"
-        press_any_key; return 0
+        auto_return 2; return 0
     fi
 
     if [[ -f "$cfg_file" ]]; then
@@ -346,7 +1158,7 @@ PYEOF
             msg_ok "局域网配置已写入"
         else
             msg_fail "配置写入失败"
-            press_any_key; return 0
+            auto_return 2; return 0
         fi
     else
         gw_token=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null | tr -d '\n' || date +%s%N)
@@ -399,7 +1211,7 @@ PYEOF
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
 
     log "LAN access configured"
-    press_any_key; return 0
+    auto_return 3; return 0
 }
 
 _write_lan_config_bash() {
@@ -416,6 +1228,10 @@ _write_lan_config_bash() {
       "dangerouslyAllowHostHeaderOriginFallback": true,
       "dangerouslyDisableDeviceAuth": true
     }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {}
   }
 }
 EOF
@@ -425,12 +1241,15 @@ EOF
     fi
 }
 
+# ============================================================
+# 插件安装
+# ============================================================
 install_plugins() {
     msg_title "${PLUGIN} 安装消息平台插件"
 
     if ! is_openclaw_installed; then
         msg_fail "OpenClaw 未安装，请先安装"
-        press_any_key; return 0
+        auto_return 2; return 0
     fi
 
     echo -e "${CYAN}可用插件:${NC}"
@@ -459,7 +1278,7 @@ install_plugins() {
         *) msg_warn "无效选项" ;;
     esac
 
-    press_any_key; return 0
+    auto_return 3; return 0
 }
 
 _install_single_plugin() {
@@ -483,12 +1302,15 @@ _install_single_plugin() {
     fi
 }
 
+# ============================================================
+# Docker 部署
+# ============================================================
 deploy_docker() {
     msg_title "${DOCKER} Docker 部署 OpenClaw"
 
     if ! has_cmd docker; then
         msg_warn "未检测到 Docker，正在安装..."
-        _install_docker || { press_any_key; return 0; }
+        _install_docker || { auto_return 3; return 0; }
     fi
 
     echo -e "${CYAN}Docker 版本:${NC} $(docker --version 2>/dev/null || echo '未知')"
@@ -533,7 +1355,7 @@ deploy_docker() {
         _docker_run "$port" "$data_dir" "$extra_opts"
     fi
 
-    press_any_key; return 0
+    auto_return 3; return 0
 }
 
 _docker_run() {
@@ -557,6 +1379,26 @@ _docker_run() {
         else
             msg_warn "镜像拉取失败，尝试使用本地缓存..."
         fi
+    fi
+
+    # 创建初始配置（关键修复！）
+    local container_config="${data_dir}/.openclaw/openclaw.json"
+    if [[ ! -f "$container_config" ]]; then
+        msg_info "创建初始配置..."
+        mkdir -p "${data_dir}/.openclaw"
+        cat > "$container_config" << 'EOF'
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "localhost"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {}
+  }
+}
+EOF
+        chmod 600 "$container_config"
     fi
 
     msg_step "启动容器..."
@@ -585,18 +1427,6 @@ _docker_run() {
             ((i++))
         done
         echo ""
-
-        if [[ ! -f "${data_dir}/.openclaw/openclaw.json" ]]; then
-            echo ""
-            msg_warn "未检测到配置文件，需完成首次 setup"
-            if confirm "现在运行 openclaw setup 完成初始化?"; then
-                docker exec -it "$DOCKER_CONTAINER" openclaw setup </dev/tty 2>&1 || true
-                docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
-                sleep 3
-            else
-                msg_info "稍后运行: docker exec -it ${DOCKER_CONTAINER} openclaw setup"
-            fi
-        fi
 
         if [[ "$extra" == "--lan" ]]; then
             msg_step "配置局域网访问..."
@@ -658,6 +1488,9 @@ _install_docker() {
     fi
 }
 
+# ============================================================
+# 命令速查
+# ============================================================
 show_command_reference() {
     msg_title "${LOBSTER} OpenClaw 命令速查"
 
@@ -690,71 +1523,33 @@ show_command_reference() {
     _cmd_row "${prefix}openclaw config file"             "配置文件路径"
     echo ""
 
-    echo -e "${CYAN}${BOLD}📡 频道管理${NC}"; print_line
-    _cmd_row "${prefix}openclaw channels add"        "添加频道"
-    _cmd_row "${prefix}openclaw channels list"       "列出频道"
-    _cmd_row "${prefix}openclaw channels status"     "频道状态"
-    _cmd_row "${prefix}openclaw channels remove"     "移除频道"
-    echo ""
-
     echo -e "${CYAN}${BOLD}🧠 模型${NC}"; print_line
     _cmd_row "${prefix}openclaw models status"       "模型认证状态"
     _cmd_row "${prefix}openclaw models list"         "可用模型"
     echo ""
 
-    echo -e "${CYAN}${BOLD}🔑 设备认证${NC}"; print_line
-    _cmd_row "${prefix}openclaw devices list"        "已配对设备"
-    _cmd_row "${prefix}openclaw devices pair"        "配对设备"
-    _cmd_row "${prefix}openclaw dashboard"           "打开 Web 控制台"
+    echo -e "${RED}${BOLD}⚠️  常见问题修复${NC}"; print_line
+    _cmd_row "openclaw config set gateway.mode local"              "修复 Missing config"
+    _cmd_row "openclaw config set models.mode merge"               "启用自定义 Provider"
+    _cmd_row "openclaw config set agents.defaults.model.primary X" "设置默认模型"
     echo ""
 
-    echo -e "${CYAN}${BOLD}📋 插件${NC}"; print_line
-    _cmd_row "${prefix}openclaw plugins list"                          "插件列表"
-    _cmd_row "${prefix}openclaw plugins install \"${WECHAT_PLUGIN_PKG}\"" "微信插件"
-    _cmd_row "${prefix}openclaw plugins install \"${FEISHU_PLUGIN_PKG}\"" "飞书插件"
-    echo ""
-
-    echo -e "${CYAN}${BOLD}💬 交互${NC}"; print_line
-    _cmd_row "${prefix}openclaw tui"                 "终端 UI"
-    _cmd_row "${prefix}openclaw chat"                "本地对话"
-    echo ""
-
-    echo -e "${CYAN}${BOLD}🔄 更新与备份${NC}"; print_line
-    _cmd_row "${prefix}openclaw update"              "更新 OpenClaw"
-    _cmd_row "${prefix}openclaw backup create"       "备份数据"
-    echo ""
-
-    if $use_docker; then
-        echo -e "${CYAN}${BOLD}${DOCKER} Docker 专用${NC}"; print_line
-        _cmd_row "docker ps"                                  "查看容器状态"
-        _cmd_row "docker logs ${DOCKER_CONTAINER}"            "查看日志"
-        _cmd_row "docker restart ${DOCKER_CONTAINER}"         "重启容器"
-        _cmd_row "docker exec -it ${DOCKER_CONTAINER} sh"     "进入容器"
-        _cmd_row "docker exec -it ${DOCKER_CONTAINER} openclaw setup" "容器内 setup"
-        echo ""
-    fi
-
-    echo -e "${GREEN}${BOLD}🚀 最常用${NC}"; print_line
-    echo -e "  ${CYAN}${prefix}openclaw setup${NC}             ${DIM}# 首次初始化（必须）${NC}"
-    echo -e "  ${CYAN}${prefix}openclaw gateway restart${NC}   ${DIM}# 修改配置后重启${NC}"
-    echo -e "  ${CYAN}${prefix}openclaw status${NC}            ${DIM}# 整体状态一览${NC}"
-    echo -e "  ${CYAN}${prefix}openclaw doctor --fix${NC}      ${DIM}# 出问题先跑这个${NC}"
-    echo -e "  ${CYAN}${prefix}openclaw logs${NC}              ${DIM}# 查日志排错${NC}"
-    print_line
-
-    press_any_key; return 0
+    auto_return 3; return 0
 }
 
 _cmd_row() {
     printf "  ${CYAN}%-52s${NC} ${DIM}%s${NC}\n" "$1" "$2"
 }
 
+# ============================================================
+# 运行 setup 向导
+# ============================================================
 run_setup_wizard() {
     msg_title "🔧 OpenClaw 初始化向导 (setup)"
 
     if ! is_openclaw_installed; then
         msg_fail "OpenClaw 未安装，请先安装"
-        press_any_key; return 0
+        auto_return 2; return 0
     fi
 
     echo -e "${CYAN}${BOLD}关于 openclaw setup${NC}"
@@ -766,6 +1561,9 @@ run_setup_wizard() {
     echo ""
     print_line
     echo ""
+
+    # 确保最小配置存在
+    ensure_minimal_config
 
     echo -e "${CYAN}当前配置状态:${NC}"
     if [[ -f "$OPENCLAW_JSON" ]] && has_cmd python3; then
@@ -782,6 +1580,18 @@ try:
     print(f"  gateway.mode  : {mode}")
     print(f"  gateway.bind  : {bind}")
     print(f"  gateway.auth  : mode={auth.get('mode','未设置')}  token={token_status}")
+    
+    models = c.get("models", {})
+    print(f"  models.mode   : {models.get('mode', '未设置')}")
+    
+    providers = models.get("providers", {})
+    if providers:
+        print(f"  providers     : {', '.join(providers.keys())}")
+    
+    agents = c.get("agents", {})
+    primary = agents.get("defaults", {}).get("model", {}).get("primary")
+    if primary:
+        print(f"  默认模型      : {primary}")
 except Exception as e:
     print(f"  解析失败: {e}")
 PYEOF
@@ -829,15 +1639,18 @@ PYEOF
         echo -e "  ${DIM}  3. openclaw gateway restart${NC}"
     fi
 
-    press_any_key; return 0
+    auto_return 3; return 0
 }
 
+# ============================================================
+# 快捷命令
+# ============================================================
 quick_commands() {
     msg_title "${GEAR} 快捷命令执行"
 
     if ! is_openclaw_installed; then
         msg_fail "OpenClaw 未安装"
-        press_any_key; return 0
+        auto_return 2; return 0
     fi
 
     echo -e "${CYAN}常用操作:${NC}"
@@ -849,17 +1662,9 @@ quick_commands() {
     echo -e "  ${BOLD}5)${NC}  openclaw logs            ${DIM}查看日志${NC}"
     echo -e "  ${BOLD}6)${NC}  openclaw models status   ${DIM}模型状态${NC}"
     echo -e "  ${BOLD}7)${NC}  openclaw models list     ${DIM}可用模型${NC}"
-    echo -e "  ${BOLD}8)${NC}  openclaw channels list   ${DIM}频道列表${NC}"
-    echo -e "  ${BOLD}9)${NC}  openclaw channels status ${DIM}频道状态${NC}"
-    echo -e "  ${BOLD}10)${NC} openclaw channels add    ${DIM}添加频道${NC}"
-    echo -e "  ${BOLD}11)${NC} openclaw devices list    ${DIM}设备列表${NC}"
-    echo -e "  ${BOLD}12)${NC} openclaw update          ${DIM}更新${NC}"
-    echo -e "  ${BOLD}13)${NC} openclaw config validate ${DIM}验证配置${NC}"
-    echo -e "  ${BOLD}14)${NC} openclaw config file     ${DIM}配置路径${NC}"
-    echo -e "  ${BOLD}15)${NC} openclaw backup create   ${DIM}备份数据${NC}"
-    echo -e "  ${BOLD}16)${NC} openclaw tui             ${DIM}终端UI${NC}"
-    echo -e "  ${BOLD}17)${NC} openclaw dashboard       ${DIM}Web 控制台${NC}"
-    echo -e "  ${BOLD}18)${NC} openclaw security audit  ${DIM}安全审计${NC}"
+    echo -e "  ${BOLD}8)${NC}  openclaw config validate ${DIM}验证配置${NC}"
+    echo -e "  ${BOLD}9)${NC}  验证本地配置             ${DIM}检查配置文件${NC}"
+    echo -e "  ${BOLD}10)${NC} 配置自定义 API           ${DIM}添加自定义 Provider${NC}"
     echo -e "  ${BOLD}0)${NC}  返回"
     echo ""
     echo -ne "${BOLD}请选择: ${NC}"
@@ -875,24 +1680,19 @@ quick_commands() {
         5)  msg_info "Ctrl+C 退出"; trap 'echo ""; msg_info "退出"' INT; openclaw_cmd logs 2>&1 || true; trap - INT ;;
         6)  openclaw_cmd models status ;;
         7)  openclaw_cmd models list ;;
-        8)  openclaw_cmd channels list ;;
-        9)  openclaw_cmd channels status ;;
-        10) openclaw_cmd channels add ;;
-        11) openclaw_cmd devices list ;;
-        12) openclaw_cmd update ;;
-        13) openclaw_cmd config validate ;;
-        14) openclaw_cmd config file ;;
-        15) openclaw_cmd backup create ;;
-        16) openclaw_cmd tui ;;
-        17) openclaw_cmd dashboard ;;
-        18) openclaw_cmd security audit ;;
+        8)  openclaw_cmd config validate ;;
+        9)  validate_config ;;
+        10) configure_custom_api ;;
         0)  return 0 ;;
         *)  msg_warn "无效选项" ;;
     esac
 
-    press_any_key; return 0
+    auto_return 2; return 0
 }
 
+# ============================================================
+# 模型管理
+# ============================================================
 get_provider_models() {
     local provider="$1"
     if is_openclaw_installed; then
@@ -911,374 +1711,13 @@ get_provider_models() {
     esac
 }
 
-pick_models_interactive() {
-    local provider="$1" recommended="$2"
-    local models=()
-    while IFS= read -r line; do [[ -n "$line" ]] && models+=("$line"); done < <(get_provider_models "$provider")
-
-    if [[ ${#models[@]} -eq 0 ]]; then
-        echo -ne "\n  模型名称 (逗号分隔): " >&2
-        local m; read -r m </dev/tty || m=""
-        echo "${m:-$recommended}"; return
-    fi
-
-    echo "" >&2; echo -e "  ${CYAN}${BOLD}可用模型 (${provider}):${NC}" >&2; echo "" >&2
-    local i=1 rec_idx=1
-    for m in "${models[@]}"; do
-        local tag=""; [[ "$m" == "$recommended" ]] && { tag=" ${GREEN}★${NC}"; rec_idx=$i; }
-        printf "    %2d) %s%b\n" "$i" "$m" "$tag" >&2; ((i++))
-    done
-    local manual_idx=$i
-    printf "    %2d) 手动输入\n" "$manual_idx" >&2
-    echo -e "\n  ${DIM}单个(2) / 多个(2,1,3) / 全选(a)${NC}\n" >&2
-    echo -ne "  选择 [默认:${rec_idx}]: " >&2
-    local choice; read -r choice </dev/tty || choice=""; choice=${choice:-$rec_idx}
-
-    local selected=()
-    if [[ "$choice" == "a" || "$choice" == "A" ]]; then
-        selected=("${models[@]}")
-    elif [[ "$choice" == "$manual_idx" ]]; then
-        echo -ne "  模型名 (逗号分隔): " >&2
-        local ci; read -r ci </dev/tty || ci=""
-        echo "${ci:-$recommended}"; return
-    else
-        IFS=',' read -ra idxs <<< "$choice"
-        for idx in "${idxs[@]}"; do
-            idx=$(echo "$idx" | tr -d ' ')
-            [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=${#models[@]} )) && selected+=("${models[$((idx-1))]}")
-        done
-    fi
-    [[ ${#selected[@]} -eq 0 ]] && selected=("$recommended")
-    local r=""; for m in "${selected[@]}"; do [[ -n "$r" ]] && r="${r},"; r="${r}${m}"; done; echo "$r"
-}
-
-pick_custom_models_interactive() {
-    local existing="${1:-}"
-    local current=()
-    [[ -n "$existing" ]] && IFS=',' read -ra current <<< "$existing"
-
-    echo "" >&2; echo -e "  ${CYAN}${BOLD}自定义模型管理${NC}" >&2; echo "" >&2
-
-    if [[ ${#current[@]} -gt 0 ]]; then
-        echo -e "  ${BOLD}当前 ${#current[@]} 个:${NC}" >&2
-        local ci=1
-        for m in "${current[@]}"; do
-            [[ $ci -eq 1 ]] && echo -e "    ${ci}. ${GREEN}${BOLD}${m}${NC} ${DIM}(默认)${NC}" >&2 || echo -e "    ${ci}. ${m}" >&2
-            ((ci++))
-        done
-        echo "" >&2
-    fi
-
-    echo "    1) 重新输入全部" >&2; echo "    2) 追加" >&2; echo "    3) 删除" >&2; echo "    4) 调整默认" >&2
-    [[ ${#current[@]} -gt 0 ]] && echo "    0) 保持不变" >&2
-    echo "" >&2; echo -ne "  选择: " >&2
-    local op; read -r op </dev/tty || op="0"
-
-    _arr_to_csv() {
-        local r="" item
-        for item in "$@"; do [[ -n "$r" ]] && r="${r},"; r="${r}${item}"; done
-        echo "$r"
-    }
-
-    case "$op" in
-        1) echo -ne "\n  模型列表: " >&2; local nl; read -r nl </dev/tty || nl=""; echo "${nl:-$existing}" ;;
-        2) echo -ne "\n  追加 (逗号分隔): " >&2; local app; read -r app </dev/tty || app=""
-           [[ -n "$app" ]] && { IFS=',' read -ra na <<< "$app"; for m in "${na[@]}"; do m=$(echo "$m"|xargs); [[ -n "$m" ]] && current+=("$m"); done; }
-           _arr_to_csv "${current[@]}" ;;
-        3) [[ ${#current[@]} -eq 0 ]] && { echo "$existing"; return; }
-           echo -ne "\n  删除序号: " >&2; local di; read -r di </dev/tty || di=""
-           if [[ -n "$di" ]]; then
-               IFS=',' read -ra da <<< "$di"; local nc=()
-               for ci in "${!current[@]}"; do
-                   local del=false
-                   for d in "${da[@]}"; do [[ "$((ci+1))" == "$(echo "$d"|tr -d ' ')" ]] && del=true; done
-                   $del || nc+=("${current[$ci]}")
-               done; current=("${nc[@]}")
-           fi
-           _arr_to_csv "${current[@]}" ;;
-        4) [[ ${#current[@]} -le 1 ]] && { _arr_to_csv "${current[@]}"; return; }
-           echo -ne "\n  设为默认的序号: " >&2; local nf; read -r nf </dev/tty || nf=""
-           if [[ "$nf" =~ ^[0-9]+$ ]] && (( nf>=1 && nf<=${#current[@]} )); then
-               local tgt="${current[$((nf-1))]}" re=("$tgt")
-               for m in "${current[@]}"; do [[ "$m" != "$tgt" ]] && re+=("$m"); done
-               current=("${re[@]}")
-           fi
-           _arr_to_csv "${current[@]}" ;;
-        *) _arr_to_csv "${current[@]}" ;;
-    esac
-
-    unset -f _arr_to_csv 2>/dev/null || true
-}
-
-pick_node_version() {
-    echo -e "\n${CYAN}获取 nodejs.org 版本列表...${NC}" >&2
-    local lts_list; lts_list=$(get_node_lts_versions)
-    local latest_major; latest_major=$(get_node_latest_major)
-    local first_lts; first_lts=$(echo "$lts_list" | awk '{print $1}')
-
-    echo -e "\n${CYAN}选择 Node.js 版本 (最低 v${NODE_MIN_VERSION}+):${NC}" >&2
-    local idx=1; declare -a vmap=()
-
-    if [[ "$latest_major" != "$first_lts" ]]; then
-        printf "  %2d) Node.js %-4s (Current)\n" "$idx" "$latest_major" >&2
-        vmap[$idx]="$latest_major"; ((idx++))
-    fi
-
-    local is_first=true
-    for v in $lts_list; do
-        $is_first && { printf "  %2d) Node.js %-4s (LTS ★ 推荐)\n" "$idx" "$v" >&2; is_first=false; } \
-                  || printf "  %2d) Node.js %-4s (LTS)\n" "$idx" "$v" >&2
-        vmap[$idx]="$v"; ((idx++))
-    done
-
-    local mi=$idx; printf "  %2d) 手动输入\n" "$mi" >&2; echo "" >&2
-    local dc; [[ "$latest_major" != "$first_lts" ]] && dc=2 || dc=1
-    echo -ne "  选择 [默认:${dc}]: " >&2
-    local vc; read -r vc </dev/tty || vc=""; vc=${vc:-$dc}
-
-    if [[ "$vc" -eq "$mi" ]] 2>/dev/null; then
-        echo -ne "  主版本号: " >&2; local mv; read -r mv </dev/tty || mv=""
-        echo "$(echo "${mv:-$NODE_MIN_VERSION}" | tr -d 'vV ')"
-    else
-        echo "${vmap[$vc]:-${vmap[$dc]:-$NODE_MIN_VERSION}}"
-    fi
-}
-
-install_nodejs() {
-    msg_step "检测 Node.js..."
-
-    if has_cmd node; then
-        local ver; ver=$(node -v | sed 's/v//' | cut -d. -f1)
-        if [[ "$ver" -ge "$NODE_MIN_VERSION" ]]; then
-            msg_ok "Node.js $(node -v) 满足要求"; return 0
-        fi
-        msg_warn "$(node -v) 低于 v${NODE_MIN_VERSION}+"
-    else
-        msg_warn "未检测到 Node.js"
-    fi
-
-    echo ""; echo "  1) NodeSource 官方源 (推荐)"; echo "  2) nvm 版本管理器"
-    echo "  3) 系统包管理器"; echo "  4) 手动安装"; echo ""
-    echo -ne "${BOLD}选择 [1-4] (默认: 1): ${NC}"
-    local nc; read -r nc </dev/tty || nc="1"; nc=${nc:-1}
-
-    local tv="$NODE_RECOMMENDED_VERSION"
-    if [[ "$nc" -eq 1 || "$nc" -eq 2 ]]; then
-        tv=$(pick_node_version); [[ -z "$tv" ]] && tv="$NODE_RECOMMENDED_VERSION"
-        msg_info "目标: v${tv}"
-    fi
-
-    case "$nc" in
-        1) _install_node_nodesource "$tv" ;;
-        2) _install_node_nvm "$tv" ;;
-        3) _install_node_native ;;
-        4) msg_info "下载: https://nodejs.org/en/download/"; return 1 ;;
-        *) msg_warn "无效"; return 1 ;;
-    esac
-
-    _refresh_node_path
-
-    if has_cmd node; then
-        local iv; iv=$(node -v | sed 's/v//' | cut -d. -f1)
-        if [[ "$iv" -ge "$NODE_MIN_VERSION" ]]; then
-            msg_ok "Node.js $(node -v) 安装成功！"; log "Node.js $(node -v)"; return 0
-        fi
-    fi
-    msg_fail "安装失败，详见: $LOG_FILE"; return 1
-}
-
-_install_node_nodesource() {
-    local version="$1"; msg_step "NodeSource v${version}..."
-    case "$OS" in
-        debian)
-            safe_run "NodeSource" bash -c "curl -fsSL https://deb.nodesource.com/setup_${version}.x | sudo -E bash -"
-            safe_run "nodejs" sudo apt-get install -y nodejs ;;
-        rhel|fedora)
-            safe_run "NodeSource" bash -c "curl -fsSL https://rpm.nodesource.com/setup_${version}.x | sudo bash -"
-            safe_run "nodejs" sudo "$PKG_MANAGER" install -y nodejs ;;
-        arch)    safe_run "nodejs" sudo pacman -S --noconfirm nodejs npm ;;
-        alpine)  safe_run "nodejs" sudo apk add nodejs npm ;;
-        macos)   has_cmd brew || { msg_fail "需要 Homebrew"; return 1; }
-                 safe_run "node@${version}" brew install "node@${version}"
-                 brew link --force --overwrite "node@${version}" 2>/dev/null || true ;;
-        *)       msg_fail "不支持"; return 1 ;;
-    esac
-}
-
-_install_node_nvm() {
-    local version="$1"
-    local nvm_ver; nvm_ver=$(get_nvm_latest_version)
-    msg_step "nvm (${nvm_ver}) → Node.js v${version}..."
-    safe_run "安装 nvm" bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_ver}/install.sh | bash"
-    export NVM_DIR="$HOME/.nvm"
-    # shellcheck source=/dev/null
-    [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" || { msg_fail "nvm 加载失败"; return 1; }
-    safe_run "nvm install $version" nvm install "$version"
-    nvm use "$version" >> "$LOG_FILE" 2>&1 || true
-    nvm alias default "$version" >> "$LOG_FILE" 2>&1 || true
-    local src="$HOME/.bashrc"; [[ "$SHELL" == *zsh* ]] && src="$HOME/.zshrc"
-    grep -q "NVM_DIR" "$src" 2>/dev/null || { echo 'export NVM_DIR="$HOME/.nvm"'; echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"'; } >> "$src"
-}
-
-_install_node_native() {
-    msg_step "系统包管理器..."
-    case "$OS" in
-        debian)  safe_run "apt" sudo apt-get update -qq; safe_run "nodejs" sudo apt-get install -y nodejs npm ;;
-        rhel)    safe_run "nodejs" sudo yum install -y nodejs npm ;;
-        fedora)  safe_run "nodejs" sudo dnf install -y nodejs npm ;;
-        arch)    safe_run "nodejs" sudo pacman -S --noconfirm nodejs npm ;;
-        alpine)  safe_run "nodejs" sudo apk add nodejs npm ;;
-        macos)   has_cmd brew && safe_run "node" brew install node || return 1 ;;
-        *)       msg_fail "不支持"; return 1 ;;
-    esac
-}
-
-_refresh_node_path() {
-    local nd=""
-    [[ -d "$HOME/.nvm/versions/node" ]] && nd=$(ls -d "$HOME/.nvm/versions/node/"v* 2>/dev/null | sort -V | tail -1)
-    for p in "${nd:+${nd}/bin}" "$HOME/.local/bin" "/usr/local/bin"; do
-        [[ -n "$p" && -d "$p" ]] && export PATH="$p:$PATH"
-    done
-    export NVM_DIR="$HOME/.nvm"
-    # shellcheck source=/dev/null
-    [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" 2>/dev/null || true
-}
-
-load_config_from_file() {
-    local cfg="$OPENCLAW_API_JSON"; [[ ! -f "$cfg" ]] && return 0; has_cmd python3 || return 0
-    local es
-    es=$(python3 - "$cfg" << 'PYEOF' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1]) as f: cfg = json.load(f)
-except: sys.exit(0)
-for p, d in cfg.items():
-    if p == "defaultProvider": print(f'G_DEFAULT_PROVIDER="{d}"'); continue
-    if not isinstance(d, dict): continue
-    key=d.get("apiKey",""); mdls=d.get("models",""); mdl=d.get("model",""); url=d.get("baseUrl","")
-    if p=="custom":
-        if url:
-            print(f'G_API_KEYS[custom_url]="{url}"')
-            print(f'G_API_KEYS[custom_key]="{key}"')
-            print(f'G_API_MODELS[custom]="{mdls or mdl}"')
-    else:
-        if key: print(f'G_API_KEYS[{p}]="{key}"')
-        if mdls: print(f'G_API_MODELS[{p}]="{mdls}"')
-        elif mdl: print(f'G_API_MODELS[{p}]="{mdl}"')
-PYEOF
-    )
-    [[ -n "${es:-}" ]] && eval "$es" 2>/dev/null || true
-}
-
-write_config_to_file() {
-    local cfg="$OPENCLAW_API_JSON"; mkdir -p "$OPENCLAW_CONFIG_DIR"
-    if has_cmd python3; then
-        local ea=()
-        for p in "${!G_API_KEYS[@]}"; do local u; u=$(echo "$p"|tr '[:lower:]' '[:upper:]'|tr '-' '_'); ea+=("OCKEY_${u}=${G_API_KEYS[$p]}"); done
-        for p in "${!G_API_MODELS[@]}"; do local u; u=$(echo "$p"|tr '[:lower:]' '[:upper:]'|tr '-' '_'); ea+=("OCMODEL_${u}=${G_API_MODELS[$p]}"); done
-        [[ -n "$G_DEFAULT_PROVIDER" ]] && ea+=("OC_DEFAULT=$G_DEFAULT_PROVIDER")
-        env "${ea[@]}" python3 - "$cfg" << 'PYEOF'
-import json, sys, os
-p=sys.argv[1]; os.makedirs(os.path.dirname(p),exist_ok=True)
-try:
-    with open(p) as f: c=json.load(f)
-except: c={}
-e=os.environ
-for k,v in e.items():
-    if k.startswith("OCKEY_") and v:
-        n=k[6:].lower()
-        if n=="custom_url": c.setdefault("custom",{})["baseUrl"]=v
-        elif n=="custom_key": c.setdefault("custom",{})["apiKey"]=v
-        else: c.setdefault(n,{})["apiKey"]=v
-    elif k.startswith("OCMODEL_") and v:
-        n=k[8:].lower(); t="custom" if n=="custom" else n
-        c.setdefault(t,{})["models"]=v; c[t]["model"]=v.split(",")[0]
-dp=e.get("OC_DEFAULT","")
-if dp: c["defaultProvider"]=dp
-with open(p,"w") as f: json.dump(c,f,indent=2,ensure_ascii=False)
-PYEOF
-        chmod 600 "$cfg"; msg_ok "配置写入 $cfg"
-    else
-        { echo "{"; local comma=""
-          for p in anthropic openai google deepseek groq mistral; do
-              local k="${G_API_KEYS[$p]:-}" ms="${G_API_MODELS[$p]:-}"
-              [[ -n "$k" ]] && { [[ -n "$comma" ]] && echo ","; echo "  \"${p}\":{\"apiKey\":\"${k}\",\"model\":\"${ms%%,*}\",\"models\":\"${ms}\"}"; comma=","; }
-          done
-          [[ -n "${G_API_KEYS[custom_url]:-}" ]] && { local cm="${G_API_MODELS[custom]:-}"; [[ -n "$comma" ]] && echo ","
-              echo "  \"custom\":{\"baseUrl\":\"${G_API_KEYS[custom_url]}\",\"apiKey\":\"${G_API_KEYS[custom_key]:-none}\",\"model\":\"${cm%%,*}\",\"models\":\"${cm}\"}"; comma=","; }
-          [[ -n "$G_DEFAULT_PROVIDER" ]] && { [[ -n "$comma" ]] && echo ","; echo "  \"defaultProvider\":\"${G_DEFAULT_PROVIDER}\""; }
-          echo "}"; } > "$cfg"; chmod 600 "$cfg"; msg_ok "配置写入 (bash)"
-    fi
-}
-
-write_config_via_openclaw() {
-    is_openclaw_installed || return 1
-    local any=false
-    _oc() { openclaw_cmd config set "$1" "$2" 2>/dev/null && any=true || true; }
-    for p in anthropic openai google deepseek groq mistral; do
-        [[ -n "${G_API_KEYS[$p]:-}" ]] && _oc "${p}.apiKey" "${G_API_KEYS[$p]}"
-        [[ -n "${G_API_MODELS[$p]:-}" ]] && { _oc "${p}.model" "${G_API_MODELS[$p]%%,*}"; _oc "${p}.models" "${G_API_MODELS[$p]}"; }
-    done
-    if [[ -n "${G_API_KEYS[custom_url]:-}" ]]; then
-        _oc custom.baseUrl "${G_API_KEYS[custom_url]}"; _oc custom.apiKey "${G_API_KEYS[custom_key]:-none}"
-        local cm="${G_API_MODELS[custom]:-}"; _oc custom.model "${cm%%,*}"; _oc custom.models "$cm"
-    fi
-    [[ -n "$G_DEFAULT_PROVIDER" ]] && _oc defaultProvider "$G_DEFAULT_PROVIDER"
-    $any && return 0 || return 1
-}
-
-_display_selected_models() {
-    local p="$1" ms="$2"; local f="${ms%%,*}" mc
-    mc=$(echo "$ms"|tr ',' '\n'|grep -c . 2>/dev/null||echo "0")
-    msg_ok "${p}: 默认=${GREEN}${BOLD}${f}${NC}"
-    [[ "$mc" -gt 1 ]] && {
-        local idx=1; IFS=',' read -ra arr <<< "$ms"
-        for m in "${arr[@]}"; do m=$(echo "$m"|xargs); [[ -z "$m" ]] && continue
-            [[ $idx -eq 1 ]] && echo -e "      ${idx}. ${GREEN}${m}${NC} ${DIM}(默认)${NC}" || echo -e "      ${idx}. ${m}"; ((idx++)); done; }
-}
-
-_show_config_summary() {
-    print_line; echo -e "${BOLD}配置摘要${NC}  默认→${GREEN}${BOLD}${G_DEFAULT_PROVIDER:-未设置}${NC}"; echo ""
-    for p in anthropic openai google deepseek groq mistral; do
-        [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
-        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[默认]${NC}"
-        local ms="${G_API_MODELS[$p]:-}" mc; mc=$(echo "$ms"|tr ',' '\n'|grep -c . 2>/dev/null||echo "0")
-        echo -e "  ${BOLD}${p}${NC}${t}  ${DIM}${G_API_KEYS[$p]:0:10}****${NC} → ${CYAN}${ms%%,*}${NC} (${mc}个)"
-    done
-    [[ -n "${G_API_KEYS[custom_url]:-}" ]] && {
-        local t=""; [[ "$G_DEFAULT_PROVIDER" == "custom" ]] && t=" ${GREEN}[默认]${NC}"
-        local ms="${G_API_MODELS[custom]:-}" mc; mc=$(echo "$ms"|tr ',' '\n'|grep -c . 2>/dev/null||echo "0")
-        echo -e "  ${BOLD}custom${NC}${t}  ${DIM}${G_API_KEYS[custom_url]}${NC} → ${CYAN}${ms%%,*}${NC} (${mc}个)"; }
-    print_line
-}
-
-_select_default_provider() {
-    echo -e "${CYAN}设置默认 Provider:${NC}"
-    local avail=() i=1
-    for p in anthropic openai google deepseek groq mistral; do
-        [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
-        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[当前]${NC}"
-        echo "  ${i}) ${p} → ${G_API_MODELS[$p]%%,*}${t}"; avail+=("$p"); ((i++))
-    done
-    [[ -n "${G_API_KEYS[custom_url]:-}" ]] && {
-        local t=""; [[ "$G_DEFAULT_PROVIDER" == "custom" ]] && t=" ${GREEN}[当前]${NC}"
-        echo "  ${i}) custom → ${G_API_MODELS[custom]%%,*}${t}"; avail+=("custom"); ((i++)); }
-    [[ ${#avail[@]} -eq 0 ]] && { msg_warn "无配置"; return; }
-    echo ""; echo -ne "  选择: "; local dc; read -r dc </dev/tty || dc=""
-    [[ "$dc" =~ ^[0-9]+$ ]] && (( dc>=1 && dc<=${#avail[@]} )) && {
-        G_DEFAULT_PROVIDER="${avail[$((dc-1))]}"; msg_ok "默认: ${G_DEFAULT_PROVIDER}"; } || msg_warn "无效"
-}
-
-_auto_select_default_provider() {
-    for p in custom anthropic openai deepseek google groq mistral; do
-        [[ "$p" == "custom" && -n "${G_API_KEYS[custom_url]:-}" ]] && { G_DEFAULT_PROVIDER="custom"; msg_info "自动默认: custom"; return; }
-        [[ "$p" != "custom" && -n "${G_API_KEYS[$p]:-}" ]] && { G_DEFAULT_PROVIDER="$p"; msg_info "自动默认: $p"; return; }
-    done
-}
-
+# ============================================================
+# 配置 API 密钥（内置 Provider）
+# ============================================================
 configure_api_keys() {
     msg_title "🔑 配置 LLM API 密钥"
-    load_config_from_file; mkdir -p "$OPENCLAW_CONFIG_DIR"
+    load_config_from_file
+    mkdir -p "$OPENCLAW_CONFIG_DIR"
 
     [[ ${#G_API_KEYS[@]} -gt 0 ]] && {
         echo -e "${CYAN}已有配置:${NC}"
@@ -1287,82 +1726,203 @@ configure_api_keys() {
             local dt=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && dt=" ${GREEN}[默认]${NC}"
             echo -e "  ${BOLD}${p}${NC}: ${DIM}${G_API_KEYS[$p]:0:8}****${NC} → ${G_API_MODELS[$p]%%,*}${dt}"
         done
-        [[ -n "${G_API_KEYS[custom_url]:-}" ]] && {
-            local dt=""; [[ "$G_DEFAULT_PROVIDER" == "custom" ]] && dt=" ${GREEN}[默认]${NC}"
-            echo -e "  ${BOLD}custom${NC}: ${G_API_KEYS[custom_url]} → ${G_API_MODELS[custom]%%,*}${dt}"; }
+        # 显示自定义 Provider
+        for p in "${!G_API_URLS[@]}"; do
+            [[ -z "${G_API_URLS[$p]:-}" ]] && continue
+            local dt=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && dt=" ${GREEN}[默认]${NC}"
+            echo -e "  ${BOLD}${p}${NC}: ${DIM}${G_API_URLS[$p]}${NC} → ${G_API_MODELS[$p]%%,*}${dt}"
+        done
         echo ""; echo -e "${DIM}Enter 保留原值${NC}"; echo ""; }
 
     echo "  1) Anthropic   2) OpenAI   3) Google   4) DeepSeek"
-    echo "  5) Groq        6) Mistral  7) 自定义    8) 设默认   0) 保存"; echo ""
+    echo "  5) Groq        6) Mistral  7) 自定义 API  8) 设默认   0) 保存"; echo ""
 
     while true; do
         echo -ne "${BOLD}编号(0完成): ${NC}"; local c; read -r c </dev/tty || c="0"
         case "$c" in
             0) break ;;
-            1) _cfg_std anthropic "sk-ant-..." "claude-sonnet-4-5" ;;
-            2) _cfg_std openai "sk-..." "gpt-4o" ;;
-            3) _cfg_std google "" "gemini-2.5-flash" ;;
-            4) _cfg_std deepseek "sk-..." "deepseek-chat" ;;
-            5) _cfg_std groq "gsk_..." "llama-3.3-70b-versatile" ;;
-            6) _cfg_std mistral "" "mistral-large-latest" ;;
-            7) _cfg_custom ;;
+            1) _cfg_builtin_provider anthropic "sk-ant-..." "claude-sonnet-4-5" ;;
+            2) _cfg_builtin_provider openai "sk-..." "gpt-4o" ;;
+            3) _cfg_builtin_provider google "" "gemini-2.5-flash" ;;
+            4) _cfg_builtin_provider deepseek "sk-..." "deepseek-chat" ;;
+            5) _cfg_builtin_provider groq "gsk_..." "llama-3.3-70b-versatile" ;;
+            6) _cfg_builtin_provider mistral "" "mistral-large-latest" ;;
+            7) configure_custom_api ;;
             8) echo ""; _select_default_provider; echo "" ;;
             *) msg_warn "0-8" ;;
         esac
     done
 
-    [[ ${#G_API_KEYS[@]} -eq 0 ]] && { msg_warn "未配置"; return 0; }
-    msg_step "保存..."; [[ -z "$G_DEFAULT_PROVIDER" ]] && _auto_select_default_provider
-    write_config_via_openclaw 2>/dev/null || write_config_to_file
-    echo ""; _show_config_summary; return 0
+    if [[ ${#G_API_KEYS[@]} -eq 0 && ${#G_API_URLS[@]} -eq 0 ]]; then
+        msg_warn "未配置任何 Provider"
+        return 0
+    fi
+
+    msg_step "保存配置..."
+    
+    # 自动选择默认 Provider
+    [[ -z "$G_DEFAULT_PROVIDER" ]] && _auto_select_default_provider
+    
+    # 确保最小配置存在
+    ensure_minimal_config
+    
+    # 写入配置
+    if is_openclaw_installed; then
+        write_config_via_openclaw 2>/dev/null || write_config_to_file
+    else
+        write_config_to_file
+    fi
+    
+    echo ""
+    _show_config_summary
+    
+    # 验证配置
+    echo ""
+    validate_config
+    
+    return 0
 }
 
-_cfg_std() {
-    local p="$1" hint="$2" rec="$3"; echo ""
+_cfg_builtin_provider() {
+    local p="$1" hint="$2" rec="$3"
+    echo ""
     echo -e "${CYAN}${BOLD}─── ${p} ───${NC}"
     local ek="${G_API_KEYS[$p]:-}"
     [[ -n "$ek" ]] && echo -e "  ${DIM}已有: ${ek:0:8}**** → ${G_API_MODELS[$p]:-}${NC}"
-    echo -ne "  Key${hint:+ ($hint)}: "; local nk; read -rs nk </dev/tty; echo ""
+    echo -ne "  Key${hint:+ ($hint)}: "
+    local nk
+    read -rs nk </dev/tty
+    echo ""
+    
     if [[ -z "$nk" ]]; then
-        [[ -n "$ek" ]] && { msg_info "保留"; confirm "  重选模型?" && { local sm; sm=$(pick_models_interactive "$p" "$rec"); G_API_MODELS["$p"]="$sm"; _display_selected_models "$p" "$sm"; }; } || msg_warn "空，跳过"
-        echo ""; return
+        if [[ -n "$ek" ]]; then
+            msg_info "保留原配置"
+        else
+            msg_warn "空，跳过"
+        fi
+        echo ""
+        return
     fi
+    
     G_API_KEYS["$p"]="$nk"
-    local sm; sm=$(pick_models_interactive "$p" "$rec"); G_API_MODELS["$p"]="$sm"
-    _display_selected_models "$p" "$sm"
-    [[ -z "$G_DEFAULT_PROVIDER" ]] && { G_DEFAULT_PROVIDER="$p"; msg_info "自动默认: $p"; }; echo ""
-}
-
-_cfg_custom() {
-    echo ""; echo -e "${CYAN}${BOLD}─── 自定义 OpenAI 兼容 API ───${NC}"
-    local eu="${G_API_KEYS[custom_url]:-}"; [[ -n "$eu" ]] && echo -e "  ${DIM}当前: ${eu}${NC}"
-    echo -ne "  Base URL: "; local cu; read -r cu </dev/tty || cu=""; [[ -z "$cu" && -n "$eu" ]] && cu="$eu"
-    [[ -z "$cu" ]] && { msg_warn "URL空，跳过"; echo ""; return; }
-    local ek="${G_API_KEYS[custom_key]:-}"
-    echo -ne "  Key (none=无认证): "; local ck; read -rs ck </dev/tty; echo ""
-    [[ -z "$ck" ]] && ck="${ek:-none}"
-    local em="${G_API_MODELS[custom]:-}"; local nm; nm=$(pick_custom_models_interactive "$em")
-    [[ -z "$nm" ]] && { msg_warn "模型空，跳过"; echo ""; return; }
-    G_API_KEYS["custom_url"]="$cu"; G_API_KEYS["custom_key"]="$ck"; G_API_MODELS["custom"]="$nm"
-    _display_selected_models "custom" "$nm"
-    [[ -z "$G_DEFAULT_PROVIDER" ]] && { G_DEFAULT_PROVIDER="custom"; msg_info "自动默认"; } \
-        || { [[ "$G_DEFAULT_PROVIDER" != "custom" ]] && confirm "  设为默认?" && G_DEFAULT_PROVIDER="custom"; }
+    
+    # 选择模型
+    echo -ne "  模型 (默认: $rec): "
+    local sm
+    read -r sm </dev/tty || sm=""
+    sm=${sm:-$rec}
+    G_API_MODELS["$p"]="$sm"
+    
+    msg_ok "${p}: ${sm}"
+    
+    [[ -z "$G_DEFAULT_PROVIDER" ]] && {
+        G_DEFAULT_PROVIDER="$p"
+        msg_info "自动设为默认: $p"
+    }
     echo ""
 }
 
+_select_default_provider() {
+    echo -e "${CYAN}设置默认 Provider:${NC}"
+    local avail=() i=1
+    
+    # 内置 Provider
+    for p in anthropic openai google deepseek groq mistral; do
+        [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
+        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[当前]${NC}"
+        echo "  ${i}) ${p} → ${G_API_MODELS[$p]%%,*}${t}"
+        avail+=("$p")
+        ((i++))
+    done
+    
+    # 自定义 Provider
+    for p in "${!G_API_URLS[@]}"; do
+        [[ -z "${G_API_URLS[$p]:-}" ]] && continue
+        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[当前]${NC}"
+        echo "  ${i}) ${p} → ${G_API_MODELS[$p]%%,*}${t}"
+        avail+=("$p")
+        ((i++))
+    done
+    
+    [[ ${#avail[@]} -eq 0 ]] && { msg_warn "无配置"; return; }
+    
+    echo ""
+    echo -ne "  选择: "
+    local dc
+    read -r dc </dev/tty || dc=""
+    
+    if [[ "$dc" =~ ^[0-9]+$ ]] && (( dc >= 1 && dc <= ${#avail[@]} )); then
+        G_DEFAULT_PROVIDER="${avail[$((dc-1))]}"
+        msg_ok "默认: ${G_DEFAULT_PROVIDER}"
+    else
+        msg_warn "无效选择"
+    fi
+}
+
+_auto_select_default_provider() {
+    # 优先选择自定义 Provider
+    for p in "${!G_API_URLS[@]}"; do
+        if [[ -n "${G_API_URLS[$p]:-}" ]]; then
+            G_DEFAULT_PROVIDER="$p"
+            msg_info "自动默认: $p"
+            return
+        fi
+    done
+    
+    # 然后选择内置 Provider
+    for p in anthropic openai deepseek google groq mistral; do
+        if [[ -n "${G_API_KEYS[$p]:-}" ]]; then
+            G_DEFAULT_PROVIDER="$p"
+            msg_info "自动默认: $p"
+            return
+        fi
+    done
+}
+
+_show_config_summary() {
+    print_line
+    echo -e "${BOLD}配置摘要${NC}  默认→${GREEN}${BOLD}${G_DEFAULT_PROVIDER:-未设置}${NC}"
+    echo ""
+    
+    # 内置 Provider
+    for p in anthropic openai google deepseek groq mistral; do
+        [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
+        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[默认]${NC}"
+        local ms="${G_API_MODELS[$p]:-}"
+        echo -e "  ${BOLD}${p}${NC}${t}  ${DIM}${G_API_KEYS[$p]:0:10}****${NC} → ${CYAN}${ms%%,*}${NC}"
+    done
+    
+    # 自定义 Provider
+    for p in "${!G_API_URLS[@]}"; do
+        [[ -z "${G_API_URLS[$p]:-}" ]] && continue
+        local t=""; [[ "$G_DEFAULT_PROVIDER" == "$p" ]] && t=" ${GREEN}[默认]${NC}"
+        local ms="${G_API_MODELS[$p]:-}"
+        local at="${G_API_TYPES[$p]:-openai-completions}"
+        echo -e "  ${BOLD}${p}${NC}${t}  ${DIM}${G_API_URLS[$p]}${NC}"
+        echo -e "    api: ${CYAN}${at}${NC} → ${CYAN}${ms%%,*}${NC}"
+    done
+    
+    print_line
+}
+
+# ============================================================
+# 服务管理
+# ============================================================
 _try_systemd() {
     local svc
     for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
         sudo systemctl "$@" "$svc" 2>/dev/null && return 0
         systemctl --user "$@" "$svc" 2>/dev/null && return 0
-    done; return 1
+    done
+    return 1
 }
 
 _try_openrc() {
     local svc
     for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
         sudo rc-service "$svc" "$1" 2>/dev/null && return 0
-    done; return 1
+    done
+    return 1
 }
 
 _try_launchd() {
@@ -1376,11 +1936,13 @@ _try_launchd() {
             restart) launchctl unload "$plist" 2>/dev/null; launchctl load "$plist" 2>/dev/null && return 0 ;;
             status)  launchctl list 2>/dev/null | grep -i openclaw && return 0 ;;
         esac
-    done; return 1
+    done
+    return 1
 }
 
 service_action() {
-    local action="$1"; detect_system
+    local action="$1"
+    detect_system
 
     if ! has_cmd openclaw && docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
         case "$action" in
@@ -1390,33 +1952,41 @@ service_action() {
             status)  docker inspect --format='Status: {{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null
                      docker logs --tail 10 "$DOCKER_CONTAINER" 2>/dev/null ;;
             enable)  msg_info "Docker 已设置 --restart unless-stopped" ;;
-        esac; return 0
+        esac
+        return 0
     fi
 
     case "$SERVICE_MANAGER" in
-        systemd) case "$action" in
-            start)   _try_systemd start ;;
-            stop)    _try_systemd stop ;;
-            restart) _try_systemd restart ;;
-            enable)  _try_systemd enable --now ;;
-            status)  _try_systemd status --no-pager ;;
-        esac ;;
-        openrc) _try_openrc "$action" || { [[ "$action" == "enable" ]] && sudo rc-update add openclaw 2>/dev/null || true; } ;;
-        launchd) _try_launchd "$action" ;;
-        *) case "$action" in
-            start)   openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
-            stop)    openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true ;;
-            restart) openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true; sleep 1; openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
-            status)  openclaw gateway status 2>/dev/null || echo "状态未知" ;;
-        esac ;;
-    esac; return 0
+        systemd)
+            case "$action" in
+                start)   _try_systemd start ;;
+                stop)    _try_systemd stop ;;
+                restart) _try_systemd restart ;;
+                enable)  _try_systemd enable --now ;;
+                status)  _try_systemd status --no-pager ;;
+            esac ;;
+        openrc)
+            _try_openrc "$action" || { [[ "$action" == "enable" ]] && sudo rc-update add openclaw 2>/dev/null || true; } ;;
+        launchd)
+            _try_launchd "$action" ;;
+        *)
+            case "$action" in
+                start)   openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
+                stop)    openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true ;;
+                restart) openclaw gateway stop  >> "$LOG_FILE" 2>&1 || true; sleep 1; openclaw gateway start >> "$LOG_FILE" 2>&1 & ;;
+                status)  openclaw gateway status 2>/dev/null || echo "状态未知" ;;
+            esac ;;
+    esac
+    return 0
 }
 
 show_dashboard_info() {
-    local local_ip; local_ip=$(get_local_ip)
+    local local_ip
+    local_ip=$(get_local_ip)
     local public_ip
     public_ip=$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null \
              || curl -s --max-time 4 https://ifconfig.me 2>/dev/null || echo "无法获取")
+    
     [[ -z "$G_DEFAULT_PROVIDER" ]] && load_config_from_file
 
     local bind_mode="localhost"
@@ -1437,15 +2007,16 @@ except: print('localhost')
     echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}本机:${NC}    ${CYAN}http://127.0.0.1:${OPENCLAW_PORT}${NC}                      ${GREEN}${BOLD}║${NC}"
     if [[ "$bind_mode" == "lan" ]]; then
-    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${NC} ${GREEN}(已启用)${NC}         ${GREEN}${BOLD}║${NC}"
+        echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${CYAN}http://${local_ip}:${OPENCLAW_PORT}${NC} ${GREEN}(已启用)${NC}         ${GREEN}${BOLD}║${NC}"
     else
-    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${DIM}http://${local_ip}:${OPENCLAW_PORT} (需配置LAN)${NC}      ${GREEN}${BOLD}║${NC}"
+        echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}局域网:${NC}  ${DIM}http://${local_ip}:${OPENCLAW_PORT} (需配置LAN)${NC}      ${GREEN}${BOLD}║${NC}"
     fi
     echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}SSH隧道:${NC} ${YELLOW}ssh -L ${OPENCLAW_PORT}:localhost:${OPENCLAW_PORT} user@${public_ip}${NC}  ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}bind:${NC}    ${bind_mode}                                             ${GREEN}${BOLD}║${NC}"
     if [[ -n "$G_DEFAULT_PROVIDER" ]]; then
-        local dm="${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"; dm="${dm%%,*}"
-    echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}默认AI:${NC}  ${CYAN}${G_DEFAULT_PROVIDER}${NC} → ${dm}                   ${GREEN}${BOLD}║${NC}"
+        local dm="${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"
+        dm="${dm%%,*}"
+        echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}默认AI:${NC}  ${CYAN}${G_DEFAULT_PROVIDER}${NC} → ${dm}                   ${GREEN}${BOLD}║${NC}"
     fi
     echo -e "${GREEN}${BOLD}║${NC}  ${RED}⚠️  勿将端口直接暴露公网！${NC}                              ${GREEN}${BOLD}║${NC}"
     echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
@@ -1453,13 +2024,20 @@ except: print('localhost')
     echo ""
 }
 
+# ============================================================
+# 安装 OpenClaw
+# ============================================================
 install_openclaw() {
     msg_title "${ROCKET} 安装 OpenClaw"
-    detect_system; echo -e "${CYAN}环境:${NC} ${BOLD}${OS} ${ARCH_LABEL}${NC}"; echo ""
+    detect_system
+    echo -e "${CYAN}环境:${NC} ${BOLD}${OS} ${ARCH_LABEL}${NC}"
+    echo ""
 
     if has_cmd openclaw; then
-        local iv; iv=$(openclaw --version 2>/dev/null || echo "未知")
-        msg_warn "已安装 ($iv)"; confirm "重新安装/升级?" || { return 0; }
+        local iv
+        iv=$(openclaw --version 2>/dev/null || echo "未知")
+        msg_warn "已安装 ($iv)"
+        confirm "重新安装/升级?" || { return 0; }
     fi
 
     msg_step "Step 1/5: 系统依赖..."
@@ -1475,7 +2053,7 @@ install_openclaw() {
             safe_run "基础依赖" sudo pacman -S --noconfirm curl wget git base-devel ;;
         alpine)
             safe_run "apk update" sudo apk update
-            safe_run "基础依赖" sudo apk add curl wget git build-base ;;
+            safe_run "基础依赖" sudo apk add curl wget git build-base python3 ;;
         macos)
             has_cmd brew || safe_run "Homebrew" bash -c '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
             safe_run "基础工具" brew install curl wget git ;;
@@ -1483,12 +2061,17 @@ install_openclaw() {
     msg_ok "依赖完成"
 
     msg_step "Step 2/5: Node.js..."
-    install_nodejs || { msg_fail "Node.js 失败"; press_any_key; return 1; }
+    install_nodejs || { msg_fail "Node.js 失败"; auto_return 3; return 1; }
 
     msg_step "Step 3/5: 安装 OpenClaw..."
-    echo "  1) 官方脚本 [推荐]"; echo "  2) npm"; echo "  3) GitHub 源码 (pnpm)"; echo ""
+    echo "  1) 官方脚本 [推荐]"
+    echo "  2) npm"
+    echo "  3) GitHub 源码 (pnpm)"
+    echo ""
     echo -ne "${BOLD}选择 [1-3] (默认:1): ${NC}"
-    local ic; read -r ic </dev/tty || ic="1"; ic=${ic:-1}
+    local ic
+    read -r ic </dev/tty || ic="1"
+    ic=${ic:-1}
 
     case "$ic" in
         1)
@@ -1503,63 +2086,56 @@ install_openclaw() {
             npm install -g openclaw@latest 2>&1 | tee -a "$LOG_FILE" || true ;;
         3)
             echo -ne "${BOLD}仓库 (默认: ${GITHUB_REPO}): ${NC}"
-            local repo; read -r repo </dev/tty || repo=""; repo=${repo:-"$GITHUB_REPO"}
+            local repo
+            read -r repo </dev/tty || repo=""
+            repo=${repo:-"$GITHUB_REPO"}
             local tmp="/tmp/oc_src_$$"
-            git clone "$repo" "$tmp" >> "$LOG_FILE" 2>&1 || { msg_fail "clone失败"; press_any_key; return 1; }
+            git clone "$repo" "$tmp" >> "$LOG_FILE" 2>&1 || { msg_fail "clone失败"; auto_return 3; return 1; }
             pushd "$tmp" > /dev/null
             has_cmd pnpm || npm install -g pnpm >> "$LOG_FILE" 2>&1 || true
             pnpm install >> "$LOG_FILE" 2>&1 || true
             pnpm run build >> "$LOG_FILE" 2>&1 || true
             pnpm install -g . >> "$LOG_FILE" 2>&1 || true
-            popd > /dev/null; rm -rf "$tmp" ;;
+            popd > /dev/null
+            rm -rf "$tmp" ;;
     esac
 
     _refresh_node_path
     if ! has_cmd openclaw; then
-        msg_fail "安装失败，详见: $LOG_FILE"; press_any_key; return 1
+        msg_fail "安装失败，详见: $LOG_FILE"
+        auto_return 3
+        return 1
     fi
     msg_ok "OpenClaw $(openclaw --version 2>/dev/null) 安装成功！"
 
-    msg_step "Step 4/5: API 密钥..."
-    confirm "现在配置 API 密钥？(推荐)" && configure_api_keys || msg_info "稍后菜单[3]配置"
+    msg_step "Step 4/5: 配置..."
+    
+    # 关键修复：确保最小配置存在
+    ensure_minimal_config
+    
+    # 询问配置 API
+    if confirm "现在配置 API 密钥？(推荐)"; then
+        configure_api_keys
+    else
+        msg_info "稍后菜单[3]配置"
+    fi
 
     msg_step "Step 5/5: 初始化 Gateway..."
 
-    msg_info "写入最低启动配置 (gateway.mode=local)..."
-    mkdir -p "$OPENCLAW_CONFIG_DIR"
-    if has_cmd python3; then
-        python3 - "$OPENCLAW_JSON" << 'PYEOF'
-import json, sys, os
-p = sys.argv[1]
-os.makedirs(os.path.dirname(p), exist_ok=True)
-try:
-    with open(p) as f:
-        c = json.load(f)
-except:
-    c = {}
-c.setdefault("gateway", {}).setdefault("mode", "local")
-with open(p, "w") as f:
-    json.dump(c, f, indent=2, ensure_ascii=False)
-PYEOF
-        msg_ok "gateway.mode=local 已写入"
-    else
-        [[ ! -f "$OPENCLAW_JSON" ]] && echo '{"gateway":{"mode":"local"}}' > "$OPENCLAW_JSON" && msg_ok "最低配置已创建"
-    fi
-
     echo ""
-    echo -e "${CYAN}${BOLD}OpenClaw 需要完成 setup 才能正常启动 Gateway。${NC}"
+    echo -e "${CYAN}${BOLD}是否运行 openclaw setup 完成初始化?${NC}"
+    echo -e "${DIM}setup 会引导你完成更多配置，但 Gateway 已可以启动${NC}"
     echo ""
-    if confirm "现在运行 openclaw setup 完成初始化？(推荐)"; then
+    if confirm "运行 openclaw setup?"; then
         echo ""
         msg_info "运行 openclaw setup..."
         if openclaw setup </dev/tty; then
             msg_ok "setup 完成"
         else
-            msg_warn "setup 未完成，稍后运行: openclaw setup"
+            msg_warn "setup 未完成，但基本配置已存在"
         fi
     else
-        msg_warn "跳过 setup"
-        echo -e "  ${DIM}稍后运行: openclaw setup${NC}"
+        msg_info "跳过 setup"
     fi
 
     msg_step "启动 Gateway..."
@@ -1574,18 +2150,214 @@ PYEOF
         msg_ok "Gateway 运行中"
     else
         msg_warn "Gateway 未响应"
-        echo -e "  ${DIM}1. setup 未完成 → 运行: openclaw setup${NC}"
-        echo -e "  ${DIM}2. 查看日志    → 运行: openclaw logs${NC}"
+        echo -e "  ${DIM}查看日志: openclaw logs${NC}"
     fi
 
-    echo ""; print_line; echo -e "${GREEN}${BOLD}🎉 安装完成！${NC}"; print_line
+    echo ""
+    print_line
+    echo -e "${GREEN}${BOLD}🎉 安装完成！${NC}"
+    print_line
     show_dashboard_info
-    log "Installation completed"; press_any_key; return 0
+    
+    # 最终验证
+    echo ""
+    validate_config
+    
+    log "Installation completed"
+    auto_return 3
+    return 0
 }
 
+pick_node_version() {
+    echo -e "\n${CYAN}获取 nodejs.org 版本列表...${NC}" >&2
+    local lts_list
+    lts_list=$(get_node_lts_versions)
+    local latest_major
+    latest_major=$(get_node_latest_major)
+    local first_lts
+    first_lts=$(echo "$lts_list" | awk '{print $1}')
+
+    echo -e "\n${CYAN}选择 Node.js 版本 (最低 v${NODE_MIN_VERSION}+):${NC}" >&2
+    local idx=1
+    declare -a vmap=()
+
+    if [[ "$latest_major" != "$first_lts" ]]; then
+        printf "  %2d) Node.js %-4s (Current)\n" "$idx" "$latest_major" >&2
+        vmap[$idx]="$latest_major"
+        ((idx++))
+    fi
+
+    local is_first=true
+    for v in $lts_list; do
+        if $is_first; then
+            printf "  %2d) Node.js %-4s (LTS ★ 推荐)\n" "$idx" "$v" >&2
+            is_first=false
+        else
+            printf "  %2d) Node.js %-4s (LTS)\n" "$idx" "$v" >&2
+        fi
+        vmap[$idx]="$v"
+        ((idx++))
+    done
+
+    local mi=$idx
+    printf "  %2d) 手动输入\n" "$mi" >&2
+    echo "" >&2
+    local dc
+    [[ "$latest_major" != "$first_lts" ]] && dc=2 || dc=1
+    echo -ne "  选择 [默认:${dc}]: " >&2
+    local vc
+    read -r vc </dev/tty || vc=""
+    vc=${vc:-$dc}
+
+    if [[ "$vc" -eq "$mi" ]] 2>/dev/null; then
+        echo -ne "  主版本号: " >&2
+        local mv
+        read -r mv </dev/tty || mv=""
+        echo "$(echo "${mv:-$NODE_MIN_VERSION}" | tr -d 'vV ')"
+    else
+        echo "${vmap[$vc]:-${vmap[$dc]:-$NODE_MIN_VERSION}}"
+    fi
+}
+
+install_nodejs() {
+    msg_step "检测 Node.js..."
+
+    if has_cmd node; then
+        local ver
+        ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [[ "$ver" -ge "$NODE_MIN_VERSION" ]]; then
+            msg_ok "Node.js $(node -v) 满足要求"
+            return 0
+        fi
+        msg_warn "$(node -v) 低于 v${NODE_MIN_VERSION}+"
+    else
+        msg_warn "未检测到 Node.js"
+    fi
+
+    echo ""
+    echo "  1) NodeSource 官方源 (推荐)"
+    echo "  2) nvm 版本管理器"
+    echo "  3) 系统包管理器"
+    echo "  4) 手动安装"
+    echo ""
+    echo -ne "${BOLD}选择 [1-4] (默认: 1): ${NC}"
+    local nc
+    read -r nc </dev/tty || nc="1"
+    nc=${nc:-1}
+
+    local tv="$NODE_RECOMMENDED_VERSION"
+    if [[ "$nc" -eq 1 || "$nc" -eq 2 ]]; then
+        tv=$(pick_node_version)
+        [[ -z "$tv" ]] && tv="$NODE_RECOMMENDED_VERSION"
+        msg_info "目标: v${tv}"
+    fi
+
+    case "$nc" in
+        1) _install_node_nodesource "$tv" ;;
+        2) _install_node_nvm "$tv" ;;
+        3) _install_node_native ;;
+        4) msg_info "下载: https://nodejs.org/en/download/"; return 1 ;;
+        *) msg_warn "无效"; return 1 ;;
+    esac
+
+    _refresh_node_path
+
+    if has_cmd node; then
+        local iv
+        iv=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [[ "$iv" -ge "$NODE_MIN_VERSION" ]]; then
+            msg_ok "Node.js $(node -v) 安装成功！"
+            log "Node.js $(node -v)"
+            return 0
+        fi
+    fi
+    msg_fail "安装失败，详见: $LOG_FILE"
+    return 1
+}
+
+_install_node_nodesource() {
+    local version="$1"
+    msg_step "NodeSource v${version}..."
+    case "$OS" in
+        debian)
+            safe_run "NodeSource" bash -c "curl -fsSL https://deb.nodesource.com/setup_${version}.x | sudo -E bash -"
+            safe_run "nodejs" sudo apt-get install -y nodejs ;;
+        rhel|fedora)
+            safe_run "NodeSource" bash -c "curl -fsSL https://rpm.nodesource.com/setup_${version}.x | sudo bash -"
+            safe_run "nodejs" sudo "$PKG_MANAGER" install -y nodejs ;;
+        arch)
+            safe_run "nodejs" sudo pacman -S --noconfirm nodejs npm ;;
+        alpine)
+            safe_run "nodejs" sudo apk add nodejs npm ;;
+        macos)
+            has_cmd brew || { msg_fail "需要 Homebrew"; return 1; }
+            safe_run "node@${version}" brew install "node@${version}"
+            brew link --force --overwrite "node@${version}" 2>/dev/null || true ;;
+        *)
+            msg_fail "不支持"
+            return 1 ;;
+    esac
+}
+
+_install_node_nvm() {
+    local version="$1"
+    local nvm_ver
+    nvm_ver=$(get_nvm_latest_version)
+    msg_step "nvm (${nvm_ver}) → Node.js v${version}..."
+    safe_run "安装 nvm" bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_ver}/install.sh | bash"
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck source=/dev/null
+    [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" || { msg_fail "nvm 加载失败"; return 1; }
+    safe_run "nvm install $version" nvm install "$version"
+    nvm use "$version" >> "$LOG_FILE" 2>&1 || true
+    nvm alias default "$version" >> "$LOG_FILE" 2>&1 || true
+    local src="$HOME/.bashrc"
+    [[ "$SHELL" == *zsh* ]] && src="$HOME/.zshrc"
+    grep -q "NVM_DIR" "$src" 2>/dev/null || {
+        echo 'export NVM_DIR="$HOME/.nvm"'
+        echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"'
+    } >> "$src"
+}
+
+_install_node_native() {
+    msg_step "系统包管理器..."
+    case "$OS" in
+        debian)
+            safe_run "apt" sudo apt-get update -qq
+            safe_run "nodejs" sudo apt-get install -y nodejs npm ;;
+        rhel)
+            safe_run "nodejs" sudo yum install -y nodejs npm ;;
+        fedora)
+            safe_run "nodejs" sudo dnf install -y nodejs npm ;;
+        arch)
+            safe_run "nodejs" sudo pacman -S --noconfirm nodejs npm ;;
+        alpine)
+            safe_run "nodejs" sudo apk add nodejs npm ;;
+        macos)
+            has_cmd brew && safe_run "node" brew install node || return 1 ;;
+        *)
+            msg_fail "不支持"
+            return 1 ;;
+    esac
+}
+
+_refresh_node_path() {
+    local nd=""
+    [[ -d "$HOME/.nvm/versions/node" ]] && nd=$(ls -d "$HOME/.nvm/versions/node/"v* 2>/dev/null | sort -V | tail -1)
+    for p in "${nd:+${nd}/bin}" "$HOME/.local/bin" "/usr/local/bin"; do
+        [[ -n "$p" && -d "$p" ]] && export PATH="$p:$PATH"
+    done
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck source=/dev/null
+    [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" 2>/dev/null || true
+}
+
+# ============================================================
+# 版本与升级
+# ============================================================
 show_version() {
     msg_title "📦 版本信息"
-    is_openclaw_installed || { msg_fail "未安装"; press_any_key; return 0; }
+    is_openclaw_installed || { msg_fail "未安装"; auto_return 2; return 0; }
     print_line
     echo -e "  ${BOLD}OpenClaw${NC}    : $(openclaw_cmd --version 2>/dev/null || echo '未知')"
     echo -e "  ${BOLD}Node.js${NC}     : $(node -v 2>/dev/null || echo '未安装')"
@@ -1593,15 +2365,19 @@ show_version() {
     echo -e "  ${BOLD}Docker${NC}      : $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo '未安装')"
     echo -e "  ${BOLD}部署方式${NC}    : $(_detect_deploy_mode)"
     echo -e "  ${BOLD}脚本版本${NC}    : ${SCRIPT_VERSION}"
-    print_line; echo ""
+    print_line
+    echo ""
 
     msg_info "检查最新版本..."
-    local latest; latest=$(get_openclaw_latest_version)
-    local current; current=$(openclaw_cmd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
+    local latest
+    latest=$(get_openclaw_latest_version)
+    local current
+    current=$(openclaw_cmd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
     echo -e "  ${BOLD}当前${NC}: ${current}  ${BOLD}最新${NC}: ${latest:-无法获取}"
 
     if [[ -n "$latest" && "$latest" != "$current" ]]; then
-        echo ""; msg_warn "发现新版本 $latest"
+        echo ""
+        msg_warn "发现新版本 $latest"
         confirm "立即升级?" && {
             if docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
                 docker pull "${DOCKER_IMAGE}:latest" && docker rm -f "$DOCKER_CONTAINER" && _docker_run "$OPENCLAW_PORT" "$DOCKER_DATA_DIR"
@@ -1610,95 +2386,116 @@ show_version() {
             fi
         }
     else
-        echo ""; msg_ok "已是最新版本"
+        echo ""
+        msg_ok "已是最新版本"
     fi
 
-    press_any_key; return 0
+    auto_return 3
+    return 0
 }
 
+# ============================================================
+# 服务管理
+# ============================================================
 manage_service() {
-    local action="$1"; detect_system
+    local action="$1"
+    detect_system
+    
     case "$action" in
         start)
-            msg_step "启动 Gateway..."; service_action start; sleep 2
-            curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null \
-                && { msg_ok "启动成功！"; show_dashboard_info; } \
-                || msg_warn "未响应，若报 Missing config 请运行菜单[19] setup" ;;
+            msg_step "启动 Gateway..."
+            # 确保配置存在
+            ensure_minimal_config
+            service_action start
+            sleep 2
+            if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
+                msg_ok "启动成功！"
+                show_dashboard_info
+            else
+                msg_warn "未响应，检查配置: openclaw config validate"
+            fi ;;
         stop)
-            confirm "确认停止?" && { msg_step "停止..."; service_action stop; sleep 1; msg_ok "已停止"; } || msg_info "已取消" ;;
+            confirm "确认停止?" && {
+                msg_step "停止..."
+                service_action stop
+                sleep 1
+                msg_ok "已停止"
+            } || msg_info "已取消" ;;
         restart)
-            msg_step "重启..."; service_action restart; sleep 3; msg_ok "已重启"; show_dashboard_info ;;
+            msg_step "重启..."
+            service_action restart
+            sleep 3
+            msg_ok "已重启"
+            show_dashboard_info ;;
         status)
-            msg_step "状态:"; echo ""; service_action status; load_config_from_file
-            [[ -n "$G_DEFAULT_PROVIDER" ]] && { echo ""; echo -e "  ${BOLD}默认AI:${NC} ${GREEN}${G_DEFAULT_PROVIDER}${NC} → ${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"; }
+            msg_step "状态:"
+            echo ""
+            service_action status
+            load_config_from_file
+            [[ -n "$G_DEFAULT_PROVIDER" ]] && {
+                echo ""
+                echo -e "  ${BOLD}默认AI:${NC} ${GREEN}${G_DEFAULT_PROVIDER}${NC} → ${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"
+            }
             show_dashboard_info ;;
     esac
-    press_any_key; return 0
+    auto_return 3
+    return 0
 }
 
-manage_models() {
-    msg_title "🤖 模型管理"; load_config_from_file
-    [[ ${#G_API_KEYS[@]} -eq 0 ]] && { msg_warn "未配置 Provider"; press_any_key; return 0; }
-    _show_config_summary; echo ""
-    echo "  1) 切换默认  2) 修改模型  3) 查看可用  0) 返回"; echo ""
-    echo -ne "${BOLD}选择: ${NC}"; local mc; read -r mc </dev/tty || mc="0"
-    case "$mc" in
-        1) echo ""; _select_default_provider; [[ -n "$G_DEFAULT_PROVIDER" ]] && { write_config_via_openclaw 2>/dev/null || write_config_to_file; } ;;
-        2) echo ""; local avail=() i=1
-           for p in anthropic openai google deepseek groq mistral; do
-               [[ -n "${G_API_KEYS[$p]:-}" ]] && { echo "  $i) $p"; avail+=("$p"); ((i++)); }; done
-           [[ -n "${G_API_KEYS[custom_url]:-}" ]] && { echo "  $i) custom"; avail+=("custom"); ((i++)); }
-           echo ""; echo -ne "  选择: "; local pm; read -r pm </dev/tty || pm=""
-           if [[ "$pm" =~ ^[0-9]+$ ]] && (( pm>=1 && pm<=${#avail[@]} )); then
-               local tp="${avail[$((pm-1))]}" nm
-               [[ "$tp" == "custom" ]] && nm=$(pick_custom_models_interactive "${G_API_MODELS[custom]:-}") \
-                   || nm=$(pick_models_interactive "$tp" "${G_API_MODELS[$tp]%%,*}")
-               [[ -n "$nm" ]] && { G_API_MODELS["$tp"]="$nm"; _display_selected_models "$tp" "$nm"; write_config_via_openclaw 2>/dev/null || write_config_to_file; }
-           fi ;;
-        3) echo ""
-           for p in anthropic openai google deepseek groq mistral; do
-               [[ -z "${G_API_KEYS[$p]:-}" ]] && continue
-               echo -e "${CYAN}── ${p} ──${NC}"; get_provider_models "$p" | sed 's/^/  /'; echo ""
-           done
-           [[ -n "${G_API_KEYS[custom_url]:-}" ]] && { echo -e "${CYAN}── custom ──${NC}"; echo "${G_API_MODELS[custom]:-}" | tr ',' '\n' | sed 's/^/  /'; echo ""; } ;;
-        0) ;;
-    esac
-    press_any_key; return 0
-}
-
+# ============================================================
+# 诊断与修复
+# ============================================================
 diagnose_and_fix() {
-    msg_title "${DOCTOR} 诊断与修复"; detect_system
+    msg_title "${DOCTOR} 诊断与修复"
+    detect_system
     local issues=0 fixed=0
-    echo -e "${CYAN}${BOLD}检测中...${NC}"; echo ""
+    
+    echo -e "${CYAN}${BOLD}检测中...${NC}"
+    echo ""
 
     _chk() { echo -ne "  [${1}] ${2}...  "; }
     _pass() { echo -e "${GREEN}${OK} $*${NC}"; }
     _fail_msg() { echo -e "${RED}${FAIL} $*${NC}"; }
 
     _chk "1/10" "OpenClaw 安装"
-    if is_openclaw_installed; then _pass "$(openclaw_cmd --version 2>/dev/null) ($(_detect_deploy_mode))"
-    else _fail_msg "未安装"; ((issues++)); confirm "  立即安装?" && { install_openclaw && ((fixed++)) || true; }; fi
+    if is_openclaw_installed; then
+        _pass "$(openclaw_cmd --version 2>/dev/null) ($(_detect_deploy_mode))"
+    else
+        _fail_msg "未安装"
+        ((issues++))
+        confirm "  立即安装?" && { install_openclaw && ((fixed++)) || true; }
+    fi
 
     _chk "2/10" "Node.js"
     if has_cmd node; then
-        local nv; nv=$(node -v | sed 's/v//' | cut -d. -f1)
-        [[ "$nv" -ge "$NODE_MIN_VERSION" ]] && _pass "$(node -v)" || {
-            _fail_msg "$(node -v) < v${NODE_MIN_VERSION}"; ((issues++))
-            confirm "  升级?" && { install_nodejs && ((fixed++)) || true; }; }
-    else _fail_msg "未安装"; ((issues++)); install_nodejs && ((fixed++)) || true; fi
+        local nv
+        nv=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [[ "$nv" -ge "$NODE_MIN_VERSION" ]]; then
+            _pass "$(node -v)"
+        else
+            _fail_msg "$(node -v) < v${NODE_MIN_VERSION}"
+            ((issues++))
+            confirm "  升级?" && { install_nodejs && ((fixed++)) || true; }
+        fi
+    else
+        _fail_msg "未安装"
+        ((issues++))
+        install_nodejs && ((fixed++)) || true
+    fi
 
-    _chk "3/10" "Docker"
-    has_cmd docker && _pass "$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')" || echo -e "${DIM}未安装(可选)${NC}"
+    _chk "3/10" "配置文件"
+    if [[ -f "$OPENCLAW_JSON" ]]; then
+        _pass "$OPENCLAW_JSON"
+    else
+        _fail_msg "不存在"
+        ((issues++))
+        confirm "  创建最小配置?" && {
+            ensure_minimal_config
+            ((fixed++))
+        }
+    fi
 
-    _chk "4/10" "端口 ${OPENCLAW_PORT}"
-    if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then _pass "响应正常"
-    else echo -e "${YELLOW}${WARN} 无响应${NC}"; ((issues++))
-         confirm "  启动 Gateway?" && {
-             service_action start 2>/dev/null || { openclaw_cmd gateway start >> "$LOG_FILE" 2>&1 & true; }
-             sleep 3; curl -s --max-time 5 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null \
-                 && { msg_ok "  已启动"; ((fixed++)); } || msg_warn "  失败"; }; fi
-
-    _chk "5/10" "gateway.mode 配置"
+    _chk "4/10" "gateway.mode"
     if [[ -f "$OPENCLAW_JSON" ]] && has_cmd python3; then
         local gw_mode
         gw_mode=$(python3 -c "
@@ -1708,172 +2505,319 @@ try:
     print(c.get('gateway',{}).get('mode',''))
 except: print('')
 " 2>/dev/null || echo "")
-        if [[ -n "$gw_mode" ]]; then _pass "gateway.mode=$gw_mode"
+        if [[ -n "$gw_mode" ]]; then
+            _pass "gateway.mode=$gw_mode"
         else
-            echo -e "${RED}${FAIL} 未设置 → Gateway 将报 Missing config${NC}"; ((issues++))
-            if confirm "  写入 gateway.mode=local 修复?"; then
-                python3 - "$OPENCLAW_JSON" << 'PYEOF'
-import json, sys, os
-p=sys.argv[1]; os.makedirs(os.path.dirname(p),exist_ok=True)
-try:
-    with open(p) as f: c=json.load(f)
-except: c={}
-c.setdefault("gateway",{})["mode"]="local"
-with open(p,"w") as f: json.dump(c,f,indent=2,ensure_ascii=False)
-PYEOF
-                msg_ok "  gateway.mode=local 已写入"; ((fixed++))
-                confirm "  重启 Gateway?" && { service_action restart 2>/dev/null || true; sleep 2; }
+            _fail_msg "未设置 → Gateway 将报 'Missing config'"
+            ((issues++))
+            if confirm "  设置 gateway.mode=local?"; then
+                ensure_minimal_config
+                ((fixed++))
+                msg_ok "  已修复"
             fi
-            echo ""; msg_warn "  根本解决：运行菜单[19] openclaw setup"
         fi
     else
-        echo -e "${YELLOW}${WARN} openclaw.json 不存在${NC}"; ((issues++))
-        if confirm "  创建最低配置?"; then
-            mkdir -p "$OPENCLAW_CONFIG_DIR"; echo '{"gateway":{"mode":"local"}}' > "$OPENCLAW_JSON"
-            msg_ok "  已创建"; ((fixed++)); msg_warn "  根本解决：运行菜单[19] openclaw setup"
-        fi
+        echo -e "${YELLOW}${WARN} 无法检查${NC}"
     fi
 
-    _chk "6/10" "API 配置"
-    load_config_from_file
-    [[ ${#G_API_KEYS[@]} -gt 0 ]] && _pass "${#G_API_KEYS[@]} 个 Provider" || {
-        echo -e "${YELLOW}${WARN} 未配置${NC}"; ((issues++)); msg_info "  菜单[3]配置"; }
-
-    _chk "7/10" "局域网"
+    _chk "5/10" "models.mode"
     if [[ -f "$OPENCLAW_JSON" ]] && has_cmd python3; then
-        local bm; bm=$(python3 -c "
+        local models_mode
+        models_mode=$(python3 -c "
 import json
 try:
     c=json.load(open('$OPENCLAW_JSON'))
-    print(c.get('gateway',{}).get('bind','localhost'))
-except: print('?')
-" 2>/dev/null || echo "?")
-        [[ "$bm" == "lan" ]] && _pass "bind=lan" || echo -e "${DIM}bind=${bm}${NC}"
-    else echo -e "${DIM}不存在${NC}"; fi
+    print(c.get('models',{}).get('mode',''))
+except: print('')
+" 2>/dev/null || echo "")
+        if [[ "$models_mode" == "merge" ]]; then
+            _pass "models.mode=merge"
+        else
+            _fail_msg "models.mode=${models_mode:-未设置} → 自定义 Provider 不工作"
+            ((issues++))
+            if confirm "  设置 models.mode=merge?"; then
+                ensure_minimal_config
+                ((fixed++))
+                msg_ok "  已修复"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}${WARN} 无法检查${NC}"
+    fi
 
-    _chk "8/10" "自启动"
-    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
-        local svc_ok=false svc
-        for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
-            { systemctl is-enabled "$svc" &>/dev/null || systemctl --user is-enabled "$svc" &>/dev/null; } && { svc_ok=true; break; }
-        done
-        $svc_ok && _pass "已启用" || { echo -e "${YELLOW}${WARN} 未设置${NC}"; ((issues++))
-            confirm "  设置?" && { service_action enable 2>/dev/null && { msg_ok "  已设置"; ((fixed++)); } || true; }; }
-    else echo -e "${DIM}跳过${NC}"; fi
+    _chk "6/10" "自定义 Provider api 字段"
+    if [[ -f "$OPENCLAW_JSON" ]] && has_cmd python3; then
+        local api_check
+        api_check=$(python3 - "$OPENCLAW_JSON" << 'PYEOF' 2>/dev/null
+import json
+import sys
 
-    _chk "9/10" "磁盘"
-    local da; da=$(df "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo "9999999")
-    [[ "$da" -gt 1048576 ]] && _pass "$(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}')" || {
-        _fail_msg "不足"; ((issues++))
-        confirm "  清理日志?" && { rm -f "${OPENCLAW_LOG_DIR:?}"/*.log 2>/dev/null && { msg_ok "  已清理"; ((fixed++)); } || true; }; }
+try:
+    with open(sys.argv[1]) as f:
+        c = json.load(f)
+except:
+    sys.exit(0)
 
-    _chk "10/10" "外网"
-    curl -s --max-time 5 https://api.anthropic.com &>/dev/null \
-        || curl -s --max-time 5 https://api.openai.com &>/dev/null \
-        && _pass "正常" || { echo -e "${YELLOW}${WARN} 异常${NC}"; ((issues++)); msg_warn "  检查防火墙/代理"; }
+providers = c.get("models", {}).get("providers", {})
+missing = []
+for name, p in providers.items():
+    if not p.get("api"):
+        missing.append(name)
 
+if missing:
+    print("FAIL:" + ",".join(missing))
+elif providers:
+    print("PASS:" + str(len(providers)))
+else:
+    print("NONE")
+PYEOF
+)
+        if [[ "$api_check" == PASS:* ]]; then
+            _pass "${api_check#PASS:} 个 Provider"
+        elif [[ "$api_check" == FAIL:* ]]; then
+            _fail_msg "Provider 缺少 api 字段: ${api_check#FAIL:}"
+            ((issues++))
+            msg_warn "  请编辑 $OPENCLAW_JSON 添加 api 字段"
+        else
+            echo -e "${DIM}无自定义 Provider${NC}"
+        fi
+    else
+        echo -e "${DIM}无法检查${NC}"
+    fi
+
+    _chk "7/10" "默认模型"
+    if [[ -f "$OPENCLAW_JSON" ]] && has_cmd python3; then
+        local primary
+        primary=$(python3 -c "
+import json
+try:
+    c=json.load(open('$OPENCLAW_JSON'))
+    print(c.get('agents',{}).get('defaults',{}).get('model',{}).get('primary',''))
+except: print('')
+" 2>/dev/null || echo "")
+        if [[ -n "$primary" ]]; then
+            _pass "$primary"
+        else
+            echo -e "${YELLOW}${WARN} 未设置${NC}"
+            ((issues++))
+        fi
+    else
+        echo -e "${DIM}无法检查${NC}"
+    fi
+
+    _chk "8/10" "Gateway 端口"
+    if curl -s --max-time 3 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null; then
+        _pass "响应正常"
+    else
+        echo -e "${YELLOW}${WARN} 无响应${NC}"
+        ((issues++))
+        confirm "  启动 Gateway?" && {
+            service_action start 2>/dev/null || { openclaw_cmd gateway start >> "$LOG_FILE" 2>&1 & true; }
+            sleep 3
+            curl -s --max-time 5 "http://127.0.0.1:${OPENCLAW_PORT}" &>/dev/null && {
+                msg_ok "  已启动"
+                ((fixed++))
+            } || msg_warn "  启动失败"
+        }
+    fi
+
+    _chk "9/10" "磁盘空间"
+    local da
+    da=$(df "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo "9999999")
+    if [[ "$da" -gt 1048576 ]]; then
+        _pass "$(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}')"
+    else
+        _fail_msg "不足"
+        ((issues++))
+    fi
+
+    _chk "10/10" "网络连接"
+    if curl -s --max-time 5 https://api.anthropic.com &>/dev/null \
+       || curl -s --max-time 5 https://api.openai.com &>/dev/null; then
+        _pass "正常"
+    else
+        echo -e "${YELLOW}${WARN} 异常${NC}"
+        ((issues++))
+        msg_warn "  检查防火墙/代理"
+    fi
+
+    # 运行 openclaw doctor
     if is_openclaw_installed; then
-        echo ""; msg_step "openclaw doctor --fix..."
+        echo ""
+        msg_step "运行 openclaw doctor --fix..."
         openclaw_cmd doctor --fix 2>&1 | sed 's/^/    /' || true
     fi
 
-    echo ""; print_line
+    echo ""
+    print_line
     echo -e "${BOLD}结果:${NC}  问题 ${RED}${BOLD}${issues}${NC}  修复 ${GREEN}${BOLD}${fixed}${NC}"
     (( issues > fixed )) && echo -e "  待处理: ${YELLOW}$(( issues - fixed ))${NC}"
     echo -e "  日志: ${DIM}${LOG_FILE}${NC}"
-    print_line; press_any_key; return 0
+    print_line
+    
+    auto_return 3
+    return 0
 }
 
+# ============================================================
+# 查看日志
+# ============================================================
 view_logs() {
     msg_title "📋 日志"
-    echo "  1) 实时 Gateway  2) systemd  3) 应用文件  4) Docker  5) 脚本日志  0) 返回"; echo ""
-    echo -ne "${BOLD}选择 [0-5]: ${NC}"; local lc; read -r lc </dev/tty || lc="0"
+    echo "  1) 实时 Gateway  2) systemd  3) 应用文件  4) Docker  5) 脚本日志  0) 返回"
+    echo ""
+    echo -ne "${BOLD}选择 [0-5]: ${NC}"
+    local lc
+    read -r lc </dev/tty || lc="0"
 
     case "$lc" in
-        1) msg_info "Ctrl+C 退出"; sleep 1
-           trap 'echo ""; msg_info "退出"' INT
-           openclaw_cmd gateway logs --follow 2>/dev/null \
-               || openclaw_cmd logs 2>/dev/null \
-               || journalctl -u "$OPENCLAW_SERVICE" -f 2>/dev/null \
-               || tail -f "${OPENCLAW_LOG_DIR}/gateway.log" 2>/dev/null \
-               || msg_fail "无法获取" || true
-           trap - INT ;;
-        2) detect_system; [[ "$SERVICE_MANAGER" == "systemd" ]] && {
-               local svc found=false
-               for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
-                   { sudo journalctl -u "$svc" -n 100 --no-pager 2>/dev/null \
-                     || journalctl --user -u "$svc" -n 100 --no-pager 2>/dev/null; } && { found=true; break; }
-               done; $found || msg_fail "不可用"
-           } || msg_warn "非 systemd" ;;
-        3) [[ -d "$OPENCLAW_LOG_DIR" ]] && {
-               ls -lh "$OPENCLAW_LOG_DIR" 2>/dev/null || echo "(空)"
-               echo -ne "${BOLD}文件名 (Enter最新): ${NC}"; local lf; read -r lf </dev/tty || lf=""
-               if [[ -n "$lf" ]]; then less "${OPENCLAW_LOG_DIR}/${lf}" 2>/dev/null || msg_warn "不存在"
-               else local ll; ll=$(ls -t "${OPENCLAW_LOG_DIR}"/*.log 2>/dev/null | head -1 || echo "")
-                   [[ -n "$ll" ]] && less "$ll" || msg_warn "无日志"; fi
-           } || msg_warn "目录不存在" ;;
-        4) has_cmd docker && docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER" && {
-               trap 'echo ""; msg_info "退出"' INT
-               docker logs -f "$DOCKER_CONTAINER" 2>&1 || true
-               trap - INT
-           } || msg_warn "无 Docker 容器" ;;
-        5) [[ -f "$LOG_FILE" ]] && less "$LOG_FILE" || msg_warn "不存在" ;;
-        0) return 0 ;;
-        *) msg_warn "无效" ;;
+        1)
+            msg_info "Ctrl+C 退出"
+            sleep 1
+            trap 'echo ""; msg_info "退出"' INT
+            openclaw_cmd gateway logs --follow 2>/dev/null \
+                || openclaw_cmd logs 2>/dev/null \
+                || journalctl -u "$OPENCLAW_SERVICE" -f 2>/dev/null \
+                || tail -f "${OPENCLAW_LOG_DIR}/gateway.log" 2>/dev/null \
+                || msg_fail "无法获取" || true
+            trap - INT ;;
+        2)
+            detect_system
+            if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+                local svc found=false
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    if sudo journalctl -u "$svc" -n 100 --no-pager 2>/dev/null \
+                       || journalctl --user -u "$svc" -n 100 --no-pager 2>/dev/null; then
+                        found=true
+                        break
+                    fi
+                done
+                $found || msg_fail "不可用"
+            else
+                msg_warn "非 systemd"
+            fi ;;
+        3)
+            if [[ -d "$OPENCLAW_LOG_DIR" ]]; then
+                ls -lh "$OPENCLAW_LOG_DIR" 2>/dev/null || echo "(空)"
+                echo -ne "${BOLD}文件名 (Enter最新): ${NC}"
+                local lf
+                read -r lf </dev/tty || lf=""
+                if [[ -n "$lf" ]]; then
+                    less "${OPENCLAW_LOG_DIR}/${lf}" 2>/dev/null || msg_warn "不存在"
+                else
+                    local ll
+                    ll=$(ls -t "${OPENCLAW_LOG_DIR}"/*.log 2>/dev/null | head -1 || echo "")
+                    [[ -n "$ll" ]] && less "$ll" || msg_warn "无日志"
+                fi
+            else
+                msg_warn "目录不存在"
+            fi ;;
+        4)
+            if has_cmd docker && docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
+                trap 'echo ""; msg_info "退出"' INT
+                docker logs -f "$DOCKER_CONTAINER" 2>&1 || true
+                trap - INT
+            else
+                msg_warn "无 Docker 容器"
+            fi ;;
+        5)
+            [[ -f "$LOG_FILE" ]] && less "$LOG_FILE" || msg_warn "不存在" ;;
+        0)
+            return 0 ;;
+        *)
+            msg_warn "无效" ;;
     esac
-    press_any_key; return 0
+    auto_return 2
+    return 0
 }
 
+# ============================================================
+# 卸载
+# ============================================================
 uninstall_openclaw() {
     msg_title "${TRASH} 卸载 OpenClaw"
-    echo -e "${RED}${BOLD}⚠️  此操作将卸载 OpenClaw${NC}"; echo ""
-    echo "  • 停止并禁用 Gateway / 容器"; echo "  • 卸载 npm 包或删除 Docker 容器"; echo "  • 可选: 删除配置/数据"; echo ""
-    confirm "确认卸载?" || { msg_info "已取消"; press_any_key; return 0; }
+    echo -e "${RED}${BOLD}⚠️  此操作将卸载 OpenClaw${NC}"
+    echo ""
+    echo "  • 停止并禁用 Gateway / 容器"
+    echo "  • 卸载 npm 包或删除 Docker 容器"
+    echo "  • 可选: 删除配置/数据"
+    echo ""
+    confirm "确认卸载?" || { msg_info "已取消"; auto_return 2; return 0; }
     detect_system
 
     docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER" && {
         msg_step "Docker 容器..."
         docker stop "$DOCKER_CONTAINER" 2>/dev/null || true
         confirm "删除容器?" && { docker rm -f "$DOCKER_CONTAINER" 2>/dev/null && msg_ok "容器已删除"; }
-        confirm "删除镜像?" && { docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true; docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true; msg_ok "镜像已删除"; }; }
+        confirm "删除镜像?" && {
+            docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true
+            docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true
+            msg_ok "镜像已删除"
+        }
+    }
 
     if has_cmd openclaw; then
-        msg_step "停止服务..."; openclaw gateway uninstall >> "$LOG_FILE" 2>&1 || true
-        service_action stop 2>/dev/null || true; sleep 1
+        msg_step "停止服务..."
+        openclaw gateway uninstall >> "$LOG_FILE" 2>&1 || true
+        service_action stop 2>/dev/null || true
+        sleep 1
+        
         msg_step "禁用自启..."
         case "$SERVICE_MANAGER" in
-            systemd) local svc
-                     for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
-                         sudo systemctl disable "$svc" 2>/dev/null || true
-                         systemctl --user disable "$svc" 2>/dev/null || true
-                         sudo rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
-                     done
-                     sudo systemctl daemon-reload 2>/dev/null || true ;;
-            launchd) _try_launchd stop 2>/dev/null || true
-                     rm -f "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" \
-                           "$HOME/Library/LaunchAgents/com.openclaw.gateway.plist" 2>/dev/null || true ;;
-            openrc)  local svc; for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do sudo rc-update del "$svc" 2>/dev/null || true; done ;;
+            systemd)
+                local svc
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    sudo systemctl disable "$svc" 2>/dev/null || true
+                    systemctl --user disable "$svc" 2>/dev/null || true
+                    sudo rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
+                done
+                sudo systemctl daemon-reload 2>/dev/null || true ;;
+            launchd)
+                _try_launchd stop 2>/dev/null || true
+                rm -f "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" \
+                      "$HOME/Library/LaunchAgents/com.openclaw.gateway.plist" 2>/dev/null || true ;;
+            openrc)
+                local svc
+                for svc in "${OPENCLAW_SERVICE_CANDIDATES[@]}"; do
+                    sudo rc-update del "$svc" 2>/dev/null || true
+                done ;;
         esac
+        
         msg_step "卸载 npm..."
         npm uninstall -g openclaw >> "$LOG_FILE" 2>&1 && msg_ok "已卸载" || {
             msg_warn "npm 失败，手动清理..."
-            local np; np=$(npm prefix -g 2>/dev/null || echo "/usr/local")
+            local np
+            np=$(npm prefix -g 2>/dev/null || echo "/usr/local")
             sudo rm -f "${np}/bin/openclaw" 2>/dev/null || true
             sudo rm -rf "${np}/lib/node_modules/openclaw" 2>/dev/null || true
-            msg_ok "清理完成"; }
+            msg_ok "清理完成"
+        }
     fi
 
     echo ""
     confirm "删除配置和数据? ($OPENCLAW_CONFIG_DIR)" && {
-        rm -rf "$OPENCLAW_CONFIG_DIR"; G_API_KEYS=(); G_API_MODELS=(); G_DEFAULT_PROVIDER=""
-        msg_ok "数据已删除"; } || msg_info "配置保留: $OPENCLAW_CONFIG_DIR"
+        rm -rf "$OPENCLAW_CONFIG_DIR"
+        G_API_KEYS=()
+        G_API_MODELS=()
+        G_API_TYPES=()
+        G_API_URLS=()
+        G_DEFAULT_PROVIDER=""
+        msg_ok "数据已删除"
+    } || msg_info "配置保留: $OPENCLAW_CONFIG_DIR"
 
-    echo ""; msg_ok "OpenClaw 已卸载"; log "Uninstalled"
-    press_any_key; return 0
+    echo ""
+    msg_ok "OpenClaw 已卸载"
+    log "Uninstalled"
+    auto_return 3
+    return 0
 }
 
+# ============================================================
+# 主菜单
+# ============================================================
 show_banner() {
-    clear; echo -e "${CYAN}${BOLD}"
+    clear
+    echo -e "${CYAN}${BOLD}"
     cat << 'BANNER'
   ██████╗ ██████╗ ███████╗███╗   ██╗ ██████╗██╗      █████╗ ██╗    ██╗
  ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██║     ██╔══██╗██║    ██║
@@ -1883,10 +2827,11 @@ show_banner() {
   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
 BANNER
     echo -e "${NC}"
-    echo -e "        ${DIM}一键管理 ${SCRIPT_VERSION} | 局域网 / Docker / 多模型 / 插件${NC}"
+    echo -e "        ${DIM}修复版 ${SCRIPT_VERSION} | 解决部署和自定义 API 配置问题${NC}"
     echo ""
 
-    detect_system; load_config_from_file 2>/dev/null || true
+    detect_system
+    load_config_from_file 2>/dev/null || true
 
     local sc="${RED}" st="未安装"
     if is_openclaw_installed; then
@@ -1897,7 +2842,8 @@ BANNER
 
     local mi=""
     if [[ -n "${G_DEFAULT_PROVIDER:-}" ]]; then
-        local dm="${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"; dm="${dm%%,*}"
+        local dm="${G_API_MODELS[$G_DEFAULT_PROVIDER]:-}"
+        dm="${dm%%,*}"
         [[ -n "$dm" ]] && mi="  ${DIM}|${NC} ${CYAN}${G_DEFAULT_PROVIDER}${NC}:${dm}"
     fi
 
@@ -1908,15 +2854,16 @@ BANNER
 main_menu() {
     while true; do
         show_banner
-        echo -e "${WHITE}${BOLD}  主菜单${NC}"; echo ""
+        echo -e "${WHITE}${BOLD}  主菜单${NC}"
+        echo ""
         echo -e "${BOLD}  ── 安装部署 ──${NC}"
         echo -e "  ${BOLD}${GREEN}[1]${NC}  ${ROCKET} 本地安装 / 重装"
         echo -e "  ${BOLD}${GREEN}[2]${NC}  ${DOCKER} Docker 部署"
         echo ""
         echo -e "${BOLD}  ── 配置管理 ──${NC}"
         echo -e "  ${BOLD}${CYAN}[3]${NC}  🔑 配置 API 密钥"
-        echo -e "  ${BOLD}${CYAN}[4]${NC}  ${LOBSTER} 局域网访问配置"
-        echo -e "  ${BOLD}${CYAN}[5]${NC}  🤖 模型管理"
+        echo -e "  ${BOLD}${CYAN}[4]${NC}  🔧 配置自定义 API (重要!)"
+        echo -e "  ${BOLD}${CYAN}[5]${NC}  ${LOBSTER} 局域网访问配置"
         echo -e "  ${BOLD}${CYAN}[6]${NC}  ${PLUGIN} 安装插件 (微信/飞书)"
         echo ""
         echo -e "${BOLD}  ── 服务控制 ──${NC}"
@@ -1932,58 +2879,65 @@ main_menu() {
         echo -e "  ${BOLD}${MAGENTA}[14]${NC} ${GEAR} 快捷命令执行"
         echo -e "  ${BOLD}${MAGENTA}[15]${NC} 📖 命令速查手册"
         echo -e "  ${BOLD}${MAGENTA}[16]${NC} ${DOCTOR} 诊断修复"
-        echo -e "  ${BOLD}${MAGENTA}[17]${NC} ℹ️  系统信息"
-        echo -e "  ${BOLD}${RED}[18]${NC} ${TRASH} 卸载"
-        echo -e "  ${BOLD}${GREEN}[19]${NC} 🔧 运行 setup 初始化向导"
+        echo -e "  ${BOLD}${MAGENTA}[17]${NC} ✅ 验证配置"
+        echo -e "  ${BOLD}${MAGENTA}[18]${NC} ℹ️  系统信息"
+        echo -e "  ${BOLD}${RED}[19]${NC} ${TRASH} 卸载"
+        echo -e "  ${BOLD}${GREEN}[20]${NC} 🔧 运行 setup 初始化向导"
         echo -e "  ${BOLD}[0]${NC}  🚪 退出"
         echo ""
         print_line
         echo -ne "  ${BOLD}请输入: ${NC}"
-        local choice; read -r choice </dev/tty || choice=""
+        local choice
+        read -r choice </dev/tty || choice=""
 
         case "$choice" in
             1)  install_openclaw ;;
             2)  deploy_docker ;;
-            3)  configure_api_keys; press_any_key ;;
-            4)  configure_lan_access ;;
-            5)  manage_models ;;
+            3)  configure_api_keys; auto_return 2 ;;
+            4)  configure_custom_api; auto_return 2 ;;
+            5)  configure_lan_access ;;
             6)  install_plugins ;;
             7)  manage_service start ;;
             8)  manage_service restart ;;
             9)  manage_service stop ;;
             10) manage_service status ;;
-            11) show_dashboard_info; press_any_key ;;
+            11) show_dashboard_info; auto_return 3 ;;
             12) show_version ;;
             13) view_logs ;;
             14) quick_commands ;;
             15) show_command_reference ;;
             16) diagnose_and_fix ;;
-            17) print_sysinfo; press_any_key ;;
-            18) uninstall_openclaw ;;
-            19) run_setup_wizard ;;
+            17) validate_config; auto_return 2 ;;
+            18) print_sysinfo; auto_return 3 ;;
+            19) uninstall_openclaw ;;
+            20) run_setup_wizard ;;
             0)  echo ""; echo -e "${GREEN}${BOLD}再见！👋${NC}"; echo ""; exit 0 ;;
-            *)  msg_warn "无效: ${choice} (0-19)"; sleep 1 ;;
+            *)  msg_warn "无效: ${choice} (0-20)"; sleep 1 ;;
         esac
     done
 }
 
+# ============================================================
+# 入口
+# ============================================================
 case "${1:-}" in
-    install)   detect_system; install_openclaw ;;
-    docker)    detect_system; deploy_docker ;;
-    lan)       detect_system; configure_lan_access ;;
-    plugins)   install_plugins ;;
-    setup)     detect_system; run_setup_wizard ;;
-    start)     detect_system; manage_service start ;;
-    stop)      detect_system; manage_service stop ;;
-    restart)   detect_system; manage_service restart ;;
-    status)    detect_system; manage_service status ;;
-    version)   show_version ;;
-    diagnose)  detect_system; diagnose_and_fix ;;
-    uninstall) detect_system; uninstall_openclaw ;;
-    url)       load_config_from_file; show_dashboard_info ;;
-    models)    detect_system; manage_models ;;
-    config)    detect_system; configure_api_keys ;;
-    ref|help)  show_command_reference ;;
-    cmds)      detect_system; quick_commands ;;
-    *)         main_menu ;;
+    install)    detect_system; install_openclaw ;;
+    docker)     detect_system; deploy_docker ;;
+    lan)        detect_system; configure_lan_access ;;
+    plugins)    install_plugins ;;
+    setup)      detect_system; run_setup_wizard ;;
+    start)      detect_system; manage_service start ;;
+    stop)       detect_system; manage_service stop ;;
+    restart)    detect_system; manage_service restart ;;
+    status)     detect_system; manage_service status ;;
+    version)    show_version ;;
+    diagnose)   detect_system; diagnose_and_fix ;;
+    uninstall)  detect_system; uninstall_openclaw ;;
+    url)        load_config_from_file; show_dashboard_info ;;
+    config)     detect_system; configure_api_keys ;;
+    custom)     detect_system; configure_custom_api ;;
+    validate)   validate_config ;;
+    ref|help)   show_command_reference ;;
+    cmds)       detect_system; quick_commands ;;
+    *)          main_menu ;;
 esac
