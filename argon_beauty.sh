@@ -627,7 +627,7 @@ inject_font_css() {
 }
 
 step_brand_animation() {
-    title "步骤3：Brand 名称动画效果 v3.0 [$ACTIVE_THEME]"
+    title "步骤3：Brand 名称动画效果 v3.1 [$ACTIVE_THEME]"
     ask "是否启用品牌名动画效果" || return
     echo ""
     echo "  ${WHITE}动画模式（8种）：${NC}"
@@ -839,7 +839,7 @@ step_switch_animation() {
 }
 
 step_glassmorphism() {
-    title "步骤4：智能毛玻璃效果 v3.0 [$ACTIVE_THEME]"
+    title "步骤4：智能毛玻璃效果 v3.1 [$ACTIVE_THEME]"
     info "智能检测主题底色并适配: ${THEME_BASE_COLOR}"
     ask "是否启用毛玻璃效果" || return
 
@@ -1071,6 +1071,71 @@ step_glassmorphism() {
     printf '  text-shadow: -1px -1px 0 rgba(0,0,0,0.9), 1px -1px 0 rgba(0,0,0,0.9), -1px 1px 0 rgba(0,0,0,0.9), 1px 1px 0 rgba(0,0,0,0.9), 0 0 6px rgba(0,229,255,0.5) !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
+    printf 'body #maincontent .table tbody tr.empty,\n' >> "$css"
+    printf 'body #maincontent .table tbody tr.placeholder,\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table tbody tr.empty,\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table tbody tr.placeholder,\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table-row[data-empty="true"],\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table-row.empty,\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table-row:empty,\n' >> "$css"
+    printf '.table tbody tr.empty,\n' >> "$css"
+    printf '.table tbody tr.placeholder,\n' >> "$css"
+    printf '.cbi-section-table tbody tr.empty,\n' >> "$css"
+    printf '.cbi-section-table tbody tr.placeholder,\n' >> "$css"
+    printf '.cbi-section-table-row[data-empty="true"],\n' >> "$css"
+    printf '.cbi-section-table-row.empty,\n' >> "$css"
+    printf '.cbi-section-table-row:empty {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.35) !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist-item,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist .item,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist .add-item,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist-placeholder,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist > .item,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist > .add-item {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.40) !important;\n' >> "$css"
+    printf '  border: 1px solid var(--glass-border) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist input,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist select,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist .cbi-input-text,\n' >> "$css"
+    printf 'body #maincontent .cbi-dynlist .cbi-input-select {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.55) !important;\n' >> "$css"
+    printf '  border: 1px solid rgba(255,255,255,0.55) !important;\n' >> "$css"
+    printf '  border-radius: 6px !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+    printf '.cbi-section-table-row,\n' >> "$css"
+    printf '.cbi-section-table-cell,\n' >> "$css"
+    printf '.cbi-section-table-row *,\n' >> "$css"
+    printf '.cbi-section-table-cell *,\n' >> "$css"
+    printf '.cbi-value-field,\n' >> "$css"
+    printf '.cbi-value-field *,\n' >> "$css"
+    printf '.cbi-value-description {\n' >> "$css"
+    printf '  background: transparent !important;\n' >> "$css"
+    printf '  border-color: var(--glass-border) !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
+    printf 'body #maincontent .cbi-section-table-row,\n' >> "$css"
+    printf 'body #maincontent .cbi-section-table-cell,\n' >> "$css"
+    printf 'body #maincontent .cbi-value-field,\n' >> "$css"
+    printf 'body #maincontent .cbi-value-description {\n' >> "$css"
+    printf '  background: transparent !important;\n' >> "$css"
+    printf '  border-color: var(--glass-border) !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
+    printf '.cbi-section div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
+    printf '.cbi-section-node div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
+    printf '.panel div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
+    printf '.card div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]) {\n' >> "$css"
+    printf '  background-color: transparent !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
     printf '.chart-container, .chart-wrapper,\n' >> "$css"
     printf '[id*="chart"], [class*="chart"],\n' >> "$css"
     printf '[class*="traffic"], [id*="traffic"],\n' >> "$css"
@@ -1085,6 +1150,18 @@ step_glassmorphism() {
     printf '  border-radius: 8px !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
+    printf 'body #maincontent input[type="text"],\n' >> "$css"
+    printf 'body #maincontent input[type="password"],\n' >> "$css"
+    printf 'body #maincontent input[type="number"],\n' >> "$css"
+    printf 'body #maincontent input[type="email"],\n' >> "$css"
+    printf 'body #maincontent input[type="url"],\n' >> "$css"
+    printf 'body #maincontent input[type="search"],\n' >> "$css"
+    printf 'body #maincontent input[type="tel"],\n' >> "$css"
+    printf 'body #maincontent input[type="date"],\n' >> "$css"
+    printf 'body #maincontent input[type="time"],\n' >> "$css"
+    printf 'body #maincontent select,\n' >> "$css"
+    printf 'body #maincontent textarea,\n' >> "$css"
+    printf 'body #maincontent .form-control,\n' >> "$css"
     printf 'input[type="text"], input[type="password"], input[type="number"],\n' >> "$css"
     printf 'input[type="email"], input[type="url"], input[type="search"],\n' >> "$css"
     printf 'input[type="tel"], input[type="date"], input[type="time"],\n' >> "$css"
@@ -1097,6 +1174,10 @@ step_glassmorphism() {
     printf '  box-shadow: inset 0 1px 3px rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  transition: border-color 0.25s ease, box-shadow 0.25s ease !important;\n' >> "$css"
     printf '}\n' >> "$css"
+    printf 'body #maincontent input:focus,\n' >> "$css"
+    printf 'body #maincontent select:focus,\n' >> "$css"
+    printf 'body #maincontent textarea:focus,\n' >> "$css"
+    printf 'body #maincontent .form-control:focus,\n' >> "$css"
     printf 'input:focus, select:focus, textarea:focus, .form-control:focus {\n' >> "$css"
     printf '  border-color: rgba(0,220,220,0.90) !important;\n' >> "$css"
     printf '  box-shadow: 0 0 0 2px rgba(0,220,220,0.30),\n' >> "$css"
@@ -1271,7 +1352,7 @@ step_glassmorphism() {
     printf '}\n' >> "$css"
 
     printf '/* === END GLASSMORPHISM === */\n' >> "$css"
-    success "毛玻璃注入完成 v3.0（智能底色/全面穿透/表格修复）"
+    success "毛玻璃注入完成 v3.1（智能底色/全面穿透/表格修复）"
 }
 
 step_text() {
@@ -1602,9 +1683,9 @@ show_status() {
     if grep -q "GLASSMORPHISM" "$css" 2>/dev/null; then
         local dk; dk=$(grep "GLASSMORPHISM theme=" "$css" 2>/dev/null | head -1 | \
             sed 's/.*darken=//;s/ .*//' | tr -d '*/')
-        printf "  %-30s ${GREEN}%s${NC}\n" "智能毛玻璃 v3.0" "已启用 (压暗=${dk:-?})"
+        printf "  %-30s ${GREEN}%s${NC}\n" "智能毛玻璃 v3.1" "已启用 (压暗=${dk:-?})"
     else
-        printf "  %-30s ${YELLOW}%s${NC}\n" "智能毛玻璃 v3.0" "未启用"
+        printf "  %-30s ${YELLOW}%s${NC}\n" "智能毛玻璃 v3.1" "未启用"
     fi
 
     _stat "动画关键帧" "KEYFRAMES_ALL" ""
@@ -1647,35 +1728,33 @@ do_flush() { rm -rf /tmp/luci-* 2>/dev/null; success "LuCI 缓存已清除"; }
 main_menu() {
     while true; do
         echo ""
-        echo "${CYAN}+--------------------------------------------------+${NC}"
-        printf "${CYAN}|${NC}  ${WHITE}LuCI Theme Beauty Tool v3.0 [%-14s]${NC}${CYAN}|${NC}\n" \
-            "$ACTIVE_THEME"
-        printf "${CYAN}|${NC}  ${YELLOW}底色: %-8s${NC}                               ${CYAN}|${NC}\n" \
-            "$THEME_BASE_COLOR"
-        echo "${CYAN}+--------------------------------------------------+${NC}"
-        echo "${CYAN}|${NC} ${WHITE}1${NC}) [全程] 一键智能全流程美化 (推荐新手)         ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}2${NC}) [状态] 查看当前美化状态                       ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}0${NC}) [检测] 联网检测所有内置URL可用性              ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}T${NC}) [主题] 切换目标主题                           ${CYAN}|${NC}"
-        echo "${CYAN}+--------------------------------------------------+${NC}"
-        echo "${CYAN}|${NC} ${WHITE}3${NC}) [背景] 下载/更换背景图                        ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}4${NC}) [字体] 获取/更换字体                          ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}5${NC}) [动画] Brand 动画效果 (8种)                   ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}6${NC}) [切换] 切换动画模式(不重设颜色)               ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}7${NC}) [玻璃] 智能毛玻璃 v3.0                        ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}8${NC}) [文字] 文字发光强化 v3.1                      ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}9${NC}) [位置] 登录框位置                             ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}a${NC}) [清理] 清理页面元素                           ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}e${NC}) [特效] 额外特效（扫描线/发光边框/淡入等）     ${CYAN}|${NC}"
-        echo "${CYAN}+--------------------------------------------------+${NC}"
-        echo "${CYAN}|${NC} ${WHITE}r${NC}) [恢复] 恢复原版(含时间戳备份选择)             ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}f${NC}) [缓存] 清除LuCI缓存                           ${CYAN}|${NC}"
-        echo "${CYAN}|${NC} ${WHITE}q${NC}) [退出] 退出程序                               ${CYAN}|${NC}"
-        echo "${CYAN}+--------------------------------------------------+${NC}"
+        echo "${CYAN}+============================================================+${NC}"
+        printf "${CYAN}|${NC}  ${WHITE}LuCI Theme Beauty Tool v3.1${NC}                              ${CYAN}|${NC}\n"
+        printf "${CYAN}|${NC}  ${YELLOW}主题: %-12s  底色: %-8s${NC}                ${CYAN}|${NC}\n" "$ACTIVE_THEME" "$THEME_BASE_COLOR"
+        echo "${CYAN}+============================================================+${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}1) [全程] 一键智能全流程美化 (推荐新手)${NC}                  ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}2) [状态] 查看当前美化状态${NC}                                 ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}0) [检测] 联网检测所有内置URL可用性${NC}                        ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}T) [主题] 切换目标主题${NC}                                     ${CYAN}|${NC}"
+        echo "${CYAN}+------------------------------------------------------------+${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}3) [背景] 下载/更换背景图${NC}                                  ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}4) [字体] 获取/更换字体${NC}                                    ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}5) [动画] Brand 动画效果 (8种)${NC}                             ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}6) [切换] 切换动画模式(不重设颜色)${NC}                         ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}7) [玻璃] 智能毛玻璃 v3.1${NC}                                  ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}8) [文字] 文字发光强化 v3.1${NC}                                ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}9) [位置] 登录框位置${NC}                                       ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}a) [清理] 清理页面元素${NC}                                     ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}e) [特效] 额外特效（扫描线/发光边框/淡入等）${NC}               ${CYAN}|${NC}"
+        echo "${CYAN}+------------------------------------------------------------+${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}r) [恢复] 恢复原版(含时间戳备份选择)${NC}                       ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}f) [缓存] 清除LuCI缓存${NC}                                     ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}q) [退出] 退出程序${NC}                                         ${CYAN}|${NC}"
+        echo "${CYAN}+============================================================+${NC}"
         printf "${YELLOW}  请选择: ${NC}"; read choice
         case "$choice" in
             1)
-                title "开始智能全流程美化 v3.0 [$ACTIVE_THEME]"
+                title "开始智能全流程美化 v3.1 [$ACTIVE_THEME]"
                 step_download_image
                 step_download_font
                 step_brand_animation
