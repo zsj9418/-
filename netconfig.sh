@@ -1,5 +1,5 @@
 #!/bin/sh
-VERSION="4.2"
+VERSION="1.1"
 CONFIG_DIR="/etc/config"
 BACKUP_DIR="/etc/backups"
 LOG_FILE="/tmp/netconfig.log"
