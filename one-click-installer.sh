@@ -67,12 +67,12 @@ declare -A DEFAULT_SCRIPTS=(
     ["39"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/4G-UFI_sim.sh"
     ["40"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/manage_openwrt.sh"
     ["41"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/netconfig.sh"
-    ["42"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openwrt_mac.sh"
+    ["42"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openclaw-manager.sh"
     ["43"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/argon_beauty.sh"
     ["44"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/pve_smart_migration.sh"
     ["45"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/uninstall_histb.sh"
     ["46"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cpu-tool.sh"
-    ["47"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/openclaw-manager.sh"
+
 )
 
 DEFAULT_OPTIONS=(
@@ -117,12 +117,11 @@ DEFAULT_OPTIONS=(
     "39. 4G-UFI 切卡管理"
     "40. 安装 Docker 版 OpenWrt"
     "41. OpenWrt 网口配置"
-    "42. OpenWrt 固定 MAC"
+    "42. OpenClaw部署"
     "43. OpenWrt UI 界面美化"
     "44. PVE 智能存储迁移"
     "45. 海纳思内置卸载"
     "46. CPU频率仪表"
-    "47. OpenClaw部署"
     "98. 快捷键管理"
 )
 
