@@ -1,701 +1,1260 @@
 #!/bin/sh
 
-# OpenWRT 多网口高级配置脚本
-# 优化版 v3.1
-# 更新：修复VLAN配置/增强兼容性/优化输入验证
-
-# 全局变量
-VERSION="3.1"
+VERSION="4.0"
 CONFIG_DIR="/etc/config"
 BACKUP_DIR="/etc/backups"
 LOG_FILE="/tmp/netconfig.log"
 SWITCH_DEVICE=""
 SWPORT_MAP=""
+PHYSICAL_IFACES=""
+VLAN_CAPABLE=0
+SELECTED_RESULT=""
 
-# 颜色定义
 RED='\033[1;31m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[1;34m'
 NC='\033[0m'
 
-# 日志记录
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> $LOG_FILE
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-# 初始化检查
 init_check() {
-    # 检查root权限
-    [ "$(id -u)" -ne 0 ] && {
-        echo -e "${RED}错误: 此脚本必须以root权限运行！${NC}" 
-        log "权限检查失败"
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}此脚本必须以root权限运行${NC}"
         exit 1
-    }
-
-    # 检查OpenWRT系统
-    ! grep -qi "OpenWrt" /etc/os-release 2>/dev/null && {
-        echo -e "${RED}错误: 此脚本仅适用于OpenWRT系统！${NC}"
-        log "系统检查失败"
-        exit 1
-    }
-
-    # 创建必要目录
-    mkdir -p $BACKUP_DIR
-    touch $LOG_FILE
+    fi
+    if ! grep -qi "openwrt\|lede" /etc/os-release 2>/dev/null; then
+        if [ ! -f /etc/openwrt_release ] && [ ! -f /etc/openwrt_version ]; then
+            echo -e "${RED}此脚本仅适用于OpenWRT系统${NC}"
+            exit 1
+        fi
+    fi
+    mkdir -p "$BACKUP_DIR"
+    touch "$LOG_FILE"
     log "===== 脚本初始化 ====="
-    
-    # 检测SSH连接警告
-    [ -n "$SSH_CONNECTION" ] && {
-        echo -e "${YELLOW}警告: 当前通过SSH连接，配置网络可能导致连接中断！${NC}"
-        read -p "按回车键继续或Ctrl+C退出..." dummy
-    }
+    if [ -n "$SSH_CONNECTION" ]; then
+        echo -e "${YELLOW}警告: 当前通过SSH连接,配置网络可能导致连接中断${NC}"
+        printf "按回车键继续或Ctrl+C退出..."
+        read dummy
+    fi
 }
 
-# 获取系统信息
 get_system_info() {
     ARCH=$(uname -m)
-    MODEL=$(cat /proc/cpuinfo | grep -i 'model name' | head -1 | cut -d':' -f2 | sed 's/^[ \t]*//')
-    SWITCH_DEVICE=$(swconfig list 2>/dev/null | awk '{print $2}' | head -n1)
-    
+    MODEL=""
+    if [ -f /tmp/sysinfo/model ]; then
+        MODEL=$(cat /tmp/sysinfo/model)
+    elif [ -f /proc/device-tree/model ]; then
+        MODEL=$(cat /proc/device-tree/model 2>/dev/null)
+    else
+        MODEL=$(grep -i 'machine\|model name\|system type' /proc/cpuinfo 2>/dev/null | head -1 | cut -d':' -f2 | sed 's/^[ \t]*//')
+    fi
+    SWITCH_DEVICE=""
+    if command -v swconfig >/dev/null 2>&1; then
+        SWITCH_DEVICE=$(swconfig list 2>/dev/null | awk '{print $2}' | head -n1)
+    fi
     echo -e "${BLUE}系统架构: ${ARCH}${NC}"
     echo -e "${BLUE}设备型号: ${MODEL}${NC}"
-    [ -n "$SWITCH_DEVICE" ] && {
-        echo -e "${BLUE}交换机设备: ${SWITCH_DEVICE}${NC}"
-        SWITCH_INFO=$(swconfig dev $SWITCH_DEVICE help 2>/dev/null | head -1)
-        echo -e "${BLUE}交换机信息: ${SWITCH_INFO}${NC}"
-    }
-    
+    if [ -n "$SWITCH_DEVICE" ]; then
+        echo -e "${BLUE}交换机: ${SWITCH_DEVICE}${NC}"
+    fi
     log "系统信息收集完成"
 }
 
-# 初始化交换机端口映射
 init_switch_port_map() {
     SWPORT_MAP=""
-    [ -n "$SWITCH_DEVICE" ] && {
-        for port in $(swconfig dev $SWITCH_DEVICE show | grep -oE 'Port [0-9]+:' | cut -d' ' -f2 | tr -d :); do
-            iface=$(swconfig dev $SWITCH_DEVICE port $port show | grep -Eo 'link: port:[^ ]+' | cut -d':' -f3)
-            [ -n "$iface" ] && SWPORT_MAP="$SWPORT_MAP ${iface}:${port}"
+    if [ -n "$SWITCH_DEVICE" ]; then
+        for port in $(swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep -oE 'Port [0-9]+:' | cut -d' ' -f2 | tr -d :); do
+            iface=$(swconfig dev "$SWITCH_DEVICE" port "$port" show 2>/dev/null | grep -Eo 'link: port:[^ ]+' | cut -d':' -f3)
+            if [ -n "$iface" ]; then
+                SWPORT_MAP="$SWPORT_MAP ${iface}:${port}"
+            fi
         done
         log "交换机端口映射: $SWPORT_MAP"
-    }
+    fi
 }
 
-# 网络接口检测
 detect_interfaces() {
-    # 物理接口检测（排除虚拟接口）
-    PHYSICAL_IFACES=$(find /sys/class/net -mindepth 1 -maxdepth 1 \
-        ! -name lo ! -name 'br*' ! -name 'veth*' -exec basename {} \; | sort)
-    [ -z "$PHYSICAL_IFACES" ] && {
-        echo -e "${RED}错误: 未检测到物理网络接口！${NC}"
-        log "接口检测失败"
+    PHYSICAL_IFACES=""
+    for path in /sys/class/net/*; do
+        iface=$(basename "$path")
+        case "$iface" in
+            lo|br-*|br[0-9]*|veth*|docker*|vir*|wlan*|ra*|rai*|rax*|apcli*|apclii*) continue ;;
+        esac
+        if [ -d "/sys/class/net/$iface/device" ] || echo "$iface" | grep -qE '^eth[0-9]'; then
+            PHYSICAL_IFACES="$PHYSICAL_IFACES $iface"
+        fi
+    done
+    PHYSICAL_IFACES=$(echo "$PHYSICAL_IFACES" | xargs)
+    if [ -z "$PHYSICAL_IFACES" ]; then
+        echo -e "${RED}未检测到物理网络接口${NC}"
         exit 1
-    }
-
-    # VLAN能力检测
+    fi
     VLAN_CAPABLE=0
-    [ -n "$SWITCH_DEVICE" ] && VLAN_CAPABLE=1
-    
+    if [ -n "$SWITCH_DEVICE" ]; then
+        VLAN_CAPABLE=1
+    fi
     log "检测到物理接口: $PHYSICAL_IFACES"
-    log "VLAN支持: $VLAN_CAPABLE"
 }
 
-# IP地址验证
 validate_ip() {
-    echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if ! echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        return 1
+    fi
+    local IFS='.'
+    set -- $1
+    for octet in "$1" "$2" "$3" "$4"; do
+        if [ "$octet" -gt 255 ] 2>/dev/null; then
+            return 1
+        fi
+    done
+    return 0
 }
 
-# 子网掩码验证
 validate_netmask() {
-    validate_ip "$1" && {
-        local mask=$1
-        local binary=$(echo "$mask" | awk -F. '{printf "%d%d%d%d", $1,$2,$3,$4}')
-        echo "$binary" | grep -Eq '^(1*0*)$'
-    }
+    if ! validate_ip "$1"; then
+        return 1
+    fi
+    case "$1" in
+        255.255.255.0|255.255.0.0|255.0.0.0|255.255.255.128|255.255.255.192|255.255.255.224|255.255.255.240|255.255.255.248|255.255.255.252|255.255.128.0|255.255.192.0|255.255.224.0|255.255.240.0|255.255.248.0|255.255.252.0|255.255.254.0)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
 }
 
-# 显示当前配置
 show_current_config() {
     clear
     echo -e "${YELLOW}=== 当前网络配置 ===${NC}"
-    
-    # 接口配置
     echo -e "\n${GREEN}接口配置:${NC}"
-    uci show network | grep -E "interface|ifname|proto|ipaddr|type" | sed 's/network\.//'
-    
-    # 物理接口状态
+    uci show network 2>/dev/null | grep -E "interface|ifname|device|proto|ipaddr|type|ports|gateway|dns" | sed 's/network\./  /'
     echo -e "\n${GREEN}物理接口状态:${NC}"
     for iface in $PHYSICAL_IFACES; do
-        state=$(ip link show $iface 2>/dev/null | grep -Eo 'state [A-Z]+' | cut -d' ' -f2 || echo "不存在")
-        speed=$(ethtool $iface 2>/dev/null | grep -Eo '[0-9]+Mb/s' || echo "未知")
-        echo -e "$iface: 状态=${state}, 速度=${speed}"
+        state=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+        speed=""
+        if command -v ethtool >/dev/null 2>&1; then
+            speed=$(ethtool "$iface" 2>/dev/null | grep -i "speed:" | awk '{print $2}')
+        fi
+        if [ -z "$speed" ]; then
+            speed=$(cat "/sys/class/net/$iface/speed" 2>/dev/null)
+            if [ -n "$speed" ] && [ "$speed" != "-1" ]; then
+                speed="${speed}Mb/s"
+            else
+                speed="N/A"
+            fi
+        fi
+        printf "  %-10s state=%-8s speed=%s\n" "$iface" "$state" "$speed"
     done
-    
-    # VLAN配置
-    [ $VLAN_CAPABLE -eq 1 ] && {
+    if [ $VLAN_CAPABLE -eq 1 ]; then
         echo -e "\n${GREEN}VLAN配置:${NC}"
-        swconfig dev $SWITCH_DEVICE show | grep -E 'vid|ports'
-    }
-    
-    # 防火墙配置
+        swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep -E 'vid|ports' | sed 's/^/  /'
+    fi
     echo -e "\n${GREEN}防火墙区域:${NC}"
-    uci show firewall | grep -E "name|network|input|output|forward"
-    
-    log "显示当前配置完成"
+    uci show firewall 2>/dev/null | grep -E "\.name=|\.network=|\.input=|\.forward=" | sed 's/firewall\./  /'
+    echo -e "\n${GREEN}桥接信息:${NC}"
+    if command -v brctl >/dev/null 2>&1; then
+        brctl show 2>/dev/null | sed 's/^/  /'
+    fi
+    echo -e "\n${GREEN}DHCP状态:${NC}"
+    local dhcp_ignore=$(uci -q get dhcp.lan.ignore)
+    if [ "$dhcp_ignore" = "1" ]; then
+        echo "  LAN DHCP: 已禁用"
+    else
+        echo "  LAN DHCP: 已启用"
+    fi
+    echo -e "\n${GREEN}Flow Offloading:${NC}"
+    local fo=$(uci -q get firewall.@defaults[0].flow_offloading)
+    local fohw=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+    echo "  软件分载: ${fo:-未设置}"
+    echo "  硬件分载: ${fohw:-未设置}"
+    log "显示当前配置"
 }
 
-# 智能接口选择
 select_interfaces() {
     local prompt=$1
     local multi=$2
     local selected=""
-    
+    SELECTED_RESULT=""
     echo -e "\n${GREEN}${prompt}${NC}"
     echo "可用接口:"
-    
-    # 显示接口菜单
     local i=1
-    local iface_list=""
+    local iface_arr=""
     for iface in $PHYSICAL_IFACES; do
-        state=$(ip link show $iface | grep -Eo 'state [A-Z]+' | cut -d' ' -f2)
-        echo "$i) $iface (状态: $state)"
-        iface_list="$iface_list $iface"
-        i=$((i+1))
+        state=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+        echo "  $i) $iface ($state)"
+        iface_arr="$iface_arr $iface"
+        i=$((i + 1))
     done
-    
-    # 多选处理
+    local max=$((i - 1))
+    if [ "$max" -eq 0 ]; then
+        echo -e "${RED}没有可用接口${NC}"
+        return 1
+    fi
     if [ "$multi" = "multi" ]; then
-        echo "可多选 (用空格分隔数字，如 1 2 3):"
-        read -p "请输入选择: " choices
-        
+        echo "可多选(空格分隔):"
+        printf "请输入: "
+        read choices
+        if [ -z "$choices" ]; then
+            echo -e "${RED}未选择任何接口${NC}"
+            return 1
+        fi
         for choice in $choices; do
+            if ! echo "$choice" | grep -qE '^[0-9]+$'; then
+                echo -e "${RED}无效输入 '$choice'${NC}"
+                return 1
+            fi
+            if [ "$choice" -lt 1 ] || [ "$choice" -gt "$max" ]; then
+                echo -e "${RED}选择 $choice 超出范围${NC}"
+                return 1
+            fi
             local idx=1
-            for iface in $iface_list; do
-                if [ "$choice" = "$idx" ]; then
+            for iface in $iface_arr; do
+                if [ "$choice" -eq "$idx" ]; then
                     selected="$selected $iface"
                     break
                 fi
-                idx=$((idx+1))
+                idx=$((idx + 1))
             done
         done
     else
-        # 单选处理
-        read -p "请输入选择 (1-$((i-1))): " choice
+        printf "请输入选择 (1-%d): " "$max"
+        read choice
+        if ! echo "$choice" | grep -qE '^[0-9]+$'; then
+            echo -e "${RED}无效输入${NC}"
+            return 1
+        fi
+        if [ "$choice" -lt 1 ] || [ "$choice" -gt "$max" ]; then
+            echo -e "${RED}超出范围${NC}"
+            return 1
+        fi
         local idx=1
-        for iface in $iface_list; do
-            if [ "$choice" = "$idx" ]; then
-                selected=$iface
+        for iface in $iface_arr; do
+            if [ "$choice" -eq "$idx" ]; then
+                selected="$iface"
                 break
             fi
-            idx=$((idx+1))
+            idx=$((idx + 1))
         done
     fi
-    
-    # 验证选择
     if [ -z "$selected" ]; then
-        echo -e "${RED}错误: 无效的选择！${NC}"
-        log "接口选择失败: 用户输入=$choices"
+        echo -e "${RED}选择无效${NC}"
         return 1
     fi
-    
-    # 去除多余空格
-    selected=$(echo $selected | xargs)
+    selected=$(echo "$selected" | xargs)
     echo -e "已选择: ${YELLOW}$selected${NC}"
-    log "接口选择结果: $selected"
-    
-    # 返回选择结果
-    SELECTED_RESULT=$selected
+    log "接口选择: $selected"
+    SELECTED_RESULT="$selected"
     return 0
 }
 
-# 端口到接口转换
 port_iface_to_switch() {
     local iface=$1
-    echo $(echo "$SWPORT_MAP" | grep -E "$iface:" | cut -d':' -f2)
+    echo "$SWPORT_MAP" | tr ' ' '\n' | grep "^${iface}:" | cut -d':' -f2 | head -1
 }
 
-# WAN接口配置
 configure_wan() {
     echo -e "\n${YELLOW}=== 配置WAN接口 ===${NC}"
-    
-    # 接口选择
     if ! select_interfaces "请选择WAN接口" "single"; then
         return 1
     fi
     local wan_iface=$SELECTED_RESULT
-    
-    # WAN类型选择
     echo -e "\n${GREEN}选择WAN类型:${NC}"
-    echo "1) PPPoE (ADSL拨号)"
-    echo "2) DHCP (自动获取IP)"
-    echo "3) Static (静态IP)"
-    echo "4) 取消"
-    
+    echo "  1) PPPoE"
+    echo "  2) DHCP"
+    echo "  3) 静态IP"
+    echo "  4) 取消"
+    local wan_type=""
     while true; do
-        read -p "请输入选择 [1-4]: " choice
+        printf "请选择 [1-4]: "
+        read choice
         case $choice in
             1) wan_type="pppoe"; break ;;
             2) wan_type="dhcp"; break ;;
             3) wan_type="static"; break ;;
             4) return ;;
-            *) echo -e "${RED}无效选择，请重新输入！${NC}" ;;
+            *) echo -e "${RED}无效${NC}" ;;
         esac
     done
-    
-    # 根据类型配置
     case $wan_type in
         "pppoe")
-            read -p "输入PPPoE用户名: " pppoe_user
-            [ -z "$pppoe_user" ] && {
-                echo -e "${RED}错误: 用户名不能为空！${NC}"
+            printf "PPPoE用户名: "
+            read pppoe_user
+            if [ -z "$pppoe_user" ]; then
+                echo -e "${RED}用户名不能为空${NC}"
                 return 1
-            }
-            
-            read -s -p "输入PPPoE密码: " pppoe_pass
+            fi
+            printf "PPPoE密码: "
+            stty -echo 2>/dev/null
+            read pppoe_pass
+            stty echo 2>/dev/null
             echo
-            [ -z "$pppoe_pass" ] && {
-                echo -e "${RED}错误: 密码不能为空！${NC}"
+            if [ -z "$pppoe_pass" ]; then
+                echo -e "${RED}密码不能为空${NC}"
                 return 1
-            }
-            
+            fi
             uci set network.wan=interface
-            uci set network.wan.ifname="$wan_iface"
+            uci set network.wan.device="$wan_iface"
             uci set network.wan.proto="pppoe"
             uci set network.wan.username="$pppoe_user"
             uci set network.wan.password="$pppoe_pass"
             uci set network.wan.ipv6="auto"
-            
-            log "配置PPPoE WAN接口: $wan_iface"
             ;;
-            
         "dhcp")
             uci set network.wan=interface
-            uci set network.wan.ifname="$wan_iface"
+            uci set network.wan.device="$wan_iface"
             uci set network.wan.proto="dhcp"
             uci set network.wan.ipv6="auto"
-            
-            log "配置DHCP WAN接口: $wan_iface"
             ;;
-            
         "static")
+            local static_ip static_mask static_gw static_dns
             while true; do
-                read -p "输入静态IP地址 (如192.168.1.100): " static_ip
+                printf "静态IP (如192.168.1.100): "
+                read static_ip
                 validate_ip "$static_ip" && break
-                echo -e "${RED}错误: 无效的IP地址格式！${NC}"
+                echo -e "${RED}无效IP${NC}"
             done
-            
             while true; do
-                read -p "输入子网掩码 (如255.255.255.0): " static_mask
+                printf "子网掩码 (如255.255.255.0): "
+                read static_mask
                 validate_netmask "$static_mask" && break
-                echo -e "${RED}错误: 无效的子网掩码格式！${NC}"
+                echo -e "${RED}无效掩码${NC}"
             done
-            
             while true; do
-                read -p "输入网关地址: " static_gw
-                [ -z "$static_gw" ] || validate_ip "$static_gw" && break
-                echo -e "${RED}错误: 无效的网关地址格式！${NC}"
+                printf "网关 (留空跳过): "
+                read static_gw
+                if [ -z "$static_gw" ]; then break; fi
+                validate_ip "$static_gw" && break
+                echo -e "${RED}无效网关${NC}"
             done
-            
             while true; do
-                read -p "输入DNS服务器: " static_dns
-                [ -z "$static_dns" ] || validate_ip "$static_dns" && break
-                echo -e "${RED}错误: 无效的DNS地址格式！${NC}"
+                printf "DNS (留空跳过): "
+                read static_dns
+                if [ -z "$static_dns" ]; then break; fi
+                validate_ip "$static_dns" && break
+                echo -e "${RED}无效DNS${NC}"
             done
-            
             uci set network.wan=interface
-            uci set network.wan.ifname="$wan_iface"
+            uci set network.wan.device="$wan_iface"
             uci set network.wan.proto="static"
             uci set network.wan.ipaddr="$static_ip"
             uci set network.wan.netmask="$static_mask"
             [ -n "$static_gw" ] && uci set network.wan.gateway="$static_gw"
-            [ -n "$static_dns" ] && uci set network.wan.dns="$static_dns"
-            
-            log "配置静态WAN接口: $wan_iface IP=$static_ip"
+            if [ -n "$static_dns" ]; then
+                uci -q delete network.wan.dns
+                uci add_list network.wan.dns="$static_dns"
+            fi
             ;;
     esac
-    
-    # 防火墙配置
-    uci set firewall.@zone[1].network='wan'
-    
-    echo -e "${GREEN}WAN接口配置完成！${NC}"
+    local wan_zone_exists=0
+    local zone_idx=0
+    while uci -q get "firewall.@zone[$zone_idx]" >/dev/null 2>&1; do
+        local zname=$(uci -q get "firewall.@zone[$zone_idx].name")
+        if [ "$zname" = "wan" ]; then
+            wan_zone_exists=1
+            uci -q delete "firewall.@zone[$zone_idx].network"
+            uci add_list "firewall.@zone[$zone_idx].network"='wan'
+            break
+        fi
+        zone_idx=$((zone_idx + 1))
+    done
+    if [ $wan_zone_exists -eq 0 ]; then
+        uci add firewall zone
+        uci set "firewall.@zone[-1].name"='wan'
+        uci set "firewall.@zone[-1].input"='REJECT'
+        uci set "firewall.@zone[-1].output"='ACCEPT'
+        uci set "firewall.@zone[-1].forward"='REJECT'
+        uci set "firewall.@zone[-1].masq"='1'
+        uci set "firewall.@zone[-1].mtu_fix"='1'
+        uci add_list "firewall.@zone[-1].network"='wan'
+    fi
+    echo -e "${GREEN}WAN配置完成${NC}"
+    log "WAN: $wan_iface type=$wan_type"
     return 0
 }
 
-# LAN接口配置
 configure_lan() {
     echo -e "\n${YELLOW}=== 配置LAN接口 ===${NC}"
-    
-    # 接口选择
-    if ! select_interfaces "请选择LAN接口 (可多选)" "multi"; then
+    if ! select_interfaces "请选择LAN接口(可多选)" "multi"; then
         return 1
     fi
     local lan_ifaces=$SELECTED_RESULT
-    
-    # IP地址设置
+    local lan_ip
     while true; do
-        read -p "输入LAN IP地址 (如192.168.1.1): " lan_ip
+        printf "LAN IP (如192.168.1.1): "
+        read lan_ip
         validate_ip "$lan_ip" && break
-        echo -e "${RED}错误: 无效的IP地址格式！${NC}"
+        echo -e "${RED}无效IP${NC}"
     done
-    
-    # 基本LAN配置
     uci set network.lan=interface
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr="$lan_ip"
     uci set network.lan.netmask='255.255.255.0'
-    
-    # 多接口桥接处理
-    if [ $(echo "$lan_ifaces" | wc -w) -gt 1 ]; then
-        uci set network.lan.type='bridge'
-        uci set network.lan.ifname="$lan_ifaces"
-        log "配置桥接LAN接口: $lan_ifaces"
+    local iface_count=$(echo "$lan_ifaces" | wc -w)
+    if [ "$iface_count" -gt 1 ]; then
+        local br_section=$(uci show network 2>/dev/null | grep "\.name='br-lan'" | head -1 | cut -d'.' -f2)
+        if [ -z "$br_section" ]; then
+            br_section=$(uci add network device)
+        fi
+        uci set "network.$br_section.name"='br-lan'
+        uci set "network.$br_section.type"='bridge'
+        uci -q delete "network.$br_section.ports"
+        for p in $lan_ifaces; do
+            uci add_list "network.$br_section.ports"="$p"
+        done
+        uci set network.lan.device='br-lan'
     else
-        uci set network.lan.ifname="$lan_ifaces"
-        log "配置单一LAN接口: $lan_ifaces"
+        uci set network.lan.device="$lan_ifaces"
     fi
-    
-    # DHCP配置
     configure_dhcp "$lan_ip"
-    
-    echo -e "${GREEN}LAN接口配置完成！${NC}"
+    echo -e "${GREEN}LAN配置完成${NC}"
+    log "LAN: $lan_ifaces IP=$lan_ip"
     return 0
 }
 
-# DHCP服务器配置
 configure_dhcp() {
     local lan_ip=$1
-    local dhcp_start=$(echo "$lan_ip" | cut -d'.' -f1-3).100
-    local dhcp_end=$(echo "$lan_ip" | cut -d'.' -f1-3).200
-    local dhcp_leasetime="12h"
-    
-    echo -e "\n${YELLOW}=== 配置DHCP服务器 ===${NC}"
-    read -p "启用DHCP服务器? [Y/n]: " enable_dhcp
+    local base=$(echo "$lan_ip" | cut -d'.' -f1-3)
+    echo -e "\n${YELLOW}=== DHCP配置 ===${NC}"
+    printf "启用DHCP? [Y/n]: "
+    read enable_dhcp
     enable_dhcp=${enable_dhcp:-y}
-    
-    if [ "$enable_dhcp" = "y" ] || [ "$enable_dhcp" = "Y" ]; then
-        # 起始地址
-        while true; do
-            read -p "输入DHCP起始地址 [$dhcp_start]: " input_start
-            [ -z "$input_start" ] && input_start=$dhcp_start
-            validate_ip "$input_start" && break
-            echo -e "${RED}错误: 无效的IP地址格式！${NC}"
-        done
-        
-        # 结束地址
-        while true; do
-            read -p "输入DHCP结束地址 [$dhcp_end]: " input_end
-            [ -z "$input_end" ] && input_end=$dhcp_end
-            validate_ip "$input_end" && break
-            echo -e "${RED}错误: 无效的IP地址格式！${NC}"
-        done
-        
-        # 租约时间
-        read -p "输入DHCP租约时间 [$dhcp_leasetime]: " input_leasetime
-        input_leasetime=${input_leasetime:-$dhcp_leasetime}
-        
-        # 应用配置
-        uci set dhcp.lan=dhcp
-        uci set dhcp.lan.interface='lan'
-        uci set dhcp.lan.start="$(echo $input_start | cut -d'.' -f4)"
-        uci set dhcp.lan.limit="$(($(echo $input_end | cut -d'.' -f4)-$(echo $input_start | cut -d'.' -f4)+1))"
-        uci set dhcp.lan.leasetime="$input_leasetime"
-        
-        echo -e "${GREEN}DHCP服务器已启用 (${input_start}-${input_end})${NC}"
-        log "配置DHCP: ${input_start}-${input_end} leasetime=${input_leasetime}"
-    else
-        uci delete dhcp.lan >/dev/null 2>&1
-        echo -e "${YELLOW}DHCP服务器已禁用${NC}"
-        log "禁用DHCP服务器"
-    fi
+    case "$enable_dhcp" in
+        y|Y)
+            local input_start input_end input_lease
+            while true; do
+                printf "起始地址 [%s.100]: " "$base"
+                read input_start
+                input_start=${input_start:-${base}.100}
+                validate_ip "$input_start" && break
+                echo -e "${RED}无效IP${NC}"
+            done
+            while true; do
+                printf "结束地址 [%s.200]: " "$base"
+                read input_end
+                input_end=${input_end:-${base}.200}
+                validate_ip "$input_end" && break
+                echo -e "${RED}无效IP${NC}"
+            done
+            printf "租约时间 [12h]: "
+            read input_lease
+            input_lease=${input_lease:-12h}
+            local s=$(echo "$input_start" | cut -d'.' -f4)
+            local e=$(echo "$input_end" | cut -d'.' -f4)
+            local limit=$((e - s + 1))
+            if [ "$limit" -le 0 ]; then
+                echo -e "${RED}结束地址必须大于起始地址${NC}"
+                return 1
+            fi
+            uci set dhcp.lan=dhcp
+            uci set dhcp.lan.interface='lan'
+            uci set dhcp.lan.start="$s"
+            uci set dhcp.lan.limit="$limit"
+            uci set dhcp.lan.leasetime="$input_lease"
+            uci -q delete dhcp.lan.ignore
+            echo -e "${GREEN}DHCP已启用${NC}"
+            ;;
+        *)
+            uci set dhcp.lan=dhcp
+            uci set dhcp.lan.interface='lan'
+            uci set dhcp.lan.ignore='1'
+            echo -e "${YELLOW}DHCP已禁用${NC}"
+            ;;
+    esac
 }
 
-# VLAN配置
 configure_vlan() {
-    [ $VLAN_CAPABLE -eq 0 ] && {
-        echo -e "${RED}错误: 当前设备不支持VLAN配置！${NC}"
-        log "VLAN配置尝试失败: 设备不支持"
+    if [ $VLAN_CAPABLE -eq 0 ]; then
+        echo -e "${RED}设备不支持VLAN${NC}"
         return 1
-    }
-    
-    echo -e "\n${YELLOW}=== 配置VLAN ===${NC}"
-    echo -e "当前VLAN配置:"
-    swconfig dev $SWITCH_DEVICE show | grep -E 'vid|ports'
-    
-    # VLAN操作选择
-    echo -e "\n${GREEN}选择操作:${NC}"
-    echo "1) 创建新VLAN"
-    echo "2) 删除现有VLAN"
-    echo "3) 返回"
-    
+    fi
+    echo -e "\n${YELLOW}=== VLAN配置 ===${NC}"
+    echo "当前VLAN:"
+    swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep -E 'vid|ports' | sed 's/^/  /'
+    echo -e "\n  1) 创建VLAN"
+    echo "  2) 删除VLAN"
+    echo "  3) 返回"
     while true; do
-        read -p "请输入选择 [1-3]: " choice
+        printf "请选择 [1-3]: "
+        read choice
         case $choice in
             1) create_vlan; break ;;
             2) delete_vlan; break ;;
             3) return ;;
-            *) echo -e "${RED}无效选择，请重新输入！${NC}" ;;
+            *) echo -e "${RED}无效${NC}" ;;
         esac
     done
-    
-    return 0
 }
 
-# 创建VLAN
 create_vlan() {
-    # VLAN ID输入
+    local vlan_id
     while true; do
-        read -p "输入VLAN ID (2-4094): " vlan_id
-        if [[ "$vlan_id" =~ ^[0-9]+$ ]] && [ "$vlan_id" -ge 2 ] && [ "$vlan_id" -le 4094 ]; then
-            # 检查是否已存在
-            swconfig dev $SWITCH_DEVICE show | grep -q "vid: $vlan_id" && {
-                echo -e "${RED}错误: VLAN $vlan_id 已存在！${NC}"
-                continue
-            }
-            break
+        printf "VLAN ID (2-4094): "
+        read vlan_id
+        if ! echo "$vlan_id" | grep -qE '^[0-9]+$'; then
+            echo -e "${RED}请输入数字${NC}"
+            continue
         fi
-        echo -e "${RED}错误: VLAN ID必须是2-4094之间的数字！${NC}"
+        if [ "$vlan_id" -lt 2 ] || [ "$vlan_id" -gt 4094 ]; then
+            echo -e "${RED}范围2-4094${NC}"
+            continue
+        fi
+        if swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep -q "vid: $vlan_id"; then
+            echo -e "${RED}VLAN $vlan_id 已存在${NC}"
+            continue
+        fi
+        break
     done
-    
-    # 接口选择
-    if ! select_interfaces "请选择属于此VLAN的接口 (可多选)" "multi"; then
+    if ! select_interfaces "选择VLAN成员接口(可多选)" "multi"; then
         return 1
     fi
     local vlan_members=$SELECTED_RESULT
-    
-    # 转换为交换机端口
     local tagged_ports=""
     for iface in $vlan_members; do
-        port=$(port_iface_to_switch $iface)
-        [ -z "$port" ] && {
-            echo -e "${RED}错误: 无法找到接口 $iface 对应的交换机端口！${NC}"
+        port=$(port_iface_to_switch "$iface")
+        if [ -z "$port" ]; then
+            echo -e "${RED}无法找到 $iface 的交换机端口${NC}"
             return 1
-        }
+        fi
         tagged_ports="$tagged_ports $port"
     done
-    
-    # 配置交换机VLAN
-    uci set network.vlan${vlan_id}_switch="switch_vlan"
-    uci set network.vlan${vlan_id}_switch.device="$SWITCH_DEVICE"
-    uci set network.vlan${vlan_id}_switch.vlan="$vlan_id"
-    uci set network.vlan${vlan_id}_switch.ports="$(echo $tagged_ports | xargs)"
-    
-    # 配置VLAN接口
-    uci set network.vlan$vlan_id="interface"
-    uci set network.vlan$vlan_id.ifname="eth0.$vlan_id"
-    uci set network.vlan$vlan_id.proto='static'
-    
-    # IP地址设置
-    read -p "是否为此VLAN配置IP地址? [y/N]: " config_ip
-    if [ "$config_ip" = "y" ] || [ "$config_ip" = "Y" ]; then
-        while true; do
-            read -p "输入VLAN $vlan_id IP地址: " vlan_ip
-            validate_ip "$vlan_ip" && break
-            echo -e "${RED}错误: 无效的IP地址格式！${NC}"
-        done
-        
-        uci set network.vlan$vlan_id.ipaddr="$vlan_ip"
-        uci set network.vlan$vlan_id.netmask='255.255.255.0'
-    fi
-    
-    echo -e "${GREEN}VLAN $vlan_id 创建成功！${NC}"
-    log "创建VLAN: id=$vlan_id 成员=$vlan_members 端口=$tagged_ports IP=${vlan_ip:-未配置}"
+    tagged_ports=$(echo "$tagged_ports" | xargs)
+    uci set "network.vlan${vlan_id}_switch=switch_vlan"
+    uci set "network.vlan${vlan_id}_switch.device=$SWITCH_DEVICE"
+    uci set "network.vlan${vlan_id}_switch.vlan=$vlan_id"
+    uci set "network.vlan${vlan_id}_switch.ports=$tagged_ports"
+    uci set "network.vlan$vlan_id=interface"
+    uci set "network.vlan$vlan_id.device=eth0.$vlan_id"
+    uci set "network.vlan$vlan_id.proto=static"
+    printf "为此VLAN配置IP? [y/N]: "
+    read config_ip
+    case "$config_ip" in
+        y|Y)
+            local vlan_ip
+            while true; do
+                printf "VLAN %d IP: " "$vlan_id"
+                read vlan_ip
+                validate_ip "$vlan_ip" && break
+                echo -e "${RED}无效IP${NC}"
+            done
+            uci set "network.vlan$vlan_id.ipaddr=$vlan_ip"
+            uci set "network.vlan$vlan_id.netmask=255.255.255.0"
+            ;;
+    esac
+    echo -e "${GREEN}VLAN $vlan_id 已创建${NC}"
+    log "创建VLAN $vlan_id ports=$tagged_ports"
 }
 
-# 删除VLAN
 delete_vlan() {
-    # 获取现有VLAN列表
-    local existing_vlans=$(swconfig dev $SWITCH_DEVICE show | grep 'vid:' | awk '{print $2}')
-    [ -z "$existing_vlans" ] && {
-        echo -e "${YELLOW}没有可删除的VLAN配置！${NC}"
+    local existing_vlans=$(swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep 'vid:' | awk '{print $2}')
+    if [ -z "$existing_vlans" ]; then
+        echo -e "${YELLOW}无可删除的VLAN${NC}"
         return
-    }
-    
-    echo -e "\n${GREEN}现有VLAN列表:${NC}"
+    fi
+    echo -e "\n${GREEN}现有VLAN:${NC}"
     for vlan in $existing_vlans; do
-        ports=$(swconfig dev $SWITCH_DEVICE show | grep "vid: $vlan" | awk -F'ports: ' '{print $2}')
-        echo "VLAN $vlan: 端口 $ports"
+        echo "  VLAN $vlan"
     done
-    
-    # 选择要删除的VLAN
+    local del_vlan
     while true; do
-        read -p "输入要删除的VLAN ID: " del_vlan
-        if echo "$existing_vlans" | grep -q "$del_vlan"; then
+        printf "要删除的VLAN ID: "
+        read del_vlan
+        if echo "$existing_vlans" | grep -qw "$del_vlan"; then
             break
         fi
-        echo -e "${RED}错误: 无效的VLAN ID！${NC}"
+        echo -e "${RED}无效VLAN ID${NC}"
     done
-    
-    # 确认删除
-    read -p "确认删除VLAN $del_vlan? 此操作不可恢复！ [y/N]: " confirm
-    [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || {
-        echo -e "${YELLOW}已取消删除操作${NC}"
-        return
-    }
-    
-    # 执行删除
-    uci delete network.vlan$del_vlan >/dev/null 2>&1
-    uci delete network.vlan${del_vlan}_switch >/dev/null 2>&1
-    
-    echo -e "${GREEN}VLAN $del_vlan 已删除！${NC}"
-    log "删除VLAN: id=$del_vlan"
+    printf "确认删除VLAN %s? [y/N]: " "$del_vlan"
+    read confirm
+    case "$confirm" in
+        y|Y) ;;
+        *) echo -e "${YELLOW}已取消${NC}"; return ;;
+    esac
+    uci -q delete "network.vlan$del_vlan"
+    uci -q delete "network.vlan${del_vlan}_switch"
+    echo -e "${GREEN}VLAN $del_vlan 已删除${NC}"
+    log "删除VLAN $del_vlan"
 }
 
-# 备份配置
+get_all_switch_ports() {
+    if [ -z "$SWITCH_DEVICE" ]; then
+        return
+    fi
+    swconfig dev "$SWITCH_DEVICE" show 2>/dev/null | grep -oE 'Port [0-9]+:' | cut -d' ' -f2 | tr -d : | sort -n | tr '\n' ' ' | xargs
+}
+
+get_cpu_port() {
+    if [ -z "$SWITCH_DEVICE" ]; then
+        return
+    fi
+    local all_vlans_ports=""
+    local idx=0
+    while uci -q get "network.@switch_vlan[$idx]" >/dev/null 2>&1; do
+        local ports=$(uci -q get "network.@switch_vlan[$idx].ports")
+        all_vlans_ports="$all_vlans_ports $ports"
+        idx=$((idx + 1))
+    done
+    local max_port=""
+    for p in $all_vlans_ports; do
+        p_num=$(echo "$p" | tr -d 't')
+        if [ -z "$max_port" ]; then
+            max_port=$p_num
+        elif [ "$p_num" -gt "$max_port" ] 2>/dev/null; then
+            max_port=$p_num
+        fi
+    done
+    local help_cpu=$(swconfig dev "$SWITCH_DEVICE" help 2>/dev/null | grep -oE 'cpu @ [0-9]+' | grep -oE '[0-9]+')
+    if [ -n "$help_cpu" ]; then
+        echo "$help_cpu"
+    elif [ -n "$max_port" ]; then
+        echo "$max_port"
+    else
+        echo "6"
+    fi
+}
+
+configure_ap_mode() {
+    echo -e "\n${YELLOW}=================================================${NC}"
+    echo -e "  ${GREEN}AP/桥接模式一键配置${NC}"
+    echo -e "${YELLOW}=================================================${NC}"
+    echo -e ""
+    echo -e "  ${BLUE}此功能将执行以下操作:${NC}"
+    echo -e "  [1] 询问并设置管理IP/子网掩码/网关/DNS"
+    echo -e "  [2] 所有网口并入LAN桥接(含原WAN口)"
+    echo -e "  [3] 合并交换机VLAN(如适用)"
+    echo -e "  [4] 删除WAN/WAN6接口"
+    echo -e "  [5] 关闭DHCP服务器"
+    echo -e "  [6] 清理IPv6多余配置"
+    echo -e "  [7] 关闭Flow Offloading"
+    echo -e "  [8] 停用防火墙"
+    echo -e ""
+    echo -e "  ${YELLOW}完成后设备将作为纯AP/交换机使用${NC}"
+    echo -e "  ${YELLOW}由主路由负责DHCP/NAT/拨号${NC}"
+    echo -e ""
+    printf "继续? [y/N]: "
+    read ap_confirm
+    case "$ap_confirm" in
+        y|Y) ;;
+        *) echo -e "${YELLOW}已取消${NC}"; return ;;
+    esac
+    echo -e "\n${BLUE}[步骤1] 备份当前配置${NC}"
+    backup_config
+    echo -e "\n${BLUE}[步骤2] 设置网络参数${NC}"
+    echo -e "${YELLOW}请根据主路由所在网段填写以下信息${NC}"
+    echo -e "${YELLOW}(主路由通常为 192.168.x.1,本机IP不要与其冲突)${NC}"
+    echo ""
+    local current_ip=$(uci -q get network.lan.ipaddr)
+    local current_mask=$(uci -q get network.lan.netmask)
+    local current_gw=$(uci -q get network.lan.gateway)
+    local current_dns=""
+    current_dns=$(uci -q get network.lan.dns 2>/dev/null)
+    local ap_ip ap_mask ap_gateway ap_dns
+    while true; do
+        printf "本机管理IP [%s]: " "${current_ip:-192.168.1.2}"
+        read ap_ip
+        ap_ip=${ap_ip:-${current_ip:-192.168.1.2}}
+        if validate_ip "$ap_ip"; then
+            break
+        fi
+        echo -e "${RED}无效IP,请重新输入${NC}"
+    done
+    while true; do
+        printf "子网掩码 [%s]: " "${current_mask:-255.255.255.0}"
+        read ap_mask
+        ap_mask=${ap_mask:-${current_mask:-255.255.255.0}}
+        if validate_netmask "$ap_mask"; then
+            break
+        fi
+        echo -e "${RED}无效子网掩码,请重新输入${NC}"
+    done
+    local default_gw=""
+    if [ -n "$current_gw" ]; then
+        default_gw="$current_gw"
+    else
+        default_gw=$(echo "$ap_ip" | cut -d'.' -f1-3).1
+    fi
+    while true; do
+        printf "主路由网关地址 [%s]: " "$default_gw"
+        read ap_gateway
+        ap_gateway=${ap_gateway:-$default_gw}
+        if validate_ip "$ap_gateway"; then
+            break
+        fi
+        echo -e "${RED}无效网关,请重新输入${NC}"
+    done
+    local default_dns="${current_dns:-$ap_gateway}"
+    while true; do
+        printf "DNS服务器 [%s]: " "$default_dns"
+        read ap_dns
+        ap_dns=${ap_dns:-$default_dns}
+        if validate_ip "$ap_dns"; then
+            break
+        fi
+        echo -e "${RED}无效DNS,请重新输入${NC}"
+    done
+    echo -e "\n${YELLOW}--- 确认配置信息 ---${NC}"
+    echo -e "  管理IP:   ${GREEN}$ap_ip${NC}"
+    echo -e "  子网掩码: ${GREEN}$ap_mask${NC}"
+    echo -e "  网关:     ${GREEN}$ap_gateway${NC}"
+    echo -e "  DNS:      ${GREEN}$ap_dns${NC}"
+    echo -e "  桥接网口: ${GREEN}$PHYSICAL_IFACES${NC}"
+    echo ""
+    printf "以上信息是否正确? [Y/n]: "
+    read info_confirm
+    case "$info_confirm" in
+        n|N) echo -e "${YELLOW}已取消,请重新运行${NC}"; return ;;
+    esac
+    echo -e "\n${BLUE}[步骤3] 配置网络接口${NC}"
+    local current_mac=$(uci -q get network.lan.macaddr)
+    if [ -z "$current_mac" ]; then
+        local br_sec=$(uci show network 2>/dev/null | grep "\.name='br-lan'" | head -1 | cut -d'.' -f2)
+        if [ -n "$br_sec" ]; then
+            current_mac=$(uci -q get "network.$br_sec.macaddr")
+        fi
+    fi
+    if [ -z "$current_mac" ]; then
+        current_mac=$(cat /sys/class/net/br-lan/address 2>/dev/null)
+    fi
+    if [ -z "$current_mac" ]; then
+        local first_eth=$(echo "$PHYSICAL_IFACES" | awk '{print $1}')
+        current_mac=$(cat "/sys/class/net/$first_eth/address" 2>/dev/null)
+    fi
+    local br_section=$(uci show network 2>/dev/null | grep "\.name='br-lan'" | head -1 | cut -d'.' -f2)
+    if [ -z "$br_section" ]; then
+        br_section=$(uci add network device)
+    fi
+    uci set "network.$br_section.name"='br-lan'
+    uci set "network.$br_section.type"='bridge'
+    uci -q delete "network.$br_section.ports"
+    for p in $PHYSICAL_IFACES; do
+        uci add_list "network.$br_section.ports"="$p"
+    done
+    if [ -n "$current_mac" ]; then
+        uci set "network.$br_section.macaddr"="$current_mac"
+    fi
+    echo -e "  ${GREEN}桥接设备br-lan已配置,成员: $PHYSICAL_IFACES${NC}"
+    uci set network.lan=interface
+    uci set network.lan.device='br-lan'
+    uci set network.lan.proto='static'
+    uci set network.lan.ipaddr="$ap_ip"
+    uci set network.lan.netmask="$ap_mask"
+    uci set network.lan.gateway="$ap_gateway"
+    uci -q delete network.lan.dns
+    uci add_list network.lan.dns="$ap_dns"
+    uci -q delete network.lan.ip6assign
+    uci -q delete network.lan.ip6ifaceid
+    uci -q delete network.lan.ip6hint
+    uci -q delete network.lan.ip6class
+    uci set network.lan.delegate='0'
+    if [ -n "$current_mac" ]; then
+        uci set network.lan.macaddr="$current_mac"
+    fi
+    uci -q delete network.lan.ifname
+    uci -q delete network.lan.type
+    echo -e "  ${GREEN}LAN接口已配置: IP=$ap_ip GW=$ap_gateway DNS=$ap_dns${NC}"
+    echo -e "\n${BLUE}[步骤4] 合并交换机端口${NC}"
+    if [ -n "$SWITCH_DEVICE" ]; then
+        local cpu_port=$(get_cpu_port)
+        local all_ports=$(get_all_switch_ports)
+        local user_ports=""
+        for p in $all_ports; do
+            if [ "$p" != "$cpu_port" ]; then
+                user_ports="$user_ports $p"
+            fi
+        done
+        user_ports=$(echo "$user_ports" | xargs)
+        local merged_ports="$user_ports $cpu_port"
+        merged_ports=$(echo "$merged_ports" | xargs)
+        echo -e "  交换机: $SWITCH_DEVICE"
+        echo -e "  CPU端口: $cpu_port"
+        echo -e "  用户端口: $user_ports"
+        echo -e "  合并后VLAN1端口: $merged_ports"
+        local vlan_idx=0
+        while uci -q get "network.@switch_vlan[$vlan_idx]" >/dev/null 2>&1; do
+            vlan_idx=$((vlan_idx + 1))
+        done
+        local del_idx=$((vlan_idx - 1))
+        while [ $del_idx -ge 0 ]; do
+            uci -q delete "network.@switch_vlan[$del_idx]"
+            del_idx=$((del_idx - 1))
+        done
+        uci add network switch_vlan
+        uci set "network.@switch_vlan[-1].device=$SWITCH_DEVICE"
+        uci set "network.@switch_vlan[-1].vlan=1"
+        uci set "network.@switch_vlan[-1].ports=$merged_ports"
+        echo -e "  ${GREEN}所有交换机端口已合并到VLAN1${NC}"
+    else
+        echo -e "  ${YELLOW}无swconfig交换机,跳过VLAN合并${NC}"
+    fi
+    echo -e "\n${BLUE}[步骤5] 删除WAN相关接口${NC}"
+    uci -q delete network.wan
+    uci -q delete network.wan6
+    echo -e "  ${GREEN}已删除wan和wan6接口${NC}"
+    echo -e "\n${BLUE}[步骤6] 关闭DHCP${NC}"
+    uci set dhcp.lan=dhcp
+    uci set dhcp.lan.interface='lan'
+    uci set dhcp.lan.ignore='1'
+    uci -q set dhcp.lan.dynamicdhcp='0'
+    uci -q set dhcp.lan.ra='disabled'
+    uci -q set dhcp.lan.dhcpv6='disabled'
+    uci -q set dhcp.lan.ra_management='0'
+    if uci -q get dhcp.odhcpd >/dev/null 2>&1; then
+        uci set dhcp.odhcpd.maindhcp='0'
+    fi
+    echo -e "  ${GREEN}DHCP/DHCPv6/RA已关闭${NC}"
+    echo -e "\n${BLUE}[步骤7] 关闭Flow Offloading${NC}"
+    if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+        uci set firewall.@defaults[0].flow_offloading='0'
+        uci set firewall.@defaults[0].flow_offloading_hw='0'
+    fi
+    echo -e "  ${GREEN}Flow Offloading已关闭${NC}"
+    echo -e "\n${BLUE}[步骤8] 处理防火墙${NC}"
+    printf "  停用防火墙? (AP模式建议停用) [Y/n]: "
+    read fw_confirm
+    fw_confirm=${fw_confirm:-y}
+    local fw_action=""
+    case "$fw_confirm" in
+        y|Y)
+            fw_action="disable"
+            ;;
+        *)
+            fw_action="clean"
+            ;;
+    esac
+    echo -e "\n${BLUE}[步骤9] 提交配置${NC}"
+    uci commit network
+    uci commit dhcp
+    uci commit firewall
+    echo -e "  ${GREEN}所有UCI配置已提交${NC}"
+    if [ "$fw_action" = "disable" ]; then
+        /etc/init.d/firewall stop 2>/dev/null
+        /etc/init.d/firewall disable 2>/dev/null
+        echo -e "  ${GREEN}防火墙已停用${NC}"
+    else
+        local zone_idx=0
+        local zones_to_del=""
+        while uci -q get "firewall.@zone[$zone_idx]" >/dev/null 2>&1; do
+            local zname=$(uci -q get "firewall.@zone[$zone_idx].name")
+            if [ "$zname" = "wan" ]; then
+                zones_to_del="$zones_to_del $zone_idx"
+            fi
+            zone_idx=$((zone_idx + 1))
+        done
+        local sorted_del=$(echo "$zones_to_del" | tr ' ' '\n' | sort -rn | xargs)
+        for didx in $sorted_del; do
+            uci -q delete "firewall.@zone[$didx]"
+        done
+        local fwd_idx=0
+        local fwd_to_del=""
+        while uci -q get "firewall.@forwarding[$fwd_idx]" >/dev/null 2>&1; do
+            local fsrc=$(uci -q get "firewall.@forwarding[$fwd_idx].src")
+            local fdst=$(uci -q get "firewall.@forwarding[$fwd_idx].dest")
+            if [ "$fdst" = "wan" ] || [ "$fsrc" = "wan" ]; then
+                fwd_to_del="$fwd_to_del $fwd_idx"
+            fi
+            fwd_idx=$((fwd_idx + 1))
+        done
+        sorted_del=$(echo "$fwd_to_del" | tr ' ' '\n' | sort -rn | xargs)
+        for didx in $sorted_del; do
+            uci -q delete "firewall.@forwarding[$didx]"
+        done
+        uci commit firewall
+        /etc/init.d/firewall restart 2>/dev/null
+        echo -e "  ${YELLOW}防火墙保留,已清理wan相关配置${NC}"
+    fi
+    echo -e "\n${YELLOW}============= AP模式配置摘要 =============${NC}"
+    echo -e "  管理IP:    ${GREEN}$ap_ip${NC}"
+    echo -e "  子网掩码:  ${GREEN}$ap_mask${NC}"
+    echo -e "  网关:      ${GREEN}$ap_gateway${NC}"
+    echo -e "  DNS:       ${GREEN}$ap_dns${NC}"
+    echo -e "  桥接网口:  ${GREEN}$PHYSICAL_IFACES${NC}"
+    echo -e "  DHCP:      ${RED}已关闭${NC}"
+    echo -e "  IPv6 RA:   ${RED}已关闭${NC}"
+    echo -e "  Offload:   ${RED}已关闭${NC}"
+    if [ "$fw_action" = "disable" ]; then
+        echo -e "  防火墙:    ${RED}已停用${NC}"
+    else
+        echo -e "  防火墙:    ${YELLOW}运行中(已清理wan)${NC}"
+    fi
+    echo -e "${YELLOW}==========================================${NC}"
+    echo ""
+    echo -e "${YELLOW}重要提示:${NC}"
+    echo -e "  1. 请用网线连接主路由LAN口到本机任意网口"
+    echo -e "  2. 主路由DHCP地址池请避开 $ap_ip"
+    echo -e "  3. 应用后请通过 $ap_ip 重新连接管理"
+    echo -e "  4. 如出问题可用备份恢复"
+    echo ""
+    printf "立即重启网络使配置生效? [y/N]: "
+    read restart_confirm
+    case "$restart_confirm" in
+        y|Y)
+            echo -e "\n${BLUE}正在重启网络服务...${NC}"
+            /etc/init.d/network restart
+            sleep 3
+            if /etc/init.d/dnsmasq enabled 2>/dev/null; then
+                /etc/init.d/dnsmasq restart 2>/dev/null
+            fi
+            echo -e "${GREEN}网络已重启${NC}"
+            echo ""
+            echo -e "${BLUE}正在验证连通性...${NC}"
+            sleep 2
+            local gw_ok=0
+            local dns_ok=0
+            local inet_ok=0
+            if ping -c 2 -W 3 "$ap_gateway" >/dev/null 2>&1; then
+                gw_ok=1
+                echo -e "  网关 $ap_gateway: ${GREEN}可达${NC}"
+            else
+                echo -e "  网关 $ap_gateway: ${RED}不可达${NC}"
+            fi
+            if ping -c 2 -W 3 223.5.5.5 >/dev/null 2>&1; then
+                inet_ok=1
+                echo -e "  外网 223.5.5.5:  ${GREEN}可达${NC}"
+            else
+                echo -e "  外网 223.5.5.5:  ${RED}不可达${NC}"
+            fi
+            if command -v nslookup >/dev/null 2>&1; then
+                if nslookup openwrt.org >/dev/null 2>&1; then
+                    dns_ok=1
+                    echo -e "  DNS解析:         ${GREEN}正常${NC}"
+                else
+                    echo -e "  DNS解析:         ${RED}失败${NC}"
+                fi
+            fi
+            echo ""
+            if [ $gw_ok -eq 1 ] && [ $inet_ok -eq 1 ]; then
+                echo -e "${GREEN}AP模式配置成功,网络正常!${NC}"
+            elif [ $gw_ok -eq 1 ]; then
+                echo -e "${YELLOW}网关可达但外网不通,请检查主路由是否正常上网${NC}"
+            else
+                echo -e "${RED}网关不可达,请检查:${NC}"
+                echo -e "  1. 网线是否连接到主路由LAN口"
+                echo -e "  2. 网关地址 $ap_gateway 是否正确"
+                echo -e "  3. IP $ap_ip 是否与主路由同网段"
+                echo -e "  4. 可运行备份恢复: sh $BACKUP_DIR/config_*/restore.sh"
+            fi
+            log "AP模式完成 gw=$gw_ok inet=$inet_ok dns=$dns_ok"
+            ;;
+        *)
+            echo -e "${YELLOW}配置已保存未生效,手动执行:${NC}"
+            echo -e "  /etc/init.d/network restart"
+            log "AP模式配置完成,未重启"
+            ;;
+    esac
+}
+
+configure_offloading() {
+    echo -e "\n${YELLOW}=== Flow Offloading 配置 ===${NC}"
+    if ! /etc/init.d/firewall enabled 2>/dev/null; then
+        echo -e "${YELLOW}防火墙未启用,Flow Offloading无法工作${NC}"
+        printf "是否先启用防火墙? [y/N]: "
+        read fw_en
+        case "$fw_en" in
+            y|Y)
+                /etc/init.d/firewall enable 2>/dev/null
+                /etc/init.d/firewall start 2>/dev/null
+                ;;
+            *) return ;;
+        esac
+    fi
+    local fo=$(uci -q get firewall.@defaults[0].flow_offloading)
+    local fohw=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+    echo "当前状态:"
+    echo "  软件分载: ${fo:-未设置(关闭)}"
+    echo "  硬件分载: ${fohw:-未设置(关闭)}"
+    local has_module=0
+    if lsmod 2>/dev/null | grep -q "nf_flow_table\|xt_FLOWOFFLOAD"; then
+        has_module=1
+        echo -e "  内核模块: ${GREEN}已加载${NC}"
+    else
+        echo -e "  内核模块: ${YELLOW}未检测到${NC}"
+    fi
+    local has_hw=0
+    if lsmod 2>/dev/null | grep -qE "nf_flow_table_hw|mtkhnat|shortcut_fe"; then
+        has_hw=1
+        echo -e "  硬件加速: ${GREEN}已加载${NC}"
+    else
+        echo -e "  硬件加速: ${YELLOW}未检测到${NC}"
+    fi
+    echo ""
+    echo "  1) 开启软件流量分载"
+    echo "  2) 开启软件+硬件流量分载"
+    echo "  3) 关闭所有流量分载"
+    echo "  4) 返回"
+    while true; do
+        printf "请选择 [1-4]: "
+        read choice
+        case $choice in
+            1)
+                uci set firewall.@defaults[0].flow_offloading='1'
+                uci set firewall.@defaults[0].flow_offloading_hw='0'
+                uci commit firewall
+                /etc/init.d/firewall restart 2>/dev/null
+                echo -e "${GREEN}软件分载已开启${NC}"
+                log "开启软件offloading"
+                break
+                ;;
+            2)
+                if [ $has_hw -eq 0 ]; then
+                    echo -e "${YELLOW}未检测到硬件加速模块,可能不生效${NC}"
+                    printf "继续? [y/N]: "
+                    read hw_c
+                    case "$hw_c" in
+                        y|Y) ;;
+                        *) continue ;;
+                    esac
+                fi
+                uci set firewall.@defaults[0].flow_offloading='1'
+                uci set firewall.@defaults[0].flow_offloading_hw='1'
+                uci commit firewall
+                /etc/init.d/firewall restart 2>/dev/null
+                echo -e "${GREEN}软件+硬件分载已开启${NC}"
+                log "开启软件+硬件offloading"
+                break
+                ;;
+            3)
+                uci set firewall.@defaults[0].flow_offloading='0'
+                uci set firewall.@defaults[0].flow_offloading_hw='0'
+                uci commit firewall
+                /etc/init.d/firewall restart 2>/dev/null
+                echo -e "${GREEN}已关闭${NC}"
+                log "关闭offloading"
+                break
+                ;;
+            4) return ;;
+            *) echo -e "${RED}无效${NC}" ;;
+        esac
+    done
+    echo -e "\n${BLUE}验证:${NC}"
+    if command -v iptables-save >/dev/null 2>&1; then
+        local r=$(iptables-save 2>/dev/null | grep FLOWOFFLOAD)
+        if [ -n "$r" ]; then
+            echo -e "  IPv4: ${GREEN}$r${NC}"
+        else
+            echo -e "  IPv4: ${YELLOW}无FLOWOFFLOAD规则${NC}"
+        fi
+    fi
+    if command -v ip6tables-save >/dev/null 2>&1; then
+        local r6=$(ip6tables-save 2>/dev/null | grep FLOWOFFLOAD)
+        if [ -n "$r6" ]; then
+            echo -e "  IPv6: ${GREEN}$r6${NC}"
+        else
+            echo -e "  IPv6: ${YELLOW}无FLOWOFFLOAD规则${NC}"
+        fi
+    fi
+}
+
 backup_config() {
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_name="config_$timestamp"
-    
     mkdir -p "$BACKUP_DIR/$backup_name"
-    
-    # 备份关键配置文件
-    cp $CONFIG_DIR/network "$BACKUP_DIR/$backup_name/"
-    cp $CONFIG_DIR/firewall "$BACKUP_DIR/$backup_name/"
-    cp $CONFIG_DIR/dhcp "$BACKUP_DIR/$backup_name/"
-    
-    # 备份VLAN配置
-    [ $VLAN_CAPABLE -eq 1 ] && {
-        swconfig dev $SWITCH_DEVICE show > "$BACKUP_DIR/$backup_name/vlan_config"
-    }
-    
-    # 创建恢复脚本
-    cat > "$BACKUP_DIR/$backup_name/restore.sh" <<EOF
+    for f in network firewall dhcp wireless; do
+        if [ -f "$CONFIG_DIR/$f" ]; then
+            cp "$CONFIG_DIR/$f" "$BACKUP_DIR/$backup_name/"
+        fi
+    done
+    if [ $VLAN_CAPABLE -eq 1 ]; then
+        swconfig dev "$SWITCH_DEVICE" show > "$BACKUP_DIR/$backup_name/vlan_config" 2>/dev/null
+    fi
+    cat > "$BACKUP_DIR/$backup_name/restore.sh" <<RESTORE_EOF
 #!/bin/sh
-# 自动生成的恢复脚本
-cp network $CONFIG_DIR/
-cp firewall $CONFIG_DIR/
-cp dhcp $CONFIG_DIR/
+SCRIPT_DIR=\$(cd "\$(dirname "\$0")" && pwd)
+for f in network firewall dhcp wireless; do
+    if [ -f "\$SCRIPT_DIR/\$f" ]; then
+        cp "\$SCRIPT_DIR/\$f" "$CONFIG_DIR/"
+    fi
+done
 /etc/init.d/network restart
-/etc/init.d/firewall restart >/dev/null 2>&1
-/etc/init.d/dnsmasq restart >/dev/null 2>&1
-echo "配置已从备份 $backup_name 恢复！"
-EOF
+/etc/init.d/firewall enable 2>/dev/null
+/etc/init.d/firewall restart 2>/dev/null
+/etc/init.d/dnsmasq restart 2>/dev/null
+echo "配置已恢复"
+RESTORE_EOF
     chmod +x "$BACKUP_DIR/$backup_name/restore.sh"
-    
-    echo -e "${GREEN}配置已备份到: ${BACKUP_DIR}/${backup_name}${NC}"
-    log "创建配置备份: $backup_name"
+    echo -e "${GREEN}已备份到: ${BACKUP_DIR}/${backup_name}${NC}"
+    log "备份: $backup_name"
 }
 
-# 恢复配置
 restore_config() {
-    local backups=$(ls -d $BACKUP_DIR/config_* 2>/dev/null | sort -r)
-    [ -z "$backups" ] && {
-        echo -e "${RED}错误: 找不到任何备份配置！${NC}"
-        log "恢复失败: 无备份文件"
+    local backups=$(ls -d "$BACKUP_DIR"/config_* 2>/dev/null | sort -r)
+    if [ -z "$backups" ]; then
+        echo -e "${RED}无备份可恢复${NC}"
         return 1
-    }
-    
+    fi
     echo -e "\n${YELLOW}=== 恢复配置 ===${NC}"
-    echo -e "${GREEN}可用的备份:${NC}"
-    
     local i=1
     local backup_list=""
     for backup in $backups; do
-        backup_name=$(basename $backup)
-        backup_date=$(echo $backup_name | cut -d'_' -f2- | sed 's/$$....$$$$..$$$$..$$_$$..$$$$..$$$$..$$/\1-\2-\3 \4:\5:\6/')
-        echo "$i) $backup_name (${backup_date})"
+        echo "  $i) $(basename "$backup")"
         backup_list="$backup_list $backup"
-        i=$((i+1))
+        i=$((i + 1))
     done
-    
-    # 选择备份
+    local max=$((i - 1))
+    local selected_backup=""
     while true; do
-        read -p "选择要恢复的备份 (1-$((i-1))): " choice
-        if [ "$choice" -ge 1 ] && [ "$choice" -lt $i ] 2>/dev/null; then
-            selected_backup=$(echo $backup_list | cut -d' ' -f$choice)
-            break
+        printf "选择备份 (1-%d): " "$max"
+        read choice
+        if ! echo "$choice" | grep -qE '^[0-9]+$'; then
+            echo -e "${RED}无效输入${NC}"
+            continue
         fi
-        echo -e "${RED}错误: 无效的选择！${NC}"
+        if [ "$choice" -lt 1 ] || [ "$choice" -gt "$max" ]; then
+            echo -e "${RED}超出范围${NC}"
+            continue
+        fi
+        local idx=1
+        for b in $backup_list; do
+            if [ "$idx" -eq "$choice" ]; then
+                selected_backup="$b"
+                break
+            fi
+            idx=$((idx + 1))
+        done
+        break
     done
-    
-    # 确认恢复
-    read -p "确认从 ${selected_backup} 恢复配置? [y/N]: " confirm
-    [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || {
-        echo -e "${YELLOW}已取消恢复操作${NC}"
-        return
-    }
-    
-    # 执行恢复
-    cp "$selected_backup/network" $CONFIG_DIR/
-    cp "$selected_backup/firewall" $CONFIG_DIR/
-    cp "$selected_backup/dhcp" $CONFIG_DIR/
-    
+    printf "确认恢复 %s? [y/N]: " "$(basename "$selected_backup")"
+    read confirm
+    case "$confirm" in
+        y|Y) ;;
+        *) echo -e "${YELLOW}已取消${NC}"; return ;;
+    esac
+    for f in network firewall dhcp wireless; do
+        if [ -f "$selected_backup/$f" ]; then
+            cp "$selected_backup/$f" "$CONFIG_DIR/"
+        fi
+    done
     /etc/init.d/network restart
-    /etc/init.d/firewall restart >/dev/null 2>&1
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1
-    
-    echo -e "${GREEN}配置已从 ${selected_backup} 成功恢复！${NC}"
-    log "恢复配置从: $(basename $selected_backup)"
+    /etc/init.d/firewall enable 2>/dev/null
+    /etc/init.d/firewall restart 2>/dev/null
+    /etc/init.d/dnsmasq restart 2>/dev/null
+    echo -e "${GREEN}已恢复${NC}"
+    log "恢复: $(basename "$selected_backup")"
 }
 
-# 配置预验证
-validate_config() {
-    echo -e "${BLUE}正在验证配置...${NC}"
-    if ! uci -q validate; then
-        echo -e "${RED}配置错误: 请检查以下问题：\n$(uci changes)${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}配置验证通过${NC}"
-    return 0
-}
-
-# 应用配置
 apply_configuration() {
     echo -e "\n${YELLOW}=== 应用配置 ===${NC}"
-    
-    # 验证配置
-    if ! validate_config; then
-        return 1
-    fi
-    
-    # 显示待应用的更改
-    echo -e "${GREEN}以下配置将被应用:${NC}"
-    uci changes
-    
-    # 确认应用
-    read -p "确认应用以上所有配置? [y/N]: " confirm
-    [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || {
-        echo -e "${YELLOW}已取消应用配置${NC}"
-        log "用户取消应用配置"
+    local changes=$(uci changes 2>/dev/null)
+    if [ -z "$changes" ]; then
+        echo -e "${YELLOW}无待应用的更改${NC}"
         return
-    }
-    
-    # 执行应用
-    echo -e "${BLUE}应用配置中，请稍候...${NC}"
+    fi
+    echo -e "${GREEN}待应用:${NC}"
+    echo "$changes" | sed 's/^/  /'
+    echo ""
+    printf "确认? [y/N]: "
+    read confirm
+    case "$confirm" in
+        y|Y) ;;
+        *) echo -e "${YELLOW}已取消${NC}"; return ;;
+    esac
     uci commit network
     uci commit firewall
     uci commit dhcp
-    
     /etc/init.d/network restart
-    /etc/init.d/firewall restart >/dev/null 2>&1
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1
-    
-    echo -e "${GREEN}所有配置已成功应用！${NC}"
-    log "配置已应用并生效"
+    /etc/init.d/firewall restart 2>/dev/null
+    /etc/init.d/dnsmasq restart 2>/dev/null
+    echo -e "${GREEN}已应用${NC}"
+    log "配置已应用"
 }
 
-# 显示主菜单
+network_diagnostics() {
+    echo -e "\n${YELLOW}=== 网络诊断 ===${NC}"
+    local lan_ip=$(uci -q get network.lan.ipaddr)
+    local lan_gw=$(uci -q get network.lan.gateway)
+    local lan_dns=$(uci -q get network.lan.dns 2>/dev/null)
+    echo -e "\n${GREEN}[基本信息]${NC}"
+    echo "  本机IP: ${lan_ip:-未设置}"
+    echo "  网关:   ${lan_gw:-未设置}"
+    echo "  DNS:    ${lan_dns:-未设置}"
+    echo -e "\n${GREEN}[IPv4路由表]${NC}"
+    ip route 2>/dev/null | sed 's/^/  /'
+    echo -e "\n${GREEN}[IPv6路由表]${NC}"
+    ip -6 route 2>/dev/null | head -10 | sed 's/^/  /'
+    if [ -n "$lan_gw" ]; then
+        echo -e "\n${GREEN}[网关连通]${NC}"
+        if ping -c 2 -W 3 "$lan_gw" >/dev/null 2>&1; then
+            echo -e "  ping $lan_gw: ${GREEN}通${NC}"
+        else
+            echo -e "  ping $lan_gw: ${RED}不通${NC}"
+        fi
+    else
+        echo -e "\n${GREEN}[网关连通]${NC}"
+        echo -e "  ${RED}未设置网关${NC}"
+    fi
+    echo -e "\n${GREEN}[外网连通]${NC}"
+    if ping -c 2 -W 3 223.5.5.5 >/dev/null 2>&1; then
+        echo -e "  ping 223.5.5.5: ${GREEN}通${NC}"
+    else
+        echo -e "  ping 223.5.5.5: ${RED}不通${NC}"
+    fi
+    echo -e "\n${GREEN}[DNS解析]${NC}"
+    if command -v nslookup >/dev/null 2>&1; then
+        if nslookup openwrt.org >/dev/null 2>&1; then
+            echo -e "  DNS: ${GREEN}正常${NC}"
+        else
+            echo -e "  DNS: ${RED}失败${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}nslookup不可用${NC}"
+    fi
+    echo -e "\n${GREEN}[桥接状态]${NC}"
+    if command -v brctl >/dev/null 2>&1; then
+        brctl show 2>/dev/null | sed 's/^/  /'
+    else
+        ip link show type bridge 2>/dev/null | sed 's/^/  /'
+    fi
+    echo -e "\n${GREEN}[接口状态]${NC}"
+    for iface in $PHYSICAL_IFACES; do
+        local st=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+        local cr=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo "0")
+        printf "  %-10s state=%-8s carrier=%s\n" "$iface" "$st" "$cr"
+    done
+    echo -e "\n${GREEN}[服务状态]${NC}"
+    if /etc/init.d/firewall enabled 2>/dev/null; then
+        echo -e "  防火墙: ${GREEN}启用${NC}"
+    else
+        echo -e "  防火墙: ${YELLOW}禁用${NC}"
+    fi
+    local dhcp_ign=$(uci -q get dhcp.lan.ignore)
+    if [ "$dhcp_ign" = "1" ]; then
+        echo -e "  DHCP:   ${YELLOW}关闭${NC}"
+    else
+        echo -e "  DHCP:   ${GREEN}开启${NC}"
+    fi
+    local wan_exists=$(uci -q get network.wan)
+    if [ -n "$wan_exists" ]; then
+        echo -e "  WAN口:  ${GREEN}存在${NC}"
+    else
+        echo -e "  WAN口:  ${YELLOW}不存在(AP模式)${NC}"
+    fi
+    log "诊断完成"
+}
+
 show_main_menu() {
     clear
-    echo -e "${YELLOW}=============================================${NC}"
-    echo -e " OpenWRT 多网口高级配置工具 ${GREEN}v${VERSION}${NC}"
-    echo -e "${YELLOW}=============================================${NC}"
-    echo -e "${GREEN} 1. 显示当前网络配置${NC}"
-    echo -e "${GREEN} 2. 配置WAN接口${NC}"
-    echo -e "${GREEN} 3. 配置LAN接口${NC}"
-    echo -e "${GREEN} 4. 配置VLAN${NC}"
-    echo -e "${GREEN} 5. 备份当前配置${NC}"
-    echo -e "${GREEN} 6. 恢复备份配置${NC}"
-    echo -e "${GREEN} 7. 应用所有配置${NC}"
-    echo -e "${GREEN} 8. 退出${NC}"
-    echo -e "${YELLOW}=============================================${NC}"
+    echo -e "${YELLOW}=================================================${NC}"
+    echo -e "  OpenWRT 多网口高级配置工具 ${GREEN}v${VERSION}${NC}"
+    echo -e "${YELLOW}=================================================${NC}"
+    echo -e "  ${GREEN} 1.${NC} 显示当前网络配置"
+    echo -e "  ${GREEN} 2.${NC} 配置WAN接口"
+    echo -e "  ${GREEN} 3.${NC} 配置LAN接口"
+    echo -e "  ${GREEN} 4.${NC} 配置VLAN"
+    echo -e "  ${GREEN} 5.${NC} 备份当前配置"
+    echo -e "  ${GREEN} 6.${NC} 恢复备份配置"
+    echo -e "  ${GREEN} 7.${NC} 应用所有配置"
+    echo -e "  ${GREEN} 8.${NC} AP/桥接模式一键配置"
+    echo -e "  ${GREEN} 9.${NC} Flow Offloading 配置"
+    echo -e "  ${GREEN}10.${NC} 网络诊断"
+    echo -e "  ${GREEN} 0.${NC} 退出"
+    echo -e "${YELLOW}=================================================${NC}"
 }
 
-# 主循环
 main_loop() {
     while true; do
         show_main_menu
-        
-        read -p "请输入操作选项 [1-8]: " option
+        printf "请输入 [0-10]: "
+        read option
         case $option in
             1) show_current_config ;;
             2) configure_wan ;;
@@ -704,23 +1263,25 @@ main_loop() {
             5) backup_config ;;
             6) restore_config ;;
             7) apply_configuration ;;
-            8) 
-                echo -e "${GREEN}感谢使用，再见！${NC}"
-                log "脚本正常退出"
+            8) configure_ap_mode ;;
+            9) configure_offloading ;;
+            10) network_diagnostics ;;
+            0)
+                echo -e "${GREEN}再见${NC}"
+                log "退出"
                 exit 0
                 ;;
-            *) 
-                echo -e "${RED}错误: 无效的选项！${NC}"
+            *)
+                echo -e "${RED}无效选项${NC}"
                 sleep 1
                 ;;
         esac
-        
         echo
-        read -p "按回车键返回主菜单..."
+        printf "按回车返回菜单..."
+        read dummy
     done
 }
 
-# 主程序
 init_check
 get_system_info
 init_switch_port_map
