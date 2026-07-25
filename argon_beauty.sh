@@ -1,6 +1,5 @@
 #!/bin/sh
 # shellcheck shell=sh
-
 ESC=$(printf '\033')
 RED="${ESC}[0;31m"
 GREEN="${ESC}[0;32m"
@@ -9,17 +8,14 @@ BLUE="${ESC}[0;34m"
 CYAN="${ESC}[0;36m"
 WHITE="${ESC}[1;37m"
 NC="${ESC}[0m"
-
 info()    { printf "${CYAN}  [i]  %s${NC}\n" "$1"; }
 success() { printf "${GREEN}  [v]  %s${NC}\n" "$1"; }
 warn()    { printf "${YELLOW}  [!]  %s${NC}\n" "$1"; }
 error()   { printf "${RED}  [x]  %s${NC}\n" "$1"; }
-
 title() {
     local line="=================================================="
     printf "\n${WHITE}%s\n  %s\n%s${NC}\n" "$line" "$1" "$line"
 }
-
 ask() {
     printf "${YELLOW}  [?]  %s [y/N]: ${NC}" "$1" >&2
     read _ask_val
@@ -28,7 +24,6 @@ ask() {
         *) return 1 ;;
     esac
 }
-
 ask_num() {
     local prompt="$1" def="$2" min="$3" max="$4"
     printf "${YELLOW}  [>]  %s [%s-%s, 默认%s]: ${NC}" \
@@ -43,21 +38,19 @@ ask_num() {
     fi
     printf '%s\n' "$_n_val"
 }
-
 ask_float() {
     local prompt="$1" def="$2"
     printf "${YELLOW}  [>]  %s [默认 %s]: ${NC}" "$prompt" "$def" >&2
     read _f_val
     [ -z "$_f_val" ] && _f_val="$def"
     case "$_f_val" in
-        0.[0-9]*|0.[0-9][0-9]*|1.0|1)
+        0.[0-9]*|1.0|1)
             printf '%s\n' "$_f_val" ;;
         *)
             printf "${YELLOW}  [!]  格式不合法，使用默认: %s${NC}\n" "$def" >&2
             printf '%s\n' "$def" ;;
     esac
 }
-
 ask_str() {
     local prompt="$1" def="$2"
     printf "${YELLOW}  [>]  %s [默认: %s]: ${NC}" "$prompt" "$def" >&2
@@ -65,7 +58,6 @@ ask_str() {
     [ -z "$_s_val" ] && _s_val="$def"
     printf '%s\n' "$_s_val"
 }
-
 _count_lines() {
     local cnt=0
     while IFS= read -r line; do
@@ -75,7 +67,6 @@ _count_lines() {
     done < "$1"
     printf '%s\n' "$cnt"
 }
-
 IMG_API_LIST="yppp自适应|https://api.yppp.net/api.php|横竖自适应二次元(推荐)
 yppp横屏PC|https://api.yppp.net/pc.php|横屏壁纸
 yppp竖屏手机|https://api.yppp.net/pe.php|竖屏壁纸
@@ -87,12 +78,10 @@ UAPIs|https://uapis.cn/api/v1/random/image|免费随机动漫(国内CDN)
 南风自适应|https://api.sretna.cn/api/anime/auto|自动横竖适配
 必应每日|https://bing.img.run/1920x1080.php|必应每日壁纸
 自定义|custom|输入自己的图片API地址"
-
 FONT_LIST="TypoGraphica(本地已有)|TypoGraphica|local|local
 阿里妈妈数黑体|AlimamaShuHeiTi|https://at.alicdn.com/wf/webfont/kfq1sgJFWQ6g/cPCrTL8ewntCCMPMNgo40.woff2|https://at.alicdn.com/wf/webfont/kfq1sgJFWQ6g/fu9Q_dW8qzsGtfSSU60a3.woff
 阿里妈妈东方大楷|AlimamaDFDaKai|https://at.alicdn.com/wf/webfont/kfq1sgJFWQ6g/Vilu-bh7P5eQjO8r8act3.woff2|https://at.alicdn.com/wf/webfont/kfq1sgJFWQ6g/IXc_dDK4CjiHaiUgrlZL5.woff
 系统默认字体|system-ui|none|none"
-
 GRADIENT_LIST="青蓝极光(默认)|#00e5ff,#2979ff,#aa00ff,#00e5ff
 金橙日落|#ff6b35,#f7931e,#ffcd3c,#ff6b35
 紫霞幻境|#a855f7,#6366f1,#ec4899,#a855f7
@@ -102,7 +91,6 @@ GRADIENT_LIST="青蓝极光(默认)|#00e5ff,#2979ff,#aa00ff,#00e5ff
 星空深蓝|#0f3460,#16213e,#0f3460,#533483
 珊瑚暖阳|#f093fb,#f5576c,#fda085,#f093fb
 自定义|custom"
-
 ACTIVE_THEME=""
 ACTIVE_CSS=""
 ACTIVE_FONTS_DIR=""
@@ -133,7 +121,6 @@ THEME_BASE_COLOR="dark"
 BG_OVERLAY="0.45"
 LOGIN_BG=""
 LOGIN_BG_WEBPATH=""
-
 _detect_bg_file() {
     local dir="$1"
     local f
@@ -142,22 +129,22 @@ _detect_bg_file() {
     done
     printf '%s\n' "${dir}/bg1.jpg"
 }
-
 _set_theme_bg() {
     ACTIVE_BG=$(_detect_bg_file "$ACTIVE_IMG_DIR")
     THEME_BG_WEBPATH=$(printf '%s' "$ACTIVE_BG" | sed 's|^/www||')
-    
-    local login_ext="jpg"
-    [ -f "${ACTIVE_IMG_DIR}/login-bg.webp" ] && login_ext="webp"
-    if [ -f "${ACTIVE_IMG_DIR}/login-bg.${login_ext}" ]; then
-        LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.${login_ext}"
-        LOGIN_BG_WEBPATH=$(printf '%s' "$LOGIN_BG" | sed 's|^/www||')
+    if [ -f "${ACTIVE_IMG_DIR}/login-bg.webp" ]; then
+        LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.webp"
+    elif [ -f "${ACTIVE_IMG_DIR}/login-bg.jpg" ]; then
+        LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.jpg"
     else
         LOGIN_BG="$ACTIVE_BG"
+    fi
+    if [ "$LOGIN_BG" != "$ACTIVE_BG" ]; then
+        LOGIN_BG_WEBPATH=$(printf '%s' "$LOGIN_BG" | sed 's|^/www||')
+    else
         LOGIN_BG_WEBPATH="$THEME_BG_WEBPATH"
     fi
 }
-
 _load_theme_vars() {
     local t="$1"
     case "$t" in
@@ -254,7 +241,6 @@ _load_theme_vars() {
     success "CSS    : $ACTIVE_CSS"
     success "背景图 : $ACTIVE_BG"
 }
-
 _detect_theme_base_color() {
     local css="$ACTIVE_CSS"
     local detected="unknown"
@@ -280,30 +266,28 @@ _detect_theme_base_color() {
     fi
     THEME_BASE_COLOR="$detected"
 }
-
 _detect_real_selectors() {
     local css="$ACTIVE_CSS"
     local tmpf="/tmp/_sel_detect_$$"
     grep -oE '[a-zA-Z0-9_#\.>\*\+~:()\[\]^$=-]+' "$css" 2>/dev/null | sort -u > "$tmpf"
     [ -s "$tmpf" ] || { rm -f "$tmpf"; return; }
-    if grep -q '\.main-left' "$tmpf" && [ -z "$(echo "$SEL_SIDEBAR" | grep '\.main-left')" ]; then
+    if grep -q '\.main-left' "$tmpf" && [ -z "$(printf '%s' "$SEL_SIDEBAR" | grep '\.main-left')" ]; then
         SEL_SIDEBAR="$SEL_SIDEBAR, .main-left"
     fi
-    if grep -q '\.main-right' "$tmpf" && [ -z "$(echo "$SEL_CONTENT" | grep '\.main-right')" ]; then
+    if grep -q '\.main-right' "$tmpf" && [ -z "$(printf '%s' "$SEL_CONTENT" | grep '\.main-right')" ]; then
         SEL_CONTENT="$SEL_CONTENT, .main-right"
     fi
-    if grep -q '#mainmenu' "$tmpf" && [ -z "$(echo "$SEL_SIDEBAR" | grep '#mainmenu')" ]; then
+    if grep -q '#mainmenu' "$tmpf" && [ -z "$(printf '%s' "$SEL_SIDEBAR" | grep '#mainmenu')" ]; then
         SEL_SIDEBAR="$SEL_SIDEBAR, #mainmenu"
     fi
-    if grep -q '\.cbi-tabmenu' "$tmpf" && [ -z "$(echo "$SEL_CARD" | grep '\.cbi-tabmenu')" ]; then
+    if grep -q '\.cbi-tabmenu' "$tmpf" && [ -z "$(printf '%s' "$SEL_CARD" | grep '\.cbi-tabmenu')" ]; then
         SEL_CARD="$SEL_CARD, .cbi-tabmenu"
     fi
-    if grep -q '\.table' "$tmpf" && [ -z "$(echo "$SEL_CARD" | grep '\.table')" ]; then
+    if grep -q '\.table' "$tmpf" && [ -z "$(printf '%s' "$SEL_CARD" | grep '\.table')" ]; then
         SEL_CARD="$SEL_CARD, .table"
     fi
     rm -f "$tmpf"
 }
-
 detect_themes() {
     title "自动探测已安装 LuCI 主题"
     local tmplist="/tmp/_themes_$$"
@@ -347,7 +331,6 @@ detect_themes() {
     _detect_theme_base_color
     _detect_real_selectors
 }
-
 detect_paths() {
     title "自动探测系统环境"
     HEADER_HTM=$(find /usr/lib/lua /usr/share/ucode /usr/lib/lua/luci/view -name "header.htm" 2>/dev/null | grep -F "$ACTIVE_THEME" | head -1)
@@ -368,7 +351,6 @@ detect_paths() {
     info "路由器IP: $ROUTER_IP"
     info "主题底色: $THEME_BASE_COLOR"
 }
-
 check_url() {
     local url="$1" timeout="${2:-8}"
     [ -z "$NET_TOOL" ] && return 1
@@ -381,7 +363,6 @@ check_url() {
         wget -q --timeout="$timeout" -U "Mozilla/5.0" --spider "$url" 2>/dev/null
     fi
 }
-
 net_download() {
     local url="$1" dest="$2" desc="${3:-文件}"
     info "正在下载 $desc ..."; info "来源: $url"
@@ -400,7 +381,6 @@ net_download() {
         error "$desc 下载失败"; rm -f "$dest" 2>/dev/null; return 1
     fi
 }
-
 verify_image() {
     local file="$1"
     [ ! -f "$file" ] && return 1
@@ -420,11 +400,12 @@ verify_image() {
             424d*)                     return 0 ;;
         esac
     fi
-    local size; size=$(wc -c < "$file" 2>/dev/null || echo 0)
+    local size
+    size=$(wc -c < "$file" 2>/dev/null)
+    size=${size:-0}
     [ "$size" -gt 10240 ] && return 0
     return 1
 }
-
 step_check_urls() {
     title "联网检查所有内置 URL 可用性"
     [ -z "$NET_TOOL" ] && warn "无网络工具，跳过" && return
@@ -454,7 +435,6 @@ step_check_urls() {
     done < "$tmpf2"; rm -f "$tmpf2"
     echo ""; success "检测完成"
 }
-
 show_api_list() {
     local do_check="${1:-0}"
     printf "  ${WHITE}图片 API 列表：${NC}\n"
@@ -476,7 +456,6 @@ show_api_list() {
         i=$((i+1))
     done < "$tmpf"; rm -f "$tmpf"
 }
-
 _remove_css_block() {
     local tag="$1" css="$ACTIVE_CSS" tmpout="/tmp/_css_rm_$$"
     grep -q "=== ${tag}" "$css" 2>/dev/null || return 0
@@ -488,13 +467,51 @@ _remove_css_block() {
             *) [ "$in_block" -eq 0 ] && printf '%s\n' "$line" ;;
         esac
     done < "$css" > "$tmpout"
-    if [ -s "$tmpout" ]; then
+    if [ -f "$tmpout" ]; then
         mv "$tmpout" "$css"; info "已移除旧 [${tag}] 块"
     else
         rm -f "$tmpout"; warn "移除 [${tag}] 块失败，已跳过"
     fi
 }
-
+_download_bg_from_api() {
+    local dest="$1" desc="$2"
+    show_api_list 0
+    local tmpf="/tmp/_api_cnt_dl_$$"
+    printf '%s\n' "$IMG_API_LIST" > "$tmpf"
+    local api_total; api_total=$(_count_lines "$tmpf"); rm -f "$tmpf"
+    local api_num; api_num=$(ask_num "选择API编号" 1 1 "$api_total")
+    local tmpf2="/tmp/_api_sel_dl_$$"
+    printf '%s\n' "$IMG_API_LIST" > "$tmpf2"
+    local sel_line sel_cnt=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue ;; esac
+        sel_cnt=$((sel_cnt+1))
+        [ "$sel_cnt" -eq "$api_num" ] && sel_line="$line" && break
+    done < "$tmpf2"
+    rm -f "$tmpf2"
+    local sel_name sel_url
+    sel_name=$(printf '%s' "$sel_line" | cut -d'|' -f1)
+    sel_url=$(printf '%s' "$sel_line"  | cut -d'|' -f2)
+    [ "$sel_url" = "custom" ] && sel_url=$(ask_str "请输入自定义API地址" "")
+    [ -z "$NET_TOOL" ] && { warn "无网络工具，无法下载"; return 1; }
+    [ -z "$sel_url" ] && { warn "URL为空，取消下载"; return 1; }
+    info "使用: $sel_name -> $sel_url"
+    local real_url="$sel_url"
+    if [ "$NET_TOOL" = "curl" ]; then
+        info "解析最终图片地址..."
+        local resolved
+        resolved=$(curl -sSL --connect-timeout 10 --max-time 20 \
+            -A "Mozilla/5.0" -w "%{url_effective}" \
+            -o /dev/null -L "$sel_url" 2>/dev/null)
+        case "$resolved" in
+            *.jpg|*.jpeg|*.png|*.webp|*.gif|\
+            *.jpg\?*|*.jpeg\?*|*.png\?*|*.webp\?*|*.gif\?*)
+                real_url="$resolved"; info "真实地址: $real_url" ;;
+        esac
+    fi
+    net_download "$real_url" "$dest" "$desc"
+}
 step_download_image() {
     title "步骤1：背景图片获取 [$ACTIVE_THEME]"
     echo "  ${CYAN}1)${NC} [网] 从内置API在线下载（直接列出）"
@@ -509,40 +526,7 @@ step_download_image() {
             [ "$img_choice" = "2" ] && [ -n "$NET_TOOL" ] && \
                 { info "正在检测 API 可用性..."; show_api_list 1; } || show_api_list 0
             echo ""
-            local tmpf="/tmp/_api_cnt_$$"
-            printf '%s\n' "$IMG_API_LIST" > "$tmpf"
-            local api_total; api_total=$(_count_lines "$tmpf"); rm -f "$tmpf"
-            local api_num; api_num=$(ask_num "选择API编号" 1 1 "$api_total")
-            local tmpf2="/tmp/_api_sel_$$"
-            printf '%s\n' "$IMG_API_LIST" > "$tmpf2"
-            local sel_line sel_cnt=0
-            while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                case "$line" in \#*) continue ;; esac
-                sel_cnt=$((sel_cnt+1))
-                [ "$sel_cnt" -eq "$api_num" ] && sel_line="$line" && break
-            done < "$tmpf2"
-            rm -f "$tmpf2"
-            local sel_name sel_url
-            sel_name=$(printf '%s' "$sel_line" | cut -d'|' -f1)
-            sel_url=$(printf '%s' "$sel_line"  | cut -d'|' -f2)
-            [ "$sel_url" = "custom" ] && sel_url=$(ask_str "请输入自定义API地址" "")
-            [ -z "$NET_TOOL" ] && { warn "无网络工具，无法下载"; return; }
-            info "使用: $sel_name -> $sel_url"
-            local real_url="$sel_url"
-            if [ "$NET_TOOL" = "curl" ]; then
-                info "解析最终图片地址..."
-                local resolved
-                resolved=$(curl -sSL --connect-timeout 10 --max-time 20 \
-                    -A "Mozilla/5.0" -w "%{url_effective}" \
-                    -o /dev/null -L "$sel_url" 2>/dev/null)
-                case "$resolved" in
-                    *.jpg|*.jpeg|*.png|*.webp|*.gif|\
-                    *.jpg\?*|*.jpeg\?*|*.png\?*|*.webp\?*|*.gif\?*)
-                        real_url="$resolved"; info "真实地址: $real_url" ;;
-                esac
-            fi
-            net_download "$real_url" "$ACTIVE_BG" "背景图"
+            _download_bg_from_api "$ACTIVE_BG" "背景图"
             verify_image "$ACTIVE_BG" && success "图片格式验证通过" || \
                 warn "格式验证未通过，仍会尝试使用"
             ;;
@@ -564,19 +548,14 @@ step_download_image() {
         5) info "已跳过图片设置" ;;
     esac
 }
-
 step_login_background() {
     title "步骤1.5：登录页背景设置 [$ACTIVE_THEME]"
     echo "  ${CYAN}1)${NC} [共用] 与主界面使用同一张背景图"
     echo "  ${CYAN}2)${NC} [单独] 为登录页单独设置一张背景图"
     echo "  ${CYAN}3)${NC} [跳]  保持当前登录背景不变"
     local login_choice; login_choice=$(ask_num "请选择" 1 1 3)
-
-    local login_ext="jpg"
-    [ -f "${ACTIVE_IMG_DIR}/bg.webp" ] && login_ext="webp"
-    LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.${login_ext}"
-    LOGIN_BG_WEBPATH="/luci-static/${ACTIVE_THEME}/img/login-bg.${login_ext}"
-
+    local login_dest="${ACTIVE_IMG_DIR}/login-bg.jpg"
+    local login_webpath="/luci-static/${ACTIVE_THEME}/img/login-bg.jpg"
     case "$login_choice" in
         1)
             rm -f "${ACTIVE_IMG_DIR}/login-bg.jpg" "${ACTIVE_IMG_DIR}/login-bg.webp" 2>/dev/null
@@ -592,62 +571,46 @@ step_login_background() {
             local sub_choice; sub_choice=$(ask_num "请选择" 1 1 3)
             case "$sub_choice" in
                 1)
-                    show_api_list 0
-                    local tmpf="/tmp/_api_cnt_login_$$"
-                    printf '%s\n' "$IMG_API_LIST" > "$tmpf"
-                    local api_total; api_total=$(_count_lines "$tmpf"); rm -f "$tmpf"
-                    local api_num; api_num=$(ask_num "选择API编号" 1 1 "$api_total")
-                    local tmpf2="/tmp/_api_sel_login_$$"
-                    printf '%s\n' "$IMG_API_LIST" > "$tmpf2"
-                    local sel_line sel_cnt=0
-                    while IFS= read -r line; do
-                        [ -z "$line" ] && continue
-                        case "$line" in \#*) continue ;; esac
-                        sel_cnt=$((sel_cnt+1))
-                        [ "$sel_cnt" -eq "$api_num" ] && sel_line="$line" && break
-                    done < "$tmpf2"
-                    rm -f "$tmpf2"
-                    local sel_name sel_url
-                    sel_name=$(printf '%s' "$sel_line" | cut -d'|' -f1)
-                    sel_url=$(printf '%s' "$sel_line"  | cut -d'|' -f2)
-                    [ "$sel_url" = "custom" ] && sel_url=$(ask_str "请输入自定义API地址" "")
-                    [ -z "$NET_TOOL" ] && { warn "无网络工具，无法下载"; return; }
-                    info "使用: $sel_name -> $sel_url"
-                    local real_url="$sel_url"
-                    if [ "$NET_TOOL" = "curl" ]; then
-                        info "解析最终图片地址..."
-                        local resolved
-                        resolved=$(curl -sSL --connect-timeout 10 --max-time 20 \
-                            -A "Mozilla/5.0" -w "%{url_effective}" \
-                            -o /dev/null -L "$sel_url" 2>/dev/null)
-                        case "$resolved" in
-                            *.jpg|*.jpeg|*.png|*.webp|*.gif|\
-                            *.jpg\?*|*.jpeg\?*|*.png\?*|*.webp\?*|*.gif\?*)
-                                real_url="$resolved"; info "真实地址: $real_url" ;;
-                        esac
-                    fi
-                    net_download "$real_url" "$LOGIN_BG" "登录背景图"
-                    verify_image "$LOGIN_BG" && success "登录背景格式验证通过" || warn "格式验证未通过"
+                    _download_bg_from_api "$login_dest" "登录背景图"
+                    verify_image "$login_dest" && success "登录背景格式验证通过" || warn "格式验证未通过"
+                    LOGIN_BG="$login_dest"
+                    LOGIN_BG_WEBPATH="$login_webpath"
                     ;;
                 2)
-                    if [ -f "$LOGIN_BG" ]; then
-                        success "已有登录背景图 ($(du -sh "$LOGIN_BG" | cut -f1))"
-                        verify_image "$LOGIN_BG" && success "格式验证通过" || warn "格式异常"
+                    if [ -f "$login_dest" ]; then
+                        success "已有登录背景图 ($(du -sh "$login_dest" | cut -f1))"
+                        verify_image "$login_dest" && success "格式验证通过" || warn "格式异常"
+                        LOGIN_BG="$login_dest"
+                        LOGIN_BG_WEBPATH="$login_webpath"
                     else
-                        warn "未找到 $LOGIN_BG"
-                        info "上传: scp login-bg.jpg root@${ROUTER_IP}:${LOGIN_BG}"
+                        warn "未找到 $login_dest"
+                        info "上传: scp login-bg.jpg root@${ROUTER_IP}:${login_dest}"
+                        LOGIN_BG="$ACTIVE_BG"
+                        LOGIN_BG_WEBPATH="$THEME_BG_WEBPATH"
                     fi
                     ;;
                 3)
                     local direct_url; direct_url=$(ask_str "图片直链URL" "")
-                    [ -n "$direct_url" ] && {
-                        net_download "$direct_url" "$LOGIN_BG" "自定义登录背景图"
-                        verify_image "$LOGIN_BG" && success "格式验证通过"
-                    } ;;
+                    if [ -n "$direct_url" ]; then
+                        net_download "$direct_url" "$login_dest" "自定义登录背景图"
+                        verify_image "$login_dest" && success "格式验证通过"
+                        LOGIN_BG="$login_dest"
+                        LOGIN_BG_WEBPATH="$login_webpath"
+                    else
+                        LOGIN_BG="$ACTIVE_BG"
+                        LOGIN_BG_WEBPATH="$THEME_BG_WEBPATH"
+                    fi
+                    ;;
             esac
             ;;
         3)
-            if [ -f "$LOGIN_BG" ]; then
+            if [ -f "${ACTIVE_IMG_DIR}/login-bg.webp" ]; then
+                LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.webp"
+                LOGIN_BG_WEBPATH="/luci-static/${ACTIVE_THEME}/img/login-bg.webp"
+                info "保持当前登录背景不变"
+            elif [ -f "${ACTIVE_IMG_DIR}/login-bg.jpg" ]; then
+                LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.jpg"
+                LOGIN_BG_WEBPATH="$login_webpath"
                 info "保持当前登录背景不变"
             else
                 LOGIN_BG="$ACTIVE_BG"
@@ -657,7 +620,6 @@ step_login_background() {
             ;;
     esac
 }
-
 step_download_font() {
     title "步骤2：品牌字体获取 [$ACTIVE_THEME]"
     local typo_woff2="${ACTIVE_FONTS_DIR}/TypoGraphica.woff2"
@@ -714,7 +676,6 @@ step_download_font() {
     fi
     inject_font_css
 }
-
 inject_font_css() {
     if [ "$FONT_WOFF2_URL" = "none" ] || [ -z "$FONT_WOFF2_URL" ]; then
         info "系统字体，跳过 @font-face"; return
@@ -731,7 +692,6 @@ inject_font_css() {
     printf '/* === END FONT_FACE_%s === */\n' "$FONT_NAME" >> "$css"
     success "@font-face 已注入: $FONT_NAME"
 }
-
 step_brand_animation() {
     title "步骤3：Brand 名称动画效果 v3.1 [$ACTIVE_THEME]"
     ask "是否启用品牌名动画效果" || return
@@ -746,7 +706,6 @@ step_brand_animation() {
     echo "  ${CYAN}7)${NC} 深呼吸发光  柔和脉冲式外发光"
     echo "  ${CYAN}8)${NC} 故障波纹   RGB 位移+噪点故障艺术风"
     local anim_mode; anim_mode=$(ask_num "选择动画模式" 1 1 8)
-
     echo ""; echo "  ${WHITE}渐变色方案：${NC}"
     local tmpf="/tmp/_grd_show_$$"
     printf '%s\n' "$GRADIENT_LIST" > "$tmpf"
@@ -766,21 +725,18 @@ step_brand_animation() {
     GRAD_COLORS=$(printf '%s' "$sel_line" | cut -d'|' -f2)
     [ "$GRAD_COLORS" = "custom" ] && \
         GRAD_COLORS=$(ask_str "输入颜色(逗号分隔)" "#00e5ff,#2979ff,#aa00ff,#00e5ff")
-
     local anim_speed; anim_speed=$(ask_num "动画速度(秒，越小越快)" 4 1 30)
     [ -z "$FONT_NAME" ] && FONT_NAME="system-ui"
-    info "模式: $anim_mode | 配色: $GRAD_NAME |速度: ${anim_speed}s"
+    info "模式: $anim_mode | 配色: $GRAD_NAME | 速度: ${anim_speed}s"
     _inject_keyframes
     _remove_css_block "BRAND_ANIMATION"
     _inject_brand_css "$anim_mode" "$anim_speed" "$GRAD_COLORS" "$FONT_NAME"
 }
-
 _inject_keyframes() {
     grep -q "=== KEYFRAMES_ALL ===" "$ACTIVE_CSS" 2>/dev/null && \
         { info "关键帧已存在，跳过"; return; }
     local css="$ACTIVE_CSS"
     printf '\n/* === KEYFRAMES_ALL === */\n' >> "$css"
-
     printf '@keyframes hue-rotate-flow {\n' >> "$css"
     printf '  0%%   { filter: hue-rotate(0deg)   brightness(1.2); }\n' >> "$css"
     printf '  25%%  { filter: hue-rotate(90deg)  brightness(1.3); }\n' >> "$css"
@@ -788,13 +744,11 @@ _inject_keyframes() {
     printf '  75%%  { filter: hue-rotate(270deg) brightness(1.3); }\n' >> "$css"
     printf '  100%% { filter: hue-rotate(360deg) brightness(1.2); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes aurora-flow {\n' >> "$css"
     printf '  0%%   { background-position: 0%%   50%%; }\n' >> "$css"
     printf '  50%%  { background-position: 100%% 50%%; }\n' >> "$css"
     printf '  100%% { background-position: 0%%   50%%; }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes rainbow-pulse {\n' >> "$css"
     printf '  0%%   { filter: hue-rotate(0deg)   drop-shadow(0 0 6px  #00fff7); }\n' >> "$css"
     printf '  20%%  { filter: hue-rotate(72deg)  drop-shadow(0 0 14px #007cf0); }\n' >> "$css"
@@ -803,7 +757,6 @@ _inject_keyframes() {
     printf '  80%%  { filter: hue-rotate(288deg) drop-shadow(0 0 6px  #00fff7); }\n' >> "$css"
     printf '  100%% { filter: hue-rotate(360deg) drop-shadow(0 0 6px  #00fff7); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes neon-flicker {\n' >> "$css"
     printf '  0%%,100%% { opacity:1;    filter: hue-rotate(0deg)   brightness(1.4) drop-shadow(0 0 10px #00fff7); }\n' >> "$css"
     printf '  15%%     { opacity:0.82; filter: hue-rotate(30deg)  brightness(1.1); }\n' >> "$css"
@@ -812,12 +765,10 @@ _inject_keyframes() {
     printf '  70%%     { opacity:1;    filter: hue-rotate(270deg) brightness(1.4) drop-shadow(0 0 20px #a855f7); }\n' >> "$css"
     printf '  85%%     { opacity:0.82; filter: hue-rotate(330deg) brightness(1.1); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes shine {\n' >> "$css"
     printf '  0%%   { background-position: -200%% center; }\n' >> "$css"
     printf '  100%% { background-position:  200%% center; }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes cursor-blink {\n' >> "$css"
     printf '  0%%,100%% { border-right-color: rgba(255,255,255,0.9); }\n' >> "$css"
     printf '  50%%     { border-right-color: transparent; }\n' >> "$css"
@@ -827,7 +778,6 @@ _inject_keyframes() {
     printf '  50%%  { filter: hue-rotate(180deg) brightness(1.4); }\n' >> "$css"
     printf '  100%% { filter: hue-rotate(360deg) brightness(1.1); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes breath-glow {\n' >> "$css"
     printf '  0%%,100%% {\n' >> "$css"
     printf '    filter: brightness(1.0) drop-shadow(0 0  4px rgba(0,229,255,0.4));\n' >> "$css"
@@ -839,7 +789,6 @@ _inject_keyframes() {
     printf '    opacity: 1.0;\n' >> "$css"
     printf '  }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes glitch-shift {\n' >> "$css"
     printf '  0%%,100%% { filter: hue-rotate(0deg)   drop-shadow( 2px 0 0 #ff0040) drop-shadow(-2px 0 0 #00fff7); transform: skewX(0deg); }\n' >> "$css"
     printf '  10%%      { filter: hue-rotate(40deg)  drop-shadow( 3px 0 0 #ff0040) drop-shadow(-3px 0 0 #00fff7); transform: skewX(-1.5deg); }\n' >> "$css"
@@ -849,21 +798,17 @@ _inject_keyframes() {
     printf '  60%%      { filter: hue-rotate(320deg) drop-shadow( 2px 0 0 #ff0040) drop-shadow(-3px 0 0 #00fff7); transform: skewX(0.5deg); }\n' >> "$css"
     printf '  80%%      { filter: hue-rotate(0deg)   drop-shadow( 3px 0 0 #ff0040) drop-shadow(-2px 0 0 #00fff7); transform: skewX(-0.5deg); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes page-fade-in {\n' >> "$css"
     printf '  from { opacity: 0; transform: translateY(8px); }\n' >> "$css"
     printf '  to   { opacity: 1; transform: translateY(0); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@keyframes card-border-pulse {\n' >> "$css"
     printf '  0%%,100%% { box-shadow: 0 4px 24px rgba(0,0,0,0.35), 0 0  6px rgba(0,229,255,0.15); }\n' >> "$css"
     printf '  50%%      { box-shadow: 0 6px 32px rgba(0,0,0,0.45), 0 0 18px rgba(0,229,255,0.50); }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '/* === END KEYFRAMES_ALL === */\n' >> "$css"
     success "所有动画关键帧已注入（8种模式）"
 }
-
 _inject_brand_css() {
     local mode="$1" speed="$2" colors="$3" font="$4"
     local brand_anim use_filter bg_size first_color
@@ -881,7 +826,6 @@ _inject_brand_css() {
     esac
     local css="$ACTIVE_CSS"
     printf '\n/* === BRAND_ANIMATION mode=%s filter=%s === */\n' "$mode" "$use_filter" >> "$css"
-
     printf '%s {\n' "$SEL_BRAND" >> "$css"
     printf '  display: block !important; font-family: "%s", sans-serif !important;\n' "$font" >> "$css"
     printf '  text-decoration: none !important; text-align: center !important; cursor: default !important;\n' >> "$css"
@@ -898,7 +842,6 @@ _inject_brand_css() {
         printf '  padding-right: 4px !important;\n' >> "$css"
     fi
     printf '  animation: %s !important;\n}\n' "$brand_anim" >> "$css"
-
     printf '%s {\n' "$SEL_BRAND_LOGIN" >> "$css"
     printf '  font-weight: 400 !important; word-break: break-word !important;\n' >> "$css"
     printf '  font-family: "%s", sans-serif !important;\n' "$font" >> "$css"
@@ -915,8 +858,6 @@ _inject_brand_css() {
         printf '  padding-right: 4px !important;\n' >> "$css"
     fi
     printf '  animation: %s !important;\n}\n' "$brand_anim" >> "$css"
-
-    printf '/* 强制子元素透明，防止被全局字体覆盖 */\n' >> "$css"
     printf '%s *, %s * {\n' "$SEL_BRAND" "$SEL_BRAND_LOGIN" >> "$css"
     printf '  -webkit-text-fill-color: transparent !important;\n' >> "$css"
     printf '  color: transparent !important;\n' >> "$css"
@@ -924,11 +865,9 @@ _inject_brand_css() {
     printf '  -webkit-background-clip: text !important;\n' >> "$css"
     printf '  background-clip: text !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '/* === END BRAND_ANIMATION === */\n' >> "$css"
     success "Brand 动画注入完成 [模式${mode}: $GRAD_NAME | ${speed}s]"
 }
-
 step_switch_animation() {
     title "切换 Brand 动画模式"
     if ! grep -q "=== BRAND_ANIMATION" "$ACTIVE_CSS" 2>/dev/null; then
@@ -941,24 +880,29 @@ step_switch_animation() {
     local new_mode; new_mode=$(ask_num "选择新模式" 1 1 8)
     local new_speed; new_speed=$(ask_num "动画速度(秒)" 4 1 30)
     local cur_colors
-    cur_colors=$(grep "background: linear-gradient" "$ACTIVE_CSS" 2>/dev/null | \
-        head -1 | sed 's/.*linear-gradient([^,]*,\s*//;s/)\s*!important.*//' | tr -d ' ')
-    [ -z "$cur_colors" ] && cur_colors="${GRAD_COLORS:-#00e5ff,#2979ff,#aa00ff,#00e5ff}"
-    local cur_font
-    cur_font=$(grep 'font-family:' "$ACTIVE_CSS" 2>/dev/null | \
-        grep -v '@font-face' | head -1 | sed 's/.*font-family: "//;s/".*//')
-    [ -z "$cur_font" ] && cur_font="${FONT_NAME:-system-ui}"
-    GRAD_COLORS="$cur_colors"; FONT_NAME="$cur_font"; GRAD_NAME="(当前配色)"
+    cur_colors=$(grep "=== BRAND_ANIMATION" "$ACTIVE_CSS" 2>/dev/null | head -1)
+    cur_colors="${GRAD_COLORS:-#00e5ff,#2979ff,#aa00ff,#00e5ff}"
+    local cur_font="${FONT_NAME:-system-ui}"
+    GRAD_COLORS="$cur_colors"
+    FONT_NAME="$cur_font"
+    GRAD_NAME="(当前配色)"
     _remove_css_block "BRAND_ANIMATION"
     _inject_brand_css "$new_mode" "$new_speed" "$GRAD_COLORS" "$FONT_NAME"
     success "动画已切换为模式 ${new_mode}"
 }
-
+_calc_darken() {
+    local d="$1" factor="$2"
+    awk -v d="$d" -v f="$factor" 'BEGIN{
+        v = d * f
+        if (v > 1.0) v = 1.0
+        if (v < 0.0) v = 0.0
+        printf "%.2f\n", v
+    }'
+}
 step_glassmorphism() {
     title "步骤4：智能毛玻璃效果 v3.1 [$ACTIVE_THEME]"
     info "智能检测主题底色并适配: ${THEME_BASE_COLOR}"
     ask "是否启用毛玻璃效果" || return
-
     echo ""
     echo "  ${WHITE}压暗强度选择：${NC}"
     echo "  ${CYAN}1)${NC} 轻度 (0.55) → 背景图隐约可见，通透感强"
@@ -979,25 +923,24 @@ step_glassmorphism() {
         3) GLASS_BLUR="22" ;;
     esac
     info "压暗强度: ${GLASS_DARKEN} | 模糊: ${GLASS_BLUR}px"
-
     if grep -q "=== GLASSMORPHISM ===" "$ACTIVE_CSS" 2>/dev/null; then
         if ask "毛玻璃样式已存在，是否重新注入"; then
             _remove_css_block "GLASSMORPHISM"
         else info "跳过"; return; fi
     fi
-
     local css="$ACTIVE_CSS"
     local BL="$GLASS_BLUR" DK="$GLASS_DARKEN"
     local BR="$GLASS_BORDER" BGPATH="$THEME_BG_WEBPATH"
     local login_bg="${LOGIN_BG_WEBPATH:-$BGPATH}"
-
+    local DK_LIGHT DK_LIGHTER
+    DK_LIGHT=$(_calc_darken "$DK" "0.6")
+    DK_LIGHTER=$(_calc_darken "$DK" "0.35")
     printf '\n/* === GLASSMORPHISM theme=%s darken=%s blur=%s === */\n' \
         "$ACTIVE_THEME" "$DK" "$BL" >> "$css"
-
     printf ':root {\n' >> "$css"
     printf '  --glass-bg: rgba(0,0,0,%s);\n' "$DK" >> "$css"
-    printf '  --glass-bg-light: rgba(0,0,0,%s);\n' "$(awk -v d="$DK" 'BEGIN{printf "%.2f", d*0.6}')" >> "$css"
-    printf '  --glass-bg-lighter: rgba(0,0,0,%s);\n' "$(awk -v d="$DK" 'BEGIN{printf "%.2f", d*0.35}')" >> "$css"
+    printf '  --glass-bg-light: rgba(0,0,0,%s);\n' "$DK_LIGHT" >> "$css"
+    printf '  --glass-bg-lighter: rgba(0,0,0,%s);\n' "$DK_LIGHTER" >> "$css"
     printf '  --glass-border: %s;\n' "$BR" >> "$css"
     printf '  --glass-blur: %spx;\n' "$BL" >> "$css"
     printf '  --glass-radius: 12px;\n' >> "$css"
@@ -1006,23 +949,19 @@ step_glassmorphism() {
     printf '  --accent: #00d4aa;\n' >> "$css"
     printf '  --accent-hover: #00fff7;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'html, body {\n' >> "$css"
     printf "  background: url('%s') center center / cover fixed no-repeat !important;\n" "$BGPATH" >> "$css"
     printf '  background-color: #05080f !important;\n' >> "$css"
     printf '  min-height: 100vh !important;\n' >> "$css"
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-    
     printf 'body.login-page, body.login, .login-page, #login-page, .login-page body {\n' >> "$css"
     printf "  background: url('%s') center center / cover fixed no-repeat !important;\n" "$login_bg" >> "$css"
     printf '  background-color: #05080f !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.login-bg, #login-bg, .login-page::before, .login-page::after, body.login::before, body.login::after {\n' >> "$css"
     printf '  display: none !important; content: none !important; background: transparent !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #wrapper,\n' >> "$css"
     printf 'body #page-wrapper,\n' >> "$css"
     printf 'body #main,\n' >> "$css"
@@ -1043,26 +982,23 @@ step_glassmorphism() {
     printf '  background-color: transparent !important;\n' >> "$css"
     printf '  border-color: var(--glass-border) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s {\n' "$SEL_SIDEBAR" >> "$css"
     printf '  background: rgba(0,0,0,0.22) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.1) blur(var(--glass-blur)) saturate(160%%) !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: brightness(1.1) blur(var(--glass-blur)) saturate(160%%) !important;\n' >> "$css"
     printf '  border-right: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     local header_list="$SEL_HEADER, .bg-primary, .main-top, .header-bg, .navbar-inner, .navbar-default"
     local sh_arr="" sh_pseudo=""
     local old_ifs="$IFS"; IFS=','
     for s in $header_list; do
-        s=$(echo "$s" | awk '{$1=$1};1')
-        [ -n "$s" ] && sh_arr="$sh_arr body $s,"
-        [ -n "$s" ] && sh_pseudo="$sh_pseudo body $s::before, body $s::after,"
+        s=$(printf '%s' "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sh_arr="${sh_arr} body ${s},"
+        [ -n "$s" ] && sh_pseudo="${sh_pseudo} body ${s}::before, body ${s}::after,"
     done
     IFS="$old_ifs"
-    sh_arr=$(echo "$sh_arr" | sed 's/,$//')
-    sh_pseudo=$(echo "$sh_pseudo" | sed 's/,$//')
-
+    sh_arr=$(printf '%s' "$sh_arr" | sed 's/,$//')
+    sh_pseudo=$(printf '%s' "$sh_pseudo" | sed 's/,$//')
     printf '%s {\n' "$sh_arr" >> "$css"
     printf '  background: rgba(0,0,0,0.12) !important;\n' >> "$css"
     printf '  background-color: rgba(0,0,0,0.12) !important;\n' >> "$css"
@@ -1072,12 +1008,10 @@ step_glassmorphism() {
     printf '  border-bottom: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  box-shadow: 0 2px 16px rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s {\n' "$sh_pseudo" >> "$css"
     printf '  display: none !important; content: none !important; background: transparent !important;\n' >> "$css"
     printf '  background-image: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s,\n' "$SEL_CARD" >> "$css"
     printf '.cbi-section, .cbi-section-node, .cbi-map, fieldset,\n' >> "$css"
     printf '.panel, .card, .box, .well, .cbi-value, .cbi-section-descr,\n' >> "$css"
@@ -1094,7 +1028,6 @@ step_glassmorphism() {
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '  transition: box-shadow 0.3s ease, border-color 0.3s ease !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #maincontent .cbi-section,\n' >> "$css"
     printf 'body #maincontent .cbi-section-node,\n' >> "$css"
     printf 'body #maincontent .cbi-map,\n' >> "$css"
@@ -1144,7 +1077,6 @@ step_glassmorphism() {
     printf '  box-shadow: 0 4px 24px rgba(0,0,0,0.35) !important;\n' >> "$css"
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s:hover,\n' "$SEL_CARD" >> "$css"
     printf '.cbi-section:hover, .panel:hover, .card:hover,\n' >> "$css"
     printf '.box:hover, .well:hover, .cbi-value:hover,\n' >> "$css"
@@ -1154,7 +1086,6 @@ step_glassmorphism() {
     printf '  border-color: rgba(0,229,255,0.35) !important;\n' >> "$css"
     printf '  transition: box-shadow 0.3s ease, border-color 0.3s ease !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.cbi-map-title, .cbi-section-legend,\n' >> "$css"
     printf 'legend, .panel-heading, .panel-title,\n' >> "$css"
     printf '.page-header, .node-title,\n' >> "$css"
@@ -1171,7 +1102,6 @@ step_glassmorphism() {
     printf '  font-weight: 600 !important;\n' >> "$css"
     printf '  text-shadow: 0 1px 4px rgba(0,0,0,0.90) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #maincontent #tabmenu,\n' >> "$css"
     printf 'body #maincontent .container #tabmenu,\n' >> "$css"
     printf 'body #maincontent .nav-tabs,\n' >> "$css"
@@ -1222,7 +1152,6 @@ step_glassmorphism() {
     printf '  border-bottom-color: transparent !important;\n' >> "$css"
     printf '  box-shadow: 0 -2px 8px rgba(0,229,255,0.30) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'table, .table, .table-striped, .table-bordered, .cbi-section-table {\n' >> "$css"
     printf '  background: transparent !important;\n' >> "$css"
     printf '  border-color: var(--glass-border) !important;\n' >> "$css"
@@ -1298,7 +1227,6 @@ step_glassmorphism() {
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  text-shadow: -1px -1px 0 rgba(0,0,0,0.9), 1px -1px 0 rgba(0,0,0,0.9), -1px 1px 0 rgba(0,0,0,0.9), 1px 1px 0 rgba(0,0,0,0.9), 0 0 6px rgba(0,229,255,0.5) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #maincontent .table tbody tr.empty,\n' >> "$css"
     printf 'body #maincontent .table tbody tr.placeholder,\n' >> "$css"
     printf 'body #maincontent .cbi-section-table tbody tr.empty,\n' >> "$css"
@@ -1347,7 +1275,6 @@ step_glassmorphism() {
     printf '  border-color: var(--glass-border) !important;\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #maincontent .cbi-section-table-row,\n' >> "$css"
     printf 'body #maincontent .cbi-section-table-cell,\n' >> "$css"
     printf 'body #maincontent .cbi-value-field,\n' >> "$css"
@@ -1356,14 +1283,12 @@ step_glassmorphism() {
     printf '  border-color: var(--glass-border) !important;\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.cbi-section div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
     printf '.cbi-section-node div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
     printf '.panel div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]),\n' >> "$css"
     printf '.card div:not(.btn):not(.badge):not(.label):not(.zonebadge):not(.ifacebadge):not(.progress-bar):not(.progress):not([class*="btn-"]) {\n' >> "$css"
     printf '  background-color: transparent !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.chart-container, .chart-wrapper,\n' >> "$css"
     printf '[id*="chart"], [class*="chart"],\n' >> "$css"
     printf '[class*="traffic"], [id*="traffic"],\n' >> "$css"
@@ -1377,7 +1302,6 @@ step_glassmorphism() {
     printf '  background: rgba(0,0,0,0.15) !important;\n' >> "$css"
     printf '  border-radius: 8px !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #maincontent input[type="text"],\n' >> "$css"
     printf 'body #maincontent input[type="password"],\n' >> "$css"
     printf 'body #maincontent input[type="number"],\n' >> "$css"
@@ -1412,7 +1336,6 @@ step_glassmorphism() {
     printf '    inset 0 1px 3px rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  outline: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'input[type="checkbox"], input[type="radio"] {\n' >> "$css"
     printf '  accent-color: var(--accent) !important;\n' >> "$css"
     printf '  width: 16px !important;\n' >> "$css"
@@ -1433,7 +1356,6 @@ step_glassmorphism() {
     printf '  outline: 1.5px solid rgba(0,212,170,0.80) !important;\n' >> "$css"
     printf '  filter: brightness(1.5) drop-shadow(0 0 4px rgba(0,212,170,0.8)) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'body #mainmenu .nav-item.active > a,\n' >> "$css"
     printf 'body .main-left .nav-item.active > a,\n' >> "$css"
     printf 'body .sidenav-menu .nav-item.active > a,\n' >> "$css"
@@ -1471,17 +1393,15 @@ step_glassmorphism() {
     printf '  border-bottom: none !important;\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     local login_list="$SEL_LOGIN, .login-container, .login-box, .login-wrapper, .login-form"
     local sl_arr=""
-    local old_ifs="$IFS"; IFS=','
+    local old_ifs2="$IFS"; IFS=','
     for s in $login_list; do
-        s=$(echo "$s" | awk '{$1=$1};1')
-        [ -n "$s" ] && sl_arr="$sl_arr body $s,"
+        s=$(printf '%s' "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sl_arr="${sl_arr} body ${s},"
     done
-    IFS="$old_ifs"
-    sl_arr=$(echo "$sl_arr" | sed 's/,$//')
-
+    IFS="$old_ifs2"
+    sl_arr=$(printf '%s' "$sl_arr" | sed 's/,$//')
     printf '%s {\n' "$sl_arr" >> "$css"
     printf '  background: rgba(0,0,0,0.22) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.15) blur(12px) saturate(160%%) !important;\n' >> "$css"
@@ -1490,7 +1410,6 @@ step_glassmorphism() {
     printf '  border-radius: 18px !important;\n' >> "$css"
     printf '  box-shadow: 0 8px 40px rgba(0,0,0,0.50) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s .cbi-button-apply,\n' "$SEL_LOGIN" >> "$css"
     printf '%s input[type="submit"],\n' "$SEL_LOGIN" >> "$css"
     printf '%s button[type="submit"] {\n' "$SEL_LOGIN" >> "$css"
@@ -1513,7 +1432,6 @@ step_glassmorphism() {
     printf '  box-shadow: 0 0 0 2px rgba(0,229,255,0.30),\n' >> "$css"
     printf '              0 4px 20px rgba(0,180,160,0.40) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.modal-content, .modal-dialog, .modal .card,\n' >> "$css"
     printf '[role="dialog"], [role="dialog"] .card,\n' >> "$css"
     printf '.dialog, .popup, .luci-popup, .cbi-modal, .cbi-popup {\n' >> "$css"
@@ -1534,7 +1452,6 @@ step_glassmorphism() {
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '}\n' >> "$css"
     printf '.modal-backdrop { background: rgba(0,0,0,0.65) !important; }\n' >> "$css"
-
     printf '.alert, .notice, .cbi-map-descr, .warning,\n' >> "$css"
     printf '.alert-info, .alert-success, .alert-warning, .alert-danger {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.30) !important;\n' >> "$css"
@@ -1546,7 +1463,6 @@ step_glassmorphism() {
     printf '.alert-success { border-left: 4px solid #2ecc71 !important; }\n' >> "$css"
     printf '.alert-warning { border-left: 4px solid #f1c40f !important; }\n' >> "$css"
     printf '.alert-danger  { border-left: 4px solid #e74c3c !important; }\n' >> "$css"
-
     printf 'button, .btn, .cbi-button,\n' >> "$css"
     printf 'input[type="button"], input[type="submit"],\n' >> "$css"
     printf 'input[type="reset"], .cbi-button-action,\n' >> "$css"
@@ -1566,7 +1482,6 @@ step_glassmorphism() {
     printf '  border-color: rgba(0,229,255,0.60) !important;\n' >> "$css"
     printf '  box-shadow: 0 0 12px rgba(0,229,255,0.25) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.badge, .label, .tag,\n' >> "$css"
     printf '.zonebadge, .ifacebadge, .ifacebox-head {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.45) !important;\n' >> "$css"
@@ -1574,7 +1489,6 @@ step_glassmorphism() {
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '  text-shadow: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.progress, .progress-bar, .cbi-progressbar {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  border-radius: 999px !important;\n' >> "$css"
@@ -1584,7 +1498,6 @@ step_glassmorphism() {
     printf '  background: linear-gradient(90deg, #00d4aa, #2979ff) !important;\n' >> "$css"
     printf '  box-shadow: 0 0 8px rgba(0,212,170,0.50) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '::-webkit-scrollbar { width: 6px; height: 6px; }\n' >> "$css"
     printf '::-webkit-scrollbar-track {\n' >> "$css"
     printf '  background: rgba(0,0,0,0.20);\n' >> "$css"
@@ -1597,7 +1510,6 @@ step_glassmorphism() {
     printf '::-webkit-scrollbar-thumb:hover {\n' >> "$css"
     printf '  background: rgba(0,229,255,0.70);\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '@media (max-width: 768px) {\n' >> "$css"
     printf '  html, body {\n' >> "$css"
     printf '    background-attachment: scroll !important;\n' >> "$css"
@@ -1616,11 +1528,9 @@ step_glassmorphism() {
     printf '    border-radius: 14px !important;\n' >> "$css"
     printf '  }\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '/* === END GLASSMORPHISM === */\n' >> "$css"
     success "毛玻璃注入完成 v3.1（智能底色/全面穿透/表格修复）"
 }
-
 step_text() {
     title "步骤5：文字发光与可读性强化 v3.1 [$ACTIVE_THEME]"
     echo ""
@@ -1632,13 +1542,11 @@ step_text() {
     echo "  ${CYAN}5)${NC} 跳过"
     local glow_choice; glow_choice=$(ask_num "请选择" 4 1 5)
     [ "$glow_choice" = "5" ] && { info "跳过文字优化"; return; }
-
     if grep -q "=== TEXT_COLOR ===" "$ACTIVE_CSS" 2>/dev/null; then
         if ask "文字样式已存在，是否重新注入"; then
             _remove_css_block "TEXT_COLOR"
         else info "跳过"; return; fi
     fi
-
     local css="$ACTIVE_CSS"
     local glow_rule=""
     case "$glow_choice" in
@@ -1647,11 +1555,8 @@ step_text() {
         3) glow_rule="text-shadow: 0 0 6px rgba(0,229,255,0.9), 0 0 12px rgba(0,229,255,0.7), 0 0 20px rgba(0,229,255,0.5), 0 1px 3px rgba(0,0,0,0.95) !important;" ;;
         4) glow_rule="text-shadow: -1px -1px 0 rgba(0,0,0,0.9), 1px -1px 0 rgba(0,0,0,0.9), -1px 1px 0 rgba(0,0,0,0.9), 1px 1px 0 rgba(0,0,0,0.9), 0 0 6px rgba(0,229,255,0.8), 0 0 14px rgba(0,229,255,0.5), 0 0 22px rgba(0,229,255,0.3) !important;" ;;
     esac
-
     printf '\n/* === TEXT_COLOR theme=%s glow=%s === */\n' "$ACTIVE_THEME" "$glow_choice" >> "$css"
-
     printf '*, *::before, *::after { color: #ffffff !important; }\n' >> "$css"
-
     printf 'body, p, li, span, label, div,\n' >> "$css"
     printf 'h1, h2, h3, h4, h5, h6,\n' >> "$css"
     printf '.cbi-value-title, .cbi-value-field,\n' >> "$css"
@@ -1663,14 +1568,12 @@ step_text() {
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf 'h1, h2, h3, h4, h5, h6, legend,\n' >> "$css"
     printf '.cbi-map-title, .cbi-section-legend, .panel-title {\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '  font-weight: 700 !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.cbi-section-legend, .cbi-section-legend *,\n' >> "$css"
     printf '.cbi-map-title, .cbi-map-title *,\n' >> "$css"
     printf 'legend *, .panel-heading, .panel-heading *,\n' >> "$css"
@@ -1678,24 +1581,20 @@ step_text() {
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf '.text-muted, small, .help-block, .cbi-map-descr p,\n' >> "$css"
     printf '.cbi-value-description, .description {\n' >> "$css"
     printf '  color: rgba(255,255,255,0.92) !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s a, %s span, %s li, %s * {\n' \
         "$SEL_SIDEBAR" "$SEL_SIDEBAR" "$SEL_SIDEBAR" "$SEL_SIDEBAR" >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf '%s * {\n' "$SEL_HEADER" >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf 'a, a:link, a:visited, .table a, td a, th a {\n' >> "$css"
     printf '  color: #7ecfff !important;\n' >> "$css"
     printf '  transition: color 0.2s ease !important;\n' >> "$css"
@@ -1705,12 +1604,10 @@ step_text() {
     printf '  color: #00fff7 !important;\n' >> "$css"
     printf '  text-shadow: 0 0 8px rgba(0,255,247,0.90), 0 0 16px rgba(0,255,247,0.60) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'input, select, textarea, .form-control {\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  text-shadow: 0 1px 2px rgba(0,0,0,0.80) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf 'input::placeholder, textarea::placeholder {\n' >> "$css"
     printf '  color: rgba(255,255,255,0.65) !important;\n' >> "$css"
     printf '  opacity: 1 !important;\n' >> "$css"
@@ -1718,33 +1615,26 @@ step_text() {
     printf '}\n' >> "$css"
     printf '::-webkit-input-placeholder { color: rgba(255,255,255,0.65) !important; }\n' >> "$css"
     printf '::-moz-placeholder           { color: rgba(255,255,255,0.65) !important; }\n' >> "$css"
-
     printf '.modal-content *, [role="dialog"] *,\n' >> "$css"
     printf '.cbi-modal *, .cbi-popup *, .dialog *, .popup * {\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  %s\n' "$glow_rule" >> "$css"
     printf '}\n' >> "$css"
-
     printf 'button:not([class*="btn-primary"]):not([class*="btn-danger"]):not([class*="btn-success"]),\n' >> "$css"
     printf '.cbi-button, .cbi-button-action {\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  text-shadow: 0 1px 3px rgba(0,0,0,0.90) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-
     printf '.badge, .label, .tag { text-shadow: none !important; }\n' >> "$css"
-
     if grep -q "=== BRAND_ANIMATION" "$ACTIVE_CSS" 2>/dev/null; then
-        printf '\n  /* 防止全局文字颜色覆盖 Brand 的透明渐变 */\n' >> "$css"
-        printf '  %s, %s *, %s, %s * {\n' "$SEL_BRAND" "$SEL_BRAND" "$SEL_BRAND_LOGIN" "$SEL_BRAND_LOGIN" >> "$css"
-        printf '    color: transparent !important;\n' >> "$css"
-        printf '    -webkit-text-fill-color: transparent !important;\n' >> "$css"
-        printf '  }\n' >> "$css"
+        printf '%s, %s *, %s, %s * {\n' "$SEL_BRAND" "$SEL_BRAND" "$SEL_BRAND_LOGIN" "$SEL_BRAND_LOGIN" >> "$css"
+        printf '  color: transparent !important;\n' >> "$css"
+        printf '  -webkit-text-fill-color: transparent !important;\n' >> "$css"
+        printf '}\n' >> "$css"
     fi
-
     printf '/* === END TEXT_COLOR === */\n' >> "$css"
     success "文字发光注入完成 v3.1（强度等级${glow_choice}）"
 }
-
 step_login_position() {
     title "步骤6：登录框位置 [$ACTIVE_THEME]"
     echo "  ${CYAN}1)${NC} 居中（默认，跳过）"; echo "  ${CYAN}2)${NC} 偏左  5%"
@@ -1776,23 +1666,20 @@ step_login_position() {
     printf '  align-items: center !important;\n' >> "$css"
     printf '  %s !important;\n' "$padding" >> "$css"
     printf '}\n' >> "$css"
-    
     local login_list="$SEL_LOGIN, .login-container, .login-box, .login-wrapper, .login-form"
     local sl_arr=""
     local old_ifs="$IFS"; IFS=','
     for s in $login_list; do
-        s=$(echo "$s" | awk '{$1=$1};1')
-        [ -n "$s" ] && sl_arr="$sl_arr body $s,"
+        s=$(printf '%s' "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sl_arr="${sl_arr} body ${s},"
     done
     IFS="$old_ifs"
-    sl_arr=$(echo "$sl_arr" | sed 's/,$//')
-
+    sl_arr=$(printf '%s' "$sl_arr" | sed 's/,$//')
     printf '%s {\n  margin: 0 !important; transform: none !important;\n' "$sl_arr" >> "$css"
     printf '  position: relative !important;\n}\n' >> "$css"
     printf '/* === END LOGIN_POSITION === */\n' >> "$css"
     success "登录框位置已设置 (${justify})"
 }
-
 step_clean() {
     title "步骤7：清理页面元素 [$ACTIVE_THEME]"
     [ -n "$SYSAUTH" ] && ask "删除登录页 SVG 图标" && {
@@ -1810,12 +1697,10 @@ step_clean() {
         success "header.htm 橙色 class 已移除"
     }
 }
-
 step_extra_effects() {
     title "步骤8：额外特效 [$ACTIVE_THEME]"
     echo ""
     echo "  ${WHITE}可选特效（可多选，逐一确认）：${NC}"
-
     if ask "启用扫描线效果（细微横纹，赛博朋克感）"; then
         _remove_css_block "SCANLINE"
         local css="$ACTIVE_CSS"
@@ -1838,61 +1723,56 @@ step_extra_effects() {
         printf '/* === END SCANLINE === */\n' >> "$css"
         success "扫描线效果已注入"
     fi
-
     if ask "启用卡片粒子感发光边框（悬停时渐变边框动画）"; then
         _remove_css_block "GLOW_BORDER"
-        local css="$ACTIVE_CSS"
-        printf '\n/* === GLOW_BORDER theme=%s === */\n' "$ACTIVE_THEME" >> "$css"
-        if ! grep -q "border-glow-rotate" "$css" 2>/dev/null; then
-            printf '@keyframes border-glow-rotate {\n' >> "$css"
-            printf '  0%%   { border-color: rgba(0,229,255,0.50); box-shadow: 0 0  8px rgba(0,229,255,0.20); }\n' >> "$css"
-            printf '  25%%  { border-color: rgba(168,85,247,0.50); box-shadow: 0 0 14px rgba(168,85,247,0.30); }\n' >> "$css"
-            printf '  50%%  { border-color: rgba(236,72,153,0.50); box-shadow: 0 0  8px rgba(236,72,153,0.20); }\n' >> "$css"
-            printf '  75%%  { border-color: rgba(41,121,255,0.50); box-shadow: 0 0 14px rgba(41,121,255,0.30); }\n' >> "$css"
-            printf '  100%% { border-color: rgba(0,229,255,0.50); box-shadow: 0 0  8px rgba(0,229,255,0.20); }\n' >> "$css"
-            printf '}\n' >> "$css"
+        local css2="$ACTIVE_CSS"
+        printf '\n/* === GLOW_BORDER theme=%s === */\n' "$ACTIVE_THEME" >> "$css2"
+        if ! grep -q "border-glow-rotate" "$css2" 2>/dev/null; then
+            printf '@keyframes border-glow-rotate {\n' >> "$css2"
+            printf '  0%%   { border-color: rgba(0,229,255,0.50); box-shadow: 0 0  8px rgba(0,229,255,0.20); }\n' >> "$css2"
+            printf '  25%%  { border-color: rgba(168,85,247,0.50); box-shadow: 0 0 14px rgba(168,85,247,0.30); }\n' >> "$css2"
+            printf '  50%%  { border-color: rgba(236,72,153,0.50); box-shadow: 0 0  8px rgba(236,72,153,0.20); }\n' >> "$css2"
+            printf '  75%%  { border-color: rgba(41,121,255,0.50); box-shadow: 0 0 14px rgba(41,121,255,0.30); }\n' >> "$css2"
+            printf '  100%% { border-color: rgba(0,229,255,0.50); box-shadow: 0 0  8px rgba(0,229,255,0.20); }\n' >> "$css2"
+            printf '}\n' >> "$css2"
         fi
-        printf '%s:hover, .cbi-section:hover, .panel:hover, .card:hover, .box:hover {\n' "$SEL_CARD" >> "$css"
-        printf '  animation: border-glow-rotate 3s linear infinite !important;\n' >> "$css"
-        printf '}\n' >> "$css"
-        printf '/* === END GLOW_BORDER === */\n' >> "$css"
+        printf '%s:hover, .cbi-section:hover, .panel:hover, .card:hover, .box:hover {\n' "$SEL_CARD" >> "$css2"
+        printf '  animation: border-glow-rotate 3s linear infinite !important;\n' >> "$css2"
+        printf '}\n' >> "$css2"
+        printf '/* === END GLOW_BORDER === */\n' >> "$css2"
         success "粒子发光边框已注入"
     fi
-
     if ask "启用页面元素淡入动画（每次加载时卡片从下方淡入）"; then
         _remove_css_block "FADE_IN"
-        local css="$ACTIVE_CSS"
-        printf '\n/* === FADE_IN theme=%s === */\n' "$ACTIVE_THEME" >> "$css"
-        printf '%s li {\n' "$SEL_SIDEBAR" >> "$css"
-        printf '  animation: page-fade-in 0.35s ease both;\n' >> "$css"
-        printf '}\n' >> "$css"
-        printf '%s li:nth-child(1)  { animation-delay: 0.00s; }\n' "$SEL_SIDEBAR" >> "$css"
-        printf '%s li:nth-child(2)  { animation-delay: 0.04s; }\n' "$SEL_SIDEBAR" >> "$css"
-        printf '%s li:nth-child(3)  { animation-delay: 0.08s; }\n' "$SEL_SIDEBAR" >> "$css"
-        printf '%s li:nth-child(4)  { animation-delay: 0.12s; }\n' "$SEL_SIDEBAR" >> "$css"
-        printf '%s li:nth-child(n+5){ animation-delay: 0.16s; }\n' "$SEL_SIDEBAR" >> "$css"
-        printf '/* === END FADE_IN === */\n' >> "$css"
+        local css3="$ACTIVE_CSS"
+        printf '\n/* === FADE_IN theme=%s === */\n' "$ACTIVE_THEME" >> "$css3"
+        printf '%s li {\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '  animation: page-fade-in 0.35s ease both;\n' >> "$css3"
+        printf '}\n' >> "$css3"
+        printf '%s li:nth-child(1)  { animation-delay: 0.00s; }\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '%s li:nth-child(2)  { animation-delay: 0.04s; }\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '%s li:nth-child(3)  { animation-delay: 0.08s; }\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '%s li:nth-child(4)  { animation-delay: 0.12s; }\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '%s li:nth-child(n+5){ animation-delay: 0.16s; }\n' "$SEL_SIDEBAR" >> "$css3"
+        printf '/* === END FADE_IN === */\n' >> "$css3"
         success "淡入动画已注入"
     fi
-
     if ask "启用顶部彩虹装饰线（header顶部细彩线）"; then
         _remove_css_block "TOP_LINE"
-        local css="$ACTIVE_CSS"
-        printf '\n/* === TOP_LINE theme=%s === */\n' "$ACTIVE_THEME" >> "$css"
-        printf '%s {\n' "$SEL_HEADER" >> "$css"
-        printf '  border-top: 2px solid transparent !important;\n' >> "$css"
-        printf '  border-image: linear-gradient(\n' >> "$css"
-        printf '    90deg,\n' >> "$css"
-        printf '    #00e5ff, #2979ff, #aa00ff, #ec4899, #ff6b35, #00e5ff\n' >> "$css"
-        printf '  ) 1 !important;\n' >> "$css"
-        printf '}\n' >> "$css"
-        printf '/* === END TOP_LINE === */\n' >> "$css"
+        local css4="$ACTIVE_CSS"
+        printf '\n/* === TOP_LINE theme=%s === */\n' "$ACTIVE_THEME" >> "$css4"
+        printf '%s {\n' "$SEL_HEADER" >> "$css4"
+        printf '  border-top: 2px solid transparent !important;\n' >> "$css4"
+        printf '  border-image: linear-gradient(\n' >> "$css4"
+        printf '    90deg,\n' >> "$css4"
+        printf '    #00e5ff, #2979ff, #aa00ff, #ec4899, #ff6b35, #00e5ff\n' >> "$css4"
+        printf '  ) 1 !important;\n' >> "$css4"
+        printf '}\n' >> "$css4"
+        printf '/* === END TOP_LINE === */\n' >> "$css4"
         success "顶部彩虹装饰线已注入"
     fi
-
     success "额外特效配置完成"
 }
-
 do_backup() {
     local ts; ts=$(date '+%Y%m%d_%H%M%S' 2>/dev/null || echo "bak")
     if [ ! -f "${ACTIVE_CSS}.bak" ]; then
@@ -1905,7 +1785,6 @@ do_backup() {
     [ -n "$SYSAUTH" ] && [ ! -f "${SYSAUTH}.bak" ] && \
         cp "$SYSAUTH" "${SYSAUTH}.bak" && success "sysauth 已备份"
 }
-
 do_restore() {
     title "恢复备份 [$ACTIVE_THEME]"
     info "可用备份文件："
@@ -1943,13 +1822,11 @@ do_restore() {
     rm -rf /tmp/luci-* 2>/dev/null && success "LuCI 缓存已清除"
     info "请在浏览器按 Ctrl+Shift+R 强制刷新"
 }
-
 show_status() {
     title "当前美化状态 [$ACTIVE_THEME]"
     local css="$ACTIVE_CSS"
     printf "  ${WHITE}%-30s %s${NC}\n" "功能" "状态"
     printf "  %s\n" "------------------------------------------------------"
-
     _stat() {
         local label="$1" tag="$2" extra="$3"
         if grep -q "$tag" "$css" 2>/dev/null; then
@@ -1958,7 +1835,6 @@ show_status() {
             printf "  %-30s ${YELLOW}%s${NC}\n" "$label" "未启用"
         fi
     }
-
     if grep -q "GLASSMORPHISM" "$css" 2>/dev/null; then
         local dk; dk=$(grep "GLASSMORPHISM theme=" "$css" 2>/dev/null | head -1 | \
             sed 's/.*darken=//;s/ .*//' | tr -d '*/')
@@ -1966,9 +1842,7 @@ show_status() {
     else
         printf "  %-30s ${YELLOW}%s${NC}\n" "智能毛玻璃 v3.1" "未启用"
     fi
-
     _stat "动画关键帧" "KEYFRAMES_ALL" ""
-
     if grep -q "BRAND_ANIMATION" "$css" 2>/dev/null; then
         local md; md=$(grep "BRAND_ANIMATION mode=" "$css" 2>/dev/null | head -1 | \
             sed 's/.*mode=//;s/ .*//' | tr -d '*/')
@@ -1976,7 +1850,6 @@ show_status() {
     else
         printf "  %-30s ${YELLOW}%s${NC}\n" "Brand动画" "未启用"
     fi
-
     if grep -q "FONT_FACE" "$css" 2>/dev/null; then
         local fn; fn=$(grep "FONT_FACE_" "$css" 2>/dev/null | head -1 | \
             sed 's/.*FONT_FACE_//;s/ ==.*//')
@@ -1984,14 +1857,12 @@ show_status() {
     else
         printf "  %-30s ${WHITE}%s${NC}\n" "字体" "系统默认"
     fi
-
     _stat "文字发光强化 v3.1" "TEXT_COLOR" ""
     _stat "登录框位置" "LOGIN_POSITION" ""
     _stat "扫描线特效" "SCANLINE" ""
     _stat "粒子发光边框" "GLOW_BORDER" ""
     _stat "淡入动画" "FADE_IN" ""
     _stat "顶部彩虹线" "TOP_LINE" ""
-
     echo ""
     [ -f "$ACTIVE_BG" ] && info "背景图: 存在 ($(du -sh "$ACTIVE_BG" | cut -f1))" || \
         warn "背景图: 未找到 ($ACTIVE_BG)"
@@ -1999,11 +1870,10 @@ show_status() {
     info "主题底色识别: $THEME_BASE_COLOR"
     echo ""; info "可用备份:"
     [ -f "${ACTIVE_CSS}.bak" ] && printf "    %s\n" "${ACTIVE_CSS}.bak"
+    local f
     for f in "${ACTIVE_CSS}".20*; do [ -f "$f" ] && printf "    %s\n" "$f"; done
 }
-
 do_flush() { rm -rf /tmp/luci-* 2>/dev/null; success "LuCI 缓存已清除"; }
-
 main_menu() {
     while true; do
         echo ""
@@ -2013,7 +1883,7 @@ main_menu() {
         echo "${CYAN}+============================================================+${NC}"
         echo "${CYAN}|${NC}  ${WHITE}1) [全程] 一键智能全流程美化 (推荐新手)${NC}                  ${CYAN}|${NC}"
         echo "${CYAN}|${NC}  ${WHITE}2) [状态] 查看当前美化状态${NC}                                 ${CYAN}|${NC}"
-        echo "${CYAN}|${NC}  ${WHITE}0) [检测] 联网检测所有内置URL可用性${NC}                        ${CYAN}|${NC}"
+        echo "${CYAN}|${NC}  ${WHITE}c) [检测] 联网检测所有内置URL可用性${NC}                        ${CYAN}|${NC}"
         echo "${CYAN}|${NC}  ${WHITE}T) [主题] 切换目标主题${NC}                                     ${CYAN}|${NC}"
         echo "${CYAN}+------------------------------------------------------------+${NC}"
         echo "${CYAN}|${NC}  ${WHITE}3) [背景] 下载/更换背景图${NC}                                  ${CYAN}|${NC}"
@@ -2052,8 +1922,16 @@ main_menu() {
                 echo "${GREEN}+----------------------------------------------+${NC}"
                 ;;
             2)  show_status ;;
-            0)  step_check_urls ;;
-            T|t) detect_themes; detect_paths; do_backup ;;
+            c|C) step_check_urls ;;
+            T|t)
+                detect_themes
+                detect_paths
+                local ts2; ts2=$(date '+%Y%m%d_%H%M%S' 2>/dev/null || echo "bak")
+                [ ! -f "${ACTIVE_CSS}.bak" ] && cp "$ACTIVE_CSS" "${ACTIVE_CSS}.bak" && \
+                    success "原始备份: ${ACTIVE_CSS}.bak"
+                cp "$ACTIVE_CSS" "${ACTIVE_CSS}.${ts2}" 2>/dev/null && \
+                    success "时间戳备份: ${ACTIVE_CSS}.${ts2}"
+                ;;
             3)  step_download_image;   do_flush ;;
             4)  step_login_background; do_flush ;;
             5)  step_download_font;    do_flush ;;
@@ -2062,16 +1940,15 @@ main_menu() {
             8)  step_glassmorphism;    do_flush ;;
             9)  step_text;             do_flush ;;
             0)  step_login_position;   do_flush ;;
-            a)  step_clean;            do_flush ;;
-            e)  step_extra_effects;    do_flush ;;
-            r)  do_restore ;;
-            f)  do_flush ;;
-            q)  echo "${GREEN}  再见！${NC}"; exit 0 ;;
+            a|A) step_clean;           do_flush ;;
+            e|E) step_extra_effects;   do_flush ;;
+            r|R) do_restore ;;
+            f|F) do_flush ;;
+            q|Q) echo "${GREEN}  再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
     done
 }
-
 printf "${CYAN}"
 printf '  +====================================================+\n'
 printf '  |   LuCI Theme Beauty Tool  v3.1                   |\n'
@@ -2079,7 +1956,6 @@ printf '  |   智能底色检测 / 全面元素适配 / 文字发光描边     |
 printf '  |   修复：白底面板 / 表格斑马纹 / 标题条 / 输入框  |\n'
 printf '  +====================================================+\n'
 printf "${NC}\n"
-
 detect_themes
 detect_paths
 do_backup
