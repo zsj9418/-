@@ -134,6 +134,30 @@ BG_OVERLAY="0.45"
 LOGIN_BG=""
 LOGIN_BG_WEBPATH=""
 
+_detect_bg_file() {
+    local dir="$1"
+    local f
+    for f in bg.webp bg.jpg bg.png bg1.webp bg1.jpg bg1.png background.webp background.jpg background.png; do
+        [ -f "${dir}/${f}" ] && { printf '%s\n' "${dir}/${f}"; return; }
+    done
+    printf '%s\n' "${dir}/bg1.jpg"
+}
+
+_set_theme_bg() {
+    ACTIVE_BG=$(_detect_bg_file "$ACTIVE_IMG_DIR")
+    THEME_BG_WEBPATH=$(printf '%s' "$ACTIVE_BG" | sed 's|^/www||')
+    
+    local login_ext="jpg"
+    [ -f "${ACTIVE_IMG_DIR}/login-bg.webp" ] && login_ext="webp"
+    if [ -f "${ACTIVE_IMG_DIR}/login-bg.${login_ext}" ]; then
+        LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.${login_ext}"
+        LOGIN_BG_WEBPATH=$(printf '%s' "$LOGIN_BG" | sed 's|^/www||')
+    else
+        LOGIN_BG="$ACTIVE_BG"
+        LOGIN_BG_WEBPATH="$THEME_BG_WEBPATH"
+    fi
+}
+
 _load_theme_vars() {
     local t="$1"
     case "$t" in
@@ -141,8 +165,6 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/argon/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/argon/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/argon/img"
-            ACTIVE_BG="/www/luci-static/argon/img/bg1.jpg"
-            THEME_BG_WEBPATH="/luci-static/argon/img/bg1.jpg"
             SEL_SIDEBAR=".main-left, #menu, aside.main-sidebar"
             SEL_HEADER="header, .sidenav-header, .bg-primary, .navbar, .main-header"
             SEL_CARD=".cbi-section, .cbi-section-node, .cbi-map, fieldset, .panel, .card, .box, .cbi-value, .cbi-section-descr, .cbi-tabcontainer"
@@ -155,8 +177,6 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/material/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/material/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/material/img"
-            ACTIVE_BG="/www/luci-static/material/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/material/img/bg.jpg"
             SEL_SIDEBAR="#mainmenu, .navigation, .sidebar"
             SEL_HEADER="#header, .header, .topbar"
             SEL_CARD=".cbi-section, .card, .panel, fieldset, .cbi-value, .cbi-section-node, .cbi-map"
@@ -169,13 +189,11 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/bootstrap/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/bootstrap/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/bootstrap/img"
-            ACTIVE_BG="/www/luci-static/bootstrap/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/bootstrap/img/bg.jpg"
             SEL_SIDEBAR=".navbar-default, .sidebar, #sidebar"
             SEL_HEADER=".navbar, .navbar-header, .page-header"
             SEL_CARD=".cbi-section, .panel, .card, .well, fieldset, .cbi-value, .cbi-section-node"
             SEL_CONTENT="#maincontent, .container-fluid, .main"
-            SEL_LOGIN=".container .row, .login-wrapper"
+            SEL_LOGIN=".login-wrapper"
             SEL_BRAND=".navbar-brand, .brand"
             SEL_BRAND_LOGIN=".login h1, .login-title"
             ;;
@@ -183,8 +201,6 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/${t}/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/${t}/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/${t}/img"
-            ACTIVE_BG="/www/luci-static/${t}/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/${t}/img/bg.jpg"
             SEL_SIDEBAR="#menu, aside, .sidenav"
             SEL_HEADER="#header, header, .topbar"
             SEL_CARD=".cbi-section, .panel, fieldset, .box, .cbi-value, .cbi-section-node, .cbi-map"
@@ -197,8 +213,6 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/edge/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/edge/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/edge/img"
-            ACTIVE_BG="/www/luci-static/edge/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/edge/img/bg.jpg"
             SEL_SIDEBAR=".main-sidebar, .sidebar, #sidebar"
             SEL_HEADER=".main-header, header, .top-bar"
             SEL_CARD=".cbi-section, .box, .panel, fieldset, .cbi-value, .cbi-section-node, .cbi-map"
@@ -211,13 +225,11 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/${t}/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/${t}/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/${t}/img"
-            ACTIVE_BG="/www/luci-static/${t}/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/${t}/img/bg.jpg"
             SEL_SIDEBAR="aside, nav, #menu, .sidebar, .sidenav, .main-left"
             SEL_HEADER="header, .navbar, #header, .topbar, .main-header"
             SEL_CARD=".cbi-section, .panel, .card, fieldset, .box, .cbi-value, .cbi-section-node, .cbi-map"
             SEL_CONTENT="#maincontent, main, .main, .content, .main-right"
-            SEL_LOGIN=".login, .login-container, #login, .login-box"
+            SEL_LOGIN=".login-container, .login-box"
             SEL_BRAND=".brand, .logo-text, .navbar-brand"
             SEL_BRAND_LOGIN=".login .brand, .login h1, .login-title"
             ;;
@@ -225,8 +237,6 @@ _load_theme_vars() {
             ACTIVE_CSS="/www/luci-static/${t}/css/cascade.css"
             ACTIVE_FONTS_DIR="/www/luci-static/${t}/fonts"
             ACTIVE_IMG_DIR="/www/luci-static/${t}/img"
-            ACTIVE_BG="/www/luci-static/${t}/img/bg.jpg"
-            THEME_BG_WEBPATH="/luci-static/${t}/img/bg.jpg"
             SEL_SIDEBAR="aside, nav, #menu, .sidebar, .sidenav"
             SEL_HEADER="header, .navbar, #header, .topbar"
             SEL_CARD=".cbi-section, .panel, .card, fieldset, .box, .cbi-value, .cbi-section-node, .cbi-map"
@@ -236,6 +246,7 @@ _load_theme_vars() {
             SEL_BRAND_LOGIN=".login .brand, .login h1, .login-title"
             ;;
     esac
+    _set_theme_bg
     mkdir -p "$ACTIVE_FONTS_DIR" "$ACTIVE_IMG_DIR" 2>/dev/null
     if [ ! -f "$ACTIVE_CSS" ]; then
         error "主题 CSS 不存在: $ACTIVE_CSS"; exit 1
@@ -561,11 +572,14 @@ step_login_background() {
     echo "  ${CYAN}3)${NC} [跳]  保持当前登录背景不变"
     local login_choice; login_choice=$(ask_num "请选择" 1 1 3)
 
-    LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.jpg"
-    LOGIN_BG_WEBPATH="/luci-static/${ACTIVE_THEME}/img/login-bg.jpg"
+    local login_ext="jpg"
+    [ -f "${ACTIVE_IMG_DIR}/bg.webp" ] && login_ext="webp"
+    LOGIN_BG="${ACTIVE_IMG_DIR}/login-bg.${login_ext}"
+    LOGIN_BG_WEBPATH="/luci-static/${ACTIVE_THEME}/img/login-bg.${login_ext}"
 
     case "$login_choice" in
         1)
+            rm -f "${ACTIVE_IMG_DIR}/login-bg.jpg" "${ACTIVE_IMG_DIR}/login-bg.webp" 2>/dev/null
             LOGIN_BG="$ACTIVE_BG"
             LOGIN_BG_WEBPATH="$THEME_BG_WEBPATH"
             info "登录页将与主界面共用背景图"
@@ -755,7 +769,7 @@ step_brand_animation() {
 
     local anim_speed; anim_speed=$(ask_num "动画速度(秒，越小越快)" 4 1 30)
     [ -z "$FONT_NAME" ] && FONT_NAME="system-ui"
-    info "模式: $anim_mode | 配色: $GRAD_NAME | 速度: ${anim_speed}s"
+    info "模式: $anim_mode | 配色: $GRAD_NAME |速度: ${anim_speed}s"
     _inject_keyframes
     _remove_css_block "BRAND_ANIMATION"
     _inject_brand_css "$anim_mode" "$anim_speed" "$GRAD_COLORS" "$FONT_NAME"
@@ -869,38 +883,48 @@ _inject_brand_css() {
     printf '\n/* === BRAND_ANIMATION mode=%s filter=%s === */\n' "$mode" "$use_filter" >> "$css"
 
     printf '%s {\n' "$SEL_BRAND" >> "$css"
-    printf '  display: block; font-family: "%s", sans-serif;\n' "$font" >> "$css"
-    printf '  text-decoration: none; text-align: center; cursor: default;\n' >> "$css"
+    printf '  display: block !important; font-family: "%s", sans-serif !important;\n' "$font" >> "$css"
+    printf '  text-decoration: none !important; text-align: center !important; cursor: default !important;\n' >> "$css"
     if [ "$use_filter" = "1" ]; then
-        printf '  background: linear-gradient(135deg, %s);\n' "$colors" >> "$css"
+        printf '  background: linear-gradient(135deg, %s) !important;\n' "$colors" >> "$css"
     else
-        printf '  background: linear-gradient(90deg, %s, %s);\n' "$colors" "$first_color" >> "$css"
+        printf '  background: linear-gradient(90deg, %s, %s) !important;\n' "$colors" "$first_color" >> "$css"
     fi
-    printf '  background-size: %s;\n' "$bg_size" >> "$css"
-    printf '  -webkit-background-clip: text; background-clip: text;\n' >> "$css"
-    printf '  -webkit-text-fill-color: transparent;\n' >> "$css"
+    printf '  background-size: %s !important;\n' "$bg_size" >> "$css"
+    printf '  -webkit-background-clip: text !important; background-clip: text !important;\n' >> "$css"
+    printf '  -webkit-text-fill-color: transparent !important; color: transparent !important;\n' >> "$css"
     if [ "$mode" = "6" ]; then
-        printf '  border-right: 2px solid rgba(255,255,255,0.9);\n' >> "$css"
-        printf '  padding-right: 4px;\n' >> "$css"
+        printf '  border-right: 2px solid rgba(255,255,255,0.9) !important;\n' >> "$css"
+        printf '  padding-right: 4px !important;\n' >> "$css"
     fi
-    printf '  animation: %s;\n}\n' "$brand_anim" >> "$css"
+    printf '  animation: %s !important;\n}\n' "$brand_anim" >> "$css"
 
     printf '%s {\n' "$SEL_BRAND_LOGIN" >> "$css"
-    printf '  font-weight: 400; word-break: break-word;\n' >> "$css"
-    printf '  font-family: "%s", sans-serif;\n' "$font" >> "$css"
+    printf '  font-weight: 400 !important; word-break: break-word !important;\n' >> "$css"
+    printf '  font-family: "%s", sans-serif !important;\n' "$font" >> "$css"
     if [ "$use_filter" = "1" ]; then
-        printf '  background: linear-gradient(135deg, %s);\n' "$colors" >> "$css"
+        printf '  background: linear-gradient(135deg, %s) !important;\n' "$colors" >> "$css"
     else
-        printf '  background: linear-gradient(90deg, %s, %s);\n' "$colors" "$first_color" >> "$css"
+        printf '  background: linear-gradient(90deg, %s, %s) !important;\n' "$colors" "$first_color" >> "$css"
     fi
-    printf '  background-size: %s;\n' "$bg_size" >> "$css"
-    printf '  -webkit-background-clip: text; background-clip: text;\n' >> "$css"
-    printf '  -webkit-text-fill-color: transparent;\n' >> "$css"
+    printf '  background-size: %s !important;\n' "$bg_size" >> "$css"
+    printf '  -webkit-background-clip: text !important; background-clip: text !important;\n' >> "$css"
+    printf '  -webkit-text-fill-color: transparent !important; color: transparent !important;\n' >> "$css"
     if [ "$mode" = "6" ]; then
-        printf '  border-right: 2px solid rgba(255,255,255,0.9);\n' >> "$css"
-        printf '  padding-right: 4px;\n' >> "$css"
+        printf '  border-right: 2px solid rgba(255,255,255,0.9) !important;\n' >> "$css"
+        printf '  padding-right: 4px !important;\n' >> "$css"
     fi
-    printf '  animation: %s;\n}\n' "$brand_anim" >> "$css"
+    printf '  animation: %s !important;\n}\n' "$brand_anim" >> "$css"
+
+    printf '/* 强制子元素透明，防止被全局字体覆盖 */\n' >> "$css"
+    printf '%s *, %s * {\n' "$SEL_BRAND" "$SEL_BRAND_LOGIN" >> "$css"
+    printf '  -webkit-text-fill-color: transparent !important;\n' >> "$css"
+    printf '  color: transparent !important;\n' >> "$css"
+    printf '  background: inherit !important;\n' >> "$css"
+    printf '  -webkit-background-clip: text !important;\n' >> "$css"
+    printf '  background-clip: text !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
     printf '/* === END BRAND_ANIMATION === */\n' >> "$css"
     success "Brand 动画注入完成 [模式${mode}: $GRAD_NAME | ${speed}s]"
 }
@@ -965,11 +989,10 @@ step_glassmorphism() {
     local css="$ACTIVE_CSS"
     local BL="$GLASS_BLUR" DK="$GLASS_DARKEN"
     local BR="$GLASS_BORDER" BGPATH="$THEME_BG_WEBPATH"
+    local login_bg="${LOGIN_BG_WEBPATH:-$BGPATH}"
 
     printf '\n/* === GLASSMORPHISM theme=%s darken=%s blur=%s === */\n' \
         "$ACTIVE_THEME" "$DK" "$BL" >> "$css"
-
-    local login_bg="${LOGIN_BG_WEBPATH:-$BGPATH}"
 
     printf ':root {\n' >> "$css"
     printf '  --glass-bg: rgba(0,0,0,%s);\n' "$DK" >> "$css"
@@ -982,9 +1005,6 @@ step_glassmorphism() {
     printf '  --text-muted: rgba(255,255,255,0.85);\n' >> "$css"
     printf '  --accent: #00d4aa;\n' >> "$css"
     printf '  --accent-hover: #00fff7;\n' >> "$css"
-    printf '  --primary: #00d4aa !important;\n' >> "$css"
-    printf '  --dark-primary: #00a884 !important;\n' >> "$css"
-    printf '  --primary-color: #00d4aa !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
     printf 'html, body {\n' >> "$css"
@@ -993,12 +1013,14 @@ step_glassmorphism() {
     printf '  min-height: 100vh !important;\n' >> "$css"
     printf '  color: var(--text-main) !important;\n' >> "$css"
     printf '}\n' >> "$css"
-    printf 'body.login-page,\n' >> "$css"
-    printf 'body.login,\n' >> "$css"
-    printf '.login-page,\n' >> "$css"
-    printf '.login-page body {\n' >> "$css"
+    
+    printf 'body.login-page, body.login, .login-page, #login-page, .login-page body {\n' >> "$css"
     printf "  background: url('%s') center center / cover fixed no-repeat !important;\n" "$login_bg" >> "$css"
     printf '  background-color: #05080f !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
+    printf '.login-bg, #login-bg, .login-page::before, .login-page::after, body.login::before, body.login::after {\n' >> "$css"
+    printf '  display: none !important; content: none !important; background: transparent !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
     printf 'body #wrapper,\n' >> "$css"
@@ -1023,19 +1045,37 @@ step_glassmorphism() {
     printf '}\n' >> "$css"
 
     printf '%s {\n' "$SEL_SIDEBAR" >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.22) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.1) blur(var(--glass-blur)) saturate(160%%) !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: brightness(1.1) blur(var(--glass-blur)) saturate(160%%) !important;\n' >> "$css"
     printf '  border-right: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
-    printf '%s {\n' "$SEL_HEADER" >> "$css"
-    printf '  background: var(--glass-bg-lighter) !important;\n' >> "$css"
-    printf '  background-color: var(--glass-bg-lighter) !important;\n' >> "$css"
+    local header_list="$SEL_HEADER, .bg-primary, .main-top, .header-bg, .navbar-inner, .navbar-default"
+    local sh_arr="" sh_pseudo=""
+    local old_ifs="$IFS"; IFS=','
+    for s in $header_list; do
+        s=$(echo "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sh_arr="$sh_arr body $s,"
+        [ -n "$s" ] && sh_pseudo="$sh_pseudo body $s::before, body $s::after,"
+    done
+    IFS="$old_ifs"
+    sh_arr=$(echo "$sh_arr" | sed 's/,$//')
+    sh_pseudo=$(echo "$sh_pseudo" | sed 's/,$//')
+
+    printf '%s {\n' "$sh_arr" >> "$css"
+    printf '  background: rgba(0,0,0,0.12) !important;\n' >> "$css"
+    printf '  background-color: rgba(0,0,0,0.12) !important;\n' >> "$css"
+    printf '  background-image: none !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.15) blur(18px) saturate(180%%) !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: brightness(1.15) blur(18px) saturate(180%%) !important;\n' >> "$css"
     printf '  border-bottom: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  box-shadow: 0 2px 16px rgba(0,0,0,0.40) !important;\n' >> "$css"
+    printf '}\n' >> "$css"
+
+    printf '%s {\n' "$sh_pseudo" >> "$css"
+    printf '  display: none !important; content: none !important; background: transparent !important;\n' >> "$css"
+    printf '  background-image: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
     printf '%s,\n' "$SEL_CARD" >> "$css"
@@ -1120,13 +1160,13 @@ step_glassmorphism() {
     printf '.page-header, .node-title,\n' >> "$css"
     printf '.cbi-tabcontainer > .cbi-section-legend,\n' >> "$css"
     printf '.cbi-section > legend, .cbi-section > h3 {\n' >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.45) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.2) blur(10px) !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: brightness(1.2) blur(10px) !important;\n' >> "$css"
     printf '  border: none !important;\n' >> "$css"
     printf '  border-bottom: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  border-radius: 10px 10px 0 0 !important;\n' >> "$css"
-    printf '  color: var(--text-main) !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
     printf '  padding: 10px 16px !important;\n' >> "$css"
     printf '  font-weight: 600 !important;\n' >> "$css"
     printf '  text-shadow: 0 1px 4px rgba(0,0,0,0.90) !important;\n' >> "$css"
@@ -1134,44 +1174,27 @@ step_glassmorphism() {
 
     printf 'body #maincontent #tabmenu,\n' >> "$css"
     printf 'body #maincontent .container #tabmenu,\n' >> "$css"
-    printf 'body #maincontent #tabmenu ul.tabs,\n' >> "$css"
-    printf 'body #maincontent #tabmenu .tabs,\n' >> "$css"
     printf 'body #maincontent .nav-tabs,\n' >> "$css"
-    printf 'body #maincontent .nav-tabs > li,\n' >> "$css"
     printf 'body #maincontent .cbi-tabmenu,\n' >> "$css"
-    printf 'body #maincontent .cbi-tabmenu li,\n' >> "$css"
     printf 'body #maincontent .tabs,\n' >> "$css"
-    printf 'body #maincontent .tabs > li,\n' >> "$css"
     printf 'body .main-right .nav-tabs,\n' >> "$css"
     printf 'body .main-content .nav-tabs,\n' >> "$css"
-    printf '.nav-tabs, .nav-tabs > li,\n' >> "$css"
-    printf '.cbi-tabmenu, .cbi-tabmenu li,\n' >> "$css"
-    printf '.tabs, .tabs > li {\n' >> "$css"
-    printf '  background: transparent !important;\n' >> "$css"
-    printf '  background-color: transparent !important;\n' >> "$css"
+    printf '.nav-tabs, .cbi-tabmenu, .tabs {\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.40) !important;\n' >> "$css"
+    printf '  background-color: rgba(0,0,0,0.40) !important;\n' >> "$css"
     printf '  background-image: none !important;\n' >> "$css"
     printf '  border-color: var(--glass-border) !important;\n' >> "$css"
     printf '  border-bottom: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  box-shadow: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
-    printf 'body #maincontent .bg-primary,\n' >> "$css"
-    printf 'body #maincontent .btn-primary,\n' >> "$css"
-    printf 'body #maincontent .label-primary,\n' >> "$css"
-    printf 'body #maincontent .badge-primary,\n' >> "$css"
-    printf 'body #maincontent [class*="primary"],\n' >> "$css"
-    printf 'body #maincontent .nav-tabs,\n' >> "$css"
-    printf 'body #maincontent .cbi-tabmenu,\n' >> "$css"
-    printf 'body #maincontent .tabs,\n' >> "$css"
-    printf 'body #maincontent .cbi-map-title,\n' >> "$css"
-    printf 'body #maincontent .cbi-section-legend,\n' >> "$css"
-    printf 'body #maincontent .panel-heading,\n' >> "$css"
-    printf 'body #maincontent legend,\n' >> "$css"
-    printf 'body #maincontent h3 {\n' >> "$css"
+    printf 'body #maincontent #tabmenu ul.tabs,\n' >> "$css"
+    printf 'body #maincontent #tabmenu .tabs,\n' >> "$css"
+    printf 'body #maincontent .nav-tabs > li,\n' >> "$css"
+    printf 'body #maincontent .cbi-tabmenu li,\n' >> "$css"
+    printf 'body #maincontent .tabs > li,\n' >> "$css"
+    printf '.nav-tabs > li, .cbi-tabmenu li, .tabs > li {\n' >> "$css"
     printf '  background: transparent !important;\n' >> "$css"
     printf '  background-color: transparent !important;\n' >> "$css"
-    printf '  background-image: none !important;\n' >> "$css"
-    printf '  border-color: var(--glass-border) !important;\n' >> "$css"
-    printf '  box-shadow: none !important;\n' >> "$css"
     printf '}\n' >> "$css"
     printf 'body #maincontent .nav-tabs *,\n' >> "$css"
     printf 'body #maincontent .cbi-tabmenu *,\n' >> "$css"
@@ -1181,21 +1204,21 @@ step_glassmorphism() {
     printf '}\n' >> "$css"
     printf '.nav-tabs .nav-link, .nav-tabs > li > a,\n' >> "$css"
     printf '.cbi-tabmenu li a, .tabs > li > a {\n' >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
-    printf '  color: var(--text-muted) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.35) !important;\n' >> "$css"
+    printf '  color: rgba(255,255,255,0.90) !important;\n' >> "$css"
     printf '  border: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  border-radius: 8px 8px 0 0 !important;\n' >> "$css"
     printf '  transition: all 0.25s ease !important;\n' >> "$css"
     printf '}\n' >> "$css"
     printf '.nav-tabs .nav-link:hover, .cbi-tabmenu li a:hover,\n' >> "$css"
     printf '.tabs > li > a:hover {\n' >> "$css"
-    printf '  background: rgba(0,180,160,0.35) !important;\n' >> "$css"
-    printf '  color: var(--text-main) !important;\n' >> "$css"
+    printf '  background: rgba(0,180,160,0.45) !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
     printf '}\n' >> "$css"
     printf '.nav-tabs .nav-link.active, .nav-tabs > li.active > a,\n' >> "$css"
     printf '.cbi-tabmenu li.cbi-tab a, .tabs > li.active > a {\n' >> "$css"
-    printf '  background: rgba(0,180,160,0.50) !important;\n' >> "$css"
-    printf '  color: var(--text-main) !important;\n' >> "$css"
+    printf '  background: rgba(0,180,160,0.55) !important;\n' >> "$css"
+    printf '  color: #ffffff !important;\n' >> "$css"
     printf '  border-bottom-color: transparent !important;\n' >> "$css"
     printf '  box-shadow: 0 -2px 8px rgba(0,229,255,0.30) !important;\n' >> "$css"
     printf '}\n' >> "$css"
@@ -1210,7 +1233,7 @@ step_glassmorphism() {
     printf 'body .main-right .table thead,\n' >> "$css"
     printf 'body .main-content .table thead,\n' >> "$css"
     printf '.thead, .table thead, .cbi-section-table thead {\n' >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.45) !important;\n' >> "$css"
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 6px rgba(0,229,255,0.6) !important;\n' >> "$css"
     printf '}\n' >> "$css"
@@ -1449,10 +1472,20 @@ step_glassmorphism() {
     printf '  color: #ffffff !important;\n' >> "$css"
     printf '}\n' >> "$css"
 
-    printf '%s {\n' "$SEL_LOGIN" >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
-    printf '  backdrop-filter: brightness(1.15) blur(24px) saturate(160%%) !important;\n' >> "$css"
-    printf '  -webkit-backdrop-filter: brightness(1.15) blur(24px) saturate(160%%) !important;\n' >> "$css"
+    local login_list="$SEL_LOGIN, .login-container, .login-box, .login-wrapper, .login-form"
+    local sl_arr=""
+    local old_ifs="$IFS"; IFS=','
+    for s in $login_list; do
+        s=$(echo "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sl_arr="$sl_arr body $s,"
+    done
+    IFS="$old_ifs"
+    sl_arr=$(echo "$sl_arr" | sed 's/,$//')
+
+    printf '%s {\n' "$sl_arr" >> "$css"
+    printf '  background: rgba(0,0,0,0.22) !important;\n' >> "$css"
+    printf '  backdrop-filter: brightness(1.15) blur(12px) saturate(160%%) !important;\n' >> "$css"
+    printf '  -webkit-backdrop-filter: brightness(1.15) blur(12px) saturate(160%%) !important;\n' >> "$css"
     printf '  border: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  border-radius: 18px !important;\n' >> "$css"
     printf '  box-shadow: 0 8px 40px rgba(0,0,0,0.50) !important;\n' >> "$css"
@@ -1484,7 +1517,7 @@ step_glassmorphism() {
     printf '.modal-content, .modal-dialog, .modal .card,\n' >> "$css"
     printf '[role="dialog"], [role="dialog"] .card,\n' >> "$css"
     printf '.dialog, .popup, .luci-popup, .cbi-modal, .cbi-popup {\n' >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.25) !important;\n' >> "$css"
     printf '  backdrop-filter: brightness(1.15) blur(20px) saturate(150%%) !important;\n' >> "$css"
     printf '  -webkit-backdrop-filter: brightness(1.15) blur(20px) saturate(150%%) !important;\n' >> "$css"
     printf '  border: 1px solid var(--glass-border) !important;\n' >> "$css"
@@ -1504,7 +1537,7 @@ step_glassmorphism() {
 
     printf '.alert, .notice, .cbi-map-descr, .warning,\n' >> "$css"
     printf '.alert-info, .alert-success, .alert-warning, .alert-danger {\n' >> "$css"
-    printf '  background: var(--glass-bg-light) !important;\n' >> "$css"
+    printf '  background: rgba(0,0,0,0.30) !important;\n' >> "$css"
     printf '  border: 1px solid var(--glass-border) !important;\n' >> "$css"
     printf '  border-radius: 8px !important;\n' >> "$css"
     printf '  color: var(--text-main) !important;\n' >> "$css"
@@ -1578,7 +1611,7 @@ step_glassmorphism() {
     printf '    backdrop-filter: brightness(1.1) blur(8px) !important;\n' >> "$css"
     printf '    -webkit-backdrop-filter: brightness(1.1) blur(8px) !important;\n' >> "$css"
     printf '  }\n' >> "$css"
-    printf '  %s {\n' "$SEL_LOGIN" >> "$css"
+    printf '  %s {\n' "$sl_arr" >> "$css"
     printf '    margin: 16px !important;\n' >> "$css"
     printf '    border-radius: 14px !important;\n' >> "$css"
     printf '  }\n' >> "$css"
@@ -1700,6 +1733,14 @@ step_text() {
 
     printf '.badge, .label, .tag { text-shadow: none !important; }\n' >> "$css"
 
+    if grep -q "=== BRAND_ANIMATION" "$ACTIVE_CSS" 2>/dev/null; then
+        printf '\n  /* 防止全局文字颜色覆盖 Brand 的透明渐变 */\n' >> "$css"
+        printf '  %s, %s *, %s, %s * {\n' "$SEL_BRAND" "$SEL_BRAND" "$SEL_BRAND_LOGIN" "$SEL_BRAND_LOGIN" >> "$css"
+        printf '    color: transparent !important;\n' >> "$css"
+        printf '    -webkit-text-fill-color: transparent !important;\n' >> "$css"
+        printf '  }\n' >> "$css"
+    fi
+
     printf '/* === END TEXT_COLOR === */\n' >> "$css"
     success "文字发光注入完成 v3.1（强度等级${glow_choice}）"
 }
@@ -1735,7 +1776,18 @@ step_login_position() {
     printf '  align-items: center !important;\n' >> "$css"
     printf '  %s !important;\n' "$padding" >> "$css"
     printf '}\n' >> "$css"
-    printf '%s {\n  margin: 0 !important; transform: none !important;\n' "$SEL_LOGIN" >> "$css"
+    
+    local login_list="$SEL_LOGIN, .login-container, .login-box, .login-wrapper, .login-form"
+    local sl_arr=""
+    local old_ifs="$IFS"; IFS=','
+    for s in $login_list; do
+        s=$(echo "$s" | awk '{$1=$1};1')
+        [ -n "$s" ] && sl_arr="$sl_arr body $s,"
+    done
+    IFS="$old_ifs"
+    sl_arr=$(echo "$sl_arr" | sed 's/,$//')
+
+    printf '%s {\n  margin: 0 !important; transform: none !important;\n' "$sl_arr" >> "$css"
     printf '  position: relative !important;\n}\n' >> "$css"
     printf '/* === END LOGIN_POSITION === */\n' >> "$css"
     success "登录框位置已设置 (${justify})"
@@ -1986,10 +2038,10 @@ main_menu() {
                 step_download_image
                 step_login_background
                 step_download_font
-                step_brand_animation
                 step_glassmorphism
                 step_text
                 step_login_position
+                step_brand_animation
                 step_clean
                 step_extra_effects
                 do_flush
