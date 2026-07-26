@@ -18,27 +18,28 @@ MH_BIN_PATH="/usr/local/bin/mihomo"
 MH_CONFIG_FILE="$MH_BASE_DIR/config.yaml"
 MH_ENV_FILE="$MH_BASE_DIR/.mihomo_env"
 MH_SERVICE_NAME="mihomo"
+MH_DNS_BACKUP_DIR="/etc/mihomo/.dns_backup"
+MH_DEFAULT_DNS_PORT="7874"
 
 BIN_DIR="/usr/local/bin"
 LOG_FILE="/var/log/proxy-manager.log"
 LOG_MAX_SIZE=5242880
 DEPS_INSTALLED_MARKER="/var/lib/proxy_manager_deps_installed"
+MIRROR_CACHE_FILE="/var/lib/proxy_manager_mirror.cache"
 
-PROXY_PREFIX="https://cdn.yyds9527.nyc.mn/"
+PROXY_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://cdn.yyds9527.nyc.mn/ https://mirror.ghproxy.com/"
 
-DL_CONNECT_TIMEOUT=15
-DL_MAX_TIME=300
-DL_SPEED_LIMIT=1024
-DL_SPEED_TIME=30
-DL_RETRY=3
-DL_RETRY_DELAY=5
+DL_CONNECT_TIMEOUT=8
+DL_MAX_TIME=180
+DL_RETRY=1
+DL_RETRY_DELAY=2
 
-CFG_CONNECT_TIMEOUT=15
+CFG_CONNECT_TIMEOUT=10
 CFG_MAX_TIME=120
-CFG_SPEED_LIMIT=512
-CFG_SPEED_TIME=60
-CFG_RETRY=3
-CFG_RETRY_DELAY=8
+CFG_RETRY=2
+CFG_RETRY_DELAY=3
+
+PROBE_TIMEOUT=5
 
 log() {
     local timestamp
@@ -103,22 +104,17 @@ get_device_name() {
 DEVICE_NAME=$(get_device_name)
 
 detect_system() {
-    if [ -f /etc/openwrt_release ] \
-       || [ -f /etc/openwrt_version ]; then
-        echo "openwrt"
-        return
+    if [ -f /etc/openwrt_release ] || [ -f /etc/openwrt_version ]; then
+        echo "openwrt"; return
     fi
     if [ -d /etc/config ] && command -v uci >/dev/null 2>&1; then
-        echo "openwrt"
-        return
+        echo "openwrt"; return
     fi
     if grep -qiE "openwrt|immortalwrt|lede|istoreos" /etc/banner 2>/dev/null; then
-        echo "openwrt"
-        return
+        echo "openwrt"; return
     fi
     if [ -f /etc/os-release ] && grep -qiE "openwrt|immortalwrt|lede" /etc/os-release 2>/dev/null; then
-        echo "openwrt"
-        return
+        echo "openwrt"; return
     fi
 
     local os_id=""
@@ -146,21 +142,12 @@ detect_existing_binary() {
     local name="$1"
     local default_path="$2"
     local candidates="$default_path /usr/bin/$name /usr/sbin/$name /usr/local/sbin/$name /opt/$name/$name"
-
     for p in $candidates; do
-        if [ -x "$p" ]; then
-            echo "$p"
-            return 0
-        fi
+        if [ -x "$p" ]; then echo "$p"; return 0; fi
     done
-
     local found
     found=$(command -v "$name" 2>/dev/null)
-    if [ -n "$found" ] && [ -x "$found" ]; then
-        echo "$found"
-        return 0
-    fi
-
+    if [ -n "$found" ] && [ -x "$found" ]; then echo "$found"; return 0; fi
     echo "$default_path"
     return 1
 }
@@ -177,24 +164,16 @@ fi
 
 DL_TOOL=""
 detect_download_tool() {
-    if command -v curl >/dev/null 2>&1; then
-        if curl --help >/dev/null 2>&1; then
-            DL_TOOL="curl"
-            return 0
-        fi
+    if command -v curl >/dev/null 2>&1 && curl --help >/dev/null 2>&1; then
+        DL_TOOL="curl"; return 0
     fi
-    if command -v wget >/dev/null 2>&1; then
-        if wget --help >/dev/null 2>&1; then
-            DL_TOOL="wget"
-            return 0
-        fi
+    if command -v wget >/dev/null 2>&1 && wget --help >/dev/null 2>&1; then
+        DL_TOOL="wget"; return 0
     fi
     if command -v uclient-fetch >/dev/null 2>&1; then
-        DL_TOOL="uclient-fetch"
-        return 0
+        DL_TOOL="uclient-fetch"; return 0
     fi
-    DL_TOOL=""
-    return 1
+    DL_TOOL=""; return 1
 }
 
 http_fetch() {
@@ -202,21 +181,16 @@ http_fetch() {
     local out="$2"
     local connect_timeout="${3:-15}"
     local max_time="${4:-120}"
-    local speed_limit="${5:-0}"
-    local speed_time="${6:-0}"
-
     detect_download_tool || return 127
 
     case "$DL_TOOL" in
         curl)
-            local curl_opts="-L --connect-timeout $connect_timeout --max-time $max_time --retry 0"
-            if [ "$speed_limit" -gt 0 ] && [ "$speed_time" -gt 0 ]; then
-                curl_opts="$curl_opts --speed-limit $speed_limit --speed-time $speed_time"
-            fi
             if [ -n "$out" ]; then
-                curl $curl_opts -o "$out" "$url"
+                curl -L --connect-timeout "$connect_timeout" --max-time "$max_time" \
+                    --retry 0 -sS -o "$out" "$url"
             else
-                curl $curl_opts -s "$url"
+                curl -L --connect-timeout "$connect_timeout" --max-time "$max_time" \
+                    --retry 0 -sS "$url"
             fi
             return $?
             ;;
@@ -242,94 +216,114 @@ http_fetch() {
 
 http_get() {
     local url="$1"
-    local connect_timeout="${2:-15}"
-    local max_time="${3:-30}"
-    http_fetch "$url" "" "$connect_timeout" "$max_time" 0 0
+    local connect_timeout="${2:-8}"
+    local max_time="${3:-20}"
+    http_fetch "$url" "" "$connect_timeout" "$max_time"
 }
 
-download_file_with_proxy() {
+probe_url() {
+    local url="$1"
+    detect_download_tool || return 127
+    case "$DL_TOOL" in
+        curl)
+            curl -sS -o /dev/null -m "$PROBE_TIMEOUT" --connect-timeout "$PROBE_TIMEOUT" -w "%{http_code}" "$url" 2>/dev/null
+            ;;
+        wget)
+            wget --spider -q --timeout="$PROBE_TIMEOUT" --tries=1 "$url" 2>/dev/null && echo "200" || echo "000"
+            ;;
+        uclient-fetch)
+            uclient-fetch --spider -q --timeout="$PROBE_TIMEOUT" "$url" 2>/dev/null && echo "200" || echo "000"
+            ;;
+    esac
+}
+
+load_best_mirror() {
+    [ -f "$MIRROR_CACHE_FILE" ] && cat "$MIRROR_CACHE_FILE" 2>/dev/null
+}
+
+save_best_mirror() {
+    local mirror="$1"
+    mkdir -p "$(dirname "$MIRROR_CACHE_FILE")"
+    echo "$mirror" > "$MIRROR_CACHE_FILE"
+}
+
+test_direct_github() {
+    log "探测 GitHub 直连..."
+    local code
+    code=$(probe_url "https://api.github.com" 2>/dev/null)
+    if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+        green "GitHub 直连可用"
+        return 0
+    fi
+    yellow "GitHub 直连不可用 (HTTP: ${code:-无})"
+    return 1
+}
+
+download_file_smart() {
     local url="$1"
     local output_path="$2"
     local mode="${3:-binary}"
     local filename="${url##*/}"
 
-    local connect_timeout max_time speed_limit speed_time retry retry_delay
+    local connect_timeout max_time
     if [ "$mode" = "config" ]; then
         connect_timeout=$CFG_CONNECT_TIMEOUT
         max_time=$CFG_MAX_TIME
-        speed_limit=$CFG_SPEED_LIMIT
-        speed_time=$CFG_SPEED_TIME
-        retry=$CFG_RETRY
-        retry_delay=$CFG_RETRY_DELAY
     else
         connect_timeout=$DL_CONNECT_TIMEOUT
         max_time=$DL_MAX_TIME
-        speed_limit=$DL_SPEED_LIMIT
-        speed_time=$DL_SPEED_TIME
-        retry=$DL_RETRY
-        retry_delay=$DL_RETRY_DELAY
     fi
 
-    _do_download() {
-        local target_url="$1"
-        local out_path="$2"
-        local attempt=0
-        local exit_code=1
+    local cached_mirror
+    cached_mirror=$(load_best_mirror)
 
-        while [ "$attempt" -lt "$retry" ]; do
-            attempt=$((attempt + 1))
-            log "下载尝试 $attempt/$retry: $filename (工具: ${DL_TOOL:-未探测}, 模式: $mode)"
-
-            http_fetch "$target_url" "$out_path" "$connect_timeout" "$max_time" "$speed_limit" "$speed_time"
-            exit_code=$?
-
-            if [ "$exit_code" -eq 127 ]; then
-                red "未找到可用下载工具（curl/wget/uclient-fetch 均不可用）"
-                red "OpenWrt 请执行: opkg update && opkg install wget-ssl"
-                red "或修复 curl: opkg install --force-reinstall libustream-mbedtls libmbedtls"
-                return 1
-            fi
-
-            if [ "$exit_code" -eq 0 ] && [ -s "$out_path" ]; then
-                return 0
-            fi
-
-            case "$exit_code" in
-                6)  yellow "DNS 解析失败 (exit 6)" ;;
-                7)  yellow "无法连接到服务器 (exit 7)" ;;
-                28) yellow "下载超时 (exit 28)" ;;
-                35) yellow "SSL 握手失败 (exit 35)" ;;
-                56) yellow "数据传输中断 (exit 56)" ;;
-                *)  yellow "下载失败，退出码: $exit_code" ;;
-            esac
-
-            if [ "$attempt" -lt "$retry" ]; then
-                yellow "等待 ${retry_delay}s 后重试..."
-                sleep "$retry_delay"
-                rm -f "$out_path"
-            fi
-        done
+    _try_download() {
+        local turl="$1"
+        rm -f "$output_path"
+        log "下载: $(echo "$turl" | sed 's|https://[^/]*/||' | head -c 80)..."
+        http_fetch "$turl" "$output_path" "$connect_timeout" "$max_time"
+        local ec=$?
+        if [ "$ec" -eq 0 ] && [ -s "$output_path" ]; then
+            return 0
+        fi
         return 1
     }
 
-    log "尝试直连下载 $filename..."
-    if _do_download "$url" "$output_path"; then
-        green "直连下载成功: $filename"
-        return 0
+    if [ -n "$cached_mirror" ]; then
+        log "使用缓存镜像: $cached_mirror"
+        if _try_download "${cached_mirror}${url}"; then
+            green "下载成功（缓存镜像）: $filename"
+            return 0
+        fi
+        yellow "缓存镜像失效，清除并重新探测"
+        rm -f "$MIRROR_CACHE_FILE"
     fi
 
-    yellow "直连下载失败，尝试代理加速下载..."
-    local proxied_url="${PROXY_PREFIX}${url}"
-    log "代理下载地址: $proxied_url"
-    rm -f "$output_path"
-
-    if _do_download "$proxied_url" "$output_path"; then
-        green "代理下载成功: $filename"
-        return 0
+    if [ ! -f "$MIRROR_CACHE_FILE" ] && test_direct_github; then
+        if _try_download "$url"; then
+            green "直连下载成功: $filename"
+            save_best_mirror ""
+            return 0
+        fi
+        yellow "直连虽通但下载失败，改用镜像"
     fi
 
-    red "直连和代理均下载失败: $filename"
+    log "轮询镜像加速下载..."
+    for mirror in $PROXY_MIRRORS; do
+        log "尝试镜像: $mirror"
+        if _try_download "${mirror}${url}"; then
+            green "镜像下载成功: $mirror"
+            save_best_mirror "$mirror"
+            return 0
+        fi
+    done
+
+    red "所有下载源均失败: $filename"
     return 1
+}
+
+download_file_with_proxy() {
+    download_file_smart "$@"
 }
 
 load_service_env() {
@@ -344,19 +338,13 @@ load_service_env() {
 
     local key value line
     while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            '#'*|'') continue ;;
-        esac
+        case "$line" in '#'*|'') continue ;; esac
         key="${line%%=*}"
         value="${line#*=}"
-        value="${value%\"}"
-        value="${value#\"}"
-        value="${value%\'}"
-        value="${value#\'}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            PROXY_API_URL|PROXY_MODE|CRON_INTERVAL)
-                export "$key=$value"
-                ;;
+            PROXY_API_URL|PROXY_MODE|CRON_INTERVAL) export "$key=$value" ;;
         esac
     done < "$env_file"
 
@@ -392,12 +380,10 @@ update_env_field() {
     local env_file="$1"
     local key="$2"
     local value="$3"
-
     if [ ! -f "$env_file" ]; then
         yellow "env 文件不存在，无法更新字段 $key"
         return 1
     fi
-
     if grep -q "^${key}=" "$env_file"; then
         sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$env_file"
     else
@@ -406,7 +392,7 @@ update_env_field() {
 }
 
 fix_openwrt_curl() {
-    yellow "检测到 curl 库依赖问题，尝试修复..."
+    yellow "尝试修复 OpenWrt 下载工具..."
     if command -v opkg >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1 || true
         opkg install --force-reinstall libmbedtls libustream-mbedtls ca-bundle ca-certificates >/dev/null 2>&1 || true
@@ -424,44 +410,39 @@ install_deps() {
     fi
 
     log "首次运行，正在检查并安装依赖..."
-    local pkg_manager install_cmd update_cmd pkgs cron_pkg failed_pkgs
+    local pkg_manager install_cmd update_cmd pkgs failed_pkgs
     failed_pkgs=""
-    cron_pkg="cron"
 
     case "$SYSTEM_TYPE" in
         debian)
             pkg_manager="apt"
             update_cmd="apt-get update"
             install_cmd="apt-get install -y"
-            pkgs="curl wget tar iptables ipset jq psmisc cron unzip fzf"
+            pkgs="curl wget tar iptables ipset jq psmisc cron unzip dnsutils"
             ;;
         centos)
             pkg_manager="yum"
             update_cmd=""
             install_cmd="yum install -y"
-            cron_pkg="cronie"
-            pkgs="curl wget tar iptables ipset jq psmisc cronie unzip fzf"
+            pkgs="curl wget tar iptables ipset jq psmisc cronie unzip bind-utils"
             ;;
         alpine)
             pkg_manager="apk"
             update_cmd="apk update"
             install_cmd="apk add"
-            cron_pkg="cronie"
-            pkgs="curl wget tar iptables ipset jq psmisc cronie unzip fzf bash"
+            pkgs="curl wget tar iptables ipset jq psmisc unzip bash bind-tools"
             ;;
         arch)
             pkg_manager="pacman"
             update_cmd="pacman -Sy"
             install_cmd="pacman -S --noconfirm"
-            cron_pkg="cronie"
-            pkgs="curl wget tar iptables ipset jq psmisc cronie unzip fzf"
+            pkgs="curl wget tar iptables ipset jq psmisc cronie unzip bind"
             ;;
         openwrt)
             pkg_manager="opkg"
             update_cmd="opkg update"
             install_cmd="opkg install"
-            pkgs="wget-ssl tar iptables ipset jq unzip bash ca-bundle ca-certificates"
-            cron_pkg="cron"
+            pkgs="wget-ssl tar iptables ipset jq unzip bash ca-bundle ca-certificates bind-dig"
             ;;
         *)
             red "不支持的系统类型，请手动安装依赖"
@@ -471,14 +452,12 @@ install_deps() {
 
     log "使用包管理器: $pkg_manager"
     if [ -n "$update_cmd" ]; then
-        if ! $update_cmd; then
-            yellow "包列表更新失败，将尝试直接安装..."
-        fi
+        $update_cmd 2>/dev/null || yellow "包列表更新失败，将尝试直接安装..."
     fi
 
     for pkg in $pkgs; do
         if ! $install_cmd "$pkg" >/dev/null 2>&1; then
-            yellow "安装 $pkg 失败（可能不在软件源中），跳过。"
+            yellow "安装 $pkg 失败，跳过。"
             failed_pkgs="$failed_pkgs $pkg"
         else
             green "已安装: $pkg"
@@ -489,27 +468,16 @@ install_deps() {
         opkg install --force-reinstall libmbedtls libustream-mbedtls >/dev/null 2>&1 || true
         if command -v crond >/dev/null 2>&1 || [ -f /etc/init.d/cron ]; then
             /etc/init.d/cron enable 2>/dev/null || true
-            /etc/init.d/cron start 2>/dev/null || yellow "无法启动 cron"
-        else
-            yellow "未检测到 cron，请执行: opkg install cron"
+            /etc/init.d/cron start 2>/dev/null || true
         fi
     fi
 
     if ! detect_download_tool >/dev/null 2>&1; then
-        red "未检测到可用的下载工具，尝试修复..."
         fix_openwrt_curl
-        if ! detect_download_tool >/dev/null 2>&1; then
-            red "修复失败，请手动安装 wget-ssl 或修复 curl"
-            return 1
-        fi
+        detect_download_tool >/dev/null 2>&1 || { red "无可用下载工具"; return 1; }
     fi
 
-    if [ -n "$failed_pkgs" ]; then
-        yellow "以下依赖安装失败:$failed_pkgs"
-    else
-        green "所有依赖安装成功。"
-    fi
-
+    [ -n "$failed_pkgs" ] && yellow "以下依赖失败:$failed_pkgs" || green "所有依赖安装成功。"
     touch "$DEPS_INSTALLED_MARKER"
     return 0
 }
@@ -528,23 +496,20 @@ trap 'cleanup' EXIT
 
 check_network() {
     log "检查网络连通性..."
-    if ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 || ping -c 1 -W 5 223.5.5.5 >/dev/null 2>&1; then
-        green "网络连接正常 (ping 成功)"
+    if ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+        green "网络连接正常"
         return 0
     fi
-    log "ping 失败，尝试 http 检测..."
-    if http_get "https://www.baidu.com" 10 15 >/dev/null 2>&1 || \
-       http_get "https://www.google.com" 10 15 >/dev/null 2>&1; then
-        green "网络连接正常 (http 成功)"
+    if http_get "https://www.baidu.com" 5 10 >/dev/null 2>&1; then
+        green "网络连接正常 (http)"
         return 0
     fi
-    red "无法连接到外网，请检查网络配置"
+    red "无法连接到外网"
     return 1
 }
 
 configure_network_forwarding_nat() {
     log "配置 IPv4/IPv6 转发及 NAT..."
-
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || { red "启用 IPv4 转发失败"; return 1; }
     if grep -q "^net.ipv4.ip_forward=" /etc/sysctl.conf 2>/dev/null; then
         sed -i 's/^net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
@@ -554,56 +519,33 @@ configure_network_forwarding_nat() {
     green "IPv4 转发已启用"
 
     if sysctl net.ipv6.conf.all.forwarding >/dev/null 2>&1; then
-        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || yellow "IPv6 转发启用失败"
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
         if grep -q "^net.ipv6.conf.all.forwarding=" /etc/sysctl.conf 2>/dev/null; then
             sed -i 's/^net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
         else
             echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
         fi
-        sed -i '/^net.ipv6.conf.all.disable_ipv6=/d' /etc/sysctl.conf
-        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
         green "IPv6 转发已启用"
-    else
-        yellow "系统不支持 IPv6 转发，跳过"
     fi
-
-    sysctl -p >/dev/null 2>&1 || yellow "sysctl -p 部分配置可能无效"
+    sysctl -p >/dev/null 2>&1 || true
 
     local NAT_SOURCE_CIDR="192.168.0.0/16"
     if ! iptables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null; then
         if iptables -t nat -A POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE; then
             green "IPv4 NAT 规则添加成功"
-            if [ "$SYSTEM_TYPE" = "openwrt" ]; then
-                yellow "OpenWrt: 请手动将 NAT 规则写入 UCI 防火墙以持久化"
-            elif command -v iptables-save >/dev/null 2>&1; then
-                mkdir -p /etc/iptables
-                iptables-save > /etc/iptables/rules.v4 || yellow "iptables-save 失败"
-            fi
-        else
-            red "IPv4 NAT 规则添加失败"
+            [ "$SYSTEM_TYPE" != "openwrt" ] && command -v iptables-save >/dev/null 2>&1 && \
+                { mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4 2>/dev/null || true; }
         fi
     else
         green "IPv4 NAT 规则已存在"
     fi
 
-    local NAT_SOURCE_CIDR_V6="fc00::/7"
     if command -v ip6tables >/dev/null 2>&1; then
-        yellow "注意: IPv6 NAT (NAT66) 会破坏 IPv6 端到端连通性"
+        local NAT_SOURCE_CIDR_V6="fc00::/7"
         if ! ip6tables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null; then
-            if ip6tables -t nat -A POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE; then
-                green "IPv6 NAT 规则添加成功"
-                if [ "$SYSTEM_TYPE" != "openwrt" ] && command -v ip6tables-save >/dev/null 2>&1; then
-                    mkdir -p /etc/iptables
-                    ip6tables-save > /etc/iptables/rules.v6 || yellow "ip6tables-save 失败"
-                fi
-            else
-                yellow "IPv6 NAT 规则添加失败"
-            fi
-        else
-            green "IPv6 NAT 规则已存在"
+            ip6tables -t nat -A POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null && \
+                green "IPv6 NAT 规则添加成功" || yellow "IPv6 NAT 添加失败"
         fi
-    else
-        yellow "ip6tables 未安装，跳过 IPv6 NAT"
     fi
     return 0
 }
@@ -615,26 +557,11 @@ clean_up_system_configs() {
     sysctl -p >/dev/null 2>&1 || true
 
     local NAT_SOURCE_CIDR="192.168.0.0/16"
-    local NAT_SOURCE_CIDR_V6="fc00::/7"
-
-    if iptables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE
+    iptables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR" -j MASQUERADE 2>/dev/null && \
         green "IPv4 NAT 规则已移除"
-        [ "$SYSTEM_TYPE" != "openwrt" ] && command -v iptables-save >/dev/null 2>&1 && \
-            iptables-save > /etc/iptables/rules.v4
-    else
-        yellow "未找到 IPv4 NAT 规则"
-    fi
-
     if command -v ip6tables >/dev/null 2>&1; then
-        if ip6tables -t nat -C POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE 2>/dev/null; then
-            ip6tables -t nat -D POSTROUTING -s "$NAT_SOURCE_CIDR_V6" -j MASQUERADE
+        ip6tables -t nat -D POSTROUTING -s "fc00::/7" -j MASQUERADE 2>/dev/null && \
             green "IPv6 NAT 规则已移除"
-            [ "$SYSTEM_TYPE" != "openwrt" ] && command -v ip6tables-save >/dev/null 2>&1 && \
-                ip6tables-save > /etc/iptables/rules.v6
-        else
-            yellow "未找到 IPv6 NAT 规则"
-        fi
     fi
     green "系统配置清理完成。"
 }
@@ -649,18 +576,12 @@ setup_service_env() {
     while true; do
         printf "%b请输入 %s 订阅链接或 API 地址：%b\n" "$GREEN" "$service_name" "$NC"
         read -r PROXY_API_URL
-        if [ -z "$PROXY_API_URL" ]; then
-            red "订阅链接不能为空！"
-            continue
-        fi
-        if ! echo "$PROXY_API_URL" | grep -qE '^https?://'; then
-            red "URL 格式无效，必须以 http:// 或 https:// 开头"
-            continue
-        fi
+        [ -z "$PROXY_API_URL" ] && { red "订阅链接不能为空！"; continue; }
+        echo "$PROXY_API_URL" | grep -qE '^https?://' || { red "URL 格式无效"; continue; }
         break
     done
 
-    printf "%b请选择代理模式：%b\n  1) 全局 (global)\n  2) GFWList\n  3) 规则 (rule)\n  4) 直连 (direct)\n" "$GREEN" "$NC"
+    printf "%b请选择代理模式：%b\n  1) global\n  2) gfwlist\n  3) rule\n  4) direct\n" "$GREEN" "$NC"
     read -r PROXY_MODE_INPUT
     local PROXY_MODE="rule"
     case "$PROXY_MODE_INPUT" in
@@ -668,17 +589,12 @@ setup_service_env() {
         2) PROXY_MODE="gfwlist" ;;
         3) PROXY_MODE="rule" ;;
         4) PROXY_MODE="direct" ;;
-        *) yellow "无效选择，使用默认 rule 模式" ;;
     esac
 
-    printf "%b请输入自动更新间隔（分钟，0=不自动更新，推荐 1440）：%b\n" "$GREEN" "$NC"
+    printf "%b请输入自动更新间隔（分钟，0=不自动，推荐 1440）：%b\n" "$GREEN" "$NC"
     read -r CRON_INTERVAL_INPUT
     local CRON_INTERVAL=1440
-    if echo "$CRON_INTERVAL_INPUT" | grep -Eq '^[0-9]+$'; then
-        CRON_INTERVAL="$CRON_INTERVAL_INPUT"
-    else
-        yellow "无效输入，使用默认 1440 分钟"
-    fi
+    echo "$CRON_INTERVAL_INPUT" | grep -Eq '^[0-9]+$' && CRON_INTERVAL="$CRON_INTERVAL_INPUT"
 
     write_env_file "$env_file" "$PROXY_API_URL" "$PROXY_MODE" "$CRON_INTERVAL" "$service_name"
 
@@ -709,38 +625,8 @@ get_config_manager_url() {
     if load_service_env "$env_file" 0 2>/dev/null; then
         echo "${PROXY_API_URL:-}"
     else
-        echo ""
-        return 1
+        echo ""; return 1
     fi
-}
-
-get_singbox_versions() {
-    local arch="$1"
-    local releases_info
-    releases_info=$(http_get "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=10" 15 30) || {
-        red "无法获取 Sing-box 版本信息"
-        return 1
-    }
-
-    local found=0
-    while IFS= read -r release_info; do
-        local tag_name is_prerelease asset_name download_url
-        tag_name=$(echo "$release_info" | jq -r '.tag_name')
-        is_prerelease=$(echo "$release_info" | jq -r '.prerelease')
-        asset_name="sing-box-$(echo "$tag_name" | sed 's/^v//')-linux-${arch}.tar.gz"
-        download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name == \"$asset_name\") | .browser_download_url")
-
-        if [ -n "$download_url" ] && [ "$download_url" != "null" ]; then
-            printf "%s|%s|%s|%s\n" "$tag_name" "$is_prerelease" "$download_url" "$asset_name"
-            found=$((found + 1))
-        fi
-    done < <(echo "$releases_info" | jq -c '.[]')
-
-    if [ "$found" -eq 0 ]; then
-        red "未找到适用于架构 $arch 的 Sing-box 版本"
-        return 1
-    fi
-    return 0
 }
 
 get_arch() {
@@ -761,6 +647,32 @@ get_arch() {
     esac
 }
 
+get_singbox_versions() {
+    local arch="$1"
+    local releases_info
+    releases_info=$(http_get "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=10" 10 20) || {
+        red "无法获取 Sing-box 版本信息"
+        return 1
+    }
+
+    local found=0
+    while IFS= read -r release_info; do
+        local tag_name is_prerelease asset_name download_url
+        tag_name=$(echo "$release_info" | jq -r '.tag_name')
+        is_prerelease=$(echo "$release_info" | jq -r '.prerelease')
+        asset_name="sing-box-$(echo "$tag_name" | sed 's/^v//')-linux-${arch}.tar.gz"
+        download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name == \"$asset_name\") | .browser_download_url")
+
+        if [ -n "$download_url" ] && [ "$download_url" != "null" ]; then
+            printf "%s|%s|%s|%s\n" "$tag_name" "$is_prerelease" "$download_url" "$asset_name"
+            found=$((found + 1))
+        fi
+    done < <(echo "$releases_info" | jq -c '.[]')
+
+    [ "$found" -eq 0 ] && { red "未找到架构 $arch 的版本"; return 1; }
+    return 0
+}
+
 install_singbox() {
     log "开始安装 Sing-box..."
     check_network || return 1
@@ -778,10 +690,7 @@ install_singbox() {
         [ -n "$line" ] && versions_list+=("$line")
     done <<< "$versions_raw"
 
-    if [ "${#versions_list[@]}" -eq 0 ]; then
-        red "版本列表为空"
-        return 1
-    fi
+    [ "${#versions_list[@]}" -eq 0 ] && { red "版本列表为空"; return 1; }
 
     clear
     printf "\n%b=== 选择要安装的 Sing-box 版本 ===%b\n" "$GREEN" "$NC"
@@ -797,14 +706,12 @@ install_singbox() {
         fi
         i=$((i + 1))
     done
-    printf "%b=====================================%b\n" "$GREEN" "$NC"
     printf "请输入选项 (1-%d): " "${#versions_list[@]}"
     read -r choice
 
     if ! echo "$choice" | grep -qE '^[0-9]+$' || \
        [ "$choice" -lt 1 ] || [ "$choice" -gt "${#versions_list[@]}" ]; then
-        red "无效选项，安装取消"
-        return 1
+        red "无效选项"; return 1
     fi
 
     local selected="${versions_list[$((choice-1))]}"
@@ -816,82 +723,60 @@ install_singbox() {
     TEMP_DIR=$(mktemp -d)
     local TAR_PATH="$TEMP_DIR/$FILENAME"
 
-    log "下载 Sing-box $VERSION_TAG ($local_arch)..."
-    if ! download_file_with_proxy "$DOWNLOAD_URL" "$TAR_PATH" "binary"; then
-        red "下载失败"; cleanup; return 1
-    fi
+    log "下载 Sing-box $VERSION_TAG..."
+    download_file_smart "$DOWNLOAD_URL" "$TAR_PATH" "binary" || { red "下载失败"; cleanup; return 1; }
 
-    log "解压文件..."
-    if ! tar -xzf "$TAR_PATH" -C "$TEMP_DIR"; then
-        red "解压失败"; cleanup; return 1
-    fi
+    tar -xzf "$TAR_PATH" -C "$TEMP_DIR" || { red "解压失败"; cleanup; return 1; }
 
     local SINGBOX_BIN
     SINGBOX_BIN=$(find "$TEMP_DIR" -type f -name "sing-box" -perm /a+x | head -n 1)
-    if [ -z "$SINGBOX_BIN" ]; then
-        red "未找到 sing-box 可执行文件"; cleanup; return 1
-    fi
+    [ -z "$SINGBOX_BIN" ] && { red "未找到 sing-box 可执行文件"; cleanup; return 1; }
 
     manage_service_internal "singbox" "stop" >/dev/null 2>&1 || true
     if [ "$SB_BIN_PATH" = "/usr/local/bin/sing-box" ] || [ ! -x "$SB_BIN_PATH" ]; then
         SB_BIN_PATH="/usr/local/bin/sing-box"
     fi
     mkdir -p "$(dirname "$SB_BIN_PATH")"
-    if ! cp "$SINGBOX_BIN" "$SB_BIN_PATH"; then
-        red "安装失败（文件复制错误）"; cleanup; return 1
-    fi
+    cp "$SINGBOX_BIN" "$SB_BIN_PATH" || { red "安装失败"; cleanup; return 1; }
     chmod +x "$SB_BIN_PATH"
     cleanup
 
-    green "Sing-box $VERSION_TAG 安装成功！路径: $SB_BIN_PATH"
+    green "Sing-box $VERSION_TAG 安装成功！"
     [ ! -f "$SB_CONFIG_FILE" ] && generate_initial_singbox_config
     setup_service "singbox"
     manage_autostart_internal "singbox" "enable"
-    green "Sing-box 部署完成，已设置开机自启。"
     return 0
 }
 
 generate_initial_singbox_config() {
-    log "生成初始 Sing-box 配置: $SB_CONFIG_FILE"
+    log "生成初始 Sing-box 配置"
     mkdir -p "$(dirname "$SB_CONFIG_FILE")"
-    if [ -f "$SB_CONFIG_FILE" ]; then
-        yellow "已备份现有配置到 ${SB_CONFIG_FILE}.bak"
-        cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
-    fi
+    [ -f "$SB_CONFIG_FILE" ] && cp "$SB_CONFIG_FILE" "${SB_CONFIG_FILE}.bak"
     cat > "$SB_CONFIG_FILE" << 'EOF'
 {
     "log": { "level": "info" },
     "inbounds": [
-        {
-            "type": "tun", "tag": "tun-in", "stack": "system",
-            "auto_route": true, "inet4_address": "172.19.0.1/24",
-            "sniff": true, "detour": "proxy"
-        },
-        {
-            "type": "mixed", "tag": "mixed-in", "listen": "::",
-            "listen_port": 2080, "detour": "proxy"
-        }
+        {"type": "tun", "tag": "tun-in", "stack": "system", "auto_route": true, "inet4_address": "172.19.0.1/24", "sniff": true, "detour": "proxy"},
+        {"type": "mixed", "tag": "mixed-in", "listen": "::", "listen_port": 2080, "detour": "proxy"}
     ],
     "outbounds": [
-        { "type": "direct", "tag": "direct" },
-        { "type": "block", "tag": "block" },
-        { "type": "dns", "tag": "dns-out" },
-        { "type": "selector", "tag": "proxy", "outbounds": ["direct"] }
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "block"},
+        {"type": "dns", "tag": "dns-out"},
+        {"type": "selector", "tag": "proxy", "outbounds": ["direct"]}
     ],
-    "route": { "rules": [{ "inbound": ["tun-in", "mixed-in"], "outbound": "proxy" }] },
-    "dns": { "servers": [{ "address": "8.8.8.8", "detour": "direct" }] }
+    "route": {"rules": [{"inbound": ["tun-in", "mixed-in"], "outbound": "proxy"}]},
+    "dns": {"servers": [{"address": "8.8.8.8", "detour": "direct"}]}
 }
 EOF
     green "Sing-box 初始配置已生成"
 }
 
 get_mihomo_latest_version() {
-    local latest_version
-    latest_version=$(http_get "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" 15 30 | jq -r '.tag_name')
-    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
-        return 1
-    fi
-    echo "$latest_version"
+    local v
+    v=$(http_get "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" 10 20 | jq -r '.tag_name')
+    [ -z "$v" ] || [ "$v" = "null" ] && return 1
+    echo "$v"
 }
 
 install_mihomo() {
@@ -900,7 +785,7 @@ install_mihomo() {
     configure_network_forwarding_nat || return 1
 
     local latest_version
-    latest_version=$(get_mihomo_latest_version) || { red "获取 Mihomo 版本失败"; return 1; }
+    latest_version=$(get_mihomo_latest_version) || { red "获取版本失败"; return 1; }
     green "Mihomo 最新版本: $latest_version"
 
     local local_arch
@@ -918,23 +803,19 @@ install_mihomo() {
         mipsle)  FILENAME="mihomo-linux-mipsle-softfloat-${latest_version}.gz" ;;
         mips64)  FILENAME="mihomo-linux-mips64-${latest_version}.gz" ;;
         mips64le) FILENAME="mihomo-linux-mips64le-${latest_version}.gz" ;;
-        *) red "不支持的架构: $local_arch"; return 1 ;;
+        *) red "不支持的架构"; return 1 ;;
     esac
 
     local DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/download/${latest_version}/${FILENAME}"
     TEMP_DIR=$(mktemp -d)
     local GZ_PATH="$TEMP_DIR/$FILENAME"
 
-    log "下载 Mihomo ${latest_version} (${local_arch})..."
-    if ! download_file_with_proxy "$DOWNLOAD_URL" "$GZ_PATH" "binary"; then
-        red "下载失败"; cleanup; return 1
-    fi
+    log "下载 Mihomo ${latest_version}..."
+    download_file_smart "$DOWNLOAD_URL" "$GZ_PATH" "binary" || { red "下载失败"; cleanup; return 1; }
 
-    if ! gzip -d "$GZ_PATH"; then
-        red "解压失败"; cleanup; return 1
-    fi
+    gzip -d "$GZ_PATH" || { red "解压失败"; cleanup; return 1; }
     local MIHOMO_BIN="${GZ_PATH%.gz}"
-    [ ! -f "$MIHOMO_BIN" ] && { red "未找到 Mihomo 可执行文件"; cleanup; return 1; }
+    [ ! -f "$MIHOMO_BIN" ] && { red "未找到可执行文件"; cleanup; return 1; }
 
     manage_service_internal "mihomo" "stop" >/dev/null 2>&1 || true
     if [ "$MH_BIN_PATH" = "/usr/local/bin/mihomo" ] || [ ! -x "$MH_BIN_PATH" ]; then
@@ -949,43 +830,39 @@ install_mihomo() {
     [ ! -f "$MH_CONFIG_FILE" ] && generate_initial_mihomo_config
     setup_service "mihomo"
     manage_autostart_internal "mihomo" "enable"
-    green "Mihomo 部署完成，已设置开机自启。"
     return 0
 }
 
 get_mihomo_alpha_versions() {
     local arch="$1"
-    local page=1
-    local found=0
+    local page=1 found=0
 
-    while true; do
+    while [ "$page" -le 3 ]; do
         local releases_info
-        releases_info=$(http_get "https://api.github.com/repos/vernesong/mihomo/releases?page=${page}&per_page=30" 15 30) || break
-
+        releases_info=$(http_get "https://api.github.com/repos/vernesong/mihomo/releases?page=${page}&per_page=30" 10 20) || break
         local count
         count=$(echo "$releases_info" | jq 'length' 2>/dev/null)
         [ -z "$count" ] || [ "$count" -eq 0 ] && break
 
-        while IFS= read -r asset_info; do
-            local asset_name download_url commit_id published_at
-            asset_name=$(echo "$asset_info" | jq -r '.name')
-            if echo "$asset_name" | grep -qE "mihomo-linux-${arch}(-compatible)?-alpha-smart-[0-9a-f]+\.gz"; then
-                commit_id=$(echo "$asset_name" | grep -oE '[0-9a-f]{7,}' | head -n 1)
-                download_url=$(echo "$asset_info" | jq -r '.browser_download_url')
-                published_at=$(echo "$asset_info" | jq -r '.published_at' | cut -d'T' -f1)
-                printf "alpha-smart-%s|%s|%s|%s\n" "$commit_id" "$published_at" "$download_url" "$asset_name"
-                found=$((found + 1))
-            fi
-        done < <(echo "$releases_info" | jq -c '.[] | .assets[]')
+        while IFS= read -r release_info; do
+            local rel_published
+            rel_published=$(echo "$release_info" | jq -r '.published_at // "unknown"' | cut -d'T' -f1)
+            while IFS= read -r asset_info; do
+                local asset_name download_url commit_id
+                asset_name=$(echo "$asset_info" | jq -r '.name')
+                if echo "$asset_name" | grep -qE "mihomo-linux-${arch}(-compatible)?-alpha-smart-[0-9a-f]+\.gz"; then
+                    commit_id=$(echo "$asset_name" | grep -oE '[0-9a-f]{7,}' | head -n 1)
+                    download_url=$(echo "$asset_info" | jq -r '.browser_download_url')
+                    printf "alpha-smart-%s|%s|%s|%s\n" "$commit_id" "$rel_published" "$download_url" "$asset_name"
+                    found=$((found + 1))
+                fi
+            done < <(echo "$release_info" | jq -c '.assets[]')
+        done < <(echo "$releases_info" | jq -c '.[]')
 
         page=$((page + 1))
-        [ "$page" -gt 5 ] && break
     done
 
-    if [ "$found" -eq 0 ]; then
-        red "未找到架构 $arch 的 Mihomo Alpha 版本，请使用稳定版"
-        return 1
-    fi
+    [ "$found" -eq 0 ] && { red "未找到 $arch 架构 Alpha 版本"; return 1; }
     return 0
 }
 
@@ -996,12 +873,9 @@ install_mihomo_alpha_smart() {
 
     local local_arch
     local_arch=$(get_arch) || return 1
-    if ! echo " amd64 arm64 " | grep -q " ${local_arch} "; then
-        red "暂无 $local_arch 架构的 Mihomo Alpha 版本，请使用稳定版"
-        return 1
-    fi
+    echo " amd64 arm64 " | grep -q " ${local_arch} " || { red "$local_arch 无 Alpha 版"; return 1; }
 
-    log "正在获取 Mihomo Alpha 版本列表..."
+    log "获取 Mihomo Alpha 版本列表..."
     local versions_raw
     versions_raw=$(get_mihomo_alpha_versions "$local_arch") || return 1
 
@@ -1009,30 +883,21 @@ install_mihomo_alpha_smart() {
     while IFS= read -r line; do
         [ -n "$line" ] && versions_list+=("$line")
     done <<< "$versions_raw"
-
-    if [ "${#versions_list[@]}" -eq 0 ]; then
-        red "版本列表为空"
-        return 1
-    fi
+    [ "${#versions_list[@]}" -eq 0 ] && { red "版本列表为空"; return 1; }
 
     clear
-    printf "\n%b=== 选择 Mihomo Alpha (Smart Group) 版本 ===%b\n" "$GREEN" "$NC"
+    printf "\n%b=== 选择 Mihomo Alpha 版本 ===%b\n" "$GREEN" "$NC"
     local i=1
     for version_info in "${versions_list[@]}"; do
-        local ver_display published_at
-        ver_display=$(echo "$version_info" | cut -d'|' -f1)
-        published_at=$(echo "$version_info" | cut -d'|' -f2)
-        printf "  %d) %s (发布于: %s)\n" "$i" "$ver_display" "$published_at"
+        printf "  %d) %s (发布于: %s)\n" "$i" "$(echo "$version_info" | cut -d'|' -f1)" "$(echo "$version_info" | cut -d'|' -f2)"
         i=$((i + 1))
     done
-    printf "%b=====================================%b\n" "$GREEN" "$NC"
     printf "请输入选项 (1-%d): " "${#versions_list[@]}"
     read -r choice
 
     if ! echo "$choice" | grep -qE '^[0-9]+$' || \
        [ "$choice" -lt 1 ] || [ "$choice" -gt "${#versions_list[@]}" ]; then
-        red "无效选项，安装取消"
-        return 1
+        red "无效选项"; return 1
     fi
 
     local selected="${versions_list[$((choice-1))]}"
@@ -1045,13 +910,9 @@ install_mihomo_alpha_smart() {
     local GZ_PATH="$TEMP_DIR/$FILENAME"
 
     log "下载 Mihomo Alpha ($VERSION_DISPLAY)..."
-    if ! download_file_with_proxy "$DOWNLOAD_URL" "$GZ_PATH" "binary"; then
-        red "下载失败"; cleanup; return 1
-    fi
+    download_file_smart "$DOWNLOAD_URL" "$GZ_PATH" "binary" || { red "下载失败"; cleanup; return 1; }
 
-    if ! gzip -d "$GZ_PATH"; then
-        red "解压失败"; cleanup; return 1
-    fi
+    gzip -d "$GZ_PATH" || { red "解压失败"; cleanup; return 1; }
     local MIHOMO_BIN="${GZ_PATH%.gz}"
     [ ! -f "$MIHOMO_BIN" ] && { red "未找到可执行文件"; cleanup; return 1; }
 
@@ -1066,32 +927,27 @@ install_mihomo_alpha_smart() {
     local MODEL_BIN_PATH="$MH_BASE_DIR/model.bin"
     local FIXED_MODEL_URL="https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/model.bin"
     mkdir -p "$MH_BASE_DIR"
-    chmod 755 "$MH_BASE_DIR"
 
     log "下载 LightGBM Model..."
-    if download_file_with_proxy "$FIXED_MODEL_URL" "$MODEL_BIN_PATH" "binary"; then
+    if download_file_smart "$FIXED_MODEL_URL" "$MODEL_BIN_PATH" "binary"; then
         chmod 644 "$MODEL_BIN_PATH"
         green "model.bin 下载成功"
     else
-        yellow "model.bin 下载失败，Smart Group 功能可能受限"
+        yellow "model.bin 下载失败，Smart Group 功能受限"
     fi
 
     cleanup
-    green "Mihomo Alpha ($VERSION_DISPLAY) 安装成功！路径: $MH_BIN_PATH"
+    green "Mihomo Alpha ($VERSION_DISPLAY) 安装成功！"
     [ ! -f "$MH_CONFIG_FILE" ] && generate_initial_mihomo_config
     setup_service "mihomo"
     manage_autostart_internal "mihomo" "enable"
-    green "Mihomo Alpha 部署完成，已设置开机自启。"
     return 0
 }
 
 generate_initial_mihomo_config() {
-    log "生成初始 Mihomo 配置: $MH_CONFIG_FILE"
+    log "生成初始 Mihomo 配置"
     mkdir -p "$(dirname "$MH_CONFIG_FILE")"
-    if [ -f "$MH_CONFIG_FILE" ]; then
-        yellow "已备份现有配置到 ${MH_CONFIG_FILE}.bak"
-        cp "$MH_CONFIG_FILE" "${MH_CONFIG_FILE}.bak"
-    fi
+    [ -f "$MH_CONFIG_FILE" ] && cp "$MH_CONFIG_FILE" "${MH_CONFIG_FILE}.bak"
     cat > "$MH_CONFIG_FILE" << 'EOF'
 port: 7890
 socks-port: 7891
@@ -1107,15 +963,18 @@ tun:
   auto-route: true
   auto-detect-interface: true
   inet4-address: 198.18.0.1/16
-dns-hijack:
-  - "any:53"
 dns:
   enable: true
-  listen: 0.0.0.0:53
-  enhanced-mode: true
+  listen: 0.0.0.0:7874
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
   nameserver:
-    - 8.8.8.8
-    - 1.1.1.1
+    - 223.5.5.5
+    - 119.29.29.29
   fallback:
     - https://dns.google/dns-query
   fallback-filter: { geoip: true, geoip-code: CN }
@@ -1132,13 +991,10 @@ proxy-groups:
   - name: Proxy
     type: select
     proxies: [Example-Proxy, DIRECT]
-  - name: Others
-    type: select
-    proxies: [Proxy, DIRECT]
 
 rules:
   - GEOIP,CN,DIRECT
-  - MATCH,Others
+  - MATCH,Proxy
 EOF
     green "Mihomo 初始配置已生成"
 }
@@ -1149,77 +1005,46 @@ update_config_and_start_service() {
 
     case "$service_type" in
         "singbox")
-            proxy_bin_path="$SB_BIN_PATH"
-            config_file="$SB_CONFIG_FILE"
-            env_file="$SB_ENV_FILE"
-            service_name_display="Sing-box"
+            proxy_bin_path="$SB_BIN_PATH"; config_file="$SB_CONFIG_FILE"
+            env_file="$SB_ENV_FILE"; service_name_display="Sing-box"
             ;;
         "mihomo")
-            proxy_bin_path="$MH_BIN_PATH"
-            config_file="$MH_CONFIG_FILE"
-            env_file="$MH_ENV_FILE"
-            service_name_display="Mihomo"
+            proxy_bin_path="$MH_BIN_PATH"; config_file="$MH_CONFIG_FILE"
+            env_file="$MH_ENV_FILE"; service_name_display="Mihomo"
             ;;
-        *)
-            red "无效的服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
-    [ ! -x "$proxy_bin_path" ] && { red "$service_name_display 未安装或不可执行"; return 1; }
-
-    if ! load_service_env "$env_file"; then
-        red "无法加载环境变量，请重新设置配置"; return 1
-    fi
+    [ ! -x "$proxy_bin_path" ] && { red "$service_name_display 未安装"; return 1; }
+    load_service_env "$env_file" || { red "无法加载环境变量"; return 1; }
 
     log "正在从 API 更新配置..."
-
     local tmp_config
     tmp_config=$(mktemp)
 
-    local exit_code=1
-    local attempt=0
-
+    local exit_code=1 attempt=0
     while [ "$attempt" -lt "$CFG_RETRY" ]; do
         attempt=$((attempt + 1))
         log "配置下载尝试 $attempt/$CFG_RETRY..."
-
-        http_fetch "$PROXY_API_URL" "$tmp_config" "$CFG_CONNECT_TIMEOUT" "$CFG_MAX_TIME" "$CFG_SPEED_LIMIT" "$CFG_SPEED_TIME"
+        http_fetch "$PROXY_API_URL" "$tmp_config" "$CFG_CONNECT_TIMEOUT" "$CFG_MAX_TIME"
         exit_code=$?
-
-        if [ "$exit_code" -eq 0 ] && [ -s "$tmp_config" ]; then
-            break
-        fi
-
-        yellow "配置下载失败 (exit $exit_code)"
-
-        if [ "$attempt" -lt "$CFG_RETRY" ]; then
-            yellow "等待 ${CFG_RETRY_DELAY}s 后重试..."
-            sleep "$CFG_RETRY_DELAY"
-            > "$tmp_config"
-        fi
+        if [ "$exit_code" -eq 0 ] && [ -s "$tmp_config" ]; then break; fi
+        yellow "下载失败 (exit $exit_code)"
+        [ "$attempt" -lt "$CFG_RETRY" ] && { sleep "$CFG_RETRY_DELAY"; > "$tmp_config"; }
     done
 
     if [ "$exit_code" -ne 0 ] || [ ! -s "$tmp_config" ]; then
-        red "配置下载失败（已重试 $CFG_RETRY 次）"
-        rm -f "$tmp_config"
-        return 1
+        red "配置下载失败"; rm -f "$tmp_config"; return 1
     fi
 
     if [ "$service_type" = "singbox" ]; then
-        if ! jq empty "$tmp_config" >/dev/null 2>&1; then
-            red "下载的配置不是有效 JSON"
-            rm -f "$tmp_config"
-            return 1
-        fi
+        jq empty "$tmp_config" >/dev/null 2>&1 || { red "不是有效 JSON"; rm -f "$tmp_config"; return 1; }
     elif [ "$service_type" = "mihomo" ]; then
-        if ! grep -q "proxies:" "$tmp_config"; then
-            red "下载的配置不包含 proxies 字段"
-            rm -f "$tmp_config"
-            return 1
-        fi
+        grep -q "proxies:" "$tmp_config" || { red "配置无 proxies 字段"; rm -f "$tmp_config"; return 1; }
     fi
 
     mv "$tmp_config" "$config_file"
-    green "配置文件更新成功: $config_file"
+    green "配置文件更新成功"
 
     if [ "$service_type" = "mihomo" ]; then
         local mode="${PROXY_MODE:-rule}"
@@ -1229,8 +1054,6 @@ update_config_and_start_service() {
             sed -i "1a mode: $mode" "$config_file"
         fi
         green "代理模式已设置为: $mode"
-    elif [ "$service_type" = "singbox" ]; then
-        yellow "Sing-box 模式切换需手动编辑 JSON 路由配置"
     fi
 
     manage_service_internal "$service_type" "restart"
@@ -1255,16 +1078,14 @@ setup_service_files() {
             service_name="$MH_SERVICE_NAME"
             exec_start="$MH_BIN_PATH -d $MH_BASE_DIR"
             ;;
-        *)
-            red "无效的服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
-    [ ! -x "$bin_path" ] && { red "$bin_path 不存在或不可执行"; return 1; }
-    [ ! -f "$config_file" ] && { red "配置文件 $config_file 不存在"; return 1; }
+    [ ! -x "$bin_path" ] && { red "$bin_path 不可执行"; return 1; }
+    [ ! -f "$config_file" ] && { red "配置文件不存在"; return 1; }
 
     if [ "$SYSTEM_TYPE" = "openwrt" ]; then
         local initd_path="/etc/init.d/$service_name"
-        log "创建 OpenWrt Init.d 服务: $initd_path"
         cat > "$initd_path" << EOF
 #!/bin/sh /etc/rc.common
 USE_PROCD=1
@@ -1283,17 +1104,11 @@ start_service() {
     procd_set_param respawn 30 5 0
     procd_close_instance
 }
-
-service_triggers() {
-    procd_add_reload_trigger "network"
-}
 EOF
         chmod +x "$initd_path"
-        green "OpenWrt 服务文件创建成功: $initd_path"
-
+        green "OpenWrt 服务文件创建成功"
     else
         local service_path="/etc/systemd/system/${service_name}.service"
-        log "创建 Systemd 服务: $service_path"
         cat > "$service_path" << EOF
 [Unit]
 Description=${service_name} Proxy Service
@@ -1315,7 +1130,7 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        green "Systemd 服务文件创建成功: $service_path"
+        green "Systemd 服务文件创建成功"
     fi
     return 0
 }
@@ -1323,26 +1138,22 @@ EOF
 setup_service() {
     local service_type="$1"
     local service_name_display env_file
-
     case "$service_type" in
         "singbox") service_name_display="Sing-box"; env_file="$SB_ENV_FILE" ;;
         "mihomo")  service_name_display="Mihomo";   env_file="$MH_ENV_FILE" ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
     if ! load_service_env "$env_file" 0 2>/dev/null; then
-        if ! setup_service_env "$env_file" "$service_name_display"; then
-            red "环境变量设置失败"; return 1
-        fi
+        setup_service_env "$env_file" "$service_name_display" || return 1
     fi
 
-    setup_service_files "$service_type" || { red "服务文件创建失败"; return 1; }
+    setup_service_files "$service_type" || return 1
     manage_service_internal "$service_type" "restart"
 
     if load_service_env "$env_file" 0 2>/dev/null && [ "${CRON_INTERVAL:-0}" -gt 0 ]; then
         setup_cron_job_internal "$service_type" "${CRON_INTERVAL}"
     fi
-
     green "$service_name_display 服务部署成功！"
     return 0
 }
@@ -1362,17 +1173,13 @@ remove_all_files_and_service() {
             base_dir="$MH_BASE_DIR"; service_name="$MH_SERVICE_NAME"
             service_name_display="Mihomo"
             ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
-    yellow "警告：将完全卸载 ${service_name_display} 及其所有文件"
-    yellow "二进制路径: $bin_path"
-    printf "确认继续？(y/N): "
-    read -r confirm
-    case "$confirm" in
-        y|Y) ;;
-        *) green "卸载已取消"; return 0 ;;
-    esac
+    yellow "将卸载 ${service_name_display} (路径: $bin_path)"
+    printf "确认？(y/N): "
+    read -r c
+    case "$c" in y|Y) ;; *) return 0 ;; esac
 
     manage_service_internal "$service_type" "stop"  >/dev/null 2>&1 || true
     manage_autostart_internal "$service_type" "disable" >/dev/null 2>&1 || true
@@ -1388,11 +1195,445 @@ remove_all_files_and_service() {
     if [ -x "$bin_path" ] && [ "$bin_path" != "/usr/bin/$service_name" ] && [ "$bin_path" != "/usr/sbin/$service_name" ]; then
         rm -f "$bin_path"
     else
-        yellow "二进制 $bin_path 由系统包管理器管理，不予删除"
+        yellow "系统包管理器安装的二进制未删除"
     fi
     rm -rf "$base_dir"
     green "$service_name_display 卸载完成。"
     return 0
+}
+
+# ==============================================================================
+# DNS 转发管理（跨系统兼容）
+# ==============================================================================
+
+parse_mihomo_dns_port() {
+    local cfg="${1:-$MH_CONFIG_FILE}"
+    [ ! -f "$cfg" ] && { echo ""; return 1; }
+    local port
+    port=$(awk '
+        /^dns:/ { in_dns=1; next }
+        /^[a-zA-Z]/ && !/^dns:/ { in_dns=0 }
+        in_dns && /^[[:space:]]+listen:/ {
+            gsub(/["'"'"']/, "")
+            n=split($0, a, ":")
+            print a[n]
+            exit
+        }
+    ' "$cfg" | tr -d ' \t')
+    echo "$port"
+}
+
+check_mihomo_dns_enabled() {
+    local cfg="${1:-$MH_CONFIG_FILE}"
+    [ ! -f "$cfg" ] && return 1
+    awk '
+        /^dns:/ { in_dns=1; next }
+        /^[a-zA-Z]/ { in_dns=0 }
+        in_dns && /^[[:space:]]+enable:[[:space:]]*true/ { print "yes"; exit }
+    ' "$cfg" | grep -q "yes"
+}
+
+update_mihomo_dns_port() {
+    local new_port="$1"
+    local cfg="$MH_CONFIG_FILE"
+    [ ! -f "$cfg" ] && { red "配置文件不存在"; return 1; }
+    cp "$cfg" "${cfg}.dnsbak"
+    if grep -qE '^[[:space:]]+listen:' "$cfg"; then
+        awk -v port="$new_port" '
+            /^dns:/ { in_dns=1 }
+            /^[a-zA-Z]/ && !/^dns:/ { in_dns=0 }
+            in_dns && /^[[:space:]]+listen:/ {
+                sub(/listen:.*/, "listen: 0.0.0.0:" port)
+            }
+            { print }
+        ' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+        green "Mihomo DNS 端口已更新: $new_port"
+    else
+        red "未找到 dns.listen 字段"
+        return 1
+    fi
+    return 0
+}
+
+inject_mihomo_dns_block() {
+    local port="$1"
+    local cfg="$MH_CONFIG_FILE"
+    [ ! -f "$cfg" ] && { red "配置文件不存在"; return 1; }
+    cp "$cfg" "${cfg}.dnsbak"
+    if grep -qE '^dns:' "$cfg"; then
+        yellow "已有 dns 段，跳过注入"
+        return 1
+    fi
+    cat >> "$cfg" << EOF
+
+dns:
+  enable: true
+  listen: 0.0.0.0:${port}
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - https://dns.google/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+EOF
+    green "已向配置注入 dns 段，端口: $port"
+    return 0
+}
+
+# 检测 DNS 后端类型
+detect_dns_backend() {
+    if [ "$SYSTEM_TYPE" = "openwrt" ] && command -v uci >/dev/null 2>&1; then
+        echo "dnsmasq-uci"; return
+    fi
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        echo "systemd-resolved"; return
+    fi
+    if [ -f /etc/dnsmasq.conf ] || systemctl is-active dnsmasq >/dev/null 2>&1 || \
+       command -v dnsmasq >/dev/null 2>&1; then
+        echo "dnsmasq"; return
+    fi
+    if [ -f /etc/resolv.conf ]; then
+        echo "resolv.conf"; return
+    fi
+    echo "unknown"
+}
+
+backup_dns_config() {
+    local backend="$1"
+    mkdir -p "$MH_DNS_BACKUP_DIR"
+    case "$backend" in
+        dnsmasq-uci)
+            {
+                echo "# dnsmasq-uci backup at $(date)"
+                uci show dhcp.@dnsmasq[0] 2>/dev/null
+            } > "$MH_DNS_BACKUP_DIR/dnsmasq-uci.bak"
+            ;;
+        systemd-resolved)
+            [ -f /etc/systemd/resolved.conf ] && \
+                cp /etc/systemd/resolved.conf "$MH_DNS_BACKUP_DIR/resolved.conf.bak"
+            ;;
+        dnsmasq)
+            [ -f /etc/dnsmasq.conf ] && \
+                cp /etc/dnsmasq.conf "$MH_DNS_BACKUP_DIR/dnsmasq.conf.bak"
+            [ -d /etc/dnsmasq.d ] && \
+                cp -r /etc/dnsmasq.d "$MH_DNS_BACKUP_DIR/dnsmasq.d.bak" 2>/dev/null
+            ;;
+        resolv.conf)
+            cp /etc/resolv.conf "$MH_DNS_BACKUP_DIR/resolv.conf.bak"
+            ;;
+    esac
+    green "DNS 配置已备份到 $MH_DNS_BACKUP_DIR"
+}
+
+apply_dns_forward() {
+    local target_port="$1"
+    local backend
+    backend=$(detect_dns_backend)
+
+    log "检测到 DNS 后端: $backend"
+    backup_dns_config "$backend"
+
+    case "$backend" in
+        dnsmasq-uci)
+            uci set dhcp.@dnsmasq[0].noresolv='1'
+            uci set dhcp.@dnsmasq[0].rebind_protection='0'
+            uci -q delete dhcp.@dnsmasq[0].server
+            uci add_list dhcp.@dnsmasq[0].server="127.0.0.1#${target_port}"
+            uci commit dhcp
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1 && \
+                green "dnsmasq(uci) 已转发到 127.0.0.1:${target_port}" || \
+                { red "dnsmasq 重启失败"; return 1; }
+            ;;
+        systemd-resolved)
+            mkdir -p /etc/systemd/resolved.conf.d
+            cat > /etc/systemd/resolved.conf.d/mihomo.conf << EOF
+[Resolve]
+DNS=127.0.0.1:${target_port}
+FallbackDNS=
+Domains=~.
+DNSStubListener=no
+EOF
+            if [ -L /etc/resolv.conf ] || [ ! -f /etc/resolv.conf ]; then
+                rm -f /etc/resolv.conf
+                echo "nameserver 127.0.0.1" > /etc/resolv.conf
+            fi
+            systemctl restart systemd-resolved && \
+                green "systemd-resolved 已转发到 127.0.0.1:${target_port}" || \
+                { red "systemd-resolved 重启失败"; return 1; }
+            yellow "提示：如需彻底生效，请重启网络或系统"
+            ;;
+        dnsmasq)
+            local cfg="/etc/dnsmasq.d/mihomo-forward.conf"
+            mkdir -p /etc/dnsmasq.d
+            cat > "$cfg" << EOF
+no-resolv
+server=127.0.0.1#${target_port}
+EOF
+            if systemctl restart dnsmasq >/dev/null 2>&1; then
+                green "dnsmasq 已转发到 127.0.0.1:${target_port}"
+            else
+                red "dnsmasq 重启失败"; return 1
+            fi
+            ;;
+        resolv.conf)
+            yellow "系统仅使用 resolv.conf，将直接写入 127.0.0.1"
+            yellow "注意：DHCP 可能会覆盖此配置"
+            echo "nameserver 127.0.0.1" > /etc/resolv.conf
+            green "/etc/resolv.conf 已设置为 127.0.0.1"
+            yellow "同时请确保 mihomo DNS 端口为 53，否则需要额外的端口转发"
+            ;;
+        *)
+            red "未识别的 DNS 后端，无法自动配置"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+restore_dns_config() {
+    local backend
+    backend=$(detect_dns_backend)
+
+    case "$backend" in
+        dnsmasq-uci)
+            [ ! -f "$MH_DNS_BACKUP_DIR/dnsmasq-uci.bak" ] && { red "无备份"; return 1; }
+            uci set dhcp.@dnsmasq[0].noresolv='0'
+            uci set dhcp.@dnsmasq[0].rebind_protection='1'
+            uci -q delete dhcp.@dnsmasq[0].server
+            while IFS= read -r line; do
+                case "$line" in
+                    *".server="*)
+                        local val
+                        val=$(echo "$line" | sed -E "s/^[^=]+=//;s/^'//;s/'$//")
+                        [ -n "$val" ] && uci add_list dhcp.@dnsmasq[0].server="$val"
+                        ;;
+                    *".noresolv="*)
+                        local val
+                        val=$(echo "$line" | sed -E "s/^[^=]+=//;s/^'//;s/'$//")
+                        uci set dhcp.@dnsmasq[0].noresolv="$val"
+                        ;;
+                    *".rebind_protection="*)
+                        local val
+                        val=$(echo "$line" | sed -E "s/^[^=]+=//;s/^'//;s/'$//")
+                        uci set dhcp.@dnsmasq[0].rebind_protection="$val"
+                        ;;
+                esac
+            done < "$MH_DNS_BACKUP_DIR/dnsmasq-uci.bak"
+            uci commit dhcp
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1
+            green "dnsmasq(uci) 已还原"
+            ;;
+        systemd-resolved)
+            rm -f /etc/systemd/resolved.conf.d/mihomo.conf
+            [ -f "$MH_DNS_BACKUP_DIR/resolved.conf.bak" ] && \
+                cp "$MH_DNS_BACKUP_DIR/resolved.conf.bak" /etc/systemd/resolved.conf
+            systemctl restart systemd-resolved
+            green "systemd-resolved 已还原"
+            ;;
+        dnsmasq)
+            rm -f /etc/dnsmasq.d/mihomo-forward.conf
+            [ -f "$MH_DNS_BACKUP_DIR/dnsmasq.conf.bak" ] && \
+                cp "$MH_DNS_BACKUP_DIR/dnsmasq.conf.bak" /etc/dnsmasq.conf
+            systemctl restart dnsmasq >/dev/null 2>&1
+            green "dnsmasq 已还原"
+            ;;
+        resolv.conf)
+            [ -f "$MH_DNS_BACKUP_DIR/resolv.conf.bak" ] && \
+                cp "$MH_DNS_BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
+            green "resolv.conf 已还原"
+            ;;
+        *)
+            red "无法识别 DNS 后端"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+detect_dns_forward_status() {
+    local backend
+    backend=$(detect_dns_backend)
+    case "$backend" in
+        dnsmasq-uci)
+            local s
+            s=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+            echo "$s" | grep -oE "127\.0\.0\.1#[0-9]+" | head -n 1
+            ;;
+        systemd-resolved)
+            [ -f /etc/systemd/resolved.conf.d/mihomo.conf ] && \
+                grep -oE "127\.0\.0\.1:[0-9]+" /etc/systemd/resolved.conf.d/mihomo.conf | head -n 1
+            ;;
+        dnsmasq)
+            [ -f /etc/dnsmasq.d/mihomo-forward.conf ] && \
+                grep -oE "127\.0\.0\.1#[0-9]+" /etc/dnsmasq.d/mihomo-forward.conf | head -n 1
+            ;;
+        resolv.conf)
+            grep -E "^nameserver[[:space:]]+127\.0\.0\.1" /etc/resolv.conf 2>/dev/null | head -n 1 | awk '{print $2}'
+            ;;
+    esac
+}
+
+auto_configure_dns_forward() {
+    log "开始一键自动配置 DNS 转发..."
+
+    [ ! -f "$MH_CONFIG_FILE" ] && { red "mihomo 配置文件不存在"; return 1; }
+
+    local backend
+    backend=$(detect_dns_backend)
+    log "系统 DNS 后端: $backend"
+    if [ "$backend" = "unknown" ]; then
+        red "无法识别系统 DNS 后端，请手动配置"
+        return 1
+    fi
+
+    local mh_port target_port
+    mh_port=$(parse_mihomo_dns_port)
+
+    if ! check_mihomo_dns_enabled; then
+        yellow "配置文件未启用 DNS，将自动注入 dns 段（端口 $MH_DEFAULT_DNS_PORT）"
+        printf "确认继续？(Y/n): "
+        read -r c
+        case "$c" in n|N) return 0 ;; esac
+        inject_mihomo_dns_block "$MH_DEFAULT_DNS_PORT" || return 1
+        target_port="$MH_DEFAULT_DNS_PORT"
+    elif [ "$mh_port" = "53" ] && [ "$backend" != "resolv.conf" ]; then
+        yellow "Mihomo 监听 53 端口，将与系统 DNS 冲突"
+        yellow "将自动改为 $MH_DEFAULT_DNS_PORT 端口"
+        printf "确认继续？(Y/n): "
+        read -r c
+        case "$c" in n|N) return 0 ;; esac
+        update_mihomo_dns_port "$MH_DEFAULT_DNS_PORT" || return 1
+        target_port="$MH_DEFAULT_DNS_PORT"
+    else
+        target_port="$mh_port"
+        green "使用现有 mihomo DNS 端口: $target_port"
+    fi
+
+    log "重启 mihomo 服务..."
+    manage_service_internal "mihomo" "restart"
+    sleep 2
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -lnup 2>/dev/null | grep -qE ":${target_port}[[:space:]]"; then
+            green "已确认 mihomo 监听 $target_port"
+        else
+            yellow "警告：未检测到 $target_port 监听"
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -lnup 2>/dev/null | grep -qE ":${target_port}[[:space:]]"; then
+            green "已确认 mihomo 监听 $target_port"
+        else
+            yellow "警告：未检测到 $target_port 监听"
+        fi
+    fi
+
+    log "配置系统 DNS 转发..."
+    apply_dns_forward "$target_port" || return 1
+
+    green "===== 自动配置完成 ====="
+    green "Mihomo DNS 端口: $target_port"
+    green "系统 DNS 后端  : $backend"
+    yellow "建议使用 [6) 测试 DNS 解析] 验证"
+    return 0
+}
+
+test_dns_resolution() {
+    log "测试 DNS 解析..."
+    local test_domain="www.google.com"
+
+    yellow "--- 通过 127.0.0.1 查询 $test_domain ---"
+    if command -v dig >/dev/null 2>&1; then
+        dig @127.0.0.1 "$test_domain" +short +time=3 +tries=1 2>&1 | head -n 5
+    elif command -v nslookup >/dev/null 2>&1; then
+        nslookup "$test_domain" 127.0.0.1 2>&1 | head -n 10
+    elif command -v host >/dev/null 2>&1; then
+        host "$test_domain" 127.0.0.1 2>&1 | head -n 5
+    else
+        red "无 DNS 测试工具，请安装 dig 或 nslookup"
+    fi
+
+    yellow ""
+    yellow "判断标准："
+    yellow "  返回 198.18.x.x  → fake-ip 生效 ✓"
+    yellow "  返回真实 IP      → redir-host 生效 ✓"
+    yellow "  返回 114/8.8.8.8 → 未生效 ✗"
+    return 0
+}
+
+manage_dns_forwarding_menu() {
+    while true; do
+        clear
+        local backend mh_port dns_enabled current_fwd
+        backend=$(detect_dns_backend)
+        mh_port=$(parse_mihomo_dns_port)
+        current_fwd=$(detect_dns_forward_status)
+        check_mihomo_dns_enabled && dns_enabled="已启用" || dns_enabled="未启用"
+
+        printf "\n%b=== Mihomo DNS 转发管理 ===%b\n" "$GREEN" "$NC"
+        printf "系统 DNS 后端    : %s\n" "$backend"
+        printf "Mihomo DNS 状态  : %s\n" "$dns_enabled"
+        printf "Mihomo DNS 端口  : %s\n" "${mh_port:-未设置}"
+        printf "系统当前转发     : %s\n" "${current_fwd:-未转发}"
+        printf "%b============================%b\n" "$GREEN" "$NC"
+
+        if [ "$backend" = "unknown" ]; then
+            red "⚠  未识别的 DNS 后端，无法自动配置"
+        fi
+        if [ "$dns_enabled" = "未启用" ] || [ -z "$mh_port" ]; then
+            yellow "⚠  Mihomo 未启用 DNS 或未设置端口"
+        elif [ "$mh_port" = "53" ] && [ "$backend" != "resolv.conf" ]; then
+            yellow "⚠  Mihomo 监听 53 端口会冲突"
+        else
+            green "✓  Mihomo DNS 配置正常"
+        fi
+        [ -z "$current_fwd" ] && yellow "⚠  系统未转发到 mihomo" || green "✓  系统已转发到 $current_fwd"
+
+        printf "\n"
+        printf " 1) %b一键自动配置%b（推荐）\n" "$GREEN" "$NC"
+        printf " 2) 仅修改 mihomo DNS 端口\n"
+        printf " 3) 仅配置系统转发\n"
+        printf " 4) 注入完整 dns 段到 mihomo 配置\n"
+        printf " 5) %b还原系统 DNS 原配置%b\n" "$YELLOW" "$NC"
+        printf " 6) 测试 DNS 解析\n"
+        printf " q) 返回\n"
+        printf "%b============================%b\n" "$GREEN" "$NC"
+        read -r -p "请输入选项: " choice
+
+        case "$choice" in
+            1) auto_configure_dns_forward ;;
+            2)
+                printf "请输入新端口（推荐 $MH_DEFAULT_DNS_PORT）: "
+                read -r np; [ -z "$np" ] && np="$MH_DEFAULT_DNS_PORT"
+                if echo "$np" | grep -qE '^[0-9]+$'; then
+                    update_mihomo_dns_port "$np"
+                    manage_service_internal "mihomo" "restart"
+                else red "端口无效"; fi
+                ;;
+            3)
+                local mp; mp=$(parse_mihomo_dns_port)
+                [ -z "$mp" ] && red "无法解析端口" || apply_dns_forward "$mp"
+                ;;
+            4)
+                printf "请输入 DNS 端口（推荐 $MH_DEFAULT_DNS_PORT）: "
+                read -r np; [ -z "$np" ] && np="$MH_DEFAULT_DNS_PORT"
+                inject_mihomo_dns_block "$np"
+                manage_service_internal "mihomo" "restart"
+                ;;
+            5) restore_dns_config ;;
+            6) test_dns_resolution ;;
+            q|Q) return 0 ;;
+            *) red "无效选项" ;;
+        esac
+        read -r -p "按 [Enter] 键继续..."
+    done
 }
 
 validate_config_internal() {
@@ -1403,34 +1644,27 @@ validate_config_internal() {
     case "$service_type" in
         singbox) service_name="Sing-box"; bin_path="$SB_BIN_PATH"; config_path="$SB_CONFIG_FILE" ;;
         mihomo)  service_name="Mihomo";   bin_path="$MH_BIN_PATH"; config_path="$MH_BASE_DIR"   ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
     [ ! -f "$bin_path" ] && { red "${service_name} 未安装"; return 1; }
 
-    local validation_output exit_code
-    local temp_dir_created=0
-
+    local validation_output exit_code temp_dir_created=0
     if [ "$service_type" = "singbox" ]; then
         local file_to_check="${config_file_override:-$config_path}"
-        [ ! -f "$file_to_check" ] && { red "配置文件不存在: $file_to_check"; return 1; }
+        [ ! -f "$file_to_check" ] && { red "配置不存在"; return 1; }
         validation_output=$("$bin_path" check -c "$file_to_check" 2>&1)
         exit_code=$?
     else
         local dir_to_check
         if [ -n "$config_file_override" ]; then
-            dir_to_check=$(mktemp -d)
-            temp_dir_created=1
+            dir_to_check=$(mktemp -d); temp_dir_created=1
             cp "$config_file_override" "$dir_to_check/config.yaml"
             [ -f "$MH_BASE_DIR/model.bin" ] && cp "$MH_BASE_DIR/model.bin" "$dir_to_check/"
         else
             dir_to_check="$config_path"
         fi
-        [ ! -f "$dir_to_check/config.yaml" ] && {
-            red "配置文件不存在: $dir_to_check/config.yaml"
-            [ "$temp_dir_created" -eq 1 ] && rm -rf "$dir_to_check"
-            return 1
-        }
+        [ ! -f "$dir_to_check/config.yaml" ] && { red "配置不存在"; [ "$temp_dir_created" -eq 1 ] && rm -rf "$dir_to_check"; return 1; }
         validation_output=$("$bin_path" -d "$dir_to_check" -t 2>&1)
         exit_code=$?
         [ "$temp_dir_created" -eq 1 ] && rm -rf "$dir_to_check"
@@ -1438,6 +1672,29 @@ validate_config_internal() {
 
     if [ "$exit_code" -eq 0 ]; then
         [ -z "$config_file_override" ] && green "✅ ${service_name} 配置文件验证通过！"
+        if [ "$service_type" = "mihomo" ] && [ -z "$config_file_override" ]; then
+            local mh_port backend fwd
+            mh_port=$(parse_mihomo_dns_port)
+            backend=$(detect_dns_backend)
+            printf "\n"
+            if ! check_mihomo_dns_enabled; then
+                yellow "⚠  提示：配置未启用 dns 段"
+                yellow "   可使用菜单 [d) DNS 转发管理] 一键配置"
+            elif [ "$mh_port" = "53" ] && [ "$backend" != "resolv.conf" ] && [ "$backend" != "unknown" ]; then
+                red   "⚠  警告：Mihomo DNS 监听 53 会与系统冲突！"
+                yellow "   系统 DNS 后端: $backend"
+                yellow "   建议使用 [d) DNS 转发管理] → 一键配置"
+            else
+                green "✓  Mihomo DNS 监听端口: $mh_port"
+                fwd=$(detect_dns_forward_status)
+                if [ -z "$fwd" ]; then
+                    yellow "⚠  系统 ($backend) 尚未转发到 mihomo"
+                    yellow "   使用 [d) DNS 转发管理] → 一键配置"
+                else
+                    green "✓  系统已转发到: $fwd"
+                fi
+            fi
+        fi
         return 0
     else
         red "❌ ${service_name} 配置文件验证失败！"
@@ -1458,10 +1715,10 @@ manage_service_internal() {
     case "$service_type" in
         singbox) service_name="$SB_SERVICE_NAME"; bin_path="$SB_BIN_PATH" ;;
         mihomo)  service_name="$MH_SERVICE_NAME"; bin_path="$MH_BIN_PATH" ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
-    [ ! -f "$bin_path" ] && { yellow "${service_name} 未安装，跳过 $action"; return 1; }
+    [ ! -f "$bin_path" ] && { yellow "${service_name} 未安装"; return 1; }
 
     log "对 ${service_name} 执行: $action"
     if [ "$SYSTEM_TYPE" = "openwrt" ]; then
@@ -1469,8 +1726,7 @@ manage_service_internal() {
         if [ -f "$init_script" ]; then
             "$init_script" "$action"
         else
-            yellow "服务脚本不存在: $init_script"
-            return 1
+            yellow "服务脚本不存在"; return 1
         fi
     else
         systemctl "$action" "$service_name"
@@ -1486,19 +1742,18 @@ manage_autostart_internal() {
     case "$service_type" in
         singbox) service_name="$SB_SERVICE_NAME" ;;
         mihomo)  service_name="$MH_SERVICE_NAME"  ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
+        *) red "无效服务类型"; return 1 ;;
     esac
 
     if [ -z "$action" ]; then
         clear
         printf "\n%b=== 管理 %s 自启动 ===%b\n" "$GREEN" "$service_name" "$NC"
-        printf "  1) 启用开机自启\n  2) 禁用开机自启\n  q) 返回\n"
-        read -r -p "请输入选项: " choice
+        printf "  1) 启用\n  2) 禁用\n  q) 返回\n"
+        read -r -p "选项: " choice
         case "$choice" in
             1) manage_autostart_internal "$service_type" "enable" ;;
             2) manage_autostart_internal "$service_type" "disable" ;;
             q|Q) return 0 ;;
-            *) red "无效选项" ;;
         esac
         return 0
     fi
@@ -1507,19 +1762,13 @@ manage_autostart_internal() {
         local init_script="/etc/init.d/$service_name"
         [ ! -f "$init_script" ] && { red "服务未安装"; return 1; }
         case "$action" in
-            enable)  "$init_script" enable  >/dev/null 2>&1; green "${service_name} 已启用自启" ;;
-            disable) "$init_script" disable >/dev/null 2>&1; yellow "${service_name} 已禁用自启" ;;
-            status)
-                if [ -L "/etc/rc.d/S95${service_name}" ]; then green "已启用"
-                else red "已禁用"; fi ;;
+            enable)  "$init_script" enable  >/dev/null 2>&1; green "已启用自启" ;;
+            disable) "$init_script" disable >/dev/null 2>&1; yellow "已禁用自启" ;;
         esac
     else
         case "$action" in
-            enable)  systemctl enable  "$service_name" >/dev/null 2>&1; green "${service_name} 已启用自启" ;;
-            disable) systemctl disable "$service_name" >/dev/null 2>&1; yellow "${service_name} 已禁用自启" ;;
-            status)
-                if systemctl is-enabled "$service_name" >/dev/null 2>&1; then green "已启用"
-                else red "已禁用"; fi ;;
+            enable)  systemctl enable  "$service_name" >/dev/null 2>&1; green "已启用自启" ;;
+            disable) systemctl disable "$service_name" >/dev/null 2>&1; yellow "已禁用自启" ;;
         esac
     fi
     return 0
@@ -1528,23 +1777,19 @@ manage_autostart_internal() {
 view_log_internal() {
     local service_type="$1"
     local service_name
-
     case "$service_type" in
         singbox) service_name="$SB_SERVICE_NAME" ;;
         mihomo)  service_name="$MH_SERVICE_NAME"  ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
     esac
-
     clear
-    yellow "--- ${service_name} 服务日志 (最近50行) ---"
+    yellow "--- ${service_name} 服务日志 ---"
     if [ "$SYSTEM_TYPE" = "openwrt" ]; then
-        logread -e "$service_name" 2>/dev/null | tail -n 50 || yellow "无法获取日志"
+        logread -e "$service_name" 2>/dev/null | tail -n 50 || yellow "无法获取"
     else
-        journalctl -u "$service_name" -n 50 --no-pager 2>/dev/null || yellow "无法获取日志"
+        journalctl -u "$service_name" -n 50 --no-pager 2>/dev/null || yellow "无法获取"
     fi
-    yellow "--- 脚本日志 ($LOG_FILE) (最近50行) ---"
-    tail -n 50 "$LOG_FILE" 2>/dev/null || yellow "暂无脚本日志"
-    yellow "----------------------------------------"
+    yellow "--- 脚本日志 ---"
+    tail -n 30 "$LOG_FILE" 2>/dev/null
     return 0
 }
 
@@ -1552,13 +1797,10 @@ setup_cron_job_internal() {
     local service_type="$1"
     local interval="$2"
     local service_name cron_entry
-
     case "$service_type" in
         singbox) service_name="Sing-box" ;;
         mihomo)  service_name="Mihomo"   ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
     esac
-
     local cron_job_id="${service_type}_proxy_update"
 
     if [ "$interval" -ge 1440 ]; then
@@ -1575,11 +1817,8 @@ setup_cron_job_internal() {
      echo "# $cron_job_id"; \
      echo "$cron_entry") | crontab -
 
-    [ "$SYSTEM_TYPE" = "openwrt" ] && command -v crond >/dev/null 2>&1 && \
-        /etc/init.d/cron restart >/dev/null 2>&1 || true
-
-    green "${service_name} 自动更新已设置（间隔: ${interval} 分钟）"
-    green "Cron 表达式: $cron_entry"
+    [ "$SYSTEM_TYPE" = "openwrt" ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+    green "${service_name} 自动更新已设置 (${interval}分钟)"
     return 0
 }
 
@@ -1593,49 +1832,37 @@ disable_scheduled_update_internal() {
 manage_scheduled_update_menu() {
     local service_type="$1"
     local service_name env_file
-
     case "$service_type" in
         singbox) service_name="Sing-box"; env_file="$SB_ENV_FILE" ;;
         mihomo)  service_name="Mihomo";   env_file="$MH_ENV_FILE"  ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
     esac
 
-    if ! load_service_env "$env_file" 2>/dev/null || [ -z "${PROXY_API_URL:-}" ]; then
-        red "请先设置订阅链接，再管理自动更新"
+    if ! load_service_env "$env_file" 2>/dev/null; then
+        red "请先设置订阅链接"
         return 1
     fi
 
     local current_interval="${CRON_INTERVAL:-0}"
     clear
     printf "\n%b=== 管理 %s 自动更新 ===%b\n" "$GREEN" "$service_name" "$NC"
-    if [ "$current_interval" -eq 0 ]; then
-        printf "当前状态: %b已禁用%b\n" "$RED" "$NC"
-    else
-        printf "当前状态: %b已启用%b (每 %s 分钟)\n" "$GREEN" "$NC" "$current_interval"
-    fi
-    printf "  1) 设置/更改更新间隔\n  2) 禁用自动更新\n  q) 返回\n"
-    read -r -p "请输入选项: " choice
+    [ "$current_interval" -eq 0 ] && printf "状态: %b已禁用%b\n" "$RED" "$NC" || \
+        printf "状态: %b已启用%b (每 %s 分钟)\n" "$GREEN" "$NC" "$current_interval"
+    printf "  1) 设置间隔\n  2) 禁用\n  q) 返回\n"
+    read -r -p "选项: " choice
 
     case "$choice" in
         1)
             printf "请输入新间隔（分钟，0=禁用）: "
-            read -r new_interval
-            if ! echo "$new_interval" | grep -qE '^[0-9]+$'; then
-                red "无效输入"; return 1
-            fi
-            update_env_field "$env_file" "CRON_INTERVAL" "$new_interval"
-            if [ "$new_interval" -gt 0 ]; then
-                setup_cron_job_internal "$service_type" "$new_interval"
-            else
+            read -r ni
+            echo "$ni" | grep -qE '^[0-9]+$' || { red "无效"; return 1; }
+            update_env_field "$env_file" "CRON_INTERVAL" "$ni"
+            [ "$ni" -gt 0 ] && setup_cron_job_internal "$service_type" "$ni" || \
                 disable_scheduled_update_internal "$service_type"
-            fi
             ;;
         2)
             update_env_field "$env_file" "CRON_INTERVAL" "0"
             disable_scheduled_update_internal "$service_type"
             ;;
-        q|Q) return 0 ;;
-        *) red "无效选项" ;;
     esac
     return 0
 }
@@ -1643,35 +1870,25 @@ manage_scheduled_update_menu() {
 view_version_internal() {
     local service_type="$1"
     local bin_path version_cmd service_name_display
-
     case "$service_type" in
         singbox) bin_path="$SB_BIN_PATH"; version_cmd="version"; service_name_display="Sing-box" ;;
         mihomo)  bin_path="$MH_BIN_PATH"; version_cmd="-v";      service_name_display="Mihomo"  ;;
-        *) red "无效服务类型: $service_type"; return 1 ;;
     esac
-
     [ ! -x "$bin_path" ] && { red "$service_name_display 未安装"; return 1; }
-
     local output
     output=$("$bin_path" $version_cmd 2>&1)
-    if [ $? -eq 0 ]; then
-        green "$service_name_display 版本信息 (路径: $bin_path):"
-        printf "%s\n" "$output"
-    else
-        red "查看版本失败: $output"
-    fi
+    green "$service_name_display 版本 (路径: $bin_path):"
+    printf "%s\n" "$output"
     return 0
 }
 
 singbox_management_menu() {
     while true; do
         clear
-        local config_status="未配置"
-        local service_status="未运行"
+        local config_status="未配置" service_status="未运行"
         [ -f "$SB_CONFIG_FILE" ] && config_status="已配置"
         manage_service_internal "singbox" "status" >/dev/null 2>&1 && service_status="运行中"
-        local api_url
-        api_url=$(get_config_manager_url "singbox" 2>/dev/null)
+        local api_url; api_url=$(get_config_manager_url "singbox" 2>/dev/null)
 
         printf "\n%b=== Sing-box 管理菜单 ===%b\n" "$GREEN" "$NC"
         printf "状态: %s | 配置: %s\n" "$service_status" "$config_status"
@@ -1685,15 +1902,14 @@ singbox_management_menu() {
         printf " 5)  停止服务\n"
         printf " 6)  重启服务\n"
         printf " 7)  查看服务状态\n"
-        printf " 8)  %b管理自动更新%b\n" "$YELLOW" "$NC"
-        printf " 9)  卸载 Sing-box\n"
+        printf " 8)  管理自动更新\n"
+        printf " 9)  卸载\n"
         printf " 10) 查看版本\n"
         printf " e)  管理自启动\n"
         printf " c)  验证配置文件\n"
         printf " v)  查看日志\n"
-        printf " q)  返回主菜单\n"
-        printf "%b========================%b\n" "$GREEN" "$NC"
-        read -r -p "请输入选项: " choice
+        printf " q)  返回\n"
+        read -r -p "选项: " choice
 
         case "$choice" in
             1)  install_singbox ;;
@@ -1719,16 +1935,16 @@ singbox_management_menu() {
 mihomo_management_menu() {
     while true; do
         clear
-        local config_status="未配置"
-        local service_status="未运行"
+        local config_status="未配置" service_status="未运行"
         [ -f "$MH_CONFIG_FILE" ] && config_status="已配置"
         manage_service_internal "mihomo" "status" >/dev/null 2>&1 && service_status="运行中"
-        local api_url
-        api_url=$(get_config_manager_url "mihomo" 2>/dev/null)
+        local api_url; api_url=$(get_config_manager_url "mihomo" 2>/dev/null)
+        local dns_backend; dns_backend=$(detect_dns_backend)
 
         printf "\n%b=== Mihomo 管理菜单 ===%b\n" "$GREEN" "$NC"
         printf "状态: %s | 配置: %s\n" "$service_status" "$config_status"
         printf "二进制: %s\n" "$MH_BIN_PATH"
+        printf "DNS 后端: %s\n" "$dns_backend"
         printf "API: %s\n" "${api_url:-未设置}"
         printf "%b=========================%b\n" "$GREEN" "$NC"
         printf " 1)  安装/更新 Mihomo（稳定版）\n"
@@ -1739,15 +1955,15 @@ mihomo_management_menu() {
         printf " 6)  停止服务\n"
         printf " 7)  重启服务\n"
         printf " 8)  查看服务状态\n"
-        printf " 9)  %b管理自动更新%b\n" "$YELLOW" "$NC"
+        printf " 9)  管理自动更新\n"
         printf " 10) 查看版本\n"
-        printf " a)  卸载 Mihomo\n"
+        printf " a)  卸载\n"
         printf " e)  管理自启动\n"
         printf " c)  验证配置文件\n"
+        printf " d)  %bDNS 转发管理%b\n" "$GREEN" "$NC"
         printf " v)  查看日志\n"
-        printf " q)  返回主菜单\n"
-        printf "%b========================%b\n" "$GREEN" "$NC"
-        read -r -p "请输入选项: " choice
+        printf " q)  返回\n"
+        read -r -p "选项: " choice
 
         case "$choice" in
             1)  install_mihomo ;;
@@ -1763,6 +1979,7 @@ mihomo_management_menu() {
             a|A) remove_all_files_and_service "mihomo" ;;
             e|E) manage_autostart_internal "mihomo" ;;
             c|C) validate_config_internal "mihomo" ;;
+            d|D) manage_dns_forwarding_menu ;;
             v|V) view_log_internal "mihomo" ;;
             q|Q) return 0 ;;
             *) red "无效选项" ;;
@@ -1775,20 +1992,36 @@ common_settings_menu() {
     while true; do
         clear
         printf "\n%b=== 通用系统设置 ===%b\n" "$GREEN" "$NC"
-        printf " 1) 检查网络连通性\n"
-        printf " 2) 配置网络转发与 NAT\n"
-        printf " 3) 清理系统转发与 NAT 配置\n"
-        printf " 4) 修复下载工具（curl/wget）\n"
-        printf " q) 返回主菜单\n"
-        printf "%b=====================%b\n" "$GREEN" "$NC"
-        read -r -p "请输入选项: " choice
+        printf " 1) 检查网络\n"
+        printf " 2) 配置转发与 NAT\n"
+        printf " 3) 清理系统配置\n"
+        printf " 4) 修复下载工具\n"
+        printf " 5) 清除镜像缓存（重新探测）\n"
+        printf " 6) 手动探测最快镜像\n"
+        printf " q) 返回\n"
+        read -r -p "选项: " choice
         case "$choice" in
             1) check_network ;;
             2) configure_network_forwarding_nat ;;
             3) clean_up_system_configs ;;
-            4) fix_openwrt_curl; detect_download_tool && green "当前下载工具: $DL_TOOL" ;;
+            4) fix_openwrt_curl; detect_download_tool && green "下载工具: $DL_TOOL" ;;
+            5) rm -f "$MIRROR_CACHE_FILE"; green "镜像缓存已清除" ;;
+            6)
+                yellow "开始探测所有镜像..."
+                for m in $PROXY_MIRRORS; do
+                    printf "  测试 %s ... " "$m"
+                    local start end diff
+                    start=$(date +%s)
+                    if probe_url "${m}https://raw.githubusercontent.com/MetaCubeX/mihomo/Meta/README.md" >/dev/null 2>&1; then
+                        end=$(date +%s)
+                        diff=$((end - start))
+                        green "OK (${diff}s)"
+                    else
+                        red "失败"
+                    fi
+                done
+                ;;
             q|Q) return 0 ;;
-            *) red "无效选项" ;;
         esac
         read -r -p "按 [Enter] 键继续..."
     done
@@ -1798,20 +2031,21 @@ initial_selection_menu() {
     detect_download_tool >/dev/null 2>&1 || true
     while true; do
         clear
-        printf "\n%b=== 代理管理器 v2.1 ===%b\n" "$GREEN" "$NC"
+        local cached_mirror; cached_mirror=$(load_best_mirror)
+        printf "\n%b=== 代理管理器 v2.2 ===%b\n" "$GREEN" "$NC"
         printf "设备: %s | 系统: %s | 下载工具: %s\n" "$DEVICE_NAME" "$SYSTEM_TYPE" "${DL_TOOL:-未探测}"
+        printf "镜像缓存: %s\n" "${cached_mirror:-未缓存（首次运行会自动探测）}"
         printf "%b================================%b\n" "$GREEN" "$NC"
         printf " 1) 管理 Sing-box\n"
         printf " 2) 管理 Mihomo\n"
         printf " 3) 通用系统设置\n"
         printf " q) 退出\n"
-        printf "%b================================%b\n" "$GREEN" "$NC"
-        read -r -p "请选择操作: " choice
+        read -r -p "请选择: " choice
         case "$choice" in
             1) singbox_management_menu ;;
             2) mihomo_management_menu ;;
             3) common_settings_menu ;;
-            q|Q) green "正在退出..."; exit 0 ;;
+            q|Q) green "退出..."; exit 0 ;;
             *) red "无效选项" ;;
         esac
     done
@@ -1823,25 +2057,20 @@ non_interactive_mode() {
             check_root
             local svc="${2:-}"
             [ -z "$svc" ] && { red "用法: $0 --update [singbox|mihomo]"; exit 1; }
-            log "Cron 触发: 更新 $svc 配置"
+            log "Cron 触发: 更新 $svc"
             update_config_and_start_service "$svc"
             ;;
-        *)
-            red "不支持的命令: ${1:-}"
-            exit 1
-            ;;
+        *) red "不支持的命令"; exit 1 ;;
     esac
     exit 0
 }
 
 main() {
     check_bash_on_openwrt "$@"
-
     if [ $# -gt 0 ]; then
         non_interactive_mode "$@"
         return
     fi
-
     check_root
     install_deps
     initial_selection_menu
