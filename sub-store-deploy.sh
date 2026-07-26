@@ -23,15 +23,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MIRROR_CANDIDATES=(
-  "direct"
-  "https://docker.1ms.run"
-  "https://docker.xuanyuan.me"
-  "https://docker.m.daocloud.io"
-  "https://docker.imgdb.de"
-  "https://docker.actima.top"
-)
-
 log() {
   local level=$1
   local message=$2
@@ -78,7 +69,7 @@ check_network() {
   local test_urls=(
     "https://www.baidu.com"
     "https://registry.npmmirror.com"
-    "https://hub.docker.com"
+    "https://ghcr.io"
   )
   for url in "${test_urls[@]}"; do
     local ok=false
@@ -177,121 +168,24 @@ install_dependencies() {
   fi
 }
 
-test_mirror_speed() {
-  local mirror=$1
-  local test_url=""
-  local start end elapsed
-
-  if [[ "$mirror" == "direct" ]]; then
-    test_url="https://hub.docker.com"
-  else
-    test_url="${mirror}/v2/"
-  fi
-
-  start=$(date +%s%3N)
-  local http_code
-  http_code=$(curl -o /dev/null -s -m 5 -w "%{http_code}" "$test_url" 2>/dev/null)
-  end=$(date +%s%3N)
-  elapsed=$((end - start))
-
-  if [[ "$http_code" =~ ^(200|301|302|401)$ ]]; then
-    echo "$elapsed $mirror"
-  else
-    echo "9999 $mirror"
-  fi
-}
-
-configure_docker_mirror() {
-  log "INFO" "开始测速所有镜像源，请稍候..."
-  echo ""
-
-  local results=()
-  for mirror in "${MIRROR_CANDIDATES[@]}"; do
-    local result
-    result=$(test_mirror_speed "$mirror")
-    results+=("$result")
-    local ms name
-    ms=$(echo "$result" | awk '{print $1}')
-    name=$(echo "$result" | awk '{print $2}')
-    if [[ "$ms" == "9999" ]]; then
-      echo -e "  ${RED}✗ $name (不可达或超时)${NC}"
-    else
-      echo -e "  ${GREEN}✓ $name : ${ms}ms${NC}"
-    fi
-  done
-
-  echo ""
-
-  local sorted
-  sorted=$(printf '%s\n' "${results[@]}" | sort -n | awk '$1 != 9999')
-
-  if [[ -z "$sorted" ]]; then
-    log "WARN" "所有镜像源均不可达，保持现有 Docker 配置不变"
-    return
-  fi
-
-  local best_mirror best_ms
-  best_mirror=$(echo "$sorted" | head -n 1 | awk '{print $2}')
-  best_ms=$(echo "$sorted" | head -n 1 | awk '{print $1}')
-
-  log "INFO" "最快镜像源: $best_mirror (${best_ms}ms)"
-
-  if [[ "$best_mirror" == "direct" ]]; then
-    log "INFO" "直连 Docker Hub 最快，不配置镜像加速"
-    sudo tee /etc/docker/daemon.json > /dev/null <<EOF
-{
-  "live-restore": true
-}
-EOF
-  else
-    local mirror_list=("$best_mirror")
-    while IFS= read -r line; do
-      local m
-      m=$(echo "$line" | awk '{print $2}')
-      if [[ "$m" != "$best_mirror" && "$m" != "direct" ]]; then
-        mirror_list+=("$m")
-      fi
-    done <<< "$sorted"
-
-    sudo tee /etc/docker/daemon.json > /dev/null <<EOF
-{
-  "live-restore": true,
-  "registry-mirrors": [
-$(printf '    "%s",\n' "${mirror_list[@]}" | sed '$ s/,$//')
-  ]
-}
-EOF
-  fi
-
-  if [[ "$OS" == "openwrt" ]]; then
-    service docker restart >/dev/null 2>&1 || log "WARN" "Docker 重启失败，请手动执行: service docker restart"
-  else
-    sudo systemctl daemon-reload
-    sudo systemctl restart docker
-  fi
-
-  log "INFO" "Docker 镜像源配置完成（已启用 live-restore，重启 daemon 不影响运行中容器）"
-  echo ""
-}
-
 select_image_source() {
   echo "请选择 Sub-Store 镜像拉取源："
-  echo "1. Docker Hub (xream/sub-store) - 需配合镜像加速"
-  echo "2. GitHub Container Registry (ghcr.io/xream/sub-store) - 推荐，无需镜像加速"
+  echo "1. GitHub Container Registry (ghcr.io/xream/sub-store) - 推荐，速度快"
+  echo "2. Docker Hub (xream/sub-store)"
   while true; do
-    read -p "请输入选项编号 [默认: 2]: " source_choice
-    source_choice=${source_choice:-2}
+    read -p "请输入选项编号 [默认: 1]: " source_choice
+    source_choice=${source_choice:-1}
     case "$source_choice" in
       1)
-        SUB_STORE_IMAGE_NAME="$DOCKERHUB_IMAGE_NAME"
-        IMAGE_SOURCE="dockerhub"
-        log "INFO" "已选择 Docker Hub 作为镜像源"
-        break
-        ;;
-      2)
         SUB_STORE_IMAGE_NAME="$GHCR_IMAGE_NAME"
         IMAGE_SOURCE="ghcr"
         log "INFO" "已选择 GitHub Container Registry 作为镜像源"
+        break
+        ;;
+      2)
+        SUB_STORE_IMAGE_NAME="$DOCKERHUB_IMAGE_NAME"
+        IMAGE_SOURCE="dockerhub"
+        log "INFO" "已选择 Docker Hub 作为镜像源"
         break
         ;;
       *) log "WARN" "无效的选择，请重新输入" ;;
@@ -358,7 +252,7 @@ prompt_for_path() {
 }
 
 get_substore_versions() {
-  local source=${1:-"dockerhub"}
+  local source=${1:-"ghcr"}
   local versions=""
 
   if [[ "$source" == "ghcr" ]]; then
@@ -756,7 +650,7 @@ _scan_backup_files() {
     [[ -d "$d" ]] || continue
     find "$d" -maxdepth 3 \
       -name "substore-backup-*.tar.gz" \
-      2>/dev/null | sort -r
+      2>/dev/null
   done | sort -ru
 }
 
@@ -1012,8 +906,7 @@ interactive_menu() {
     echo "   8. 备份数据"
     echo "   9. 恢复数据"
     echo "  10. 查看备份列表"
-    echo "  11. 重新检测并配置最优镜像源"
-    echo "  12. 退出"
+    echo "  11. 退出"
     echo "====================================="
     read -p "请输入选项编号: " choice
     case $choice in
@@ -1032,7 +925,7 @@ interactive_menu() {
           1)
             local current_image
             current_image=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].Config.Image // empty')
-            uninstall_container "$CONTAINER_NAME" "${current_image:-$DOCKERHUB_IMAGE_NAME}"
+            uninstall_container "$CONTAINER_NAME" "${current_image:-$GHCR_IMAGE_NAME}"
             ;;
           2) uninstall_container "$WATCHTOWER_CONTAINER_NAME" "$WATCHTOWER_IMAGE_NAME" ;;
           *) log "WARN" "无效输入" ;;
@@ -1041,8 +934,7 @@ interactive_menu() {
       8)  backup_data ;;
       9)  restore_data ;;
       10) list_backups ;;
-      11) configure_docker_mirror ;;
-      12) log "INFO" "退出脚本"; exit 0 ;;
+      11) log "INFO" "退出脚本"; exit 0 ;;
       *)  log "WARN" "无效输入，请重新选择" ;;
     esac
   done
@@ -1054,7 +946,6 @@ main() {
   check_network
   check_docker_permissions
   install_dependencies
-  configure_docker_mirror
   interactive_menu
 }
 
