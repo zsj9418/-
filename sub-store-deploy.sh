@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# 目录和变量
 DATA_DIR="$HOME/substore/data"
 SCRIPTS_DIR="$HOME/substore/scripts"
 BACKUP_DIR="$HOME/substore/backup"
@@ -10,7 +9,10 @@ LOG_MAX_SIZE=1048576
 CONTAINER_NAME="substore"
 WATCHTOWER_CONTAINER_NAME="watchtower"
 TIMEZONE="Asia/Shanghai"
-SUB_STORE_IMAGE_NAME="xream/sub-store"
+DOCKERHUB_IMAGE_NAME="xream/sub-store"
+GHCR_IMAGE_NAME="ghcr.io/xream/sub-store"
+SUB_STORE_IMAGE_NAME="$DOCKERHUB_IMAGE_NAME"
+IMAGE_SOURCE="dockerhub"
 WATCHTOWER_IMAGE_NAME="containrrr/watchtower"
 DEFAULT_SUB_STORE_PATH="/12345678"
 DEFAULT_FRONTEND_PORT=3000
@@ -21,7 +23,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# 候选镜像源（含直连）
 MIRROR_CANDIDATES=(
   "direct"
   "https://docker.1ms.run"
@@ -31,7 +32,6 @@ MIRROR_CANDIDATES=(
   "https://docker.actima.top"
 )
 
-# 日志
 log() {
   local level=$1
   local message=$2
@@ -112,7 +112,6 @@ check_docker_permissions() {
 }
 
 install_dependencies() {
-  # 检查 curl
   if ! command -v curl >/dev/null 2>&1; then
     case "$OS" in
       "ubuntu"|"debian") apt-get update && apt-get install -y curl ;;
@@ -122,7 +121,6 @@ install_dependencies() {
     esac
   fi
 
-  # 检查 lsof/ss/netstat
   if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
     case "$OS" in
       "ubuntu"|"debian") apt-get install -y net-tools lsof iproute2 ;;
@@ -130,14 +128,13 @@ install_dependencies() {
       "openwrt")
         opkg update
         opkg install lsof || log "WARN" "lsof 安装失败"
-        opkg install netstat || log "WARN" "netstat 安装失败"
+        opkg install net-tools || log "WARN" "net-tools 安装失败"
         opkg install ip-full || log "WARN" "ip-full 安装失败"
         ;;
       *) log "WARN" "未能自动安装端口检测工具，部分功能可能不可用" ;;
     esac
   fi
 
-  # 检查 docker
   if ! command -v docker >/dev/null 2>&1; then
     case "$OS" in
       "ubuntu"|"debian")
@@ -165,7 +162,6 @@ install_dependencies() {
     fi
   fi
 
-  # 检查 jq
   if ! command -v jq >/dev/null 2>&1; then
     case "$OS" in
       "ubuntu"|"debian") apt-get install -y jq ;;
@@ -176,7 +172,6 @@ install_dependencies() {
   fi
 }
 
-# 测试单个镜像源速度
 test_mirror_speed() {
   local mirror=$1
   local test_url=""
@@ -194,7 +189,6 @@ test_mirror_speed() {
   end=$(date +%s%3N)
   elapsed=$((end - start))
 
-  # 200/301/302/401 均视为可达（401 为未认证，属正常响应）
   if [[ "$http_code" =~ ^(200|301|302|401)$ ]]; then
     echo "$elapsed $mirror"
   else
@@ -202,7 +196,6 @@ test_mirror_speed() {
   fi
 }
 
-# 测速并自动配置最优镜像源
 configure_docker_mirror() {
   log "INFO" "开始测速所有镜像源，请稍候..."
   echo ""
@@ -225,7 +218,6 @@ configure_docker_mirror() {
 
   echo ""
 
-  # 按延迟升序排序，过滤掉不可达的
   local sorted
   sorted=$(printf '%s\n' "${results[@]}" | sort -n | awk '$1 != 9999')
 
@@ -241,14 +233,12 @@ configure_docker_mirror() {
 
   log "INFO" "最快镜像源: $best_mirror (${best_ms}ms)"
 
-  # 直连最快则清空镜像加速配置
   if [[ "$best_mirror" == "direct" ]]; then
     log "INFO" "直连 Docker Hub 最快，不配置镜像加速"
     sudo tee /etc/docker/daemon.json > /dev/null <<EOF
 {}
 EOF
   else
-    # 最快的排第一，其余可用源依次追加兜底（排除 direct）
     local mirror_list=("$best_mirror")
     while IFS= read -r line; do
       local m
@@ -258,7 +248,6 @@ EOF
       fi
     done <<< "$sorted"
 
-    # 构建 daemon.json
     sudo tee /etc/docker/daemon.json > /dev/null <<EOF
 {
   "registry-mirrors": [
@@ -268,7 +257,6 @@ $(printf '    "%s",\n' "${mirror_list[@]}" | sed '$ s/,$//')
 EOF
   fi
 
-  # OpenWrt 使用 service 重启，其余用 systemctl
   if [[ "$OS" == "openwrt" ]]; then
     service docker restart >/dev/null 2>&1 || log "WARN" "Docker 重启失败，请手动执行: service docker restart"
   else
@@ -278,6 +266,31 @@ EOF
 
   log "INFO" "Docker 镜像源配置完成"
   echo ""
+}
+
+select_image_source() {
+  echo "请选择 Sub-Store 镜像拉取源："
+  echo "1. Docker Hub (xream/sub-store) - 需配合镜像加速"
+  echo "2. GitHub Container Registry (ghcr.io/xream/sub-store) - 推荐，无需镜像加速"
+  while true; do
+    read -p "请输入选项编号 [默认: 2]: " source_choice
+    source_choice=${source_choice:-2}
+    case "$source_choice" in
+      1)
+        SUB_STORE_IMAGE_NAME="$DOCKERHUB_IMAGE_NAME"
+        IMAGE_SOURCE="dockerhub"
+        log "INFO" "已选择 Docker Hub 作为镜像源"
+        break
+        ;;
+      2)
+        SUB_STORE_IMAGE_NAME="$GHCR_IMAGE_NAME"
+        IMAGE_SOURCE="ghcr"
+        log "INFO" "已选择 GitHub Container Registry 作为镜像源"
+        break
+        ;;
+      *) log "WARN" "无效的选择，请重新输入" ;;
+    esac
+  done
 }
 
 pull_image() {
@@ -330,31 +343,48 @@ prompt_for_port() {
 }
 
 prompt_for_path() {
-  local default_path=$(basename "$DEFAULT_SUB_STORE_PATH")
+  local default_path
+  default_path=$(basename "$DEFAULT_SUB_STORE_PATH")
   local user_input=""
   read -p "请输入 Sub-Store 前后端路径（只需输入路径名，不需加/） [$default_path]: " user_input
   user_input=${user_input:-$default_path}
-  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input//[^a-zA-Z0-9_-./]/}"
+  SUB_STORE_FRONTEND_BACKEND_PATH="/${user_input//[^a-zA-Z0-9_.\/-]/}"
 }
 
 get_substore_versions() {
-  local versions
-  for i in {1..3}; do
-    versions=$(curl -s -m 15 "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -r)
-    [[ -n "$versions" ]] && break
-    sleep 2
-  done
+  local source=${1:-"dockerhub"}
+  local versions=""
+
+  if [[ "$source" == "ghcr" ]]; then
+    for i in {1..3}; do
+      local token
+      token=$(curl -s -m 10 "https://ghcr.io/token?scope=repository:xream/sub-store:pull&service=ghcr.io" | jq -r '.token // empty')
+      if [[ -n "$token" ]]; then
+        versions=$(curl -s -m 15 -H "Authorization: Bearer $token" "https://ghcr.io/v2/xream/sub-store/tags/list" | jq -r '.tags[] // empty' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -rV)
+      fi
+      [[ -n "$versions" ]] && break
+      sleep 2
+    done
+  else
+    for i in {1..3}; do
+      versions=$(curl -s -m 15 "https://hub.docker.com/v2/repositories/xream/sub-store/tags/?page_size=15" | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-http-meta)?$' | sort -rV)
+      [[ -n "$versions" ]] && break
+      sleep 2
+    done
+  fi
+
   if [[ -z "$versions" ]]; then
     read -p "请输入 Sub-Store 版本（例如: latest 或 1.0.0）: " SUB_STORE_VERSION
     SUB_STORE_VERSION=${SUB_STORE_VERSION:-latest}
     echo "$SUB_STORE_VERSION"
   else
-    echo "latest $versions"
+    printf 'latest\n%s\n' "$versions"
   fi
 }
 
 prompt_for_version() {
-  local versions=($(get_substore_versions))
+  local versions
+  mapfile -t versions < <(get_substore_versions "$IMAGE_SOURCE")
   local num_versions=${#versions[@]}
   echo "请选择 Sub-Store 版本（推荐使用 latest 以确保自动更新）："
   for i in "${!versions[@]}"; do
@@ -372,6 +402,7 @@ prompt_for_version() {
 }
 
 install_substore() {
+  select_image_source
   prompt_for_version
   pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION"
   while true; do
@@ -413,6 +444,26 @@ manual_upgrade_substore() {
     return
   fi
 
+  local current_image
+  current_image=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].Config.Image' 2>/dev/null)
+
+  if [[ "$current_image" == ghcr.io/* ]]; then
+    SUB_STORE_IMAGE_NAME="$GHCR_IMAGE_NAME"
+    IMAGE_SOURCE="ghcr"
+    log "INFO" "检测到当前使用 GitHub Container Registry"
+  else
+    SUB_STORE_IMAGE_NAME="$DOCKERHUB_IMAGE_NAME"
+    IMAGE_SOURCE="dockerhub"
+    log "INFO" "检测到当前使用 Docker Hub"
+  fi
+
+  echo "是否切换镜像源？当前: $SUB_STORE_IMAGE_NAME"
+  read -p "切换镜像源? (y/n) [默认: n]: " switch_source
+  switch_source=${switch_source:-n}
+  if [[ "$switch_source" =~ ^[yY]$ ]]; then
+    select_image_source
+  fi
+
   prompt_for_version
   pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION"
 
@@ -422,7 +473,7 @@ manual_upgrade_substore() {
   host_port_3000=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].HostConfig.PortBindings["3000/tcp"][0].HostPort // empty')
   host_port_3001=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].HostConfig.PortBindings["3001/tcp"][0].HostPort // empty')
   local old_path
-  old_path=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].Config.Env[]' | grep SUB_STORE_FRONTEND_BACKEND_PATH= | cut -d= -f2-)
+  old_path=$(docker inspect "$CONTAINER_NAME" | jq -r '.[0].Config.Env[]' | grep 'SUB_STORE_FRONTEND_BACKEND_PATH=' | cut -d= -f2-)
   [ -z "$old_path" ] && old_path="$DEFAULT_SUB_STORE_PATH"
 
   docker stop "$CONTAINER_NAME" >/dev/null 2>&1
@@ -516,7 +567,11 @@ add_watchtower_containers() {
     return
   fi
   local current_containers
-  mapfile -t current_containers < <(docker inspect "$WATCHTOWER_CONTAINER_NAME" | jq -r '.[0].Config.Entrypoint[] + " " + .[0].Config.Cmd[]' | grep -oE '[^ ]+$' | grep -vE '^--|^/')
+  mapfile -t current_containers < <(
+    docker inspect "$WATCHTOWER_CONTAINER_NAME" | \
+    jq -r '.[0].Config.Cmd[]' | \
+    awk 'skip{skip=0;next} /^--schedule$/{skip=1;next} /^--/{next} {print}'
+  )
   local all_containers
   mapfile -t all_containers < <(docker ps -a --format "{{.Names}}")
   local available_containers=()
@@ -589,6 +644,8 @@ uninstall_container() {
         rm -rf "$DATA_DIR"
       fi
     fi
+  else
+    log "WARN" "容器 $container_name 不存在，无需卸载"
   fi
 }
 
@@ -603,6 +660,8 @@ backup_data() {
     mkdir -p "$BACKUP_DIR"
     tar -czf "$backup_file" -C "$DATA_DIR" .
     log "INFO" "数据已备份到: $backup_file"
+  else
+    log "WARN" "数据目录为空或不存在，跳过备份"
   fi
 }
 
@@ -644,8 +703,13 @@ interactive_menu() {
         echo "2. Watchtower"
         read -p "请输入选项编号: " uninstall_choice
         case $uninstall_choice in
-          1) uninstall_container "$CONTAINER_NAME" "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" ;;
+          1)
+            local current_image
+            current_image=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].Config.Image // empty')
+            uninstall_container "$CONTAINER_NAME" "${current_image:-$DOCKERHUB_IMAGE_NAME}"
+            ;;
           2) uninstall_container "$WATCHTOWER_CONTAINER_NAME" "$WATCHTOWER_IMAGE_NAME" ;;
+          *) log "WARN" "无效输入" ;;
         esac
         ;;
       7) backup_data ;;
