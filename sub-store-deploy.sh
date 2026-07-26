@@ -81,15 +81,20 @@ check_network() {
     "https://hub.docker.com"
   )
   for url in "${test_urls[@]}"; do
-    for i in {1..2}; do
+    local ok=false
+    for i in 1 2; do
       if curl -sk -m 5 "$url" >/dev/null 2>&1; then
-        log "INFO" "网络检测通过: $url"
-        return 0
+        ok=true
+        break
       fi
       sleep 1
     done
+    if [[ "$ok" == true ]]; then
+      log "INFO" "网络检测通过: $url"
+      return 0
+    fi
   done
-  log "ERROR" "无法连接到网络,请检查网络"
+  log "ERROR" "无法连接到网络，请检查网络"
   exit 1
 }
 
@@ -205,9 +210,8 @@ configure_docker_mirror() {
     local result
     result=$(test_mirror_speed "$mirror")
     results+=("$result")
-    local ms
+    local ms name
     ms=$(echo "$result" | awk '{print $1}')
-    local name
     name=$(echo "$result" | awk '{print $2}')
     if [[ "$ms" == "9999" ]]; then
       echo -e "  ${RED}✗ $name (不可达或超时)${NC}"
@@ -226,9 +230,8 @@ configure_docker_mirror() {
     return
   fi
 
-  local best_mirror
+  local best_mirror best_ms
   best_mirror=$(echo "$sorted" | head -n 1 | awk '{print $2}')
-  local best_ms
   best_ms=$(echo "$sorted" | head -n 1 | awk '{print $1}')
 
   log "INFO" "最快镜像源: $best_mirror (${best_ms}ms)"
@@ -236,7 +239,9 @@ configure_docker_mirror() {
   if [[ "$best_mirror" == "direct" ]]; then
     log "INFO" "直连 Docker Hub 最快，不配置镜像加速"
     sudo tee /etc/docker/daemon.json > /dev/null <<EOF
-{}
+{
+  "live-restore": true
+}
 EOF
   else
     local mirror_list=("$best_mirror")
@@ -250,6 +255,7 @@ EOF
 
     sudo tee /etc/docker/daemon.json > /dev/null <<EOF
 {
+  "live-restore": true,
   "registry-mirrors": [
 $(printf '    "%s",\n' "${mirror_list[@]}" | sed '$ s/,$//')
   ]
@@ -264,7 +270,7 @@ EOF
     sudo systemctl restart docker
   fi
 
-  log "INFO" "Docker 镜像源配置完成"
+  log "INFO" "Docker 镜像源配置完成（已启用 live-restore，重启 daemon 不影响运行中容器）"
   echo ""
 }
 
@@ -304,7 +310,7 @@ pull_image() {
     sleep 5
   done
   log "ERROR" "拉取镜像 $image_name:$image_tag 失败。请确认镜像支持你的架构($ARCH)。"
-  exit 1
+  return 1
 }
 
 check_port_available() {
@@ -404,7 +410,7 @@ prompt_for_version() {
 install_substore() {
   select_image_source
   prompt_for_version
-  pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION"
+  pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION" || return 1
   while true; do
     read -p "请选择网络模式 (bridge 或 host) [默认: bridge]: " network_mode
     network_mode=${network_mode:-bridge}
@@ -433,7 +439,7 @@ install_substore() {
   docker_cmd+=("$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION")
   "${docker_cmd[@]}" || {
     log "ERROR" "容器启动失败"
-    exit 1
+    return 1
   }
   log "INFO" "Sub-Store 容器启动成功"
 }
@@ -465,7 +471,7 @@ manual_upgrade_substore() {
   fi
 
   prompt_for_version
-  pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION"
+  pull_image "$SUB_STORE_IMAGE_NAME" "$SUB_STORE_VERSION" || return 1
 
   local old_network_mode
   old_network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME")
@@ -499,9 +505,71 @@ manual_upgrade_substore() {
   docker_cmd+=("$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION")
   "${docker_cmd[@]}" || {
     log "ERROR" "升级后容器启动失败"
-    exit 1
+    return 1
   }
   log "INFO" "Sub-Store 已升级到 $SUB_STORE_VERSION 并自动恢复原有配置"
+}
+
+manage_container() {
+  while true; do
+    echo ""
+    echo "========== 容器管理 =========="
+    echo "请选择要管理的容器："
+    echo "1. Sub-Store"
+    echo "2. Watchtower"
+    echo "0. 返回主菜单"
+    echo "=============================="
+    read -p "请输入选项编号: " container_choice
+    case $container_choice in
+      1) _manage_single_container "$CONTAINER_NAME" ;;
+      2) _manage_single_container "$WATCHTOWER_CONTAINER_NAME" ;;
+      0) return ;;
+      *) log "WARN" "无效输入，请重新选择" ;;
+    esac
+  done
+}
+
+_manage_single_container() {
+  local cname=$1
+  if ! docker ps -a --format "{{.Names}}" | grep -q "^${cname}$"; then
+    log "WARN" "容器 $cname 不存在"
+    return
+  fi
+  while true; do
+    local status
+    status=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "未知")
+    echo ""
+    echo "======== $cname [$status] ========"
+    echo "1. 启动"
+    echo "2. 停止"
+    echo "3. 重启"
+    echo "4. 查看实时日志 (Ctrl+C 退出)"
+    echo "0. 返回"
+    echo "=================================="
+    read -p "请输入选项编号: " op
+    case $op in
+      1)
+        docker start "$cname" \
+          && log "INFO" "$cname 已启动" \
+          || log "ERROR" "$cname 启动失败"
+        ;;
+      2)
+        docker stop "$cname" \
+          && log "INFO" "$cname 已停止" \
+          || log "ERROR" "$cname 停止失败"
+        ;;
+      3)
+        docker restart "$cname" \
+          && log "INFO" "$cname 已重启" \
+          || log "ERROR" "$cname 重启失败"
+        ;;
+      4)
+        docker logs -f --tail=50 "$cname" || true
+        ;;
+      0) return ;;
+      *) log "WARN" "无效输入" ;;
+    esac
+  done
 }
 
 install_watchtower() {
@@ -535,7 +603,7 @@ install_watchtower() {
       docker rm "$container_id" >/dev/null 2>&1
     done
   fi
-  pull_image "$WATCHTOWER_IMAGE_NAME" "latest"
+  pull_image "$WATCHTOWER_IMAGE_NAME" "latest" || return 1
   local watchtower_cmd=(
     docker run -d
     --name "$WATCHTOWER_CONTAINER_NAME"
@@ -551,12 +619,12 @@ install_watchtower() {
   done
   "${watchtower_cmd[@]}" || {
     log "ERROR" "Watchtower 容器启动失败"
-    exit 1
+    return 1
   }
   sleep 3
   if ! docker ps --filter "name=$WATCHTOWER_CONTAINER_NAME" --format "{{.Status}}" | grep -q "Up"; then
     log "ERROR" "Watchtower 容器未能保持运行状态"
-    exit 1
+    return 1
   fi
   log "INFO" "Watchtower 部署成功，监控容器：${selected_containers[*]}"
 }
@@ -617,7 +685,7 @@ add_watchtower_containers() {
   done
   "${watchtower_cmd[@]}" || {
     log "ERROR" "Watchtower 更新失败"
-    exit 1
+    return 1
   }
   log "INFO" "Watchtower 已更新，新监控容器：${selected_containers[*]}"
 }
@@ -630,18 +698,26 @@ uninstall_container() {
   local container_name=$1
   local image_name=$2
   if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
-    docker stop "$container_name" >/dev/null
-    docker rm "$container_name" >/dev/null
+    docker stop "$container_name" >/dev/null \
+      && log "INFO" "容器 $container_name 已停止" \
+      || log "WARN" "容器 $container_name 停止失败"
+    docker rm "$container_name" >/dev/null \
+      && log "INFO" "容器 $container_name 已删除" \
+      || log "WARN" "容器 $container_name 删除失败"
     read -p "是否删除镜像 $image_name? (y/n) [默认: n]: " remove_image
     remove_image=${remove_image:-n}
     if [[ "$remove_image" =~ ^[yY]$ ]]; then
-      docker rmi "$image_name" >/dev/null 2>&1
+      docker rmi "$image_name" >/dev/null 2>&1 \
+        && log "INFO" "镜像 $image_name 已删除" \
+        || log "WARN" "镜像 $image_name 删除失败（可能仍被其他容器使用）"
     fi
     if [[ "$container_name" == "$CONTAINER_NAME" ]]; then
       read -p "是否清理相关数据卷 $DATA_DIR? (y/n) [默认: n]: " remove_volume
       remove_volume=${remove_volume:-n}
       if [[ "$remove_volume" =~ ^[yY]$ ]]; then
-        rm -rf "$DATA_DIR"
+        rm -rf "$DATA_DIR" \
+          && log "INFO" "数据目录已删除" \
+          || log "WARN" "数据目录删除失败"
       fi
     fi
   else
@@ -649,56 +725,306 @@ uninstall_container() {
   fi
 }
 
+_select_backup_root() {
+  echo "" >&2
+  echo "请选择备份存储位置：" >&2
+  echo "1. 主目录 ($HOME)" >&2
+  echo "2. /tmp 目录（重启后丢失）" >&2
+  echo "3. 手动输入路径" >&2
+  read -p "选项 (1-3，默认 1): " bc
+  local backup_root=""
+  case "${bc:-1}" in
+    2) backup_root="/tmp" ;;
+    3)
+      read -p "请输入目录路径: " custom_dir
+      backup_root="${custom_dir:-$HOME}"
+      ;;
+    *) backup_root="$HOME" ;;
+  esac
+  if ! mkdir -p "$backup_root" 2>/dev/null || ! touch "$backup_root/.wtest" 2>/dev/null; then
+    log "ERROR" "目录 $backup_root 不可写"
+    return 1
+  fi
+  rm -f "$backup_root/.wtest"
+  log "INFO" "备份目录：$backup_root"
+  echo "$backup_root"
+}
+
+_scan_backup_files() {
+  local scan_dirs=("$HOME" "/tmp" "$BACKUP_DIR" "/mnt" "/data")
+  for d in "${scan_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    find "$d" -maxdepth 3 \
+      -name "substore-backup-*.tar.gz" \
+      2>/dev/null | sort -r
+  done | sort -ru
+}
+
 backup_data() {
-  if [[ -d "$DATA_DIR" && -n "$(ls -A "$DATA_DIR")" ]]; then
-    if [[ ! -w "$DATA_DIR" ]]; then
-      log "ERROR" "数据目录 $DATA_DIR 不可写"
-      exit 1
-    fi
-    local timestamp=$(date +%Y%m%d%H%M%S)
-    local backup_file="$BACKUP_DIR/backup_$timestamp.tar.gz"
-    mkdir -p "$BACKUP_DIR"
-    tar -czf "$backup_file" -C "$DATA_DIR" .
-    log "INFO" "数据已备份到: $backup_file"
-  else
+  if [[ ! -d "$DATA_DIR" || -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]]; then
     log "WARN" "数据目录为空或不存在，跳过备份"
+    return
+  fi
+  if [[ ! -w "$DATA_DIR" ]]; then
+    log "ERROR" "数据目录 $DATA_DIR 不可写"
+    return 1
+  fi
+
+  local avail_kb
+  avail_kb=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
+  if [[ "$avail_kb" -lt 51200 ]]; then
+    log "WARN" "磁盘可用空间不足（${avail_kb}KB），建议清理后再备份"
+    read -p "是否继续？(y/n，默认 n): " sc
+    [[ ! "${sc:-n}" =~ ^[yY]$ ]] && return
+  fi
+
+  local backup_root
+  backup_root=$(_select_backup_root) || return 1
+
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  local backup_name="substore-backup-${stamp}"
+  local backup_tmp="${backup_root}/${backup_name}"
+  local backup_file="${backup_root}/${backup_name}.tar.gz"
+
+  mkdir -p "$backup_tmp"
+
+  log "INFO" "暂停容器以确保数据一致性..."
+  local was_running=false
+  if docker ps --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    was_running=true
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  fi
+
+  log "INFO" "复制数据目录..."
+  mkdir -p "$backup_tmp/data"
+  if ! cp -a "$DATA_DIR/." "$backup_tmp/data/" 2>/dev/null; then
+    log "ERROR" "数据复制失败"
+    [[ "$was_running" == true ]] && docker start "$CONTAINER_NAME" >/dev/null 2>&1
+    rm -rf "$backup_tmp"
+    return 1
+  fi
+
+  local cur_image="" port_3000="" port_3001="" sub_path=""
+  cur_image=$(docker inspect "$CONTAINER_NAME" --format '{{.Config.Image}}' 2>/dev/null || echo "未知")
+  port_3000=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].HostConfig.PortBindings["3000/tcp"][0].HostPort // empty' 2>/dev/null || echo "")
+  port_3001=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].HostConfig.PortBindings["3001/tcp"][0].HostPort // empty' 2>/dev/null || echo "")
+  sub_path=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].Config.Env[]' 2>/dev/null | grep 'SUB_STORE_FRONTEND_BACKEND_PATH=' | cut -d= -f2- || echo "")
+
+  cat > "$backup_tmp/backup_info.txt" << EOF
+备份时间：$(date '+%Y-%m-%d %H:%M:%S')
+主机名：$(hostname)
+系统：${OS} / ${ARCH}
+镜像版本：${cur_image}
+前端端口：${port_3000}
+后端端口：${port_3001}
+访问路径：${sub_path}
+数据目录：${DATA_DIR}
+EOF
+
+  if [[ "$was_running" == true ]]; then
+    log "INFO" "重新启动容器..."
+    docker start "$CONTAINER_NAME" >/dev/null 2>&1 \
+      && log "INFO" "容器已恢复运行" \
+      || log "WARN" "请手动启动：docker start $CONTAINER_NAME"
+  fi
+
+  log "INFO" "打包压缩中..."
+  if tar -czf "$backup_file" -C "$backup_root" "$backup_name" 2>/dev/null; then
+    rm -rf "$backup_tmp"
+    local size; size=$(du -sh "$backup_file" 2>/dev/null | cut -f1 || echo "未知")
+    log "INFO" "备份完成：$backup_file（$size）"
+    echo ""
+    echo "  备份文件：$backup_file"
+    echo "  文件大小：$size"
+    echo "  请将备份文件复制到安全位置（U盘/NAS/云盘）"
+  else
+    log "ERROR" "打包失败，临时目录保留在：$backup_tmp"
+    return 1
   fi
 }
 
 restore_data() {
-  local latest_backup
-  latest_backup=$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n 1)
-  if [[ -z "$latest_backup" ]]; then
-    log "WARN" "未找到备份文件"
-    return
+  echo ""
+  echo "请选择备份文件来源："
+  echo "1. 自动扫描列出备份文件"
+  echo "2. 手动输入备份文件路径"
+  read -p "选项 (1-2，默认 1): " sc
+  sc=${sc:-1}
+
+  local backup_file=""
+  case "$sc" in
+    2)
+      read -p "请输入备份文件路径: " backup_file
+      ;;
+    *)
+      echo ""
+      log "INFO" "正在扫描备份文件..."
+      local found_files=()
+      while IFS= read -r f; do
+        found_files+=("$f")
+      done < <(_scan_backup_files)
+
+      if [[ ${#found_files[@]} -eq 0 ]]; then
+        log "WARN" "未找到备份文件"
+        read -p "请手动输入备份文件路径: " backup_file
+      else
+        echo ""
+        local i=1
+        for f in "${found_files[@]}"; do
+          local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+          printf "  %d. %-52s [%s] %s\n" "$i" "$f" "$sz" "$ts"
+          i=$((i + 1))
+        done
+        echo ""
+        read -p "请输入编号（留空手动输入路径）: " fc
+        if [[ -z "$fc" ]]; then
+          read -p "请输入备份文件路径: " backup_file
+        elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
+          backup_file="${found_files[$((fc-1))]}"
+        else
+          log "ERROR" "无效选项"; return 1
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ -z "$backup_file" || ! -f "$backup_file" ]]; then
+    log "ERROR" "备份文件不存在：$backup_file"; return 1
   fi
+  log "INFO" "使用备份文件：$backup_file"
+
+  local restore_tmp="/tmp/substore_restore_$$"
+  mkdir -p "$restore_tmp"
+
+  log "INFO" "解压备份文件..."
+  if ! tar -xzf "$backup_file" -C "$restore_tmp" 2>/dev/null; then
+    log "ERROR" "解压失败，文件可能已损坏"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  local restore_info
+  restore_info=$(find "$restore_tmp" -maxdepth 3 -name "backup_info.txt" | head -n1)
+  if [[ -z "$restore_info" ]]; then
+    log "ERROR" "备份包格式不正确，未找到 backup_info.txt"
+    rm -rf "$restore_tmp"; return 1
+  fi
+  local restore_base; restore_base=$(dirname "$restore_info")
+
+  echo ""
+  echo "---- 备份信息 ----"
+  cat "$restore_base/backup_info.txt"
+  echo "------------------"
+  echo ""
+  read -p "确认恢复？(y/n，默认 n): " confirm
+  [[ ! "${confirm:-n}" =~ ^[yY]$ ]] && { log "INFO" "已取消恢复"; rm -rf "$restore_tmp"; return 0; }
+
+  if [[ ! -d "$restore_base/data" ]]; then
+    log "ERROR" "备份包中无 data 目录"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  log "INFO" "停止容器..."
+  if docker ps --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  fi
+
+  if [[ -d "$DATA_DIR" ]]; then
+    local bak_old="${DATA_DIR}_old_$(date +%Y%m%d_%H%M%S)"
+    mv "$DATA_DIR" "$bak_old" 2>/dev/null \
+      && log "INFO" "旧数据目录已保留：$bak_old" \
+      || { log "ERROR" "无法移动旧数据目录"; rm -rf "$restore_tmp"; return 1; }
+  fi
+
   mkdir -p "$DATA_DIR"
-  tar -xzf "$latest_backup" -C "$DATA_DIR"
-  log "INFO" "数据已从 $latest_backup 恢复"
+  if cp -a "$restore_base/data/." "$DATA_DIR/" 2>/dev/null; then
+    local fc; fc=$(find "$DATA_DIR" -type f 2>/dev/null | wc -l || echo 0)
+    log "INFO" "数据恢复完成（$fc 个文件）"
+  else
+    log "ERROR" "数据恢复失败"; rm -rf "$restore_tmp"; return 1
+  fi
+
+  rm -rf "$restore_tmp"
+
+  if docker ps -a --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    docker start "$CONTAINER_NAME" >/dev/null 2>&1 \
+      && log "INFO" "容器已启动" \
+      || log "WARN" "请手动启动：docker start $CONTAINER_NAME"
+  else
+    log "WARN" "容器不存在，请通过菜单重新部署（数据目录已恢复）"
+  fi
+
+  log "INFO" "恢复完成"
+}
+
+list_backups() {
+  echo ""
+  echo "---- Sub-Store 备份文件列表 ----"
+  local found=false
+  while IFS= read -r f; do
+    local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+    local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+      sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+    printf "  %-52s [%s] %s\n" "$f" "$sz" "$ts"
+    found=true
+  done < <(_scan_backup_files)
+  [[ "$found" == false ]] && log "WARN" "未找到任何备份文件"
+  echo "--------------------------------"
+}
+
+_get_container_status() {
+  local cname=$1
+  if docker ps --format "{{.Names}}" | grep -q "^${cname}$"; then
+    echo "运行中"
+  elif docker ps -a --format "{{.Names}}" | grep -q "^${cname}$"; then
+    echo "已停止"
+  else
+    echo "未部署"
+  fi
 }
 
 interactive_menu() {
   while true; do
-    echo -e "\n请选择操作："
-    echo "1. 部署 Sub-Store"
-    echo "2. 手动升级现有部署的 Sub-Store"
-    echo "3. 部署 Watchtower（自动更新容器）"
-    echo "4. 添加容器到 Watchtower 监控列表"
-    echo "5. 查看所有容器状态"
-    echo "6. 卸载容器（Sub-Store 或 Watchtower）"
-    echo "7. 数据备份"
-    echo "8. 数据恢复"
-    echo "9. 重新检测并配置最优镜像源"
-    echo "10. 退出"
+    local ss_status; ss_status=$(_get_container_status "$CONTAINER_NAME")
+    local wt_status; wt_status=$(_get_container_status "$WATCHTOWER_CONTAINER_NAME")
+
+    local ss_image="" ss_port_3000="" ss_port_3001="" ss_path=""
+    if [[ "$ss_status" != "未部署" ]]; then
+      ss_image=$(docker inspect "$CONTAINER_NAME" --format '{{.Config.Image}}' 2>/dev/null || echo "")
+      ss_port_3000=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].HostConfig.PortBindings["3000/tcp"][0].HostPort // empty' 2>/dev/null || echo "")
+      ss_port_3001=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].HostConfig.PortBindings["3001/tcp"][0].HostPort // empty' 2>/dev/null || echo "")
+      ss_path=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].Config.Env[]' 2>/dev/null | grep 'SUB_STORE_FRONTEND_BACKEND_PATH=' | cut -d= -f2- || echo "")
+    fi
+
+    echo ""
+    echo "========== Sub-Store 管理 =========="
+    echo "  Sub-Store  : $ss_status${ss_image:+  [$ss_image]}"
+    [[ -n "$ss_port_3000" ]] && echo "  前端端口   : $ss_port_3000  后端端口: $ss_port_3001"
+    [[ -n "$ss_path" ]]      && echo "  访问路径   : $ss_path"
+    echo "  Watchtower : $wt_status"
+    echo "------------------------------------"
+    echo "   1. 部署 Sub-Store"
+    echo "   2. 升级 Sub-Store"
+    echo "   3. 管理容器（启动/停止/重启/日志）"
+    echo "   4. 部署 Watchtower"
+    echo "   5. 添加容器到 Watchtower 监控列表"
+    echo "   6. 查看所有容器状态"
+    echo "   7. 卸载容器"
+    echo "   8. 备份数据"
+    echo "   9. 恢复数据"
+    echo "  10. 查看备份列表"
+    echo "  11. 重新检测并配置最优镜像源"
+    echo "  12. 退出"
+    echo "====================================="
     read -p "请输入选项编号: " choice
     case $choice in
-      1) create_directories; install_substore ;;
-      2) manual_upgrade_substore ;;
-      3) install_watchtower ;;
-      4) add_watchtower_containers ;;
-      5) check_all_containers_status ;;
-      6)
-        echo -e "选择卸载的容器："
+      1)  create_directories; install_substore ;;
+      2)  manual_upgrade_substore ;;
+      3)  manage_container ;;
+      4)  install_watchtower ;;
+      5)  add_watchtower_containers ;;
+      6)  check_all_containers_status ;;
+      7)
+        echo "选择卸载的容器："
         echo "1. Sub-Store"
         echo "2. Watchtower"
         read -p "请输入选项编号: " uninstall_choice
@@ -712,11 +1038,12 @@ interactive_menu() {
           *) log "WARN" "无效输入" ;;
         esac
         ;;
-      7) backup_data ;;
-      8) restore_data ;;
-      9) configure_docker_mirror ;;
-      10) log "INFO" "退出脚本"; exit 0 ;;
-      *) log "WARN" "无效输入，请重新选择" ;;
+      8)  backup_data ;;
+      9)  restore_data ;;
+      10) list_backups ;;
+      11) configure_docker_mirror ;;
+      12) log "INFO" "退出脚本"; exit 0 ;;
+      *)  log "WARN" "无效输入，请重新选择" ;;
     esac
   done
 }
