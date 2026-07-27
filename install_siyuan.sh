@@ -1,516 +1,1132 @@
 #!/bin/bash
+set -uo pipefail
+trap 'echo "[!] 已中断"; exit 1' INT
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
-
-# 默认参数
+SCRIPT_VERSION="2.1"
 BASE_IMAGE_NAME="b3log/siyuan"
-IMAGE_NAME="b3log/siyuan:latest"
+CONTAINER_NAME="siyuan"
 DEFAULT_TAG="latest"
 DEFAULT_PORT="6806"
-DEFAULT_WORKSPACE="/siyuan/workspace"
+CONTAINER_WORKSPACE="/siyuan/workspace"
 DEFAULT_AUTH_CODE="12345678"
-CONTAINER_NAME="siyuan"
-MAX_LOG_SIZE="1m"
+MAX_LOG_SIZE="20m"
 RETRY_COUNT=3
-DEPENDENCY_CHECK_FILE="/tmp/siyuan_dependency_check"
 
-# 检查是否以root权限运行
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误：请以root权限运行此脚本（使用 sudo）${NC}"
-        exit 1
-    fi
+LOG_FILE="/var/log/siyuan_deploy.log"
+BACKUP_PREFIX="siyuan-backup"
+
+# 修复：镜像源用纯主机名，直连放最后作兜底
+DOCKER_MIRRORS=(
+  "docker.1ms.run"
+  "docker.m.daocloud.io"
+  "docker.nju.edu.cn"
+  "mirror.baidubce.com"
+  ""
+)
+
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; RESET='\033[0m'
+
+_ok()   { echo -e "${GREEN}[✓]${RESET} $*"; }
+_warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
+_err()  { echo -e "${RED}[x]${RESET} $*" >&2; }
+_info() { echo -e "[i] $*"; }
+
+press_any_key() {
+  echo ""
+  read -rn1 -s -p "按任意键返回..." _j </dev/tty || true
+  echo ""
 }
 
-# OpenWrt 系统检测
-detect_openwrt() {
-    if [ -f /etc/openwrt_release ]; then
-        OS_TYPE="openwrt"
-        PKG_MANAGER="opkg"
-        return 0
-    else
-        return 1
-    fi
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# 常规系统检测
+_have() { command -v "$1" >/dev/null 2>&1; }
+
+if [[ "${EUID}" -ne 0 ]]; then
+  _err "请以 root 权限运行此脚本"
+  exit 1
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || LOG_FILE="/tmp/siyuan_deploy.log"
+touch "$LOG_FILE" 2>/dev/null || true
+log "### 思源笔记部署脚本 v${SCRIPT_VERSION} 启动 ###"
+
+OS_TYPE=""
+PKG_MGR=""
+ARCH_NAME=""
+
 detect_os() {
-    if detect_openwrt; then
-        return
-    elif [ -f /etc/debian_version ]; then
-        OS_TYPE="debian"
-        PKG_MANAGER="apt-get"
-    elif [ -f /etc/redhat-release ]; then
-        OS_TYPE="redhat"
-        PKG_MANAGER="yum"
-    elif [ "$(uname -s)" == "Darwin" ]; then
-        OS_TYPE="macos"
-        PKG_MANAGER="brew"
-    else
-        echo -e "${RED}不支持的操作系统${NC}"
-        exit 1
-    fi
+  if [[ -f /etc/openwrt_release ]]; then
+    OS_TYPE="openwrt"; PKG_MGR="opkg"
+  elif [[ -f /etc/debian_version ]]; then
+    OS_TYPE="debian"; PKG_MGR="apt-get"
+  elif [[ -f /etc/redhat-release ]]; then
+    OS_TYPE="redhat"; PKG_MGR="yum"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    OS_TYPE="macos"; PKG_MGR="brew"
+  else
+    _warn "未识别的操作系统，尝试继续..."
+    OS_TYPE="unknown"; PKG_MGR=""
+  fi
+  log "操作系统：$OS_TYPE"
 }
 
-# 检测设备架构
 detect_arch() {
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64|amd64) ARCH_NAME="amd64";;
-        armv7l|armhf) ARCH_NAME="armhf";;
-        aarch64|arm64) ARCH_NAME="arm64";;
-        *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exit 1;;
-    esac
+  local raw; raw=$(uname -m)
+  case "$raw" in
+    x86_64|amd64)        ARCH_NAME="amd64" ;;
+    aarch64|arm64)       ARCH_NAME="arm64" ;;
+    armv7l|armhf)        ARCH_NAME="armv7" ;;
+    armv6l)              ARCH_NAME="armv6" ;;
+    mips)                ARCH_NAME="mips" ;;
+    mipsel|mipsle)       ARCH_NAME="mipsle" ;;
+    riscv64)             ARCH_NAME="riscv64" ;;
+    loong64|loongarch64) ARCH_NAME="loong64" ;;
+    i386|i686)           ARCH_NAME="386" ;;
+    *)
+      _warn "未知架构：$raw，继续尝试..."
+      ARCH_NAME="$raw"
+      ;;
+  esac
+  _info "系统架构：$raw → $ARCH_NAME"
 }
 
-# 修复 OpenWrt 防火墙规则
+ensure_docker_running() {
+  if ! _have docker; then
+    _err "Docker 未安装，请先通过菜单安装 Docker"
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    _warn "Docker 未运行，尝试启动..."
+    if _have systemctl; then
+      systemctl start docker >/dev/null 2>&1 || true
+    elif [[ "$OS_TYPE" == "openwrt" ]]; then
+      /etc/init.d/dockerd start >/dev/null 2>&1 || true
+    fi
+    sleep 3
+    if ! docker info >/dev/null 2>&1; then
+      _err "Docker 无法启动，请手动检查"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+install_dependencies() {
+  echo ""
+  echo "===== 检查并安装依赖 ====="
+
+  if _have docker && _have curl && _have jq; then
+    _ok "所有依赖已满足"
+    press_any_key; return 0
+  fi
+
+  case "$OS_TYPE" in
+    openwrt)
+      opkg update >/dev/null 2>&1 || true
+      if ! _have docker; then
+        _info "安装 Docker for OpenWrt..."
+        opkg install dockerd docker luci-app-dockerman || {
+          _err "Docker 安装失败"; press_any_key; return 1
+        }
+        /etc/init.d/dockerd enable
+        /etc/init.d/dockerd start
+      fi
+      _have curl || opkg install curl || true
+      _have jq   || opkg install jq   || true
+      ;;
+    debian)
+      apt-get update -qq 2>/dev/null || true
+      if ! _have docker; then
+        _info "安装 Docker..."
+        apt-get install -y -qq ca-certificates curl gnupg lsb-release 2>/dev/null || true
+        curl -fsSL https://get.docker.com | sh 2>/dev/null || \
+          apt-get install -y -qq docker.io || {
+          _err "Docker 安装失败"; press_any_key; return 1
+        }
+        systemctl enable --now docker >/dev/null 2>&1 || true
+      fi
+      _have curl || apt-get install -y -qq curl || true
+      _have jq   || apt-get install -y -qq jq   || true
+      ;;
+    redhat)
+      if ! _have docker; then
+        _info "安装 Docker..."
+        yum install -y yum-utils 2>/dev/null || true
+        yum-config-manager --add-repo \
+          https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null || true
+        yum install -y docker-ce docker-ce-cli containerd.io || \
+          curl -fsSL https://get.docker.com | sh || {
+          _err "Docker 安装失败"; press_any_key; return 1
+        }
+        systemctl enable --now docker >/dev/null 2>&1 || true
+      fi
+      _have curl || yum install -y curl || true
+      _have jq   || yum install -y jq   || true
+      ;;
+    macos)
+      _warn "macOS 请手动安装 Docker Desktop：https://www.docker.com/products/docker-desktop"
+      if ! _have brew; then
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+      fi
+      _have curl || brew install curl || true
+      _have jq   || brew install jq   || true
+      ;;
+    *)
+      _info "尝试使用官方一键脚本安装 Docker..."
+      curl -fsSL https://get.docker.com | sh || {
+        _err "Docker 安装失败，请手动安装"
+        press_any_key; return 1
+      }
+      ;;
+  esac
+
+  if ! _have docker; then
+    _err "Docker 安装后仍不可用"
+    press_any_key; return 1
+  fi
+
+  local retry=0
+  while ! docker info >/dev/null 2>&1 && [[ $retry -lt 10 ]]; do
+    sleep 2; retry=$((retry + 1))
+  done
+
+  if ! docker info >/dev/null 2>&1; then
+    _err "Docker 守护进程无法启动"
+    press_any_key; return 1
+  fi
+
+  _ok "依赖安装完成"
+  press_any_key
+}
+
 fix_openwrt_firewall() {
-    if [ "$OS_TYPE" != "openwrt" ]; then
-        return
-    fi
+  if [[ "$OS_TYPE" != "openwrt" ]]; then
+    _warn "此功能仅适用于 OpenWrt 系统"
+    press_any_key; return
+  fi
 
-    echo -e "${BLUE}正在修复 OpenWrt 防火墙配置...${NC}"
-    
-    local forward_status=$(uci -q get firewall.@defaults[0].forward)
-    if [[ "$forward_status" != "ACCEPT" ]]; then
-        uci set firewall.@defaults[0].forward='ACCEPT'
-        uci commit firewall
-    fi
+  echo ""
+  echo "===== 修复 OpenWrt 防火墙 ====="
 
-    if ! uci -q get network.docker0 >/dev/null; then
-        uci set network.docker0=interface
-        uci set network.docker0.type='bridge'
-        uci set network.docker0.proto='none'
-        uci set network.docker0.firewall_zone='lan'
-        uci commit network
-    fi
+  local fwd_status
+  fwd_status=$(uci -q get firewall.@defaults[0].forward || echo "")
+  if [[ "$fwd_status" != "ACCEPT" ]]; then
+    uci set firewall.@defaults[0].forward='ACCEPT'
+    uci commit firewall
+    _ok "已设置 forward=ACCEPT"
+  fi
 
-    if ! iptables -t nat -C POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
-    fi
+  if ! uci -q get network.docker0 >/dev/null 2>&1; then
+    uci set network.docker0=interface
+    uci set network.docker0.type='bridge'
+    uci set network.docker0.proto='none'
+    uci set network.docker0.firewall_zone='lan'
+    uci commit network
+    _ok "已配置 docker0 网络"
+  fi
 
-    /etc/init.d/firewall restart 2>/dev/null || fw3 reload
-    /etc/init.d/network reload
-    echo -e "${GREEN}OpenWrt 网络配置已优化${NC}"
+  local docker_subnet="172.17.0.0/16"
+  if ! iptables -t nat -C POSTROUTING -s "$docker_subnet" ! -o docker0 -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -s "$docker_subnet" ! -o docker0 -j MASQUERADE
+    _ok "已添加 iptables NAT 规则"
+  fi
+
+  /etc/init.d/firewall restart 2>/dev/null || fw3 reload 2>/dev/null || true
+  /etc/init.d/network reload 2>/dev/null || true
+  _ok "OpenWrt 网络配置已优化"
+
+  press_any_key
 }
 
-# 检查并安装依赖
-check_dependencies() {
-    if [ -f "$DEPENDENCY_CHECK_FILE" ]; then
-        return 0
-    fi
-
-    echo -e "${BLUE}检查必要依赖...${NC}"
-    local deps_installed=0
-
-    if [ "$OS_TYPE" == "openwrt" ]; then
-        opkg update >/dev/null 2>&1
-        if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}安装 Docker for OpenWrt...${NC}"
-            opkg install dockerd docker luci-app-dockerman
-            /etc/init.d/dockerd enable
-            /etc/init.d/dockerd start
-            deps_installed=1
-        fi
-        if ! command -v curl &> /dev/null; then opkg install curl; deps_installed=1; fi
-        if ! command -v jq &> /dev/null; then opkg install jq; deps_installed=1; fi
-    else
-        if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}Docker 未安装，正在安装...${NC}"
-            case $OS_TYPE in
-                debian)
-                    $PKG_MANAGER update && $PKG_MANAGER install -y docker.io
-                    systemctl start docker; systemctl enable docker ;;
-                redhat)
-                    $PKG_MANAGER install -y docker
-                    systemctl start docker; systemctl enable docker ;;
-                macos)
-                    if ! command -v brew &> /dev/null; then
-                        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-                    fi
-                    brew install docker ;;
-            esac
-            deps_installed=1
-        fi
-
-        if ! command -v curl &> /dev/null; then
-            case $OS_TYPE in
-                debian|redhat) $PKG_MANAGER install -y curl;;
-                macos) brew install curl;;
-            esac
-            deps_installed=1
-        fi
-        
-        if ! command -v jq &> /dev/null; then
-            case $OS_TYPE in
-                debian|redhat) $PKG_MANAGER install -y jq;;
-                macos) brew install jq;;
-            esac
-            deps_installed=1
-        fi
-    fi
-
-    touch "$DEPENDENCY_CHECK_FILE"
-}
-
-# 获取可用镜像版本并做老设备预警
 get_available_tags() {
-    echo -e "${BLUE}正在从 Docker Hub 获取可用版本...${NC}"
-    TAGS=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/b3log/siyuan/tags/?page_size=50" | \
-           grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -v "latest" | sort -rV)
-    TAGS="latest $TAGS"
-    
-    if [ -z "$TAGS" ] || [ "$TAGS" == "latest " ]; then
-        echo -e "${RED}无法获取版本列表，使用默认版本 $DEFAULT_TAG${NC}"
-        SELECTED_TAG="$DEFAULT_TAG"
+  SELECTED_TAG="$DEFAULT_TAG"
+  IMAGE_NAME="${BASE_IMAGE_NAME}:${SELECTED_TAG}"
+
+  echo ""
+  _info "从 Docker Hub 获取版本列表..."
+
+  local raw_tags=""
+  raw_tags=$(curl -fsSL -m 15 \
+    "https://hub.docker.com/v2/repositories/${BASE_IMAGE_NAME}/tags/?page_size=50" \
+    2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | grep -v "^latest$" | \
+    sort -rV | head -n 20 || true)
+
+  local tag_list=("latest")
+  if [[ -n "$raw_tags" ]]; then
+    mapfile -t extra_tags <<< "$raw_tags"
+    tag_list+=("${extra_tags[@]}")
+  fi
+
+  echo ""
+  echo "可用版本："
+  local i=1
+  for t in "${tag_list[@]}"; do
+    if [[ "$i" -eq 1 ]]; then
+      printf "  %2d. %s  (默认)\n" "$i" "$t"
     else
-        echo -e "${BLUE}近期可用版本如下:${NC}"
-        local i=1
-        local tag_array=()
-        for tag in $TAGS; do
-            echo "$i) $tag"
-            tag_array[$i]=$tag
-            ((i++))
-            [ $i -gt 15 ] && break
-        done
-
-        # 🤖 针对老 CPU 的智能预警
-        if [[ "$ARCH_NAME" == *"arm"* ]] || [ "$OS_TYPE" == "openwrt" ]; then
-            echo -e "\n${RED}================ [⚠️ 老设备兼容性警告] =================${NC}"
-            echo -e "${YELLOW}检测到您正在使用 ARM 架构或软路由系统（如 N1、老电视盒子等）。${NC}"
-            echo -e "${YELLOW}由于思源官方从 v3.1.0 开始引入了不支持老内核的底层组件，${NC}"
-            echo -e "${GREEN}👉 强烈建议您使用最后一个稳定养老版: v3.0.17 ${NC}"
-            echo -e "${RED}========================================================${NC}\n"
-            echo -e "操作提示：您可以输入上方列表的编号，${YELLOW}也可以直接手打输入 v3.0.17 并回车。${NC}"
-        fi
-
-        read -p "请选择编号 或 直接手输版本号（回车默认 latest）: " TAG_CHOICE
-        if [ -z "$TAG_CHOICE" ]; then
-            SELECTED_TAG="$DEFAULT_TAG"
-        elif [[ "$TAG_CHOICE" =~ ^[0-9]+$ ]] && [ -n "${tag_array[$TAG_CHOICE]}" ]; then
-            SELECTED_TAG="${tag_array[$TAG_CHOICE]}"
-        else
-            # 允许用户直接手打输入 v3.0.17 等历史版本
-            SELECTED_TAG="$TAG_CHOICE"
-        fi
+      printf "  %2d. %s\n" "$i" "$t"
     fi
-    echo -e "${GREEN}已确认目标版本: $SELECTED_TAG${NC}"
-    IMAGE_NAME="$BASE_IMAGE_NAME:$SELECTED_TAG"
+    i=$((i + 1))
+  done
+  local manual_idx=$i
+  printf "  %2d. 手动输入版本号\n" "$manual_idx"
+
+  if [[ "$ARCH_NAME" == *"arm"* || "$ARCH_NAME" == *"mips"* || "$OS_TYPE" == "openwrt" ]]; then
+    echo ""
+    _warn "检测到 ARM/MIPS 架构或 OpenWrt 系统"
+    _warn "思源从 v3.1.0 起可能不兼容老内核，建议选择 v3.0.17"
+    _info "可直接在下方输入 v3.0.17 使用养老版"
+  fi
+
+  echo ""
+  read -rp "请输入编号或直接输入版本号 [默认 1/latest]: " tag_choice </dev/tty
+  tag_choice="${tag_choice:-1}"
+
+  if [[ "$tag_choice" =~ ^[0-9]+$ ]]; then
+    if [[ "$tag_choice" -ge 1 && "$tag_choice" -lt "$manual_idx" ]]; then
+      SELECTED_TAG="${tag_list[$((tag_choice - 1))]}"
+    elif [[ "$tag_choice" == "$manual_idx" ]]; then
+      read -rp "请输入版本号（如 v3.0.17）: " SELECTED_TAG </dev/tty
+      SELECTED_TAG="${SELECTED_TAG:-latest}"
+    else
+      _warn "编号超出范围，使用 latest"
+      SELECTED_TAG="latest"
+    fi
+  else
+    SELECTED_TAG="$tag_choice"
+  fi
+
+  IMAGE_NAME="${BASE_IMAGE_NAME}:${SELECTED_TAG}"
+  _ok "已选择版本：$SELECTED_TAG"
 }
 
-# 设置工作目录并暴力修复权限
+# 修复：镜像源用纯主机名拼接，直连作最后兜底
+pull_image() {
+  _info "拉取镜像：$IMAGE_NAME"
+
+  for mirror in "${DOCKER_MIRRORS[@]}"; do
+    local pull_target
+    if [[ -z "$mirror" ]]; then
+      pull_target="$IMAGE_NAME"
+      _info "尝试直连 Docker Hub（最终兜底）..."
+    else
+      pull_target="${mirror}/${IMAGE_NAME}"
+      _info "尝试加速源：$mirror"
+    fi
+
+    local attempt=1
+    while [[ $attempt -le $RETRY_COUNT ]]; do
+      if docker pull "$pull_target" >/dev/null 2>&1; then
+        if [[ "$pull_target" != "$IMAGE_NAME" ]]; then
+          docker tag "$pull_target" "$IMAGE_NAME" >/dev/null 2>&1 || true
+        fi
+        _ok "镜像拉取成功：$IMAGE_NAME（来源：${mirror:-直连}）"
+        return 0
+      fi
+      _warn "第 $attempt/$RETRY_COUNT 次失败，重试..."
+      sleep 2
+      attempt=$((attempt + 1))
+    done
+    _warn "加速源 ${mirror:-直连} 失败，切换下一个..."
+  done
+
+  _err "所有镜像源均拉取失败，请检查网络或配置代理"
+  return 1
+}
+
 setup_workspace() {
-    echo -e "${BLUE}设置宿主机工作空间目录...${NC}"
-    read -p "请输入宿主机数据存储路径（回车默认 $DEFAULT_WORKSPACE）: " WORKSPACE
-    WORKSPACE=${WORKSPACE:-$DEFAULT_WORKSPACE}
-    mkdir -p "$WORKSPACE"
-    
-    # 强制修改拥有者和权限，保障 1000 用户能绝对写入
-    chown -R 1000:1000 "$WORKSPACE" 2>/dev/null || true
-    chmod -R 777 "$WORKSPACE" 2>/dev/null || true
-    echo -e "${GREEN}工作空间已就绪并赋权: $WORKSPACE${NC}"
+  local default_ws="$CONTAINER_WORKSPACE"
+  echo ""
+  read -rp "宿主机数据存储路径 [默认: $default_ws]: " ws_input </dev/tty
+  HOST_WORKSPACE="${ws_input:-$default_ws}"
+
+  if ! mkdir -p "$HOST_WORKSPACE" 2>/dev/null; then
+    _err "无法创建目录：$HOST_WORKSPACE"
+    return 1
+  fi
+
+  chown -R 1000:1000 "$HOST_WORKSPACE" 2>/dev/null || true
+  chmod 755 "$HOST_WORKSPACE" 2>/dev/null || true
+  _ok "工作空间已就绪：$HOST_WORKSPACE"
 }
 
 get_user_input() {
-    read -p "请输入访问授权码（直接回车使用默认值 $DEFAULT_AUTH_CODE）: " AUTH_CODE
-    AUTH_CODE=${AUTH_CODE:-$DEFAULT_AUTH_CODE}
-    
-    read -p "请输入主机端口（直接回车使用默认值 $DEFAULT_PORT）: " HOST_PORT
-    HOST_PORT=${HOST_PORT:-$DEFAULT_PORT}
+  echo ""
+  read -rp "访问授权码 [默认: $DEFAULT_AUTH_CODE，建议修改]: " auth_input </dev/tty
+  AUTH_CODE="${auth_input:-$DEFAULT_AUTH_CODE}"
+  if [[ "$AUTH_CODE" == "$DEFAULT_AUTH_CODE" ]]; then
+    _warn "使用默认授权码存在安全风险，建议设置强密码"
+  fi
+
+  read -rp "主机映射端口 [默认: $DEFAULT_PORT]: " port_input </dev/tty
+  HOST_PORT="${port_input:-$DEFAULT_PORT}"
+  if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || [[ "$HOST_PORT" -lt 1 || "$HOST_PORT" -gt 65535 ]]; then
+    _warn "端口无效，使用默认 $DEFAULT_PORT"
+    HOST_PORT="$DEFAULT_PORT"
+  fi
 }
 
 check_port() {
-    if [ "$OS_TYPE" == "openwrt" ]; then
-        while netstat -tuln | grep -q ":$HOST_PORT "; do
-            echo -e "${YELLOW}端口 $HOST_PORT 已被占用${NC}"
-            read -p "请输入新的主机端口: " HOST_PORT
-        done
-    elif [ "$OS_TYPE" == "macos" ]; then
-        while netstat -an | grep -q ":$HOST_PORT "; do
-            echo -e "${YELLOW}端口 $HOST_PORT 已被占用${NC}"
-            read -p "请输入新的主机端口: " HOST_PORT
-        done
-    else
-        while ss -tuln | grep -q ":$HOST_PORT "; do
-            echo -e "${YELLOW}端口 $HOST_PORT 已被占用${NC}"
-            read -p "请输入新的主机端口: " HOST_PORT
-        done
+  local attempts=0
+  while true; do
+    local in_use=false
+    if _have ss; then
+      ss -tuln 2>/dev/null | grep -q ":${HOST_PORT} " && in_use=true
+    elif _have netstat; then
+      netstat -tuln 2>/dev/null | grep -q ":${HOST_PORT} " && in_use=true
     fi
-    echo -e "${GREEN}检测通过，将使用端口: $HOST_PORT${NC}"
+
+    if [[ "$in_use" == false ]]; then
+      _ok "端口 $HOST_PORT 可用"
+      return 0
+    fi
+
+    _warn "端口 $HOST_PORT 已被占用"
+    attempts=$((attempts + 1))
+    if [[ $attempts -ge 5 ]]; then
+      _err "端口尝试次数过多，返回菜单"
+      return 1
+    fi
+    read -rp "请输入新端口: " HOST_PORT </dev/tty
+    if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || [[ "$HOST_PORT" -lt 1 || "$HOST_PORT" -gt 65535 ]]; then
+      _warn "端口无效，请重新输入"
+      HOST_PORT="$DEFAULT_PORT"
+    fi
+  done
 }
 
 select_network_mode() {
-    echo -e "${BLUE}请选择网络模式:${NC}"
-    echo "1) bridge (默认，最稳定)"
-    echo "2) host (高性能，但 OpenWrt 可能端口冲突)"
-    echo "3) macvlan (高级)"
-    read -p "请输入选项 (1-3，直接回车使用默认值 1): " NETWORK_CHOICE
-    
-    case $NETWORK_CHOICE in
-        2) 
-            NETWORK_MODE="--network host"
-            if [ "$OS_TYPE" == "openwrt" ]; then
-                echo -e "${YELLOW}警告：Host 模式在 OpenWrt 上可能导致端口冲突${NC}"
-            fi
-            ;;
-        3) 
-            NETWORK_MODE="--network macvlan"
-            echo -e "${YELLOW}注意：macvlan 需要手动配置网络${NC}"
-            ;;
-        *) 
-            NETWORK_MODE="--network bridge"
-            if [ "$OS_TYPE" == "openwrt" ]; then
-                fix_openwrt_firewall
-            fi
-            ;;
-    esac
+  echo ""
+  echo "请选择网络模式："
+  echo "  1. bridge（推荐，最稳定）"
+  echo "  2. host（高性能，端口共享宿主机）"
+  echo "  0. 取消"
+  read -rp "选项 [默认 1]: " net_choice </dev/tty
+
+  case "${net_choice:-1}" in
+    2)
+      NETWORK_MODE="host"
+      if [[ "$OS_TYPE" == "openwrt" ]]; then
+        _warn "Host 模式在 OpenWrt 上可能导致端口冲突"
+      fi
+      _info "网络模式：host"
+      ;;
+    0)
+      _warn "已取消"; return 1
+      ;;
+    *)
+      NETWORK_MODE="bridge"
+      _info "网络模式：bridge"
+      if [[ "$OS_TYPE" == "openwrt" ]]; then
+        _info "OpenWrt bridge 模式如遇问题请使用选项 11 修复防火墙"
+      fi
+      ;;
+  esac
 }
 
-pull_image() {
-    echo -e "${BLUE}正在拉取镜像 $IMAGE_NAME...${NC}"
-    for ((i=1; i<=RETRY_COUNT; i++)); do
-        if docker pull "$IMAGE_NAME" >/dev/null 2>&1; then
-            echo -e "${GREEN}镜像拉取成功${NC}"
-            return 0
-        fi
-        echo -e "${YELLOW}第 $i 次拉取失败，重试中...${NC}"
-        sleep 2
-    done
-    echo -e "${RED}镜像拉取失败，请检查网络或镜像名称${NC}"
-    exit 1
+# 修复：v3.7.0+ 使用 serve 子命令，判断条件修正
+_detect_serve_cmd() {
+  local img="$1"
+  local ver_str="${img##*:}"
+
+  if [[ "$ver_str" == "latest" ]]; then
+    echo "serve"; return
+  fi
+
+  local ver_num; ver_num=$(echo "$ver_str" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  if [[ -z "$ver_num" ]]; then
+    echo "serve"; return
+  fi
+
+  local major minor patch
+  IFS='.' read -r major minor patch <<< "$ver_num"
+  patch="${patch:-0}"
+
+  # v3.7.0 及以上使用 serve 子命令
+  if [[ "$major" -gt 3 ]] || \
+     [[ "$major" -eq 3 && "$minor" -gt 7 ]] || \
+     [[ "$major" -eq 3 && "$minor" -eq 7 ]]; then
+    echo "serve"
+  else
+    echo ""
+  fi
 }
 
-# ================= 完美部署启动模块 =================
 start_container() {
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${YELLOW}检测到同名容器 $CONTAINER_NAME 已存在${NC}"
-        read -p "是否删除并重新创建？(y/n): " REMOVE
-        if [[ "$REMOVE" =~ ^[Yy]$ ]]; then
-            docker rm -f "$CONTAINER_NAME"
-        else
-            echo -e "${RED}请手动删除容器或更改容器名称${NC}"
-            exit 1
-        fi
-    fi
-
-    echo -e "${YELLOW}🤖 启用【底层护甲模式】: 特权提权 + 安全用户死锁...${NC}"
-
-    CMD="docker run -d \
-        --name \"$CONTAINER_NAME\" \
-        $NETWORK_MODE \
-        --privileged \
-        --security-opt seccomp=unconfined \
-        -v \"$WORKSPACE:$WORKSPACE\" \
-        -p \"$HOST_PORT:6806\" \
-        -e TZ=\"Asia/Shanghai\" \
-        -e PUID=\"1000\" \
-        -e PGID=\"1000\" \
-        -e SIYUAN_ACCESS_AUTH_CODE=\"$AUTH_CODE\" \
-        --restart unless-stopped \
-        --log-opt max-size=\"$MAX_LOG_SIZE\" \
-        \"$IMAGE_NAME\" \
-        --workspace=\"$WORKSPACE\" \
-        --accessAuthCode=\"$AUTH_CODE\""
-
-    eval $CMD
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 容器 $CONTAINER_NAME 启动指令下发成功！${NC}"
-        echo -e "${CYAN}访问地址: http://$(hostname -I | awk '{print $1}'):$HOST_PORT${NC}"
-        echo -e "宿主机工作空间: $WORKSPACE"
-        echo -e "登录授权码: $AUTH_CODE"
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _warn "检测到同名容器 $CONTAINER_NAME 已存在"
+    read -rp "是否删除并重新创建？(y/N): " rm_choice </dev/tty
+    if [[ "${rm_choice,,}" == "y" ]]; then
+      docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     else
-        echo -e "${RED}❌ 容器启动失败，请运行 'docker logs $CONTAINER_NAME' 检查错误${NC}"
-        exit 1
+      _warn "已取消，请手动删除容器或修改容器名"
+      return 1
     fi
+  fi
+
+  local serve_cmd; serve_cmd=$(_detect_serve_cmd "$IMAGE_NAME")
+
+  local run_args=(
+    docker run -d
+    --name "$CONTAINER_NAME"
+    --privileged
+    --security-opt seccomp=unconfined
+    -v "${HOST_WORKSPACE}:${CONTAINER_WORKSPACE}"
+    -e TZ="Asia/Shanghai"
+    -e PUID="1000"
+    -e PGID="1000"
+    -e SIYUAN_ACCESS_AUTH_CODE="$AUTH_CODE"
+    --restart unless-stopped
+    --log-opt max-size="$MAX_LOG_SIZE"
+    --log-opt max-file="3"
+  )
+
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+    run_args+=(--network host)
+  else
+    run_args+=(-p "${HOST_PORT}:6806")
+  fi
+
+  run_args+=("$IMAGE_NAME")
+
+  if [[ -n "$serve_cmd" ]]; then
+    run_args+=("$serve_cmd")
+  fi
+  run_args+=(
+    "--workspace=${CONTAINER_WORKSPACE}"
+    "--accessAuthCode=${AUTH_CODE}"
+  )
+
+  _info "启动容器..."
+
+  if "${run_args[@]}" >/dev/null 2>&1; then
+    sleep 3
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+      local ip; ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1 || \
+                     hostname -I 2>/dev/null | awk '{print $1}' || echo "<本机IP>")
+      _ok "容器启动成功！"
+      _info "访问地址：http://${ip}:${HOST_PORT}"
+      _info "工作空间：$HOST_WORKSPACE"
+      _info "授权码：$AUTH_CODE"
+      log "思源笔记部署成功，端口：$HOST_PORT，工作空间：$HOST_WORKSPACE"
+    else
+      _err "容器启动后异常退出，请查看日志：docker logs $CONTAINER_NAME"
+      return 1
+    fi
+  else
+    _err "容器启动失败，请查看日志：docker logs $CONTAINER_NAME"
+    return 1
+  fi
 }
 
-# ================= 一键无损更新模块 =================
 upgrade_siyuan() {
-    echo -e "\n${CYAN}--- 🔄 无损更新思源笔记容器 ---${NC}"
-    if ! command -v jq &> /dev/null; then
-        echo -e "${RED}更新功能依赖 jq，请先安装 jq。${NC}"
-        return 1
-    fi
-    if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${RED}未检测到名为 ${CONTAINER_NAME} 的容器，无法进行更新。请先安装部署！${NC}"
-        return 1
-    fi
+  echo ""
+  echo "===== 无损更新思源笔记 ====="
 
-    get_available_tags
-    echo -e "\n${YELLOW}ℹ️ 您的旧容器所有配置（网络、端口、笔记挂载、密码）将被完美保留。${NC}"
-    pull_image
+  if ! _have jq; then
+    _err "更新功能依赖 jq，请先通过选项 10 安装依赖"
+    press_any_key; return 1
+  fi
 
-    echo -e "${BLUE}📦 正在提取当前容器配置信息...${NC}"
-    local c_info=$(docker inspect "$CONTAINER_NAME")
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _err "未检测到容器 $CONTAINER_NAME，请先安装部署"
+    press_any_key; return 1
+  fi
 
-    local net_mode=$(echo "$c_info" | jq -r '.[0].HostConfig.NetworkMode')
-    local restart_policy=$(echo "$c_info" | jq -r '.[0].HostConfig.RestartPolicy.Name')
+  local cur_image
+  cur_image=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "未知")
+  _info "当前镜像：$cur_image"
 
-    local -a run_args=("-d" "--name" "$CONTAINER_NAME" "--log-opt" "max-size=$MAX_LOG_SIZE")
-    
-    [[ -n "$restart_policy" && "$restart_policy" != "no" && "$restart_policy" != "null" ]] && run_args+=("--restart" "$restart_policy")
-    [[ -n "$net_mode" && "$net_mode" != "default" && "$net_mode" != "null" ]] && run_args+=("--network" "$net_mode")
+  get_available_tags
 
-    run_args+=("--privileged" "--security-opt" "seccomp=unconfined")
+  _warn "更新将保留所有配置（挂载、端口、密码）"
+  read -rp "确认继续？(y/N): " confirm </dev/tty
+  [[ "${confirm,,}" == "y" ]] || { _warn "已取消"; press_any_key; return; }
 
-    # 提取端口映射
-    if [ "$net_mode" != "host" ]; then
-        local -a ports
-        mapfile -t ports < <(echo "$c_info" | jq -r 'if .[0].HostConfig.PortBindings then .[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key)" else empty end')
-        (( ${#ports[@]} > 0 )) && run_args+=("${ports[@]}")
-    fi
+  pull_image || { press_any_key; return 1; }
 
-    # 提取卷挂载
-    local -a mounts
-    mapfile -t mounts < <(echo "$c_info" | jq -r '.[0].Mounts[]? | "-v", "\(.Source):\(.Destination)"')
-    (( ${#mounts[@]} > 0 )) && run_args+=("${mounts[@]}")
+  _info "读取当前容器配置..."
+  local c_info
+  c_info=$(docker inspect "$CONTAINER_NAME" 2>/dev/null)
 
-    # 提取环境变量
-    local -a envs
-    mapfile -t envs < <(echo "$c_info" | jq -r '.[0].Config.Env[]? | select(test("^PATH=|^HOSTNAME=|^HOME=|PWD=") | not) | "-e", .')
-    (( ${#envs[@]} > 0 )) && run_args+=("${envs[@]}")
+  local net_mode restart_policy
+  net_mode=$(echo "$c_info" | jq -r '.[0].HostConfig.NetworkMode // "bridge"')
+  restart_policy=$(echo "$c_info" | jq -r '.[0].HostConfig.RestartPolicy.Name // "unless-stopped"')
 
-    # 提取命令参数
-    local -a cmd_args
-    mapfile -t cmd_args < <(echo "$c_info" | jq -r 'if .[0].Config.Cmd then .[0].Config.Cmd[] else empty end')
+  local run_args=(-d --name "$CONTAINER_NAME" --privileged --security-opt seccomp=unconfined)
+  run_args+=(--log-opt max-size="$MAX_LOG_SIZE" --log-opt max-file="3")
 
-    echo -e "${YELLOW}🗑️ 正在停止并删除旧容器...${NC}"
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1
-    docker rm "$CONTAINER_NAME" >/dev/null 2>&1
-    
-    echo -e "${BLUE}🚀 正在使用新镜像重建容器...${NC}"
-    docker run "${run_args[@]}" "$IMAGE_NAME" "${cmd_args[@]}" >/dev/null 2>&1
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 思源笔记已成功无损更新至 $SELECTED_TAG 并启动！${NC}"
+  [[ -n "$restart_policy" && "$restart_policy" != "no" && "$restart_policy" != "null" ]] && \
+    run_args+=(--restart "$restart_policy")
+
+  if [[ "$net_mode" != "host" ]]; then
+    run_args+=(--network bridge)
+    local ports=()
+    mapfile -t ports < <(echo "$c_info" | jq -r '
+      .[0].HostConfig.PortBindings // {} |
+      to_entries[] |
+      select(.value != null and (.value | length) > 0) |
+      "-p", "\(.value[0].HostPort):\(.key | split("/")[0])"
+    ' 2>/dev/null || true)
+    [[ ${#ports[@]} -gt 0 ]] && run_args+=("${ports[@]}")
+  else
+    run_args+=(--network host)
+  fi
+
+  local mounts=()
+  mapfile -t mounts < <(echo "$c_info" | jq -r '
+    .[0].Mounts[]? |
+    select(.Type == "bind") |
+    "-v", "\(.Source):\(.Destination)"
+  ' 2>/dev/null || true)
+  [[ ${#mounts[@]} -gt 0 ]] && run_args+=("${mounts[@]}")
+
+  local envs=()
+  mapfile -t envs < <(echo "$c_info" | jq -r '
+    .[0].Config.Env[]? |
+    select(test("^(PATH|HOSTNAME|HOME|PWD|TERM)=") | not)
+  ' 2>/dev/null || true)
+  for e in "${envs[@]}"; do
+    [[ -n "$e" ]] && run_args+=(-e "$e")
+  done
+
+  local cmd_args=()
+  mapfile -t cmd_args < <(echo "$c_info" | jq -r '
+    .[0].Config.Cmd[]? // empty
+  ' 2>/dev/null || true)
+
+  local serve_cmd; serve_cmd=$(_detect_serve_cmd "$IMAGE_NAME")
+  if [[ -n "$serve_cmd" ]]; then
+    local has_serve=false
+    for ca in "${cmd_args[@]}"; do
+      [[ "$ca" == "serve" ]] && has_serve=true && break
+    done
+    [[ "$has_serve" == false ]] && cmd_args=("serve" "${cmd_args[@]}")
+  fi
+
+  _info "停止并删除旧容器..."
+  docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+  _info "使用新镜像重建容器..."
+  if docker run "${run_args[@]}" "$IMAGE_NAME" "${cmd_args[@]}" >/dev/null 2>&1; then
+    sleep 3
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+      _ok "思源笔记已无损更新至 $SELECTED_TAG 并启动"
+      log "更新成功：$SELECTED_TAG"
     else
-        echo -e "${RED}❌ 更新后容器启动失败，请使用菜单中的查看日志功能检查原因。${NC}"
+      _err "更新后容器异常退出，请查看日志：docker logs $CONTAINER_NAME"
     fi
-}
-# ==========================================================
+  else
+    _err "容器重建失败，请查看日志"
+  fi
 
-# 容器启停与日志控制
+  press_any_key
+}
+
 control_container() {
-    echo -e "\n${CYAN}--- ⚙️ 容器启停控制 ---${NC}"
-    if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${RED}未检测到思源笔记容器，请先安装部署！${NC}"
-        return
-    fi
-    echo "1) 启动容器"
-    echo "2) 停止容器"
-    echo "3) 重启容器"
-    echo "4) 取消并返回"
-    read -p "请输入选项 (1-4): " CTRL_CHOICE
-    case $CTRL_CHOICE in
-        1) docker start "$CONTAINER_NAME" >/dev/null && echo -e "${GREEN}✅ 容器已启动${NC}" ;;
-        2) docker stop "$CONTAINER_NAME" >/dev/null && echo -e "${GREEN}✅ 容器已停止${NC}" ;;
-        3) docker restart "$CONTAINER_NAME" >/dev/null && echo -e "${GREEN}✅ 容器已重启${NC}" ;;
-        4) return ;;
-        *) echo -e "${RED}无效选项${NC}" ;;
-    esac
+  echo ""
+  echo "===== 容器启停控制 ====="
+
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _err "未检测到容器 $CONTAINER_NAME，请先安装部署"
+    press_any_key; return
+  fi
+
+  local status
+  status=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "未知")
+  _info "当前状态：$status"
+
+  echo "  1. 启动容器"
+  echo "  2. 停止容器"
+  echo "  3. 重启容器"
+  echo "  0. 返回"
+  read -rp "选项: " ctrl_choice </dev/tty
+
+  case "$ctrl_choice" in
+    1)
+      docker start "$CONTAINER_NAME" >/dev/null 2>&1 \
+        && _ok "容器已启动" || _err "启动失败"
+      ;;
+    2)
+      docker stop "$CONTAINER_NAME" >/dev/null 2>&1 \
+        && _ok "容器已停止" || _err "停止失败"
+      ;;
+    3)
+      docker restart "$CONTAINER_NAME" >/dev/null 2>&1 \
+        && _ok "容器已重启" || _err "重启失败"
+      ;;
+    0) return ;;
+    *) _warn "无效选项" ;;
+  esac
+
+  press_any_key
 }
 
 view_logs() {
-    echo -e "\n${CYAN}--- 📜 容器运行日志 ---${NC}"
-    if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo -e "${RED}未检测到思源笔记容器！${NC}"
-        return
-    fi
-    echo -e "--------------------------------------------------------"
-    docker logs "$CONTAINER_NAME" 2>&1 | head -n 50
-    echo -e "--------------------------------------------------------"
-    echo -e "${GREEN}顶部报错读取完毕。${NC}"
+  echo ""
+  echo "===== 容器日志 ====="
+
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _err "未检测到容器 $CONTAINER_NAME"
+    press_any_key; return
+  fi
+
+  echo "  1. 查看最近 50 行日志"
+  echo "  2. 查看最近 200 行日志"
+  echo "  3. 实时日志（Ctrl+C 退出）"
+  echo "  0. 返回"
+  read -rp "选项: " log_choice </dev/tty
+
+  case "$log_choice" in
+    1)
+      echo ""
+      docker logs --tail=50 "$CONTAINER_NAME" 2>&1
+      press_any_key
+      ;;
+    2)
+      echo ""
+      docker logs --tail=200 "$CONTAINER_NAME" 2>&1
+      press_any_key
+      ;;
+    3)
+      _info "实时日志（Ctrl+C 退出）..."
+      docker logs -f --tail=50 "$CONTAINER_NAME" 2>&1 || true
+      press_any_key
+      ;;
+    0) return ;;
+    *) _warn "无效选项"; press_any_key ;;
+  esac
 }
 
 view_containers() {
-    echo -e "\n${BLUE}当前思源容器状态:${NC}"
-    docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}" | grep "$CONTAINER_NAME" || echo -e "${YELLOW}未运行${NC}"
+  echo ""
+  echo "===== 容器状态 ====="
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    docker ps -a --filter "name=^${CONTAINER_NAME}$" \
+      --format "  名称：{{.Names}}\n  状态：{{.Status}}\n  镜像：{{.Image}}\n  端口：{{.Ports}}" \
+      2>/dev/null || true
+  else
+    _warn "未检测到思源笔记容器"
+  fi
+
+  echo ""
+  echo "-- Docker 环境 --"
+  if docker info >/dev/null 2>&1; then
+    _ok "Docker 正在运行"
+    _info "版本：$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 未知)"
+  else
+    _warn "Docker 未运行"
+  fi
+
+  press_any_key
+}
+
+_select_backup_root() {
+  echo "" >&2
+  echo "请选择备份保存位置：" >&2
+  echo "  1. 主目录 ($HOME)" >&2
+  echo "  2. /tmp 目录（重启后丢失）" >&2
+  echo "  3. 手动输入路径" >&2
+  read -rp "选项 [默认 1]: " bc </dev/tty
+  local backup_root
+  case "${bc:-1}" in
+    2) backup_root="/tmp" ;;
+    3)
+      read -rp "请输入目录路径: " custom_dir </dev/tty
+      backup_root="${custom_dir:-$HOME}"
+      ;;
+    *) backup_root="$HOME" ;;
+  esac
+  if ! mkdir -p "$backup_root" 2>/dev/null || ! touch "$backup_root/.wtest" 2>/dev/null; then
+    _err "目录不可写：$backup_root" >&2
+    return 1
+  fi
+  rm -f "$backup_root/.wtest"
+  _info "备份目录：$backup_root" >&2
+  echo "$backup_root"
+}
+
+_scan_backup_files() {
+  local scan_dirs=("$HOME" "/tmp" "/root" "/mnt" "/data")
+  for d in "${scan_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    find "$d" -maxdepth 3 -name "${BACKUP_PREFIX}-*.tar.gz" 2>/dev/null
+  done | sort -ru
+}
+
+_get_container_workspace() {
+  local ws=""
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    if _have jq; then
+      ws=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | \
+        jq -r '.[0].Mounts[]? | select(.Destination == "/siyuan/workspace") | .Source' \
+        2>/dev/null | head -n1 || true)
+    else
+      ws=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/siyuan/workspace"}}{{.Source}}{{end}}{{end}}' \
+        "$CONTAINER_NAME" 2>/dev/null || true)
+    fi
+  fi
+  echo "${ws:-$CONTAINER_WORKSPACE}"
+}
+
+backup_data() {
+  echo ""
+  echo "===== 备份思源笔记数据 ====="
+
+  local workspace_to_backup
+  workspace_to_backup=$(_get_container_workspace)
+
+  if [[ ! -d "$workspace_to_backup" ]]; then
+    _warn "数据目录不存在：$workspace_to_backup"
+    read -rp "手动输入工作空间路径: " manual_ws </dev/tty
+    workspace_to_backup="${manual_ws:-$CONTAINER_WORKSPACE}"
+    if [[ ! -d "$workspace_to_backup" ]]; then
+      _err "目录不存在：$workspace_to_backup"
+      press_any_key; return 1
+    fi
+  fi
+
+  local file_count; file_count=$(find "$workspace_to_backup" -type f 2>/dev/null | wc -l || echo 0)
+  _info "备份源：$workspace_to_backup（$file_count 个文件）"
+
+  local avail_kb; avail_kb=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
+  if [[ "$avail_kb" -lt 102400 ]]; then
+    _warn "磁盘可用空间较少（${avail_kb}KB）"
+    read -rp "是否继续？(y/N): " cont </dev/tty
+    [[ "${cont,,}" == "y" ]] || { press_any_key; return; }
+  fi
+
+  local backup_root
+  backup_root=$(_select_backup_root) || { press_any_key; return 1; }
+
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  local backup_name="${BACKUP_PREFIX}-${stamp}"
+  local backup_tmp="${backup_root}/${backup_name}"
+  local backup_file="${backup_root}/${backup_name}.tar.gz"
+
+  mkdir -p "$backup_tmp"
+
+  local was_running=false
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    was_running=true
+    _info "暂停容器以确保数据一致性..."
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  _info "复制数据..."
+  mkdir -p "$backup_tmp/workspace"
+  if ! cp -a "${workspace_to_backup}/." "$backup_tmp/workspace/" 2>/dev/null; then
+    _err "数据复制失败"
+    [[ "$was_running" == true ]] && docker start "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    rm -rf "$backup_tmp"
+    press_any_key; return 1
+  fi
+
+  local cur_image=""
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    cur_image=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "未知")
+  fi
+
+  cat > "$backup_tmp/backup_info.txt" << EOF
+备份时间：$(date '+%Y-%m-%d %H:%M:%S')
+主机名：$(hostname)
+架构：$(uname -m)
+操作系统：${OS_TYPE}
+容器名：${CONTAINER_NAME}
+镜像版本：${cur_image}
+工作空间：${workspace_to_backup}
+EOF
+
+  if [[ "$was_running" == true ]]; then
+    _info "恢复容器运行..."
+    docker start "$CONTAINER_NAME" >/dev/null 2>&1 \
+      && _ok "容器已恢复" \
+      || _warn "请手动启动：docker start $CONTAINER_NAME"
+  fi
+
+  _info "打包压缩中..."
+  if tar -czf "$backup_file" -C "$backup_root" "$backup_name" 2>/dev/null; then
+    rm -rf "$backup_tmp"
+    local size; size=$(du -sh "$backup_file" 2>/dev/null | cut -f1 || echo "未知")
+    _ok "备份完成：$backup_file（$size）"
+    log "备份完成：$backup_file"
+  else
+    _err "打包失败，临时目录：$backup_tmp"
+    press_any_key; return 1
+  fi
+
+  press_any_key
+}
+
+restore_data() {
+  echo ""
+  echo "===== 恢复思源笔记数据 ====="
+
+  echo "请选择备份文件来源："
+  echo "  1. 自动扫描"
+  echo "  2. 手动输入路径"
+  read -rp "选项 [默认 1]: " sc </dev/tty
+  sc="${sc:-1}"
+
+  local backup_file=""
+  case "$sc" in
+    2) read -rp "请输入备份文件路径: " backup_file </dev/tty ;;
+    *)
+      _info "扫描备份文件..."
+      local found_files=()
+      while IFS= read -r f; do found_files+=("$f"); done < <(_scan_backup_files)
+
+      if [[ ${#found_files[@]} -eq 0 ]]; then
+        _warn "未找到备份文件"
+        read -rp "请手动输入路径: " backup_file </dev/tty
+      else
+        echo ""
+        local i=1
+        for f in "${found_files[@]}"; do
+          local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+          local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+            sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+          printf "  %d. %-50s [%s] %s\n" "$i" "$f" "$sz" "$ts"
+          i=$((i + 1))
+        done
+        echo ""
+        read -rp "请输入编号（留空手动输入）: " fc </dev/tty
+        if [[ -z "$fc" ]]; then
+          read -rp "请输入路径: " backup_file </dev/tty
+        elif [[ "$fc" =~ ^[0-9]+$ ]] && [[ "$fc" -ge 1 && "$fc" -le ${#found_files[@]} ]]; then
+          backup_file="${found_files[$((fc-1))]}"
+        else
+          _err "无效选项"; press_any_key; return 1
+        fi
+      fi
+      ;;
+  esac
+
+  if [[ -z "$backup_file" || ! -f "$backup_file" ]]; then
+    _err "备份文件不存在：$backup_file"
+    press_any_key; return 1
+  fi
+
+  local restore_tmp; restore_tmp=$(mktemp -d)
+  trap "rm -rf '$restore_tmp'" RETURN
+
+  _info "解压备份文件..."
+  if ! tar -xzf "$backup_file" -C "$restore_tmp" 2>/dev/null; then
+    _err "解压失败，文件可能已损坏"
+    press_any_key; return 1
+  fi
+
+  local info_file; info_file=$(find "$restore_tmp" -maxdepth 3 -name "backup_info.txt" | head -n1 || true)
+  if [[ -n "$info_file" ]]; then
+    echo ""
+    echo "---- 备份信息 ----"
+    cat "$info_file"
+    echo "------------------"
+  fi
+
+  local restore_base; restore_base=$(dirname "${info_file:-$restore_tmp/x}")
+  if [[ ! -d "$restore_base/workspace" ]]; then
+    _err "备份包中无 workspace 目录"
+    press_any_key; return 1
+  fi
+
+  local target_ws
+  target_ws=$(_get_container_workspace)
+
+  echo ""
+  _warn "将恢复到目录：$target_ws"
+  read -rp "确认恢复？(y/N): " confirm </dev/tty
+  [[ "${confirm,,}" == "y" ]] || { _warn "已取消"; press_any_key; return; }
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _info "停止容器..."
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -d "$target_ws" ]]; then
+    local bak_old="${target_ws}_old_$(date +%Y%m%d_%H%M%S)"
+    mv "$target_ws" "$bak_old" 2>/dev/null \
+      && _info "旧数据目录已保留：$bak_old" \
+      || { _err "无法移动旧数据目录"; press_any_key; return 1; }
+  fi
+
+  mkdir -p "$target_ws"
+  if cp -a "$restore_base/workspace/." "$target_ws/" 2>/dev/null; then
+    chown -R 1000:1000 "$target_ws" 2>/dev/null || true
+    local fc; fc=$(find "$target_ws" -type f 2>/dev/null | wc -l || echo 0)
+    _ok "数据恢复完成（$fc 个文件）"
+  else
+    _err "数据恢复失败"
+    press_any_key; return 1
+  fi
+
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    docker start "$CONTAINER_NAME" >/dev/null 2>&1 \
+      && _ok "容器已启动" \
+      || _warn "请通过菜单手动启动容器"
+  else
+    _warn "容器不存在，请通过菜单重新部署（数据已恢复）"
+  fi
+
+  _ok "恢复完成"
+  press_any_key
+}
+
+list_backups() {
+  echo ""
+  echo "---- 思源笔记备份文件列表 ----"
+  local found=false
+  while IFS= read -r f; do
+    local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+    local ts; ts=$(echo "$f" | grep -oE '[0-9]{8}_[0-9]{6}' | \
+      sed 's/\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)/\1-\2-\3 \4:\5:\6/' || echo "")
+    printf "  %-52s [%s] %s\n" "$f" "$sz" "$ts"
+    found=true
+  done < <(_scan_backup_files)
+  [[ "$found" == false ]] && _warn "未找到任何备份文件"
+  echo "--------------------------------"
+  press_any_key
 }
 
 uninstall() {
-    echo -e "${YELLOW}正在卸载 $CONTAINER_NAME...${NC}"
+  echo ""
+  echo "===== 卸载思源笔记 ====="
 
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null
-        echo -e "${GREEN}容器 $CONTAINER_NAME 已删除${NC}"
-    fi
+  local workspace_path
+  workspace_path=$(_get_container_workspace)
 
-    read -p "是否删除镜像 ${BASE_IMAGE_NAME}？(y/N): " DELETE_IMAGE
-    if [[ "$DELETE_IMAGE" =~ ^[Yy]$ ]]; then
-        docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^${BASE_IMAGE_NAME}") 2>/dev/null || true
-        echo -e "${GREEN}相关镜像已删除${NC}"
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    _warn "将删除容器：$CONTAINER_NAME"
+    read -rp "确认删除容器？(y/N): " del_container </dev/tty
+    if [[ "${del_container,,}" == "y" ]]; then
+      docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 \
+        && _ok "容器已删除" \
+        || _warn "删除失败，可能已不存在"
+    else
+      _warn "已取消"; press_any_key; return
     fi
+  else
+    _warn "未检测到容器 $CONTAINER_NAME"
+  fi
 
-    if [ -d "$DEFAULT_WORKSPACE" ]; then
-        read -p "【高危】是否彻底删除宿主机的数据目录？这会丢失所有笔记！(y/N): " DELETE_DATA
-        if [[ "$DELETE_DATA" =~ ^[Yy]$ ]]; then
-            local old_path=$(docker inspect "$CONTAINER_NAME" 2>/dev/null | jq -r '.[0].Mounts[0].Source')
-            old_path=${old_path:-$DEFAULT_WORKSPACE}
-            rm -rf "$old_path"
-            echo -e "${GREEN}数据目录 $old_path 已清空${NC}"
-        else
-            echo -e "${YELLOW}保留工作空间数据${NC}"
-        fi
+  local images=()
+  mapfile -t images < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | \
+    grep "^${BASE_IMAGE_NAME}" || true)
+  if [[ ${#images[@]} -gt 0 ]]; then
+    echo ""
+    echo "检测到以下镜像："
+    for img in "${images[@]}"; do echo "  $img"; done
+    read -rp "是否删除这些镜像？(y/N): " del_img </dev/tty
+    if [[ "${del_img,,}" == "y" ]]; then
+      for img in "${images[@]}"; do
+        docker rmi "$img" >/dev/null 2>&1 && _ok "已删除：$img" || _warn "删除失败：$img"
+      done
     fi
+  fi
 
-    read -p "是否清理无用的 Docker 缓存？(y/N): " CLEAN_DOCKER
-    if [[ "$CLEAN_DOCKER" =~ ^[Yy]$ ]]; then
-        docker network prune -f 2>/dev/null
-        docker volume prune -f 2>/dev/null
-        echo -e "${GREEN}无用的 Docker 缓存已清理${NC}"
+  if [[ -d "$workspace_path" ]]; then
+    echo ""
+    _warn "数据目录：$workspace_path"
+    _warn "删除后所有笔记数据将永久丢失！"
+    read -rp "是否先备份？(y/N): " do_backup </dev/tty
+    [[ "${do_backup,,}" == "y" ]] && backup_data
+    read -rp "确认删除数据目录？(输入 yes 确认): " del_data </dev/tty
+    if [[ "$del_data" == "yes" ]]; then
+      rm -rf "$workspace_path" \
+        && _ok "数据目录已删除" \
+        || _err "删除失败，请手动执行：rm -rf $workspace_path"
+    else
+      _warn "数据目录已保留：$workspace_path"
     fi
-    echo -e "${GREEN}卸载完成${NC}"
+  fi
+
+  read -rp "是否清理 Docker 悬空资源？(y/N): " clean_docker </dev/tty
+  if [[ "${clean_docker,,}" == "y" ]]; then
+    docker image prune -f >/dev/null 2>&1 && _ok "已清理悬空镜像"
+    docker volume prune -f >/dev/null 2>&1 && _ok "已清理悬空卷"
+  fi
+
+  _ok "卸载完成"
+  press_any_key
 }
 
-main_menu() {
-    detect_os
-    detect_arch
-    check_dependencies
-    
-    while true; do
-        echo -e "\n${CYAN}=== 思源笔记部署管理脚本 (老设备兼容版) ===${NC}"
-        echo -e "1) 安装并启动思源笔记"
-        echo -e "2) 无损更新思源笔记容器 ${YELLOW}[保留笔记数据与配置]${NC}"
-        echo -e "3) 启停控制 ${YELLOW}(启动/停止/重启)${NC}"
-        echo -e "4) 查看容器顶部报错日志 ${YELLOW}(捉虫神器)${NC}"
-        echo -e "5) 查看当前容器运行状态"
-        echo -e "6) 卸载并清理思源笔记"
-        echo -e "7) 修复 OpenWrt 网络 (仅限软路由)"
-        echo -e "8) 退出"
-        echo -e "${CYAN}===========================================${NC}"
-        read -p "请选择操作 (1-8): " CHOICE
-        
-        case $CHOICE in
-            1)
-                check_root
-                get_available_tags
-                get_user_input
-                setup_workspace
-                check_port
-                select_network_mode
-                pull_image
-                start_container
-                ;;
-            2) check_root; upgrade_siyuan ;;
-            3) control_container ;;
-            4) view_logs ;;
-            5) view_containers ;;
-            6) uninstall ;;
-            7)
-                if [ "$OS_TYPE" == "openwrt" ]; then fix_openwrt_firewall
-                else echo -e "${RED}此功能仅适用于 OpenWrt 系统${NC}"; fi
-                ;;
-            8) echo -e "${GREEN}退出脚本，感谢使用！${NC}"; exit 0 ;;
-            *) echo -e "${RED}无效选项，请重试${NC}" ;;
-        esac
-    done
+_get_status_line() {
+  if ! _have docker; then
+    echo "Docker 未安装"
+    return
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    local img; img=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+    local port; port=$(docker port "$CONTAINER_NAME" 6806/tcp 2>/dev/null | head -n1 | grep -oE '[0-9]+$' || echo "")
+    echo "运行中  [${img}${port:+，端口 $port}]"
+  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    local img; img=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+    echo "已停止  [${img}]"
+  else
+    echo "未部署"
+  fi
 }
 
-main_menu
+detect_os
+detect_arch
+
+while true; do
+  container_status=$(_get_status_line)
+  local_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1 || \
+             hostname -I 2>/dev/null | awk '{print $1}' || echo "<本机IP>")
+
+  echo ""
+  echo "========== 思源笔记部署管理脚本 v${SCRIPT_VERSION} =========="
+  echo "  系统：${OS_TYPE}    架构：${ARCH_NAME}    本机IP：${local_ip}"
+  echo "  容器状态：${container_status}"
+  echo "  镜像源：国内加速（docker.1ms.run 等）→ 直连兜底"
+  echo "-----------------------------------------------------------"
+  echo "  1. 安装并启动思源笔记"
+  echo "  2. 无损更新（保留所有数据与配置）"
+  echo "  3. 容器启停控制（启动/停止/重启）"
+  echo "  4. 查看容器日志"
+  echo "  5. 查看容器状态"
+  echo "  6. 备份笔记数据"
+  echo "  7. 恢复笔记数据"
+  echo "  8. 查看备份列表"
+  echo "  9. 卸载并清理"
+  echo " 10. 安装依赖（Docker/curl/jq）"
+  echo " 11. 修复 OpenWrt 网络防火墙"
+  echo "  0. 退出"
+  echo "==========================================================="
+  read -rp "请输入选项: " choice </dev/tty
+
+  case "$choice" in
+    1)
+      ensure_docker_running || { press_any_key; continue; }
+      get_available_tags
+      get_user_input
+      setup_workspace || { press_any_key; continue; }
+      check_port || { press_any_key; continue; }
+      select_network_mode || { press_any_key; continue; }
+      pull_image || { press_any_key; continue; }
+      start_container || true
+      press_any_key
+      ;;
+    2)  upgrade_siyuan ;;
+    3)  control_container ;;
+    4)  view_logs ;;
+    5)  view_containers ;;
+    6)  backup_data ;;
+    7)  restore_data ;;
+    8)  list_backups ;;
+    9)  uninstall ;;
+    10) install_dependencies ;;
+    11) fix_openwrt_firewall ;;
+    0)
+      _ok "感谢使用，再见"
+      exit 0
+      ;;
+    *)
+      _warn "无效选项，请输入 0-11"
+      ;;
+  esac
+done
