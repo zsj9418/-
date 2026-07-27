@@ -2,7 +2,7 @@
 set -uo pipefail
 trap 'echo "[!] 已中断"; exit 1' INT
 
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.1"
 SCRIPT_LOG_FILE="/var/log/casaos_zimaos_deploy.log"
 DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 
@@ -13,10 +13,14 @@ CASAOS_CONTAINER_NAME="casa"
 PKG_MGR=""
 PKG_UPDATE=""
 PKG_INSTALL=""
+OS_ID=""
+OS_NAME=""
+
+CASA_IMAGE_GHCR="ghcr.io/dockur/casa"
+CASA_IMAGE_DOCKERHUB="dockurr/casa"
 
 ZIMAOS_GITHUB_REPO="IceWhaleTech/ZimaOS"
 ZIMAOS_RELEASES_URL="https://github.com/${ZIMAOS_GITHUB_REPO}/releases"
-ZIMAOS_API_URL="https://api.github.com/repos/${ZIMAOS_GITHUB_REPO}/releases/latest"
 
 GH_MIRRORS=(
   ""
@@ -140,6 +144,19 @@ get_local_ip() {
   echo "${ip:-<本机IP>}"
 }
 
+select_casa_image() {
+  echo ""
+  echo "请选择镜像拉取源："
+  echo "  1. ghcr.io/dockur/casa  （GitHub，推荐，国内直连更快，无速率限制）"
+  echo "  2. dockurr/casa         （Docker Hub，需配合镜像加速器）"
+  read -rp "选项 [默认 1]: " img_src_choice </dev/tty
+  case "${img_src_choice:-1}" in
+    2) SELECTED_CASA_IMAGE="$CASA_IMAGE_DOCKERHUB" ;;
+    *) SELECTED_CASA_IMAGE="$CASA_IMAGE_GHCR" ;;
+  esac
+  _info "使用镜像源：$SELECTED_CASA_IMAGE"
+}
+
 install_docker() {
   if _have docker && docker info >/dev/null 2>&1; then
     _ok "Docker 已安装且运行中：$(docker --version 2>/dev/null | head -n1)"
@@ -230,7 +247,7 @@ https://download.docker.com/linux/${distro} ${codename} stable" \
   done
 
   if ! docker info >/dev/null 2>&1; then
-    _err "Docker 守护进程无法启动，请检查系统日志：journalctl -u docker"
+    _err "Docker 守护进程无法启动，请检查：journalctl -u docker"
     return 1
   fi
 
@@ -377,30 +394,32 @@ pre_flight_check() {
   if [[ "$mem_mb" != "未知" && "$mem_mb" -lt 512 ]]; then
     _warn "内存不足 512MB（当前 ${mem_mb}MB），CasaOS 可能运行不稳定"
   fi
-
   if [[ "$disk_avail" != "未知" && "$disk_avail" -lt 8 ]]; then
     _warn "磁盘可用空间不足 8GB（当前 ${disk_avail}GB），建议清理后再安装"
   fi
 
   _info "检查网络连通性..."
-  local net_casaos=false
-  local net_docker=false
-  local net_github=false
 
   if curl -fsSL --connect-timeout 8 https://get.casaos.io -o /dev/null 2>/dev/null; then
-    _ok "get.casaos.io 可达"; net_casaos=true
+    _ok "get.casaos.io 可达"
   else
     _warn "get.casaos.io 不可达，标准安装可能失败"
   fi
 
+  if curl -fsSL --connect-timeout 8 https://ghcr.io -o /dev/null 2>/dev/null; then
+    _ok "ghcr.io 可达（推荐镜像源）"
+  else
+    _warn "ghcr.io 不可达，建议切换到 Docker Hub + 加速器"
+  fi
+
   if curl -fsSL --connect-timeout 8 https://hub.docker.com -o /dev/null 2>/dev/null; then
-    _ok "Docker Hub 可达"; net_docker=true
+    _ok "Docker Hub 可达"
   else
     _warn "Docker Hub 不可达，建议先配置镜像加速器（选项 8）"
   fi
 
   if curl -fsSL --connect-timeout 8 https://github.com -o /dev/null 2>/dev/null; then
-    _ok "GitHub 可达"; net_github=true
+    _ok "GitHub 可达"
   else
     _warn "GitHub 不可达，ZimaOS 下载和版本查询可能受影响"
   fi
@@ -474,9 +493,13 @@ install_casaos_docker() {
   install_docker || { press_any_key; return 1; }
   ensure_docker_running || { press_any_key; return 1; }
 
-  echo ""
-  read -rp "是否在部署前配置 Docker 镜像加速器？(y/N): " do_mirror </dev/tty
-  [[ "${do_mirror,,}" == "y" ]] && config_docker_mirror
+  select_casa_image
+
+  if [[ "$SELECTED_CASA_IMAGE" == "$CASA_IMAGE_DOCKERHUB" ]]; then
+    echo ""
+    read -rp "是否在部署前配置 Docker 镜像加速器？(y/N): " do_mirror </dev/tty
+    [[ "${do_mirror,,}" == "y" ]] && config_docker_mirror
+  fi
 
   for cname in casaos casa; do
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
@@ -507,9 +530,14 @@ install_casaos_docker() {
   read -rp "镜像标签 [默认: latest]: " input_tag </dev/tty
   local tag="${input_tag:-latest}"
 
-  _info "拉取镜像：dockurr/casa:${tag}"
-  if ! docker pull "dockurr/casa:${tag}"; then
-    _err "镜像拉取失败，请检查网络或配置镜像加速器（选项 8）"
+  _info "拉取镜像：${SELECTED_CASA_IMAGE}:${tag}"
+  if ! docker pull "${SELECTED_CASA_IMAGE}:${tag}"; then
+    _err "镜像拉取失败"
+    if [[ "$SELECTED_CASA_IMAGE" == "$CASA_IMAGE_GHCR" ]]; then
+      _info "ghcr.io 拉取失败，可重新选择并改用 Docker Hub + 加速器"
+    else
+      _info "请检查网络或配置镜像加速器（选项 8）"
+    fi
     press_any_key; return 1
   fi
 
@@ -527,14 +555,14 @@ install_casaos_docker() {
     -v "${data_dir}:/DATA" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     --stop-timeout 60 \
-    "dockurr/casa:${tag}" || run_result=$?
+    "${SELECTED_CASA_IMAGE}:${tag}" || run_result=$?
 
   if [[ $run_result -ne 0 ]]; then
     _err "容器创建失败，请检查：docker logs casa"
     press_any_key; return 1
   fi
 
-  _info "等待容器启动（20秒）..."
+  _info "等待容器启动（最多 20 秒）..."
   local waited=0
   while [[ $waited -lt 20 ]]; do
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^casa$"; then
@@ -550,7 +578,8 @@ install_casaos_docker() {
     _ok "CasaOS Docker 部署成功！"
     _info "访问地址：http://${ip}:${port}"
     _info "数据目录：$data_dir"
-    log "CasaOS Docker 部署成功，端口：${port}，数据：${data_dir}"
+    _info "使用镜像：${SELECTED_CASA_IMAGE}:${tag}"
+    log "CasaOS Docker 部署成功，镜像：${SELECTED_CASA_IMAGE}:${tag}，端口：${port}，数据：${data_dir}"
   else
     _err "容器未能正常运行，查看日志："
     docker logs casa 2>&1 | tail -n 30 || true
@@ -618,31 +647,6 @@ install_casaos_toolbox() {
   press_any_key
 }
 
-zimaos_menu() {
-  while true; do
-    echo ""
-    echo "===== ZimaOS 管理 ====="
-    echo "  1. 查看最新版本信息"
-    echo "  2. 下载 ZimaOS 安装镜像（.img）"
-    echo "  3. 查看安装说明"
-    echo "  4. CasaOS → ZimaOS 迁移指南"
-    echo "  5. 下载 CTOZ 应用迁移工具"
-    echo "  0. 返回主菜单"
-    echo "========================"
-    read -rp "请输入选项: " zc </dev/tty
-
-    case "$zc" in
-      1) _zimaos_show_latest; press_any_key ;;
-      2) _zimaos_download_img ;;
-      3) _zimaos_show_install_guide; press_any_key ;;
-      4) _zimaos_migration_guide; press_any_key ;;
-      5) _zimaos_download_ctoz ;;
-      0) return ;;
-      *) _warn "无效选项" ;;
-    esac
-  done
-}
-
 _zimaos_get_latest_version() {
   local ver=""
   for prefix in "${GH_MIRRORS[@]}"; do
@@ -659,7 +663,7 @@ _zimaos_show_latest() {
   _info "查询 ZimaOS 最新版本..."
   local ver; ver=$(_zimaos_get_latest_version)
   if [[ "$ver" == "未知" ]]; then
-    _warn "无法获取版本信息，请检查网络或直接访问："
+    _warn "无法获取版本信息，请直接访问："
     _info "  $ZIMAOS_RELEASES_URL"
   else
     _ok "ZimaOS 最新版本：$ver"
@@ -886,6 +890,31 @@ _zimaos_download_ctoz() {
   press_any_key
 }
 
+zimaos_menu() {
+  while true; do
+    echo ""
+    echo "===== ZimaOS 管理 ====="
+    echo "  1. 查看最新版本信息"
+    echo "  2. 下载 ZimaOS 安装镜像（.img）"
+    echo "  3. 查看安装说明"
+    echo "  4. CasaOS → ZimaOS 迁移指南"
+    echo "  5. 下载 CTOZ 应用迁移工具"
+    echo "  0. 返回主菜单"
+    echo "========================"
+    read -rp "请输入选项: " zc </dev/tty
+
+    case "$zc" in
+      1) _zimaos_show_latest;        press_any_key ;;
+      2) _zimaos_download_img ;;
+      3) _zimaos_show_install_guide; press_any_key ;;
+      4) _zimaos_migration_guide;    press_any_key ;;
+      5) _zimaos_download_ctoz ;;
+      0) return ;;
+      *) _warn "无效选项" ;;
+    esac
+  done
+}
+
 update_casaos() {
   echo ""
   echo "===== 更新 CasaOS ====="
@@ -911,15 +940,17 @@ update_casaos() {
   if [[ "$CASAOS_INSTALL_TYPE" == "docker" ]]; then
     local cname="$CASAOS_CONTAINER_NAME"
     local cur_image
-    cur_image=$(docker inspect --format='{{.Config.Image}}' "$cname" 2>/dev/null || echo "dockurr/casa:latest")
+    cur_image=$(docker inspect --format='{{.Config.Image}}' "$cname" 2>/dev/null || echo "未知")
     _info "当前镜像：$cur_image"
+
+    select_casa_image
 
     read -rp "更新到的镜像标签 [默认: latest]: " new_tag </dev/tty
     new_tag="${new_tag:-latest}"
 
-    _info "拉取新镜像：dockurr/casa:${new_tag}"
-    if ! docker pull "dockurr/casa:${new_tag}"; then
-      _err "拉取失败，请检查网络或配置镜像加速器"
+    _info "拉取新镜像：${SELECTED_CASA_IMAGE}:${new_tag}"
+    if ! docker pull "${SELECTED_CASA_IMAGE}:${new_tag}"; then
+      _err "拉取失败，请检查网络"
       press_any_key; return 1
     fi
 
@@ -974,12 +1005,13 @@ except:
       run_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
 
-    run_args+=("dockurr/casa:${new_tag}")
+    run_args+=("${SELECTED_CASA_IMAGE}:${new_tag}")
 
     if "${run_args[@]}"; then
       sleep 10
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
         _ok "CasaOS 更新完成！访问地址：http://$(get_local_ip):${old_port}"
+        _info "当前镜像：${SELECTED_CASA_IMAGE}:${new_tag}"
       else
         _err "更新后容器异常退出，查看日志："
         docker logs "$cname" 2>&1 | tail -n 30 || true
@@ -1026,11 +1058,12 @@ uninstall_casaos() {
     docker rm "$cname" >/dev/null 2>&1 || true
     _ok "容器已移除"
 
-    read -rp "是否删除 dockurr/casa 镜像？(y/N): " del_img </dev/tty
+    read -rp "是否删除 CasaOS 镜像？(y/N): " del_img </dev/tty
     if [[ "${del_img,,}" == "y" ]]; then
-      docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | \
-        grep "^dockurr/casa" | \
-        xargs -r docker rmi 2>/dev/null || true
+      for img in "$CASA_IMAGE_GHCR" "$CASA_IMAGE_DOCKERHUB"; do
+        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | \
+          grep "^${img}" | xargs -r docker rmi 2>/dev/null || true
+      done
       _ok "镜像已删除"
     fi
   fi
@@ -1139,12 +1172,9 @@ view_casaos_info() {
   if _have docker && docker info >/dev/null 2>&1; then
     _ok "Docker 守护进程：运行中"
     _info "版本：$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 未知)"
-    local mirror_cnt
-    mirror_cnt=$(docker info 2>/dev/null | grep -c "Registry Mirrors" || echo 0)
-    if [[ "$mirror_cnt" -gt 0 ]]; then
+    if docker info 2>/dev/null | grep -q "Registry Mirrors"; then
       _info "镜像加速器："
-      docker info 2>/dev/null | grep -A5 "Registry Mirrors" | grep "http" | \
-        sed 's/^/  /' || true
+      docker info 2>/dev/null | grep -A5 "Registry Mirrors" | grep "http" | sed 's/^/  /' || true
     fi
   else
     _warn "Docker：未运行或未安装"
@@ -1179,7 +1209,6 @@ switch_apt_source() {
     press_any_key; return
   fi
 
-  local os_id="${OS_ID:-}"
   echo ""
   echo "请选择镜像源："
   echo "  1. 清华大学 (mirrors.tuna.tsinghua.edu.cn)"
@@ -1226,9 +1255,9 @@ backup_casaos() {
   check_casaos_status
 
   local backup_dirs=()
-  [[ -d "/etc/casaos" ]] && backup_dirs+=("/etc/casaos")
-  [[ -d "/var/lib/casaos" ]] && backup_dirs+=("/var/lib/casaos")
-  [[ -d "${HOME}/casa" ]] && backup_dirs+=("${HOME}/casa")
+  [[ -d "/etc/casaos" ]]           && backup_dirs+=("/etc/casaos")
+  [[ -d "/var/lib/casaos" ]]       && backup_dirs+=("/var/lib/casaos")
+  [[ -d "${HOME}/casa" ]]          && backup_dirs+=("${HOME}/casa")
   [[ -d "/DATA" && "$CASAOS_INSTALL_TYPE" != "unknown" ]] && backup_dirs+=("/DATA")
 
   if [[ ${#backup_dirs[@]} -eq 0 ]]; then
@@ -1249,7 +1278,6 @@ backup_casaos() {
     [[ "${cont,,}" == "y" ]] || { press_any_key; return; }
   fi
 
-  local default_bak_dir="$HOME"
   echo ""
   echo "请选择备份保存位置："
   echo "  1. 主目录 ($HOME)"
@@ -1259,8 +1287,8 @@ backup_casaos() {
   local bak_dir
   case "${bk_opt:-1}" in
     2) bak_dir="/tmp" ;;
-    3) read -rp "请输入目录路径: " bak_dir </dev/tty; bak_dir="${bak_dir:-$default_bak_dir}" ;;
-    *) bak_dir="$default_bak_dir" ;;
+    3) read -rp "请输入目录路径: " bak_dir </dev/tty; bak_dir="${bak_dir:-$HOME}" ;;
+    *) bak_dir="$HOME" ;;
   esac
 
   if ! mkdir -p "$bak_dir" 2>/dev/null || ! touch "$bak_dir/.wtest" 2>/dev/null; then
@@ -1387,12 +1415,11 @@ restore_casaos() {
   fi
 
   local restore_tmp; restore_tmp=$(mktemp -d)
-  local restore_rc=0
+  trap "rm -rf '$restore_tmp'" RETURN
 
   _info "解压备份文件..."
   if ! tar -xzf "$backup_file" -C "$restore_tmp" 2>/dev/null; then
     _err "解压失败，文件可能已损坏"
-    rm -rf "$restore_tmp"
     press_any_key; return 1
   fi
 
@@ -1405,16 +1432,12 @@ restore_casaos() {
   else
     _warn "未找到 backup_info.txt，备份格式可能不正确"
     read -rp "是否继续恢复？(y/N): " force_restore </dev/tty
-    [[ "${force_restore,,}" == "y" ]] || { rm -rf "$restore_tmp"; press_any_key; return; }
+    [[ "${force_restore,,}" == "y" ]] || { press_any_key; return; }
   fi
 
   echo ""
   read -rp "确认恢复？这将覆盖现有配置 (y/N): " confirm </dev/tty
-  if [[ "${confirm,,}" != "y" ]]; then
-    _warn "已取消"
-    rm -rf "$restore_tmp"
-    press_any_key; return
-  fi
+  [[ "${confirm,,}" == "y" ]] || { _warn "已取消"; press_any_key; return; }
 
   check_casaos_status
   if [[ "$CASAOS_INSTALL_TYPE" == "docker" ]]; then
@@ -1424,8 +1447,8 @@ restore_casaos() {
   fi
 
   local restore_base; restore_base=$(dirname "${info_file:-$restore_tmp/x}")
-
   local found_any=false
+
   for src_dir in "$restore_base"/*/; do
     [[ -d "$src_dir" ]] || continue
     local dir_name; dir_name=$(basename "$src_dir")
@@ -1446,16 +1469,13 @@ restore_casaos() {
     fi
   done
 
-  rm -rf "$restore_tmp"
-
   if [[ "$found_any" == false ]]; then
     _warn "未恢复任何目录，请检查备份包内容"
     press_any_key; return 1
   fi
 
   if [[ "$CASAOS_INSTALL_TYPE" == "docker" ]]; then
-    local cname="$CASAOS_CONTAINER_NAME"
-    docker start "$cname" >/dev/null 2>&1 \
+    docker start "$CASAOS_CONTAINER_NAME" >/dev/null 2>&1 \
       && _ok "容器已启动" \
       || _warn "请通过菜单手动启动容器"
   elif [[ "$CASAOS_INSTALL_TYPE" == "standard" ]]; then
@@ -1501,7 +1521,7 @@ while true; do
   if _have docker && docker info >/dev/null 2>&1; then
     docker_status="运行中  [$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 未知)]"
   elif _have docker; then
-    docker_status="已安装 (未运行)"
+    docker_status="已安装（未运行）"
   fi
 
   zimaos_ver=$(_zimaos_get_latest_version 2>/dev/null || echo "未知")
@@ -1515,7 +1535,7 @@ while true; do
   echo "-------------------------------------------------------------"
   echo "  [CasaOS 部署]"
   echo "  1. 标准安装 CasaOS（官方脚本）"
-  echo "  2. Docker 部署 CasaOS（可指定端口/版本）"
+  echo "  2. Docker 部署 CasaOS（可选 ghcr.io/Docker Hub + 指定端口/版本）"
   echo "  3. 安装 CasaOS Toolbox"
   echo ""
   echo "  [ZimaOS]"
