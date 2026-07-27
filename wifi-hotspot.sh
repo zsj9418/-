@@ -2,7 +2,7 @@
 set -uo pipefail
 trap 'echo "[!] 已中断"; exit 1' INT
 
-SCRIPT_VERSION="0.3"
+SCRIPT_VERSION="0.4"
 SCRIPT_FIXED_NAME="wifi-auto-switch"
 SCRIPT_INSTALL_PATH="/usr/local/bin/${SCRIPT_FIXED_NAME}"
 DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/${SCRIPT_FIXED_NAME}.sh"
@@ -25,7 +25,6 @@ press_any_key() {
   echo ""
 }
 
-# ── 日志 ──────────────────────────────────────────────────
 restrict_log_size() {
   if [[ -f "$LOG_FILE" ]]; then
     local log_size
@@ -41,7 +40,6 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# ── Root 检查 ─────────────────────────────────────────────
 if [[ "${EUID}" -ne 0 ]]; then
   _err "请以 root 权限运行此脚本"
   exit 1
@@ -52,7 +50,6 @@ mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/wifi_auto_switch.log"
 log "脚本启动，版本: $SCRIPT_VERSION"
 
-# ── 系统与包管理器检测 ────────────────────────────────────
 detect_os() {
   OS_ID=""
   PKG_UPDATE=""
@@ -64,21 +61,13 @@ detect_os() {
 
   case "$OS_ID" in
     debian|ubuntu|raspbian|armbian)
-      PKG_UPDATE="apt-get update -qq"
-      PKG_INSTALL="apt-get install -y -qq"
-      ;;
+      PKG_UPDATE="apt-get update -qq"; PKG_INSTALL="apt-get install -y -qq" ;;
     centos|rhel|rocky|almalinux)
-      PKG_UPDATE="yum makecache -q"
-      PKG_INSTALL="yum install -y -q"
-      ;;
+      PKG_UPDATE="yum makecache -q"; PKG_INSTALL="yum install -y -q" ;;
     fedora)
-      PKG_UPDATE="dnf makecache -q"
-      PKG_INSTALL="dnf install -y -q"
-      ;;
+      PKG_UPDATE="dnf makecache -q"; PKG_INSTALL="dnf install -y -q" ;;
     arch|manjaro)
-      PKG_UPDATE="pacman -Sy --noconfirm -q"
-      PKG_INSTALL="pacman -S --noconfirm -q"
-      ;;
+      PKG_UPDATE="pacman -Sy --noconfirm -q"; PKG_INSTALL="pacman -S --noconfirm -q" ;;
     *)
       _warn "未完全识别的发行版: ${OS_ID:-unknown}，尝试自动检测包管理器"
       if command -v apt-get >/dev/null 2>&1; then
@@ -100,7 +89,6 @@ detect_os() {
 
 detect_os
 
-# ── 依赖检查 ──────────────────────────────────────────────
 ensure_nmcli() {
   if command -v nmcli >/dev/null 2>&1; then return 0; fi
   _warn "nmcli 未安装，正在安装 NetworkManager..."
@@ -125,7 +113,6 @@ ensure_nm_running() {
   nmcli general status >/dev/null 2>&1 || { _err "NetworkManager 未能正常启动"; return 1; }
 }
 
-# ── 接口检测（单次 nmcli 调用缓存）────────────────────────
 _NM_DEV_CACHE=""
 _NM_DEV_CACHE_TIME=0
 
@@ -157,7 +144,6 @@ is_ethernet_connected() {
     log "接口 $iface 不存在，视为未连接"
     return 1
   fi
-  # operstate 比 carrier 更可靠，接口 DOWN 时 carrier 读取会报错
   local operstate
   operstate=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
   if [[ "$operstate" == "up" ]]; then
@@ -169,7 +155,6 @@ is_ethernet_connected() {
   fi
 }
 
-# ── 当前 WiFi 模式（合并为单次 nmcli 调用）────────────────
 get_current_mode() {
   local wifi_iface; wifi_iface=$(detect_wifi_interface)
   if [[ -z "$wifi_iface" ]]; then echo "无线网卡未检测到"; return; fi
@@ -187,51 +172,107 @@ get_current_mode() {
   fi
 }
 
-# ── 等待网卡进入 Station 模式 ─────────────────────────────
 wait_for_station_mode() {
   local iface="$1"
-  local max_wait="${2:-15}"
+  local max_wait="${2:-20}"
   local waited=0
 
-  _info "等待无线网卡切换到 Station 模式..."
+  _info "等待无线网卡切换到 Station 模式（最多 ${max_wait} 秒）..."
+
   while [[ $waited -lt $max_wait ]]; do
-    local iw_mode
-    iw_mode=$(iw dev "$iface" info 2>/dev/null | awk '/type/{print $2}' || \
-              nmcli -t -f GENERAL.TYPE dev show "$iface" 2>/dev/null | cut -d: -f2 || \
-              echo "")
-    if [[ "$iw_mode" == "managed" || "$iw_mode" == "wifi" ]]; then
-      log "网卡 $iface 已切换到 Station 模式（${waited}s）"
-      return 0
+    # 方法1：iw 检查驱动层工作模式（最精确）
+    if command -v iw >/dev/null 2>&1; then
+      local iw_mode
+      iw_mode=$(iw dev "$iface" info 2>/dev/null | awk '/^\s*type/{print $2}' || echo "")
+      if [[ "$iw_mode" == "managed" ]]; then
+        log "网卡 $iface 已切换到 managed 模式（${waited}s）"
+        return 0
+      fi
+    else
+      # 方法2：检查该接口上是否还有活跃的 AP 类连接
+      local ap_active
+      ap_active=$(nmcli -t -f NAME,DEVICE,STATE con show --active 2>/dev/null | \
+        awk -F: -v d="$iface" '$2==d && $3=="activated"{print $1}' | \
+        grep "^${HOTSPOT_PREFIX}" || true)
+      if [[ -z "$ap_active" ]]; then
+        # AP 连接已清除，等待 2 秒让网卡稳定后返回
+        sleep 2
+        log "网卡 $iface AP 连接已清除（${waited}s）"
+        return 0
+      fi
     fi
+
     sleep 1
     waited=$((waited + 1))
   done
-  log "等待 Station 模式超时（${max_wait}s），继续尝试扫描"
+
+  log "等待 Station 模式超时（${max_wait}s），继续尝试"
   return 0
 }
 
-# ── 扫描 WiFi（修复核心：正确等待 + 过滤自身 AP）─────────
+_parse_nmcli_wifi_multiline() {
+  local raw_output="$1"
+  local hotspot_name="${2:-}"
+
+  local ssid="" signal="" security="" mode=""
+
+  while IFS= read -r line; do
+    # 去除行首空格
+    line="${line#"${line%%[! ]*}"}"
+
+    case "$line" in
+      SSID:*)
+        ssid="${line#SSID:}"
+        ssid="${ssid#"${ssid%%[! ]*}"}"
+        ;;
+      SIGNAL:*)
+        signal="${line#SIGNAL:}"
+        signal="${signal#"${signal%%[! ]*}"}"
+        ;;
+      SECURITY:*)
+        security="${line#SECURITY:}"
+        security="${security#"${security%%[! ]*}"}"
+        ;;
+      MODE:*)
+        mode="${line#MODE:}"
+        mode="${mode#"${mode%%[! ]*}"}"
+
+        if [[ -n "$ssid" && \
+              "$ssid" != "--" && \
+              "$mode" != "Ap" && \
+              "$mode" != "AP" && \
+              "$ssid" != "$hotspot_name" ]]; then
+          echo "${ssid}|${signal}|${security}"
+        fi
+
+        ssid=""; signal=""; security=""; mode=""
+        ;;
+    esac
+  done <<< "$raw_output"
+}
+
 scan_wifi() {
   local iface="$1"
 
-  # rescan 是异步的，必须等它完成再 list
-  # 参考：nmcli dev wifi rescan 不会立即显示结果
-  nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
-  sleep 4
+  local hotspot_name="4G-WIFI"
+  [[ -f "$CONFIG_DIR/hotspot_name" ]] && hotspot_name=$(cat "$CONFIG_DIR/hotspot_name")
 
-  # 过滤掉：Mode:Master（自身 AP）、SSID 为 "--"、信号为 0 的残留条目
-  # 使用 -f 精确指定字段，-t terse 模式避免列宽截断
-  nmcli -t -f SSID,SIGNAL,SECURITY,MODE dev wifi list ifname "$iface" 2>/dev/null | \
-    awk -F: '
-      $4 != "Ap" &&
-      $1 != "" &&
-      $1 != "--" &&
-      $2 > 0
-      { print $1 ":" $2 ":" $3 }
-    ' | sort -t: -k2 -rn
+  local raw_output=""
+
+  if nmcli dev wifi list ifname "$iface" --rescan yes >/dev/null 2>&1; then
+    raw_output=$(nmcli --mode multiline -f SSID,SIGNAL,SECURITY,MODE \
+      dev wifi list ifname "$iface" --rescan yes 2>/dev/null || true)
+  else
+    nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
+    sleep 6
+    raw_output=$(nmcli --mode multiline -f SSID,SIGNAL,SECURITY,MODE \
+      dev wifi list ifname "$iface" 2>/dev/null || true)
+  fi
+
+  _parse_nmcli_wifi_multiline "$raw_output" "$hotspot_name" | \
+    sort -t'|' -k2 -rn
 }
 
-# ── 热点管理 ──────────────────────────────────────────────
 clear_old_hotspots() {
   local old_hotspots=()
   mapfile -t old_hotspots < <(
@@ -283,7 +324,6 @@ create_wifi_hotspot() {
   fi
 }
 
-# ── WiFi 客户端连接 ────────────────────────────────────────
 connect_wifi_network() {
   local iface="$1"
   local ssid="$2"
@@ -293,7 +333,7 @@ connect_wifi_network() {
 
   clear_old_hotspots
   sleep 2
-  wait_for_station_mode "$iface" 10
+  wait_for_station_mode "$iface" 20
 
   log "尝试连接：$ssid"
   if nmcli dev wifi connect "$ssid" password "$password" ifname "$iface" >/dev/null 2>&1; then
@@ -317,7 +357,6 @@ connect_wifi_network() {
   return 1
 }
 
-# ── 智能 WiFi 连接 ─────────────────────────────────────────
 smart_connect_wifi() {
   local iface="$1"
   local max_retries=3
@@ -328,9 +367,8 @@ smart_connect_wifi() {
 
   clear_old_hotspots
   sleep 2
-  wait_for_station_mode "$iface" 15
+  wait_for_station_mode "$iface" 20
 
-  # 尝试已保存的非自建连接
   local saved_cons=()
   mapfile -t saved_cons < <(
     nmcli -t -f NAME,TYPE con show 2>/dev/null | \
@@ -365,11 +403,10 @@ smart_connect_wifi() {
     log "无已保存的非自建 WiFi 连接"
   fi
 
-  # 扫描附近信号并尝试无密码连接
-  log "扫描附近 WiFi..."
+  log "扫描附近 WiFi 尝试无密码连接..."
   local available_ssids=()
   mapfile -t available_ssids < <(
-    scan_wifi "$iface" | awk -F: '{print $1}' | head -n 5 || true
+    scan_wifi "$iface" | awk -F'|' '{print $1}' | head -n 5 || true
   )
 
   if [[ ${#available_ssids[@]} -gt 0 ]]; then
@@ -390,7 +427,6 @@ smart_connect_wifi() {
   return 1
 }
 
-# ── 自动切换逻辑 ───────────────────────────────────────────
 auto_switch_wifi_mode() {
   log "触发自动切换..."
 
@@ -432,7 +468,6 @@ auto_switch_wifi_mode() {
   fi
 }
 
-# ── Dispatcher 服务 ────────────────────────────────────────
 install_dispatcher() {
   _info "安装 NetworkManager Dispatcher 服务..."
 
@@ -496,7 +531,6 @@ EOF
   log "Dispatcher 服务安装完成"
 }
 
-# ── 卸载服务 ───────────────────────────────────────────────
 uninstall_dispatcher() {
   echo ""
   echo "将删除以下内容："
@@ -518,7 +552,6 @@ uninstall_dispatcher() {
   _ok "卸载完成"
 }
 
-# ── 管理已保存的 WiFi ─────────────────────────────────────
 manage_saved_wifi() {
   echo ""
   echo "===== 已保存的 WiFi 网络 ====="
@@ -548,7 +581,6 @@ manage_saved_wifi() {
   connect_wifi_network "$wifi_iface" "$new_ssid" "$new_pass"
 }
 
-# ── 配置热点参数 ───────────────────────────────────────────
 configure_hotspot_params() {
   echo ""
   echo "===== 配置热点参数 ====="
@@ -575,53 +607,72 @@ configure_hotspot_params() {
   _ok "热点参数已保存：SSID=$new_name"
 }
 
-# ── 扫描并显示周边 WiFi（选项2专用）─────────────────────────
+# ── 核心修复4：scan_and_display_wifi ─────────────────────
+# 修复：使用 _parse_nmcli_wifi_multiline 正确解析，使用 | 分隔符
 scan_and_display_wifi() {
   local iface="$1"
 
   _info "清理热点模式中..."
   clear_old_hotspots
   sleep 2
-  wait_for_station_mode "$iface" 15
+  wait_for_station_mode "$iface" 20
 
-  _info "正在扫描周边 WiFi（约需 5 秒）..."
-  nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
-  sleep 5
+  _info "正在扫描周边 WiFi（同步等待扫描完成）..."
 
-  echo ""
-  echo "周边可见的 WiFi："
-  echo "  SSID                           信号    安全"
-  echo "  ────────────────────────────────────────────"
-
-  local found=false
   local hotspot_name="4G-WIFI"
   [[ -f "$CONFIG_DIR/hotspot_name" ]] && hotspot_name=$(cat "$CONFIG_DIR/hotspot_name")
 
-  while IFS=: read -r ssid signal security; do
-    [[ -z "$ssid" || "$ssid" == "--" ]] && continue
-    [[ "$ssid" == "$hotspot_name" ]] && continue
-    printf "  %-30s %-8s %s\n" "$ssid" "${signal}%" "$security"
+  local raw_output=""
+  # 优先用 --rescan yes 同步扫描（NM 1.2+）
+  if nmcli dev wifi list ifname "$iface" --rescan yes >/dev/null 2>&1; then
+    raw_output=$(nmcli --mode multiline -f SSID,SIGNAL,SECURITY,MODE \
+      dev wifi list ifname "$iface" --rescan yes 2>/dev/null || true)
+    _info "（已使用同步扫描模式）"
+  else
+    # 降级：触发扫描后等待 8 秒
+    nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
+    _info "（异步扫描模式，等待 8 秒）..."
+    sleep 8
+    raw_output=$(nmcli --mode multiline -f SSID,SIGNAL,SECURITY,MODE \
+      dev wifi list ifname "$iface" 2>/dev/null || true)
+  fi
+
+  echo ""
+  echo "周边可见的 WiFi："
+  printf "  %-32s %-8s %s\n" "SSID" "信号" "安全"
+  echo "  ────────────────────────────────────────────────"
+
+  local found=false
+  local sorted_output
+  sorted_output=$(_parse_nmcli_wifi_multiline "$raw_output" "$hotspot_name" | \
+    sort -t'|' -k2 -rn)
+
+  while IFS='|' read -r ssid signal security; do
+    [[ -z "$ssid" ]] && continue
+    printf "  %-32s %-8s %s\n" "$ssid" "${signal:--}%" "${security:---}"
     found=true
-  done < <(
-    nmcli -t -f SSID,SIGNAL,SECURITY,MODE dev wifi list ifname "$iface" 2>/dev/null | \
-    awk -F: '
-      $4 != "Ap" &&
-      $1 != "" &&
-      $1 != "--" &&
-      $2+0 > 0
-      { print $1 ":" $2 ":" $3 }
-    ' | sort -t: -k2 -rn
-  )
+  done <<< "$sorted_output"
 
   if [[ "$found" == false ]]; then
     _warn "未扫描到可用 WiFi 网络"
-    _info "提示：如果刚从热点模式切换，网卡可能需要更长时间初始化"
-    _info "      可以等待 15-30 秒后重新选择此选项"
+    echo ""
+    _info "诊断信息："
+    _info "  无线网卡：$iface"
+    if command -v iw >/dev/null 2>&1; then
+      local iw_mode; iw_mode=$(iw dev "$iface" info 2>/dev/null | awk '/type/{print $2}' || echo "未知")
+      _info "  驱动模式：$iw_mode（应为 managed）"
+    fi
+    local nm_state; nm_state=$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | \
+      awk -F: -v d="$iface" '$1==d{print $2; exit}' || echo "未知")
+    _info "  NM 状态 ：$nm_state"
+    _info "  如仍无结果，请尝试："
+    _info "    1. 等待 30 秒后重试（网卡模式切换需要时间）"
+    _info "    2. 确认周边有 2.4GHz 信号（部分网卡不支持 5GHz 扫描）"
+    _info "    3. 执行：nmcli dev wifi rescan ifname $iface 后等待 10 秒再重试"
   fi
   echo ""
 }
 
-# ── 查看详细状态 ───────────────────────────────────────────
 show_status() {
   echo ""
   echo "===== 详细状态 ====="
@@ -646,26 +697,29 @@ show_status() {
       iw_mode=$(iw dev "$wifi_iface" info 2>/dev/null | awk '/type/{print $2}' || echo "未知")
       echo "  驱动模式：$iw_mode"
     fi
+
+    local nm_state
+    nm_state=$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | \
+      awk -F: -v d="$wifi_iface" '$1==d{print $2; exit}' || echo "未知")
+    echo "  NM 状态 ：$nm_state"
   fi
 
   echo ""
   echo "  Dispatcher：$( [[ -f "$DISPATCHER_SCRIPT" ]] && echo "已安装" || echo "未安装" )"
-  echo "  热点名称：$( [[ -f "$CONFIG_DIR/hotspot_name" ]] && cat "$CONFIG_DIR/hotspot_name" || echo "4G-WIFI（默认）" )"
-  echo "  日志文件：$LOG_FILE"
+  echo "  热点名称  ：$( [[ -f "$CONFIG_DIR/hotspot_name" ]] && cat "$CONFIG_DIR/hotspot_name" || echo "4G-WIFI（默认）" )"
+  echo "  日志文件  ：$LOG_FILE"
   echo ""
   echo "-- 最近 10 条日志 --"
   tail -n 10 "$LOG_FILE" 2>/dev/null || echo "（日志为空）"
   echo "===================="
 }
 
-# ── 参数模式（Dispatcher 调用）────────────────────────────
 if [[ "${1:-}" == "auto-switch-dispatcher" ]]; then
   ensure_nm_running >/dev/null 2>&1 || true
   auto_switch_wifi_mode
   exit 0
 fi
 
-# ── 主菜单 ────────────────────────────────────────────────
 ensure_nm_running || {
   _err "NetworkManager 启动失败，脚本无法继续"
   exit 1
