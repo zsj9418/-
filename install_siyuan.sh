@@ -15,7 +15,6 @@ RETRY_COUNT=3
 LOG_FILE="/var/log/siyuan_deploy.log"
 BACKUP_PREFIX="siyuan-backup"
 
-# 修复：镜像源用纯主机名，直连放最后作兜底
 DOCKER_MIRRORS=(
   "docker.1ms.run"
   "docker.m.daocloud.io"
@@ -302,7 +301,6 @@ get_available_tags() {
   _ok "已选择版本：$SELECTED_TAG"
 }
 
-# 修复：镜像源用纯主机名拼接，直连作最后兜底
 pull_image() {
   _info "拉取镜像：$IMAGE_NAME"
 
@@ -318,7 +316,8 @@ pull_image() {
 
     local attempt=1
     while [[ $attempt -le $RETRY_COUNT ]]; do
-      if docker pull "$pull_target" >/dev/null 2>&1; then
+      _info "拉取中：$pull_target（第 $attempt 次）..."
+      if docker pull "$pull_target" 2>&1; then
         if [[ "$pull_target" != "$IMAGE_NAME" ]]; then
           docker tag "$pull_target" "$IMAGE_NAME" >/dev/null 2>&1 || true
         fi
@@ -326,7 +325,7 @@ pull_image() {
         return 0
       fi
       _warn "第 $attempt/$RETRY_COUNT 次失败，重试..."
-      sleep 2
+      sleep 3
       attempt=$((attempt + 1))
     done
     _warn "加速源 ${mirror:-直连} 失败，切换下一个..."
@@ -426,7 +425,6 @@ select_network_mode() {
   esac
 }
 
-# 修复：v3.7.0+ 使用 serve 子命令，判断条件修正
 _detect_serve_cmd() {
   local img="$1"
   local ver_str="${img##*:}"
@@ -444,7 +442,6 @@ _detect_serve_cmd() {
   IFS='.' read -r major minor patch <<< "$ver_num"
   patch="${patch:-0}"
 
-  # v3.7.0 及以上使用 serve 子命令
   if [[ "$major" -gt 3 ]] || \
      [[ "$major" -eq 3 && "$minor" -gt 7 ]] || \
      [[ "$major" -eq 3 && "$minor" -eq 7 ]]; then
@@ -501,7 +498,7 @@ start_container() {
 
   _info "启动容器..."
 
-  if "${run_args[@]}" >/dev/null 2>&1; then
+  if "${run_args[@]}" 2>&1; then
     sleep 3
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
       local ip; ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1 || \
@@ -513,10 +510,12 @@ start_container() {
       log "思源笔记部署成功，端口：$HOST_PORT，工作空间：$HOST_WORKSPACE"
     else
       _err "容器启动后异常退出，请查看日志：docker logs $CONTAINER_NAME"
+      docker logs --tail=20 "$CONTAINER_NAME" 2>&1 || true
       return 1
     fi
   else
     _err "容器启动失败，请查看日志：docker logs $CONTAINER_NAME"
+    docker logs --tail=20 "$CONTAINER_NAME" 2>&1 || true
     return 1
   fi
 }
@@ -1053,6 +1052,38 @@ uninstall() {
   press_any_key
 }
 
+configure_registry_mirrors() {
+  local daemon_file="/etc/docker/daemon.json"
+  local mirrors_json='["https://docker.1ms.run","https://docker.m.daocloud.io","https://docker.nju.edu.cn","https://mirror.baidubce.com"]'
+
+  mkdir -p /etc/docker
+
+  if [[ -f "$daemon_file" ]]; then
+    if _have jq; then
+      local updated
+      updated=$(jq --argjson m "$mirrors_json" '."registry-mirrors" = $m' "$daemon_file" 2>/dev/null)
+      if [[ -n "$updated" ]]; then
+        echo "$updated" > "$daemon_file"
+      fi
+    else
+      cp "$daemon_file" "${daemon_file}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+      echo "{\"registry-mirrors\": $mirrors_json}" > "$daemon_file"
+    fi
+  else
+    echo "{\"registry-mirrors\": $mirrors_json}" > "$daemon_file"
+  fi
+
+  if _have systemctl && systemctl is-active docker >/dev/null 2>&1; then
+    systemctl reload docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
+    sleep 2
+  elif [[ "$OS_TYPE" == "openwrt" ]]; then
+    /etc/init.d/dockerd restart >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  _ok "已配置 Docker 镜像加速并重载守护进程"
+}
+
 _get_status_line() {
   if ! _have docker; then
     echo "Docker 未安装"
@@ -1082,7 +1113,6 @@ while true; do
   echo "========== 思源笔记部署管理脚本 v${SCRIPT_VERSION} =========="
   echo "  系统：${OS_TYPE}    架构：${ARCH_NAME}    本机IP：${local_ip}"
   echo "  容器状态：${container_status}"
-  echo "  镜像源：国内加速（docker.1ms.run 等）→ 直连兜底"
   echo "-----------------------------------------------------------"
   echo "  1. 安装并启动思源笔记"
   echo "  2. 无损更新（保留所有数据与配置）"
@@ -1095,6 +1125,7 @@ while true; do
   echo "  9. 卸载并清理"
   echo " 10. 安装依赖（Docker/curl/jq）"
   echo " 11. 修复 OpenWrt 网络防火墙"
+  echo " 12. 配置 Docker 镜像加速"
   echo "  0. 退出"
   echo "==========================================================="
   read -rp "请输入选项: " choice </dev/tty
@@ -1102,6 +1133,7 @@ while true; do
   case "$choice" in
     1)
       ensure_docker_running || { press_any_key; continue; }
+      configure_registry_mirrors
       get_available_tags
       get_user_input
       setup_workspace || { press_any_key; continue; }
@@ -1121,12 +1153,13 @@ while true; do
     9)  uninstall ;;
     10) install_dependencies ;;
     11) fix_openwrt_firewall ;;
+    12) configure_registry_mirrors; press_any_key ;;
     0)
       _ok "感谢使用，再见"
       exit 0
       ;;
     *)
-      _warn "无效选项，请输入 0-11"
+      _warn "无效选项，请输入 0-12"
       ;;
   esac
 done
