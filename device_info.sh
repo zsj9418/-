@@ -6,8 +6,8 @@ CONFIG_FILE="/etc/device_info.conf"
 MAX_LOG_SIZE=2097152
 RETRY_INTERVAL=8
 SYSTEMD_PRE_SLEEP=10
-PING_TARGET="223.5.5.5"
 SEND_RETRY_INTERVAL=15
+PING_TARGETS="1.1.1.1 8.8.8.8 223.5.5.5 9.9.9.9"
 get_script_path() {
     if command -v realpath >/dev/null 2>&1; then
         realpath "$0"
@@ -408,6 +408,49 @@ get_lan_ip() {
         return 0
     fi
 }
+check_ping() {
+    local target="$1"
+    ping -c 1 -W 2 "$target" > /dev/null 2>&1
+    return $?
+}
+get_public_ip_info() {
+    local ipinfo_json=""
+    local providers="ipinfo.io ip.sb/geoip ifconfig.co/json"
+    for provider in $providers; do
+        log_info "尝试从 $provider 获取公网信息..."
+        ipinfo_json=$(curl -s --connect-timeout 8 --max-time 12 \
+            -A "DeviceInfoScript/1.0" "https://$provider" 2>/dev/null)
+        if [ -n "$ipinfo_json" ]; then
+            log_info "成功从 $provider 获取公网信息"
+            echo "$ipinfo_json"
+            return 0
+        fi
+        log_info "从 $provider 获取公网信息失败，尝试下一个..."
+    done
+    log_error "所有公网信息源均获取失败"
+    return 1
+}
+parse_ip_info() {
+    local json="$1"
+    local public_ip operator city country location
+    public_ip=$(echo "$json" | sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -z "$public_ip" ] && public_ip=$(echo "$json" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p' | head -1)
+    operator=$(echo "$json" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -z "$operator" ] && operator=$(echo "$json" | sed -n 's/.*"isp": *"\([^"]*\)".*/\1/p' | head -1)
+    city=$(echo "$json" | sed -n 's/.*"city": *"\([^"]*\)".*/\1/p' | head -1)
+    country=$(echo "$json" | sed -n 's/.*"country": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -z "$country" ] && country=$(echo "$json" | sed -n 's/.*"country_name": *"\([^"]*\)".*/\1/p' | head -1)
+    if [ -n "$city" ] && [ -n "$country" ]; then
+        location="$city, $country"
+    elif [ -n "$city" ]; then
+        location="$city"
+    elif [ -n "$country" ]; then
+        location="$country"
+    else
+        location="未知地点"
+    fi
+    echo "${public_ip:-获取失败}|${operator:-未知运营商}|${location}"
+}
 get_system_info() {
     local runtime
     runtime=$(uptime -p 2>/dev/null | sed 's/up //')
@@ -423,7 +466,6 @@ get_system_info() {
     lan_ips_formatted=$(get_lan_ip)
     if [ -z "$lan_ips_formatted" ] || echo "$lan_ips_formatted" | grep -q "未找到"; then
         lan_ips_formatted="  未能获取局域网 IP 地址"
-        log_info "未能获取局域网 IP 地址。"
     fi
     local cpu_usage
     cpu_usage=$(get_cpu_usage)
@@ -450,23 +492,15 @@ get_system_info() {
     os_version=$(get_os_version)
     kernel_version=$(uname -r 2>/dev/null || echo '未知')
     architecture=$(uname -m 2>/dev/null || echo '未知')
-    local ipinfo_json="" public_ip="获取中..." operator="获取中..." location="获取中..."
-    ipinfo_json=$(curl -s --connect-timeout 10 --max-time 15 ipinfo.io 2>/dev/null)
+    local public_ip="获取失败" operator="获取失败" location="获取失败"
+    local ipinfo_json
+    ipinfo_json=$(get_public_ip_info)
     if [ -n "$ipinfo_json" ]; then
-        public_ip=$(echo "$ipinfo_json" | sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p')
-        [ -z "$public_ip" ] && public_ip="未知 IPv4"
-        operator=$(echo "$ipinfo_json" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
-        [ -z "$operator" ] && operator="未知运营商"
-        local city country
-        city=$(echo "$ipinfo_json" | sed -n 's/.*"city": *"\([^"]*\)".*/\1/p')
-        country=$(echo "$ipinfo_json" | sed -n 's/.*"country": *"\([^"]*\)".*/\1/p')
-        if [ -n "$city" ] && [ -n "$country" ]; then location="$city, $country"
-        elif [ -n "$city" ]; then location="$city"
-        elif [ -n "$country" ]; then location="$country"
-        else location="未知地点"; fi
-    else
-        log_error "获取公网信息失败 (curl ipinfo.io)"
-        public_ip="获取失败"; operator="获取失败"; location="获取失败"
+        local parsed
+        parsed=$(parse_ip_info "$ipinfo_json")
+        public_ip=$(echo "$parsed" | cut -d'|' -f1)
+        operator=$(echo "$parsed" | cut -d'|' -f2)
+        location=$(echo "$parsed" | cut -d'|' -f3)
     fi
     local load_avg
     load_avg=$(uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs || echo '未知')
@@ -495,32 +529,36 @@ get_system_info() {
 }
 wait_for_network() {
     local retries=0
-    log_info "开始等待网络连接 (Ping: $PING_TARGET)，将持续等待直到网络就绪..."
+    log_info "开始等待网络连接，将持续等待直到网络就绪..."
     while true; do
         local ping_ok=false
-        local webhook_ok=false
+        local target_ok=false
         local curl_exit_code=99
-        if ping -c 1 -W 2 $PING_TARGET > /dev/null 2>&1; then
-            ping_ok=true
-        fi
+        for target in $PING_TARGETS; do
+            if check_ping "$target"; then
+                ping_ok=true
+                log_info "Ping $target 成功"
+                break
+            fi
+        done
         if [ -n "$WEBHOOK_URL" ]; then
             curl --head --fail --silent --output /dev/null \
-                 --connect-timeout 5 --max-time 8 \
+                 --connect-timeout 8 --max-time 12 \
                  -A "DeviceInfoScript/1.0" "$WEBHOOK_URL"
             curl_exit_code=$?
             if [ $curl_exit_code -eq 0 ]; then
-                webhook_ok=true
+                target_ok=true
             fi
         else
-            webhook_ok=true
+            target_ok=true
             curl_exit_code=0
         fi
-        if [ "$ping_ok" = true ] && [ "$webhook_ok" = true ]; then
-            log_info "网络已连接 (Ping 成功, Webhook 可达/未配置)，共等待 $retries 次重试。"
+        if [ "$ping_ok" = true ] && [ "$target_ok" = true ]; then
+            log_info "网络已就绪 (Ping 成功, Webhook 可达/未配置)，共等待 $retries 次。"
             return 0
         fi
         retries=$((retries + 1))
-        log_info "网络未就绪 (Ping: $ping_ok, Webhook: $webhook_ok [curl:$curl_exit_code]), ${RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
+        log_info "网络未就绪 (Ping: $ping_ok, Webhook: $target_ok [curl:$curl_exit_code]), ${RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
         sleep $RETRY_INTERVAL
     done
 }
@@ -554,7 +592,7 @@ send_wechat_notification() {
         http_code=$(curl --fail -s -o /dev/null -w "%{http_code}" \
                        -H "Content-Type: application/json" \
                        -X POST -d "$json_payload" "$WEBHOOK_URL" \
-                       --connect-timeout 10 --max-time 20 \
+                       --connect-timeout 15 --max-time 30 \
                        -A "DeviceInfoScript/1.0" \
                        2> "$curl_error_log")
         curl_exit_code=$?
@@ -579,7 +617,7 @@ send_wechat_notification() {
             elif [ "$http_code" -ne 200 ]; then
                 error_reason="服务器返回非 200 状态码 (HTTP $http_code)"
             fi
-            red "企业微信通知发送失败 ($error_reason)，将在 ${SEND_RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
+            red "发送失败 ($error_reason)，${SEND_RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
             log_error "企业微信通知发送失败 ($error_reason)，重试第 $retries 次..."
             sleep $SEND_RETRY_INTERVAL
         fi
