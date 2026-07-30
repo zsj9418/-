@@ -4,10 +4,10 @@ WEBHOOK_URL=""
 DEPENDENCIES="curl ethtool ip"
 CONFIG_FILE="/etc/device_info.conf"
 MAX_LOG_SIZE=2097152
-MAX_RETRIES=20
 RETRY_INTERVAL=8
-SYSTEMD_PRE_SLEEP=20
+SYSTEMD_PRE_SLEEP=10
 PING_TARGET="223.5.5.5"
+SEND_RETRY_INTERVAL=15
 get_script_path() {
     if command -v realpath >/dev/null 2>&1; then
         realpath "$0"
@@ -38,7 +38,7 @@ log_info() {
     log_dir=$(dirname "$LOG_FILE")
     if [ ! -d "$log_dir" ]; then
         if ! mkdir -p "$log_dir"; then
-            echo "ERROR: Failed to create log directory $log_dir. Cannot log." >&2
+            echo "ERROR: Failed to create log directory $log_dir." >&2
             logger -t device_info "ERROR: Failed to create log directory $log_dir"
             return 1
         fi
@@ -229,7 +229,6 @@ get_cpu_freq() {
 get_cpu_usage() {
     local cpu_usage=""
     if [ -f /proc/stat ]; then
-        local idle1 total1 idle2 total2
         local cpu_line1 cpu_line2
         cpu_line1=$(grep '^cpu ' /proc/stat 2>/dev/null)
         sleep 1
@@ -289,11 +288,11 @@ get_swap_info() {
             }')
     fi
     if [ -z "$swap_info" ] && [ -f /proc/meminfo ]; then
-        local total used
+        local total free_swap
         total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
-        used=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+        free_swap=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
         if [ -n "$total" ] && [ "$total" -gt 0 ]; then
-            local swap_used=$((total - used))
+            local swap_used=$((total - free_swap))
             swap_info=$(awk "BEGIN {printf \"%.2f/%.2f MiB (%.2f%%)\", $swap_used/1024, $total/1024, $swap_used*100/$total}")
         else
             swap_info="N/A"
@@ -346,6 +345,69 @@ print(json.dumps(data)[1:-1], end='')
         -e ':a;N;$!ba;s/\n/\\n/g' \
         -e 's/[[:cntrl:]]//g'
 }
+get_interface_type() {
+    local interface=$1
+    local type="未知类型"
+    if command -v ethtool >/dev/null 2>&1; then
+        local ethtool_cmd="ethtool"
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            ethtool_cmd="sudo ethtool"
+        fi
+        if $ethtool_cmd "$interface" 2>/dev/null | grep -q "Link detected: yes"; then
+            type="有线"
+        elif $ethtool_cmd "$interface" 2>/dev/null | grep -q "Supports Wake-on:"; then
+            type="有线"
+        fi
+        if [ "$type" != "未知类型" ]; then echo "$type"; return 0; fi
+    fi
+    if command -v iwconfig >/dev/null 2>&1; then
+        if iwconfig "$interface" 2>&1 | grep -qE "(ESSID:|Mode:Master)"; then
+            if iwconfig "$interface" 2>&1 | grep -q "Mode:Master"; then
+                type="无线AP"
+            else
+                type="无线"
+            fi
+        fi
+        if [ "$type" != "未知类型" ]; then echo "$type"; return 0; fi
+    fi
+    if [ -d "/sys/class/net/$interface/wireless" ] || [ -d "/sys/class/net/$interface/phy80211" ]; then
+        type="无线"
+        echo "$type"; return 0
+    fi
+    if echo "$interface" | grep -qE '^(eth|enp|eno)'; then
+        type="有线 (推测)"
+    fi
+    echo "$type"
+}
+get_lan_ip() {
+    local ip_addresses=""
+    local interfaces
+    interfaces=$(ip -o link show 2>/dev/null | awk -F': ' '!/NO-CARRIER/ {print $2}' | grep -Ev '^(lo|docker|veth|tun|br-|virbr|vnet)')
+    if [ -z "$interfaces" ]; then
+        log_info "未找到合适的物理网络接口。"
+        printf "  未找到局域网 IP 地址。"
+        return 1
+    fi
+    local interface ip_info ip interface_type
+    for interface in $interfaces; do
+        ip_info=$(ip -4 -o addr show "$interface" 2>/dev/null | awk '{print $4}')
+        if [ -n "$ip_info" ]; then
+            ip=$(echo "$ip_info" | cut -d '/' -f 1)
+            if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
+                interface_type=$(get_interface_type "$interface")
+                ip_addresses="${ip_addresses}  ${interface_type} (${interface}): ${ip}\\n"
+            fi
+        fi
+    done
+    if [ -z "$ip_addresses" ]; then
+        log_info "遍历所有接口后未找到有效的局域网 IPv4 地址。"
+        printf "  未找到局域网 IP 地址。"
+        return 1
+    else
+        printf "%b" "${ip_addresses%\\n}"
+        return 0
+    fi
+}
 get_system_info() {
     local runtime
     runtime=$(uptime -p 2>/dev/null | sed 's/up //')
@@ -359,7 +421,7 @@ get_system_info() {
         -e 's/,/，/g')
     local lan_ips_formatted
     lan_ips_formatted=$(get_lan_ip)
-    if [[ -z "$lan_ips_formatted" || "$lan_ips_formatted" == *"未找到"* ]]; then
+    if [ -z "$lan_ips_formatted" ] || echo "$lan_ips_formatted" | grep -q "未找到"; then
         lan_ips_formatted="  未能获取局域网 IP 地址"
         log_info "未能获取局域网 IP 地址。"
     fi
@@ -431,73 +493,10 @@ get_system_info() {
     printf "系统时间: %s\n" "$(date '+%Z %Y-%m-%d %I:%M %p')"
     printf "运行时长: %s\n" "$runtime"
 }
-get_lan_ip() {
-    local ip_addresses=""
-    local interfaces
-    interfaces=$(ip -o link show 2>/dev/null | awk -F': ' '!/NO-CARRIER/ {print $2}' | grep -Ev '^(lo|docker|veth|tun|br-|virbr|vnet)')
-    if [ -z "$interfaces" ]; then
-        log_info "未找到合适的物理网络接口。"
-        printf "  未找到局域网 IP 地址。"
-        return 1
-    fi
-    local interface ip_info ip interface_type
-    for interface in $interfaces; do
-        ip_info=$(ip -4 -o addr show "$interface" 2>/dev/null | awk '{print $4}')
-        if [ -n "$ip_info" ]; then
-            ip=$(echo "$ip_info" | cut -d '/' -f 1)
-            if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
-                interface_type=$(get_interface_type "$interface")
-                ip_addresses="${ip_addresses}  ${interface_type} (${interface}): ${ip}\\n"
-            fi
-        fi
-    done
-    if [ -z "$ip_addresses" ]; then
-        log_info "遍历所有接口后未找到有效的局域网 IPv4 地址。"
-        printf "  未找到局域网 IP 地址。"
-        return 1
-    else
-        printf "%b" "${ip_addresses%\\n}"
-        return 0
-    fi
-}
-get_interface_type() {
-    local interface=$1
-    local type="未知类型"
-    if command -v ethtool >/dev/null 2>&1; then
-        local ethtool_cmd="ethtool"
-        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-            ethtool_cmd="sudo ethtool"
-        fi
-        if $ethtool_cmd "$interface" 2>/dev/null | grep -q "Link detected: yes"; then
-            type="有线"
-        elif $ethtool_cmd "$interface" 2>/dev/null | grep -q "Supports Wake-on:"; then
-            type="有线"
-        fi
-        if [ "$type" != "未知类型" ]; then echo "$type"; return 0; fi
-    fi
-    if command -v iwconfig >/dev/null 2>&1; then
-        if iwconfig "$interface" 2>&1 | grep -qE "(ESSID:|Mode:Master)"; then
-            if iwconfig "$interface" 2>&1 | grep -q "Mode:Master"; then
-                type="无线AP"
-            else
-                type="无线"
-            fi
-        fi
-        if [ "$type" != "未知类型" ]; then echo "$type"; return 0; fi
-    fi
-    if [[ -d "/sys/class/net/$interface/wireless" || -d "/sys/class/net/$interface/phy80211" ]]; then
-        type="无线"
-        echo "$type"; return 0
-    fi
-    if [[ "$interface" =~ ^(eth|enp|eno) ]]; then
-        type="有线 (推测)"
-    fi
-    echo "$type"
-}
 wait_for_network() {
     local retries=0
-    log_info "开始等待网络连接 (Ping: $PING_TARGET, Max: $MAX_RETRIES 次)..."
-    while [ $retries -lt $MAX_RETRIES ]; do
+    log_info "开始等待网络连接 (Ping: $PING_TARGET)，将持续等待直到网络就绪..."
+    while true; do
         local ping_ok=false
         local webhook_ok=false
         local curl_exit_code=99
@@ -517,15 +516,13 @@ wait_for_network() {
             curl_exit_code=0
         fi
         if [ "$ping_ok" = true ] && [ "$webhook_ok" = true ]; then
-            log_info "网络已连接 (Ping 成功，Webhook URL 可达/未配置)。"
+            log_info "网络已连接 (Ping 成功, Webhook 可达/未配置)，共等待 $retries 次重试。"
             return 0
         fi
         retries=$((retries + 1))
-        log_info "网络未就绪 (Ping OK: $ping_ok, Webhook OK: $webhook_ok [curl code:$curl_exit_code]), 等待 $RETRY_INTERVAL 秒后重试... (第 $retries/$MAX_RETRIES 次)"
+        log_info "网络未就绪 (Ping: $ping_ok, Webhook: $webhook_ok [curl:$curl_exit_code]), ${RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
         sleep $RETRY_INTERVAL
     done
-    log_error "网络连接检测失败，已达到最大重试次数 ($MAX_RETRIES)。"
-    return 1
 }
 send_wechat_notification() {
     if [ -z "$WEBHOOK_URL" ] && [ -f "$CONFIG_FILE" ]; then
@@ -552,8 +549,7 @@ send_wechat_notification() {
     local retries=0
     local curl_error_log
     curl_error_log=$(mktemp /tmp/curl_error.XXXXXX 2>/dev/null) || curl_error_log="/tmp/curl_error.$$"
-    trap 'rm -f "$curl_error_log"' EXIT
-    while [ $retries -lt $MAX_RETRIES ]; do
+    while true; do
         local http_code curl_exit_code curl_error_msg error_reason
         http_code=$(curl --fail -s -o /dev/null -w "%{http_code}" \
                        -H "Content-Type: application/json" \
@@ -565,9 +561,8 @@ send_wechat_notification() {
         [ -f "$curl_error_log" ] && curl_error_msg=$(<"$curl_error_log")
         if [ $curl_exit_code -eq 0 ] && [ "$http_code" -eq 200 ]; then
             green "企业微信通知发送成功 (HTTP $http_code)。"
-            log_info "企业微信通知发送成功。"
+            log_info "企业微信通知发送成功，共重试 $retries 次。"
             rm -f "$curl_error_log"
-            trap - EXIT
             return 0
         else
             retries=$((retries + 1))
@@ -584,16 +579,11 @@ send_wechat_notification() {
             elif [ "$http_code" -ne 200 ]; then
                 error_reason="服务器返回非 200 状态码 (HTTP $http_code)"
             fi
-            red "企业微信通知发送失败 ($error_reason)，将在 $RETRY_INTERVAL 秒后重试...（第 $retries/$MAX_RETRIES 次）"
-            log_error "企业微信通知发送失败 ($error_reason)，重试...（$retries 次）"
-            sleep $RETRY_INTERVAL
+            red "企业微信通知发送失败 ($error_reason)，将在 ${SEND_RETRY_INTERVAL}秒后重试 (第 $retries 次)..."
+            log_error "企业微信通知发送失败 ($error_reason)，重试第 $retries 次..."
+            sleep $SEND_RETRY_INTERVAL
         fi
     done
-    rm -f "$curl_error_log"
-    trap - EXIT
-    red "企业微信通知发送失败次数达到上限（$MAX_RETRIES 次）。"
-    log_error "企业微信通知发送失败次数达到上限（$MAX_RETRIES 次）。"
-    return 1
 }
 check_and_enable_service() {
     local service_name="$1"
@@ -647,6 +637,10 @@ ExecStartPre=/bin/sleep $SYSTEMD_PRE_SLEEP
 ExecStart=$full_script_path
 User=root
 WorkingDirectory=$working_dir
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
@@ -741,11 +735,7 @@ main() {
     blue "--- 设备信息通知脚本 ---"
     load_config
     check_dependencies
-    if ! wait_for_network; then
-        log_error "网络未就绪，无法发送通知。退出。"
-        red "网络连接失败，脚本退出。"
-        exit 1
-    fi
+    wait_for_network
     send_wechat_notification
     local send_status=$?
     log_info "开始收集并记录系统信息快照..."
@@ -767,7 +757,7 @@ main() {
         red "警告: 设置自启动失败，脚本可能不会在重启后自动运行。"
     fi
     if [ $send_status -eq 0 ]; then
-        green "脚本执行完成 (通知尝试成功或因未配置而跳过)。"
+        green "脚本执行完成 (通知发送成功或因未配置而跳过)。"
     else
         yellow "脚本执行完成，但通知发送失败 (详见日志: $LOG_FILE)。"
     fi
