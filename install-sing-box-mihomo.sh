@@ -31,7 +31,7 @@ LOG_MAX_SIZE=5242880
 DEPS_INSTALLED_MARKER="/var/lib/proxy_manager_deps_installed"
 MIRROR_CACHE_FILE="/var/lib/proxy_manager_mirror.cache"
 
-PROXY_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://cdn.yyds9527.nyc.mn/ https://mirror.ghproxy.com/"
+PROXY_MIRRORS="https://gh.xmly.dev/ https://ghf.xn--eqrr82bzpe.top/ https://ghproxy.net/ https://cdn.yyds9527.nyc.mn/ https://un.ax18.ggff.net/"
 
 DL_CONNECT_TIMEOUT=8
 DL_MAX_TIME=180
