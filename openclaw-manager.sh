@@ -1578,6 +1578,10 @@ _docker_run() {
     local extra="${3:-}"
     local network_mode="${4:-bridge}"
     local image="$DOCKER_IMAGE"
+    local gw_token
+    gw_token=$(openssl rand -hex 24 2>/dev/null || \
+               head -c 24 /dev/urandom | xxd -p | tr -d '\n' || \
+               echo "$(date +%s%N)abc123")
     mkdir -p "${data_dir}/.openclaw" "${data_dir}/workspace"
     chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null \
         || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
@@ -1652,6 +1656,7 @@ EOF
         --restart unless-stopped
         -v "${data_dir}/.openclaw:/home/node/.openclaw"
         -v "${data_dir}/workspace:/home/node/workspace"
+        -e "OPENCLAW_GATEWAY_TOKEN=${gw_token}"
     )
     if [[ "$network_mode" == "host" ]]; then
         run_cmd+=(--network host)
