@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-SCRIPT_VERSION="v2.3.0"
+SCRIPT_VERSION="v0.3.8"
 OPENCLAW_PORT=18789
 OPENCLAW_CONFIG_DIR="$HOME/.openclaw"
 OPENCLAW_JSON="$OPENCLAW_CONFIG_DIR/openclaw.json"
