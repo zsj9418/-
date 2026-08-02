@@ -986,6 +986,23 @@ _docker_apply_config() {
 local vol="$1"
 local image="$2"
 local gw_token="$3"
+docker run --rm -v "${vol}:/root/.openclaw" "${image}" sh -c '
+mkdir -p /root/.openclaw
+CFG=/root/.openclaw/openclaw.json
+if [ ! -f "$CFG" ] || ! python3 -c "import json; json.load(open(\"$CFG\"))" 2>/dev/null; then
+cat > "$CFG" << ENDJSON
+{
+  "gateway": {"mode": "local", "bind": "lan"},
+  "models": {"mode": "merge", "providers": {}},
+  "agents": {
+    "defaults": {"workspace": "~/.openclaw/workspace"},
+    "list": [{"id": "main", "default": true}]
+  }
+}
+ENDJSON
+chmod 600 "$CFG"
+fi
+' >/dev/null 2>&1 || true
 local -a pairs=(
 "gateway.mode=local"
 "gateway.bind=lan"
@@ -995,13 +1012,42 @@ local -a pairs=(
 "gateway.controlUi.dangerouslyDisableDeviceAuth=true"
 "gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback=true"
 )
+local fail_count=0
 for kv in "${pairs[@]}"; do
 local key="${kv%%=*}"
 local val="${kv#*=}"
-docker run --rm -v "${vol}:/root/.openclaw" "${image}" \
-openclaw config set "$key" "$val" >/dev/null 2>&1 || true
+if ! docker run --rm -v "${vol}:/root/.openclaw" "${image}" \
+openclaw config set "$key" "$val" >/dev/null 2>&1; then
+fail_count=$(( fail_count + 1 ))
+log "config set failed: $key=$val"
+fi
 done
+if (( fail_count > 0 )); then
+msg_warn "openclaw config set 失败${fail_count}项,尝试直接写入JSON..."
+docker run --rm -v "${vol}:/root/.openclaw" "${image}" python3 -c "
+import json,os
+p='/root/.openclaw/openclaw.json'
+try:
+    with open(p) as f: c=json.load(f)
+except: c={}
+gw=c.setdefault('gateway',{})
+gw['mode']='local'; gw['bind']='lan'
+auth=gw.setdefault('auth',{}); auth['mode']='token'; auth['token']='${gw_token}'
+gw.setdefault('controlUi',{}).update({
+    'allowInsecureAuth':True,
+    'dangerouslyDisableDeviceAuth':True,
+    'dangerouslyAllowHostHeaderOriginFallback':True
+})
+c.setdefault('models',{'mode':'merge','providers':{}})
+c.setdefault('agents',{'defaults':{'workspace':'~/.openclaw/workspace'},'list':[{'id':'main','default':True}]})
+tmp=p+'.tmp'
+with open(tmp,'w') as f: json.dump(c,f,indent=2)
+os.replace(tmp,p)
+print('OK')
+" 2>&1 | tail -1 && msg_ok "JSON直写成功" || msg_fail "配置写入失败"
+else
 msg_ok "配置写入完成"
+fi
 }
 _docker_check_port_conflict() {
 local skip_cname="$1"
