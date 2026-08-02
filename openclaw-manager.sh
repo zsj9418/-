@@ -145,16 +145,16 @@ is_ipv6_url() {
 local url="$1"
 [[ "$url" =~ ^https?://\[ ]]
 }
+_is_loopback_url() {
+local url="$1"
+[[ "$url" =~ ^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+|/) ]] || [[ "$url" =~ ^https?://(127\.0\.0\.1|localhost|\[::1\])$ ]]
+}
 convert_url_for_docker() {
 local url="$1"
 if [[ "$url" =~ ^(https?://)(127\.0\.0\.1|localhost)(:[0-9]+)?(.*)$ ]]; then
 echo "${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
-elif [[ "$url" =~ ^(https?://)(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]+\.[0-9]+)(:[0-9]+)?(.*)$ ]]; then
-echo "${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
 elif [[ "$url" =~ ^(https?://)\[::1\](:[0-9]+)?(.*)$ ]]; then
 echo "${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
-elif [[ "$url" =~ ^(https?://)\[(fc|fd)[0-9a-fA-F:]+\](:[0-9]+)?(.*)$ ]]; then
-echo "${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
 else
 echo "$url"
 fi
@@ -380,8 +380,8 @@ has_cmd python3 && json_is_valid "$cfg" || return 1
 python3 - "$cfg" << 'PYEOF'
 import json, sys, os, re
 cfg_path = sys.argv[1]
-PAT4 = re.compile(r'^(https?://)(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+)')
-PAT6 = re.compile(r'^(https?://)\[(::1|fc[0-9a-fA-F:]+|fd[0-9a-fA-F:]+)\]')
+PAT_LO = re.compile(r'^(https?://)(127\.0\.0\.1|localhost)')
+PAT_LO6 = re.compile(r'^(https?://)\[::1\]')
 try:
     with open(cfg_path) as f: c = json.load(f)
 except: sys.exit(1)
@@ -390,11 +390,11 @@ for name, p in c.get("models",{}).get("providers",{}).items():
     if not isinstance(p, dict): continue
     url = p.get("baseUrl","")
     new = url
-    if PAT4.match(url):
-        new = PAT4.sub(r'\1host.docker.internal', url)
-    elif PAT6.match(url):
-        new = PAT6.sub(r'\1host.docker.internal', url)
-    if new != url: p["baseUrl"] = new; changed.append(f"{name}: LAN -> host.docker.internal")
+    if PAT_LO.match(url):
+        new = PAT_LO.sub(r'\1host.docker.internal', url)
+    elif PAT_LO6.match(url):
+        new = PAT_LO6.sub(r'\1host.docker.internal', url)
+    if new != url: p["baseUrl"] = new; changed.append(f"{name}: loopback -> host.docker.internal")
 if changed:
     tmp = cfg_path + ".tmp"
     with open(tmp,"w") as f: json.dump(c,f,indent=2,ensure_ascii=False)
@@ -1564,7 +1564,7 @@ cfg=$(get_active_config_path)
 local docker_mode=false
 is_docker_mode && docker_mode=true
 echo -e "${DIM}URL示例: https://api.deepseek.com/v1 / http://192.168.x.x:3000 / http://127.0.0.1:11434 / http://[fd00::1]:11434${NC}"
-$docker_mode && echo -e "${YELLOW}Docker模式:局域网URL将自动转换为host.docker.internal${NC}"
+$docker_mode && echo -e "${YELLOW}Docker模式:localhost/127.0.0.1将建议转换为host.docker.internal(其他局域网IP可直接访问)${NC}"
 echo -ne "\n${CYAN}Provider名称(推荐:openai): ${NC}"
 local pname=""
 read_input pname "openai"
@@ -1575,13 +1575,24 @@ read_input base_url ""
 [[ -z "$base_url" ]] && { msg_warn "URL不能为空"; wait_and_return 2; return 1; }
 base_url="${base_url%/}"
 local final_url="$base_url"
-if $docker_mode && is_lan_url "$base_url"; then
+if $docker_mode; then
+if _is_loopback_url "$base_url"; then
 local conv=""
 conv=$(convert_url_for_docker "$base_url")
-if [[ "$conv" != "$base_url" ]]; then
-msg_warn "检测到局域网URL,建议转换:"
-echo -e "  原始: $base_url\n  转换: ${GREEN}$conv${NC}"
-confirm "使用转换后URL?" && final_url="$conv"
+msg_warn "检测到本机回环地址,Docker容器内无法直接访问"
+echo -e "  原始: ${RED}$base_url${NC}"
+echo -e "  转换: ${GREEN}$conv${NC}"
+echo -e "  ${DIM}(容器内127.0.0.1指向容器自身,需转为host.docker.internal指向宿主机)${NC}"
+confirm "使用转换后URL?(推荐)" && final_url="$conv"
+elif is_lan_url "$base_url"; then
+echo -e "  ${DIM}检测到局域网IP,Docker容器可直接访问,无需转换${NC}"
+local host_ip=""
+host_ip=$(get_local_ip)
+if [[ "$base_url" =~ $host_ip ]]; then
+msg_info "该IP与宿主机IP(${host_ip})一致"
+echo -e "  ${DIM}如果服务绑定在127.0.0.1,容器可能无法通过LAN IP访问${NC}"
+echo -e "  ${DIM}此时建议改用 http://host.docker.internal:端口${NC}"
+fi
 fi
 fi
 echo -ne "\n${CYAN}API Key(本地服务输入'local'): ${NC}"
@@ -2240,7 +2251,7 @@ if is_docker_mode && [[ -f "$cfg" ]] && json_is_valid "$cfg" && has_cmd python3;
 local lu=""
 lu=$(python3 -c "
 import json,re,sys
-PAT=re.compile(r'^https?://(127\.|localhost|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|\[::1\]|\[fc|\[fd)')
+PAT=re.compile(r'^https?://(127\.|localhost|\[::1\])')
 try:
     c=json.load(open(sys.argv[1]))
     bad=[n for n,p in c.get('models',{}).get('providers',{}).items() if isinstance(p,dict) and PAT.match(p.get('baseUrl',''))]
