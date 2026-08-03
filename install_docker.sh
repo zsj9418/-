@@ -1414,8 +1414,8 @@ check_iptables_mode() {
 }
 print_menu() {
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║    Docker / Compose 智能管理脚本 v2.2    ║${NC}"
-  echo -e "${BOLD}${CYAN}║           静态二进制 · AppArmor          ║${NC}"
+  echo -e "${BOLD}${CYAN}║    Docker / Compose 智能管理脚本 v1.2    ║${NC}"
+  echo -e "${BOLD}${CYAN}║          静态二进制 · AppArmor           ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
   echo -e "  架构: ${ARCH}  |  系统: ${OS}  |  包管理: ${PKG_MANAGER}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
