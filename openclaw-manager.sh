@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -o pipefail
-readonly SCRIPT_VERSION="1.2.8"
+readonly SCRIPT_VERSION="1.2.9"
 readonly SCRIPT_NAME="OpenClaw Manager"
 readonly CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 readonly CONFIG_FILE="$CONFIG_DIR/openclaw.json"
@@ -312,6 +312,15 @@ get_config_path() {
         echo "$CONFIG_FILE"
     fi
 }
+fix_docker_state_perms() {
+    local base_dir="$1"
+    local cfg_root="$base_dir/.openclaw"
+    local ws_root="$base_dir/workspace"
+    [[ -d "$cfg_root" ]] && chmod 755 "$cfg_root" 2>/dev/null || true
+    [[ -d "$ws_root" ]] && chmod 755 "$ws_root" 2>/dev/null || true
+    [[ -d "$cfg_root" ]] && chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_root" 2>/dev/null || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_root" 2>/dev/null || true
+    [[ -d "$ws_root" ]] && chown -R "${DOCKER_UID}:${DOCKER_UID}" "$ws_root" 2>/dev/null || sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$ws_root" 2>/dev/null || true
+}
 fix_cfg_perms() {
     local cfg="${1:-$(get_config_path)}"
     [[ -f "$cfg" ]] && chmod 600 "$cfg" 2>/dev/null || true
@@ -319,9 +328,7 @@ fix_cfg_perms() {
     cfg_dir=$(dirname "$cfg")
     chmod 755 "$cfg_dir" 2>/dev/null || true
     if is_docker_mode; then
-        chmod 755 "$DOCKER_DATA_DIR" "$DOCKER_DATA_DIR/.openclaw" "$DOCKER_DATA_DIR/workspace" 2>/dev/null || true
-        chown -R "${DOCKER_UID}:${DOCKER_UID}" "$DOCKER_DATA_DIR" 2>/dev/null ||
-        sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$DOCKER_DATA_DIR" 2>/dev/null || true
+        fix_docker_state_perms "$DOCKER_DATA_DIR"
     fi
 }
 docker_preflight_repair() {
@@ -349,6 +356,8 @@ if not gw.get('mode'):
     gw['mode'] = 'local'
 if gw.get('bind') not in ('auto','lan','loopback','custom','tailnet'):
     gw['bind'] = 'loopback'
+if not gw.get('trustedProxies'):
+    gw['trustedProxies'] = ['172.16.0.0/12','10.0.0.0/8','192.168.0.0/16']
 models = c.setdefault('models', {})
 models.setdefault('mode', 'merge')
 models.setdefault('providers', {})
@@ -361,6 +370,10 @@ if isinstance(model_cfg, str) and model_cfg:
 elif not isinstance(model_cfg, dict):
     defaults.setdefault('model', {'primary': 'openai/gpt-4o'})
 agents.setdefault('list', [{'id': 'main', 'default': True}])
+nodes = gw.setdefault('nodes', {})
+pairing = nodes.setdefault('pairing', {})
+if not pairing.get('autoApproveCidrs'):
+    pairing['autoApproveCidrs'] = ['192.168.0.0/16','10.0.0.0/8','172.16.0.0/12']
 with open(p, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 " "$cfg" 2>>"$SCRIPT_LOG" || true
@@ -666,8 +679,7 @@ service_start() {
         fix_cfg_perms
         if is_docker_mode; then
             local data_dir="${DOCKER_DATA_DIR}"
-            chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null ||
-            sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
+            fix_docker_state_perms "$data_dir"
             docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
         fi
         sleep 5
@@ -1021,6 +1033,10 @@ if bm == "lan":
     auth = gw.setdefault("auth", {})
     auth["mode"] = "token"
     auth["token"] = token
+gw["trustedProxies"] = ["172.16.0.0/12","10.0.0.0/8","192.168.0.0/16"]
+nodes = gw.setdefault("nodes", {})
+pairing = nodes.setdefault("pairing", {})
+pairing["autoApproveCidrs"] = ["192.168.0.0/16","10.0.0.0/8","172.16.0.0/12"]
 c.setdefault("models", {"mode": "merge", "providers": {}})
 c.setdefault("agents", {"defaults": {"workspace": "~/.openclaw/workspace"}, "list": [{"id": "main", "default": True}]})
 with open(p, 'w') as f:
@@ -1028,8 +1044,7 @@ with open(p, 'w') as f:
 PYEOF
         fix_cfg_perms "$cfg"
     fi
-    chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null ||
-    sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
+    fix_docker_state_perms "$data_dir"
     step "拉取镜像..."
     if ! docker_pull_ghcr "$DOCKER_IMAGE" "latest"; then
         err "无法拉取镜像"
