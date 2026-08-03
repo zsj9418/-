@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -o pipefail
-readonly SCRIPT_VERSION="1.3.8"
+readonly SCRIPT_VERSION="1.6.8"
 readonly SCRIPT_NAME="OpenClaw Manager"
 readonly CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 readonly CONFIG_FILE="$CONFIG_DIR/openclaw.json"
@@ -30,6 +30,7 @@ OS=""
 PKG_MGR=""
 SERVICE_MGR=""
 ARCH=""
+G_SELECTED_VERSION="latest"
 readonly C='\033[0m'
 readonly CB='\033[1m'
 readonly CD='\033[2m'
@@ -248,6 +249,161 @@ npm_install_cmd() {
         npm install "$@" 2>&1
     fi
 }
+get_registry_base() {
+    if $CN_MODE; then
+        echo "$NPM_MIRROR"
+    else
+        echo "https://registry.npmjs.org"
+    fi
+}
+fetch_openclaw_registry_data() {
+    local reg=""
+    reg=$(get_registry_base)
+    local body=""
+    body=$(curl -s --max-time 12 "${reg}/openclaw" 2>/dev/null) || true
+    echo "$body"
+}
+parse_versions_from_registry() {
+    local body="$1" pattern="${2:-}" count="${3:-3}"
+    [[ -z "$body" ]] && return 0
+    [[ -z "$pattern" ]] && pattern='^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$'
+    if has_cmd python3; then
+        printf '%s' "$body" | python3 -c "import json,sys; data=json.load(sys.stdin); [print(v) for v in data.get('versions',{}).keys() if isinstance(v,str)]" 2>/dev/null | grep -E "$pattern" | sort -V | tail -n "$count" | tac
+    elif has_cmd jq; then
+        printf '%s' "$body" | jq -r '.versions|keys[]' 2>/dev/null | grep -E "$pattern" | sort -V | tail -n "$count" | tac
+    fi
+}
+parse_latest_from_registry() {
+    local body="$1"
+    [[ -z "$body" ]] && return 0
+    if has_cmd python3; then
+        printf '%s' "$body" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    t=d.get('dist-tags',{}).get('latest','')
+    if t: print(t)
+except: pass
+" 2>/dev/null
+    elif has_cmd jq; then
+        printf '%s' "$body" | jq -r '."dist-tags".latest // empty' 2>/dev/null
+    fi
+}
+select_openclaw_version() {
+    local current="${1:-}"
+    info "正在查询版本列表..."
+    local registry_data=""
+    registry_data=$(fetch_openclaw_registry_data)
+    G_SELECTED_VERSION="latest"
+    if [[ -z "$registry_data" ]]; then
+        warn "无法获取版本列表,将使用 latest"
+        return 0
+    fi
+    local latest=""
+    latest=$(parse_latest_from_registry "$registry_data")
+    local latest3=""
+    latest3=$(parse_versions_from_registry "$registry_data" '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' 3)
+    local stable3=""
+    stable3=$(parse_versions_from_registry "$registry_data" '^[0-9]{4}\.[0-9]+\.[0-9]+$' 3)
+    out "版本选择:"
+    out "  [0] latest ${latest:+→ ${latest}} ${CG}(默认回车)${C}"
+    local options=()
+    local seen=""
+    local idx=1
+    if [[ -n "$latest3" ]]; then
+        out "  ${CB}最新版本:${C}"
+        while IFS= read -r v; do
+            [[ -z "$v" ]] && continue
+            local mark=""
+            [[ -n "$current" && "$v" == "$current" ]] && mark=" ${CY}[当前]${C}"
+            out "    [$idx] $v$mark"
+            options+=("$v")
+            seen="${seen}|${v}"
+            idx=$((idx + 1))
+        done <<< "$latest3"
+    fi
+    if [[ -n "$stable3" ]]; then
+        local has_unique=false
+        local stable_lines=""
+        while IFS= read -r v; do
+            [[ -z "$v" ]] && continue
+            [[ "$seen" == *"|${v}"* ]] && continue
+            has_unique=true
+            stable_lines="${stable_lines}${v}\n"
+        done <<< "$stable3"
+        if $has_unique; then
+            out "  ${CB}稳定版本:${C}"
+            while IFS= read -r v; do
+                [[ -z "$v" ]] && continue
+                local mark=""
+                [[ -n "$current" && "$v" == "$current" ]] && mark=" ${CY}[当前]${C}"
+                out "    [$idx] $v$mark"
+                options+=("$v")
+                idx=$((idx + 1))
+            done < <(printf "$stable_lines")
+        fi
+    fi
+    out "  [$idx] 自定义版本号"
+    echo -ne "选择 [0]: "
+    local choice=""
+    read_input choice "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || choice=0
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        G_SELECTED_VERSION="latest"
+        return 0
+    fi
+    if [[ "$choice" == "$idx" ]]; then
+        echo -ne "输入版本号: "
+        local custom=""
+        read_input custom "latest"
+        [[ -z "$custom" ]] && custom="latest"
+        G_SELECTED_VERSION="$custom"
+        return 0
+    fi
+    if (( choice >= 1 && choice < idx )); then
+        G_SELECTED_VERSION="${options[$((choice - 1))]}"
+        return 0
+    fi
+    G_SELECTED_VERSION="latest"
+}
+get_installed_openclaw_version() {
+    local v=""
+    v=$(oc_cmd --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1) || true
+    echo "${v:-0.0.0}"
+}
+docker_detect_runtime_port() {
+    local c=""
+    c=$(get_docker_container_name)
+    local p=""
+    p=$(docker port "$c" 18789/tcp 2>/dev/null | head -1 | awk -F: '{print $NF}') || true
+    [[ -n "$p" ]] && echo "$p" || echo "$DEFAULT_PORT"
+}
+docker_detect_runtime_data_dir() {
+    local c=""
+    c=$(get_docker_container_name)
+    local cfg_mount=""
+    cfg_mount=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.openclaw"}}{{println .Source}}{{end}}{{end}}' "$c" 2>/dev/null | head -1) || true
+    if [[ -n "$cfg_mount" ]]; then
+        dirname "$cfg_mount"
+    else
+        echo "$DOCKER_DATA_DIR"
+    fi
+}
+docker_redeploy_existing_version() {
+    local tag="$1"
+    local port=""
+    local data_dir=""
+    local bind=""
+    local token=""
+    port=$(docker_detect_runtime_port)
+    data_dir=$(docker_detect_runtime_data_dir)
+    bind=$(config_get "gateway.bind" 2>/dev/null) || true
+    token=$(config_get "gateway.auth.token" 2>/dev/null) || true
+    local enable_lan=false
+    [[ "$bind" == "lan" ]] && enable_lan=true
+    docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1 || true
+    docker_deploy_new "$enable_lan" "$token" "$tag" "$port" "$data_dir" "skip-pull"
+}
 docker_pull_ghcr() {
     local image="$1" tag="${2:-latest}"
     local full="${image}:${tag}"
@@ -374,6 +530,35 @@ get_docker_container_name() {
     local c=""
     c=$(find_openclaw_container 2>/dev/null) || true
     echo "${c:-$DOCKER_CONTAINER}"
+}
+list_openclaw_containers() {
+    has_cmd docker || return 0
+    docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /openclaw/ {print $1}' | sort -u
+}
+list_openclaw_images() {
+    has_cmd docker || return 0
+    {
+        docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /openclaw/ {print $1; print $2}'
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            docker inspect --format '{{.Config.Image}}' "$c" 2>/dev/null || true
+            docker inspect --format '{{.Image}}' "$c" 2>/dev/null || true
+        done < <(list_openclaw_containers)
+    } | awk 'NF' | sort -u
+}
+remove_local_openclaw_artifacts() {
+    resolve_openclaw_bin 2>/dev/null && npm uninstall -g openclaw >> "$SCRIPT_LOG" 2>&1 || true
+    local p=""
+    for p in "$HOME/.npm-global" "$HOME/.local" "/usr/local" "/usr"; do
+        rm -f "$p/bin/openclaw" 2>/dev/null || sudo rm -f "$p/bin/openclaw" 2>/dev/null || true
+        rm -rf "$p/lib/node_modules/openclaw" 2>/dev/null || sudo rm -rf "$p/lib/node_modules/openclaw" 2>/dev/null || true
+    done
+    local nd=""
+    for nd in "$HOME/.nvm/versions/node"/v*; do
+        [[ -d "$nd" ]] || continue
+        rm -f "$nd/bin/openclaw" 2>/dev/null || true
+        rm -rf "$nd/lib/node_modules/openclaw" 2>/dev/null || true
+    done
 }
 get_config_path() {
     if is_docker_mode; then
@@ -938,7 +1123,7 @@ install_build_deps() {
     esac
 }
 install_local() {
-    local arg_lan="${1:-}" arg_token="${2:-}"
+    local arg_lan="${1:-}" arg_token="${2:-}" arg_version="${3:-latest}"
     step "本地安装 OpenClaw"
     if resolve_openclaw_bin 2>/dev/null; then
         warn "已安装: $(openclaw --version 2>/dev/null)"
@@ -952,24 +1137,34 @@ install_local() {
     setup_npm_mirror
     setup_npm_prefix
     out ""
+    out "安装版本: ${CY}${arg_version}${C}"
     out "安装方式:"
-    out "  [1] 官方脚本 (推荐)"
+    out "  [1] 官方脚本 (仅 latest 推荐)"
     out "  [2] npm 安装"
-    echo -ne "选择 [1]: "
+    echo -ne "选择 [2]: "
     local choice=""
-    read_input choice "1"
+    read_input choice "2"
     info "正在安装..."
     case "$choice" in
-        2)
-            npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1
+        1)
+            if [[ "$arg_version" != "latest" ]]; then
+                warn "指定版本仅支持 npm 安装,已自动切换"
+                npm_install_cmd -g "openclaw@${arg_version}" >> "$SCRIPT_LOG" 2>&1
+            else
+                if $CN_MODE; then
+                    npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1 ||
+                    curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null | bash >> "$SCRIPT_LOG" 2>&1
+                else
+                    curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null | bash >> "$SCRIPT_LOG" 2>&1 ||
+                    npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1
+                fi
+            fi
             ;;
         *)
-            if $CN_MODE; then
-                npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1 ||
-                curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null | bash >> "$SCRIPT_LOG" 2>&1
-            else
-                curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null | bash >> "$SCRIPT_LOG" 2>&1 ||
+            if [[ "$arg_version" == "latest" ]]; then
                 npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1
+            else
+                npm_install_cmd -g "openclaw@${arg_version}" >> "$SCRIPT_LOG" 2>&1
             fi
             ;;
     esac
@@ -1017,7 +1212,7 @@ PYEOF
     return 0
 }
 install_docker() {
-    local arg_lan="${1:-}" arg_token="${2:-}"
+    local arg_lan="${1:-}" arg_token="${2:-}" arg_version="${3:-latest}"
     step "Docker 部署 OpenClaw"
     if ! has_cmd docker; then
         warn "Docker 未安装"
@@ -1050,7 +1245,7 @@ install_docker() {
             4)
                 if confirm "确认删除并重建"; then
                     docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
-                    docker_deploy_new "$arg_lan" "$arg_token"
+                    docker_deploy_new "$arg_lan" "$arg_token" "$arg_version"
                 fi
                 ;;
             5) docker logs --tail 30 "$(get_docker_container_name)" 2>&1 ;;
@@ -1058,16 +1253,24 @@ install_docker() {
         esac
         return 0
     fi
-    docker_deploy_new "$arg_lan" "$arg_token"
+    docker_deploy_new "$arg_lan" "$arg_token" "$arg_version"
 }
 docker_deploy_new() {
-    local arg_lan="${1:-}" arg_token="${2:-}"
-    echo -ne "端口 [${DEFAULT_PORT}]: "
-    local port=""
-    read_input port "$DEFAULT_PORT"
-    echo -ne "数据目录 [${DOCKER_DATA_DIR}]: "
-    local data_dir=""
-    read_input data_dir "$DOCKER_DATA_DIR"
+    local arg_lan="${1:-}" arg_token="${2:-}" arg_version="${3:-latest}" arg_port="${4:-}" arg_data_dir="${5:-}" arg_pull_mode="${6:-pull}"
+    if [[ -n "$arg_port" ]]; then
+        local port="$arg_port"
+    else
+        echo -ne "端口 [${DEFAULT_PORT}]: "
+        local port=""
+        read_input port "$DEFAULT_PORT"
+    fi
+    if [[ -n "$arg_data_dir" ]]; then
+        local data_dir="$arg_data_dir"
+    else
+        echo -ne "数据目录 [${DOCKER_DATA_DIR}]: "
+        local data_dir=""
+        read_input data_dir "$DOCKER_DATA_DIR"
+    fi
     local enable_lan=false
     [[ "$arg_lan" == "true" ]] && enable_lan=true
     step "准备环境..."
@@ -1109,16 +1312,20 @@ PYEOF
         fix_cfg_perms "$cfg"
     fi
     fix_docker_state_perms "$data_dir"
-    step "拉取镜像..."
-    if ! docker_pull_ghcr "$DOCKER_IMAGE" "latest"; then
-        err "无法拉取镜像"
-        return 1
+    if [[ "$arg_pull_mode" != "skip-pull" ]]; then
+        step "拉取镜像..."
+        if ! docker_pull_ghcr "$DOCKER_IMAGE" "$arg_version"; then
+            err "无法拉取镜像"
+            return 1
+        fi
+    else
+        info "复用已拉取镜像: ${arg_version}"
     fi
-    local run_image="${DOCKER_IMAGE}:latest"
+    local run_image="${DOCKER_IMAGE}:${arg_version}"
     if docker image inspect "$run_image" &>/dev/null; then
         true
-    elif docker image inspect "${DOCKER_IMAGE_MIRROR}:latest" &>/dev/null; then
-        run_image="${DOCKER_IMAGE_MIRROR}:latest"
+    elif docker image inspect "${DOCKER_IMAGE_MIRROR}:${arg_version}" &>/dev/null; then
+        run_image="${DOCKER_IMAGE_MIRROR}:${arg_version}"
     fi
     step "启动容器..."
     if ! docker run -d \
@@ -1164,7 +1371,9 @@ PYEOF
         i=$((i + 1))
     done
     warn "服务未响应 (${HEALTH_TIMEOUT}s 超时)"
-    docker logs --tail 20 "$(get_docker_container_name)" 2>&1 | sed 's/^/  /'
+    docker logs --tail 10 "$(get_docker_container_name)" 2>&1 | sed 's/^/  /'
+    out ""
+    info "容器可能仍在启动,可稍后用 [2] 服务管理查看状态"
     return 1
 }
 configure_api() {
@@ -1782,27 +1991,35 @@ show_system_info() {
 check_update() {
     step "检查更新"
     if ! is_installed; then err "未安装"; return 1; fi
-    local current="" latest=""
-    current=$(oc_cmd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-    [[ -z "$current" ]] && current="0.0.0"
-    local reg_url="https://registry.npmjs.org/openclaw/latest"
-    $CN_MODE && reg_url="${NPM_MIRROR}/openclaw/latest"
-    latest=$(curl -s --max-time 5 "$reg_url" 2>/dev/null | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4) || true
-    out "当前: ${current}    最新: ${latest:-无法获取}"
-    if [[ -n "$latest" && "$latest" != "$current" ]]; then
-        if confirm "升级到 ${latest}"; then
-            if is_docker_mode; then
-                info "更新镜像..."
-                docker_pull_ghcr "$DOCKER_IMAGE" "latest" || return 1
-                docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
-                docker_deploy_new
-            else
-                info "升级中..."
-                npm_install_cmd -g openclaw@latest >> "$SCRIPT_LOG" 2>&1 && ok "完成" || err "失败"
-            fi
+    local current=""
+    current=$(get_installed_openclaw_version)
+    out "当前版本: ${CB}${current}${C}"
+    select_openclaw_version "$current"
+    local target="$G_SELECTED_VERSION"
+    if [[ "$target" == "latest" ]]; then
+        local registry_data=""
+        registry_data=$(fetch_openclaw_registry_data)
+        local resolved=""
+        resolved=$(parse_latest_from_registry "$registry_data")
+        if [[ -n "$resolved" && "$resolved" == "$current" ]]; then
+            ok "已是最新版本"
+            return 0
         fi
+    elif [[ "$target" == "$current" ]]; then
+        ok "已是当前版本"
+        return 0
+    fi
+    if ! confirm "升级/切换到 ${target}"; then
+        return 0
+    fi
+    if is_docker_mode; then
+        info "更新镜像..."
+        docker_pull_ghcr "$DOCKER_IMAGE" "$target" || return 1
+        docker_redeploy_existing_version "$target"
     else
-        ok "已是最新"
+        info "升级中..."
+        npm_install_cmd -g "openclaw@${target}" >> "$SCRIPT_LOG" 2>&1 && ok "完成" || err "失败"
+        refresh_node_path
     fi
 }
 menu_context_window() {
@@ -2227,16 +2444,37 @@ uninstall() {
     warn "将删除 OpenClaw 及相关配置!"
     confirm "确认卸载" || return 0
     service_stop 2>/dev/null || true
-    if docker ps -a 2>/dev/null | grep -q "$(get_docker_container_name)"; then
-        docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
-        confirm "删除 Docker 镜像" && {
-            docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true
-            docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true
-        }
-        confirm "删除数据目录 (${DOCKER_DATA_DIR})" && rm -rf "$DOCKER_DATA_DIR"
+    local containers=""
+    containers=$(list_openclaw_containers)
+    if [[ -n "$containers" ]]; then
+        info "清理 Docker 容器..."
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            docker rm -f "$c" >/dev/null 2>&1 && ok "已删除容器: $c" || true
+        done <<< "$containers"
+        if confirm "删除 OpenClaw Docker 镜像"; then
+            local images=""
+            images=$(list_openclaw_images)
+            if [[ -n "$images" ]]; then
+                while IFS= read -r img; do
+                    [[ -z "$img" ]] && continue
+                    docker rmi -f "$img" >/dev/null 2>&1 && ok "已删除镜像: $img" || true
+                done <<< "$images"
+            else
+                warn "未发现可删除的 OpenClaw 镜像"
+            fi
+        fi
+        if confirm "删除数据目录 (${DOCKER_DATA_DIR})"; then
+            rm -rf "$DOCKER_DATA_DIR"
+            ok "已删除数据目录"
+        fi
     fi
-    resolve_openclaw_bin 2>/dev/null && npm uninstall -g openclaw >> "$SCRIPT_LOG" 2>&1 || true
-    confirm "删除配置 (${CONFIG_DIR})" && rm -rf "$CONFIG_DIR"
+    info "清理本地安装残留..."
+    remove_local_openclaw_artifacts
+    if confirm "删除配置 (${CONFIG_DIR})"; then
+        rm -rf "$CONFIG_DIR"
+        ok "已删除配置目录"
+    fi
     ok "卸载完成"
 }
 show_header() {
@@ -2307,21 +2545,35 @@ menu_deploy_direct() {
     fi
     confirm "部署完成后配置 API" && opt_api=true || opt_api=false
     out ""
+    select_openclaw_version
+    local selected_version="$G_SELECTED_VERSION"
+    [[ -z "$selected_version" ]] && selected_version="latest"
     line
     local lan_label="关闭" token_label="-" api_label="跳过"
     $opt_lan && lan_label="${CG}开启${C}"
     $opt_lan && token_label="${CY}${opt_token:0:16}...${C}"
     $opt_api && api_label="部署后配置"
-    out "  局域网: ${lan_label}  |  令牌: ${token_label}  |  API: ${api_label}"
+    out "  版本: ${CY}${selected_version}${C}  |  局域网: ${lan_label}  |  令牌: ${token_label}  |  API: ${api_label}"
     line
     case "$deploy_mode" in
-        1) install_local "$opt_lan" "$opt_token" ;;
-        2) install_docker "$opt_lan" "$opt_token" ;;
+        1) install_local "$opt_lan" "$opt_token" "$selected_version" ;;
+        2) install_docker "$opt_lan" "$opt_token" "$selected_version" ;;
     esac
     local deploy_ok=$?
-    if [[ $deploy_ok -eq 0 ]] && $opt_api && is_installed; then
+    if $opt_api; then
+        if [[ $deploy_ok -ne 0 ]]; then
+            out ""
+            warn "部署未完全就绪,但容器可能仍在启动中"
+            if ! confirm "继续配置 API"; then
+                return $deploy_ok
+            fi
+        fi
         out ""
         configure_api
+        out ""
+        if confirm "配置上下文窗口"; then
+            menu_context_window
+        fi
     fi
 }
 menu_service() {
