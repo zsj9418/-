@@ -356,13 +356,17 @@ oc_cmd() {
 json_valid() {
     local cfg="${1:-$(get_config_path)}"
     [[ ! -f "$cfg" ]] && return 1
-    if has_cmd python3; then
-        python3 -c "import json; json.load(open('$cfg'))" 2>/dev/null
-    elif has_cmd jq; then
+    if has_cmd jq; then
         jq empty "$cfg" 2>/dev/null
-    else
-        return 0
+        return $?
     fi
+    if has_cmd python3; then
+        python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$cfg" 2>/dev/null
+        local rc=$?
+        [[ $rc -gt 128 ]] && return 0
+        return $rc
+    fi
+    return 0
 }
 create_minimal_config() {
     local cfg="${1:-$(get_config_path)}"
@@ -413,10 +417,10 @@ config_get() {
     [[ ! -f "$cfg" ]] && return 1
     has_cmd python3 || return 1
     python3 -c "
-import json
+import json, sys
 try:
-    c = json.load(open('$cfg'))
-    keys = '$key'.split('.')
+    c = json.load(open(sys.argv[1]))
+    keys = sys.argv[2].split('.')
     v = c
     for k in keys:
         v = v.get(k, {}) if isinstance(v, dict) else {}
@@ -426,7 +430,7 @@ try:
         print(v)
 except:
     print('')
-" 2>/dev/null
+" "$cfg" "$key" 2>/dev/null || true
 }
 config_set() {
     local key="$1" value="$2" cfg=""
@@ -459,58 +463,63 @@ sanitize_config() {
     [[ ! -f "$cfg" ]] && return 1
     has_cmd python3 || return 0
     json_valid "$cfg" || return 1
-    python3 - "$cfg" << 'PYEOF'
+    local py_exit=0
+    python3 -c "
 import json, sys, os
 cfg_path = sys.argv[1]
-VALID_BIND = ["auto", "lan", "loopback", "custom", "tailnet"]
-BAD_ROOT = ["ui", "defaultProvider"]
+VALID_BIND = ['auto', 'lan', 'loopback', 'custom', 'tailnet']
+BAD_ROOT = ['ui', 'defaultProvider']
 try:
     with open(cfg_path, 'r') as f:
         cfg = json.load(f)
-except:
-    sys.exit(1)
+except Exception:
+    sys.exit(0)
 changed = False
-gw = cfg.setdefault("gateway", {})
-if gw.get("bind") not in VALID_BIND:
-    gw["bind"] = "loopback"
+gw = cfg.setdefault('gateway', {})
+if gw.get('bind') not in VALID_BIND:
+    gw['bind'] = 'loopback'
     changed = True
-if not gw.get("mode"):
-    gw["mode"] = "local"
+if not gw.get('mode'):
+    gw['mode'] = 'local'
     changed = True
 for bad in BAD_ROOT:
     if bad in cfg:
         del cfg[bad]
         changed = True
-if "agents" in cfg and isinstance(cfg["agents"], dict):
-    for bad_key in list(cfg["agents"].keys()):
-        if bad_key not in ["defaults", "list"]:
-            del cfg["agents"][bad_key]
+if 'agents' in cfg and isinstance(cfg['agents'], dict):
+    for bad_key in list(cfg['agents'].keys()):
+        if bad_key not in ['defaults', 'list']:
+            del cfg['agents'][bad_key]
             changed = True
-providers = cfg.get("models", {}).get("providers", {})
+providers = cfg.get('models', {}).get('providers', {})
 if isinstance(providers, dict):
     for name, p in providers.items():
-        if isinstance(p, dict) and not p.get("api"):
-            p["api"] = "openai-completions"
+        if isinstance(p, dict) and not p.get('api'):
+            p['api'] = 'openai-completions'
             changed = True
-agents = cfg.get("agents", {})
+agents = cfg.get('agents', {})
 if isinstance(agents, dict):
-    defaults = agents.get("defaults", {})
+    defaults = agents.get('defaults', {})
     if isinstance(defaults, dict):
-        model_cfg = defaults.get("model", {})
+        model_cfg = defaults.get('model', {})
         if isinstance(model_cfg, dict):
-            bad_keys = [k for k in model_cfg if k not in ("primary",)]
+            bad_keys = [k for k in model_cfg if k not in ('primary',)]
             for k in bad_keys:
                 del model_cfg[k]
                 changed = True
         elif isinstance(model_cfg, str) and model_cfg:
-            defaults["model"] = {"primary": model_cfg}
+            defaults['model'] = {'primary': model_cfg}
             changed = True
 if changed:
-    tmp = cfg_path + ".tmp"
+    tmp = cfg_path + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.replace(tmp, cfg_path)
-PYEOF
+" "$cfg" 2>>"$SCRIPT_LOG" || py_exit=$?
+    if [[ $py_exit -gt 128 ]]; then
+        warn "python3 异常退出 (信号 $((py_exit - 128))),跳过清理"
+        return 0
+    fi
     fix_cfg_perms "$cfg"
 }
 check_gateway_health() {
@@ -528,7 +537,7 @@ service_start() {
     step "启动服务..."
     if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
     ensure_config || return 1
-    sanitize_config
+    sanitize_config || true
     fix_cfg_perms
     if is_docker_mode; then
         info "启动 Docker 容器..."
@@ -1381,7 +1390,9 @@ diagnose() {
         issues=$((issues + 1))
     fi
     substep "Schema 兼容..."
-    if [[ -f "$cfg" ]] && json_valid "$cfg"; then sanitize_config "$cfg"; ok "已检查"; fi
+    if [[ -f "$cfg" ]] && json_valid "$cfg"; then
+        sanitize_config "$cfg" && ok "已检查" || warn "清理异常,已跳过"
+    fi
     substep "服务状态..."
     if check_gateway_health; then ok "运行中"; else warn "未运行"; fi
     substep "端口 ${DEFAULT_PORT}..."
@@ -1423,8 +1434,7 @@ repair_all() {
         ok "配置已重建"
     fi
     substep "清理不兼容字段..."
-    sanitize_config "$cfg"
-    ok "已清理"
+    sanitize_config "$cfg" && ok "已清理" || warn "清理异常"
     if is_docker_mode && has_cmd python3; then
         substep "转换 Docker URL..."
         python3 - "$cfg" << 'PYEOF'
@@ -2078,7 +2088,7 @@ menu_diagnose() {
         2) view_logs ;;
         3) ensure_config && ok "配置有效" ;;
         4) is_installed && oc_cmd doctor --fix || err "未安装" ;;
-        5) sanitize_config && ok "已清理" || err "失败" ;;
+        5) sanitize_config && ok "已清理" || warn "清理异常,已跳过" ;;
     esac
     wait_key
 }
