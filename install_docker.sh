@@ -1,15 +1,9 @@
 #!/bin/bash
 set -o pipefail
-
-#====================== 基本配置 ======================#
-
 REQ_DEPS=("curl" "wget" "jq")
 OPT_DEPS=("fzf")
-
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
-
-# 仅用于代理 GitHub 相关 URL
 PROXY_PREFIXES=(
   "https://ghproxy.com/"
   "https://gitclone.com/"
@@ -21,20 +15,16 @@ REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.xuanyuan.me"
   "https://docker.m.daocloud.io"
   "https://dockerproxy.net"
+  "https://dockerproxy.link"
   "https://docker.1panel.live"
-  "https://docker.mhtsec.com"
-  "https://hub.rat.dev"
-  "https://docker.amingg.com"
+  "https://proxy.vvvv.ee"
+  "https://docker.jiaxin.site"
+  "https://registry.cyou"
+  "https://hubfast.cn"
 )
-
-# Docker Hub 直连测速端点
 DOCKER_DIRECT_ENDPOINT="https://registry-1.docker.io/v2/"
-
-# daemon.json 备份目录
 DAEMON_BACKUP_DIR="/etc/docker/backups"
 PROXY_MIRROR_URL=""
-
-# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -42,8 +32,6 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
-
-# 全局变量
 DOCKER_URL=""
 DOCKER_INSTALL_DIR=""
 ARCH=""
@@ -51,14 +39,15 @@ OS=""
 PKG_MANAGER=""
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.5.1"
-
+IPV6_AVAILABLE="true"
+IS_LXC="false"
+IS_OPENVZ="false"
+APPARMOR_RESTRICTED="false"
 SPEED_TEST_RESULTS=()
-
 LOG_DIR="/var/log/docker_manager"
 LOG_FILE="${LOG_DIR}/docker_manager.log"
 LOG_MAX_SIZE_MB=5
 LOG_MAX_BACKUPS=3
-
 rotate_log() {
   [[ ! -f "$LOG_FILE" ]] && return 0
   local size_bytes
@@ -74,7 +63,6 @@ rotate_log() {
   : > "$LOG_FILE"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] 轮转完成，已归档至 ${LOG_FILE}.1.gz" >> "$LOG_FILE"
 }
-
 init_log() {
   mkdir -p "$LOG_DIR"
   rotate_log
@@ -87,9 +75,6 @@ init_log() {
   } >> "$LOG_FILE"
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
-
-#====================== 信号捕获 ======================#
-
 cleanup() {
   echo -e "\n${YELLOW}检测到中断信号，正在清理临时文件...${NC}"
   [[ -n "$DOCKER_INSTALL_DIR" && -d "$DOCKER_INSTALL_DIR" ]] && rm -rf "$DOCKER_INSTALL_DIR"
@@ -97,16 +82,12 @@ cleanup() {
   exit 130
 }
 trap cleanup INT TERM
-
-#====================== 通用工具函数 ======================#
-
 check_sudo() {
   if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}此脚本需要 root 权限运行。请使用 sudo 或切换到 root。${NC}"
     exit 1
   fi
 }
-
 detect_package_manager() {
   if command -v apt-get >/dev/null 2>&1; then
     PKG_MANAGER="apt-get"
@@ -119,7 +100,6 @@ detect_package_manager() {
     exit 1
   fi
 }
-
 install_dependencies() {
   echo "正在检测并安装所有缺失的依赖..."
   local missing_req_deps=()
@@ -143,7 +123,6 @@ install_dependencies() {
           echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
       fi
       if [[ ${#missing_opt_deps[@]} -gt 0 ]]; then
-        echo "正在安装可选依赖: ${missing_opt_deps[*]}"
         apt-get install -y --no-install-recommends "${missing_opt_deps[@]}" 2>/dev/null || true
       fi
       ;;
@@ -154,13 +133,11 @@ install_dependencies() {
           echo -e "${RED}安装必需依赖失败${NC}"; exit 1; }
       fi
       if [[ ${#missing_opt_deps[@]} -gt 0 ]]; then
-        echo "正在安装可选依赖: ${missing_opt_deps[*]}"
         "${PKG_MANAGER}" install -y "${missing_opt_deps[@]}" 2>/dev/null || true
       fi
       ;;
   esac
 }
-
 get_architecture() {
   local m
   m=$(uname -m)
@@ -173,7 +150,6 @@ get_architecture() {
   esac
   echo "$ARCH"
 }
-
 get_os_version() {
   if [[ -f /etc/os-release ]]; then
     local name ver
@@ -181,11 +157,10 @@ get_os_version() {
     ver=$(grep ^VERSION_ID= /etc/os-release | awk -F= '{print $2}' | tr -d '"')
     echo "$name $ver"
   else
-    echo -e "${YELLOW}警告: 无法读取 /etc/os-release，系统版本未知。${NC}" >&2
+    echo -e "${YELLOW}警告: 无法读取 /etc/os-release${NC}" >&2
     echo "unknown"
   fi
 }
-
 check_and_set_install_dir() {
   local REQUIRED_SPACE=500
   local realpath_cmd
@@ -202,7 +177,7 @@ check_and_set_install_dir() {
   local AVAILABLE_SPACE
   AVAILABLE_SPACE=$(df -m "$DEFAULT_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
   [[ -z "$AVAILABLE_SPACE" ]] && {
-    echo -e "${RED}无法检测目录 $DEFAULT_DIR 的可用空间。${NC}"; exit 1; }
+    echo -e "${RED}无法检测目录 $DEFAULT_DIR 的可用空间${NC}"; exit 1; }
   echo -e "${YELLOW}默认目录: $DEFAULT_DIR (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"
   read -r -p "是否指定自定义安装目录？(回车使用默认): " CUSTOM_DIR
   if [[ -n "$CUSTOM_DIR" ]]; then
@@ -210,19 +185,18 @@ check_and_set_install_dir() {
     AVAILABLE_SPACE=$(df -m "$CUSTOM_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
     [[ -z "$AVAILABLE_SPACE" ]] && { echo -e "${RED}无法检测 $CUSTOM_DIR 可用空间${NC}"; exit 1; }
     (( AVAILABLE_SPACE < REQUIRED_SPACE )) && {
-      echo -e "${RED}$CUSTOM_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"; exit 1; }
+      echo -e "${RED}$CUSTOM_DIR 空间不足${NC}"; exit 1; }
     DOCKER_INSTALL_DIR="$CUSTOM_DIR/docker_install"
     echo -e "${GREEN}使用自定义目录: $DOCKER_INSTALL_DIR${NC}"
   else
     (( AVAILABLE_SPACE < REQUIRED_SPACE )) && {
-      echo -e "${RED}$DEFAULT_DIR 空间不足 (可用: ${AVAILABLE_SPACE}MB, 需: ${REQUIRED_SPACE}MB)${NC}"; exit 1; }
+      echo -e "${RED}$DEFAULT_DIR 空间不足${NC}"; exit 1; }
     DOCKER_INSTALL_DIR="$DEFAULT_DIR"
     echo -e "${GREEN}使用默认目录: $DOCKER_INSTALL_DIR${NC}"
   fi
   mkdir -p "$DOCKER_INSTALL_DIR" || {
     echo -e "${RED}创建目录 $DOCKER_INSTALL_DIR 失败${NC}"; exit 1; }
 }
-
 check_docker_installed() {
   if command -v docker >/dev/null 2>&1; then
     echo -e "${GREEN}Docker 已安装：$(docker --version)${NC}"
@@ -231,7 +205,6 @@ check_docker_installed() {
   echo -e "${YELLOW}Docker 未安装。${NC}"
   return 1
 }
-
 check_docker_compose_installed() {
   if command -v docker-compose >/dev/null 2>&1; then
     echo -e "${GREEN}docker-compose 已安装：$(docker-compose --version)${NC}"
@@ -244,7 +217,6 @@ check_docker_compose_installed() {
   echo -e "${YELLOW}Docker Compose 未安装。${NC}"
   return 1
 }
-
 download_with_fallback() {
   local url="$1" dest="$2"
   echo "下载: $url" >&2
@@ -263,19 +235,15 @@ download_with_fallback() {
       echo -e "${YELLOW}代理失败: $proxy_url${NC}" >&2
     done
   else
-    echo -e "${YELLOW}注意：该地址不支持代理加速，已重试 3 次仍失败。${NC}" >&2
+    echo -e "${YELLOW}非 GitHub 地址，无代理可用。${NC}" >&2
   fi
   return 1
 }
-
-#====================== 代理镜像配置（后备 mirrors） ======================#
-
 configure_proxy_mirror() {
   echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
   echo -e "${CYAN}║      配置代理镜像源（后备 mirrors）       ║${NC}"
   echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
   echo -e "当前代理镜像源: ${YELLOW}${PROXY_MIRROR_URL:-未配置}${NC}"
-  echo ""
   read -r -p "请输入代理镜像源 URL（留空=清空配置）: " input
   input=$(echo "$input" | tr -d '[:space:]')
   if [[ -z "$input" ]]; then
@@ -291,9 +259,6 @@ configure_proxy_mirror() {
   PROXY_MIRROR_URL="$input"
   echo -e "${GREEN}已设置代理镜像源：${PROXY_MIRROR_URL}${NC}"
 }
-
-#====================== 镜像源测速 ======================#
-
 _probe_url() {
   local url="$1"
   local elapsed
@@ -303,14 +268,12 @@ _probe_url() {
   ms=$(awk "BEGIN{printf \"%.0f\", ${elapsed} * 1000}")
   echo "$ms"
 }
-
 run_mirror_speed_test() {
   SPEED_TEST_RESULTS=()
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}${CYAN}║          镜像源连通性测速                ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
   echo -e "[INFO] 开始测速，请稍候...\n"
-
   local direct_ms
   direct_ms=$(_probe_url "$DOCKER_DIRECT_ENDPOINT")
   if (( direct_ms >= 8000 )); then
@@ -320,7 +283,6 @@ run_mirror_speed_test() {
     printf "  ${GREEN}✓${NC} %-42s : ${GREEN}%sms${NC}\n" "direct" "$direct_ms"
     SPEED_TEST_RESULTS+=("${direct_ms}|direct|${DOCKER_DIRECT_ENDPOINT}")
   fi
-
   for mirror in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
     local probe_url="${mirror}/v2/"
     local ms
@@ -334,50 +296,40 @@ run_mirror_speed_test() {
     fi
   done
   echo ""
-
   local sorted
   sorted=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | sort -t'|' -k1 -n)
   mapfile -t SPEED_TEST_RESULTS <<< "$sorted"
-
   local best_entry best_ms best_label
   best_entry="${SPEED_TEST_RESULTS[0]}"
   best_ms=$(echo "$best_entry" | cut -d'|' -f1)
   best_label=$(echo "$best_entry" | cut -d'|' -f2)
-
   if (( best_ms >= 8000 )); then
     echo -e "[${RED}WARN${NC}] 所有源均不可达，请检查网络连接。"
     return 1
   fi
-
   echo -e "[INFO] 最快源: ${GREEN}${best_label}${NC} (${best_ms}ms)"
   echo ""
-
   local direct_result direct_speed
   direct_result=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | grep '|direct|')
   direct_speed=$(echo "$direct_result" | cut -d'|' -f1)
-
   if (( direct_speed < 8000 )) && [[ "$best_label" == "direct" ]]; then
     echo -e "${GREEN}[INFO] 直连 Docker Hub 速度最快 (${direct_speed}ms)，无需配置镜像加速。${NC}"
-    echo -e "${YELLOW}[INFO] 是否仍要配置镜像源作为备用？${NC}"
   else
     if (( direct_speed >= 8000 )); then
       echo -e "${RED}[INFO] 直连 Docker Hub 不可达。${NC}"
     else
-      echo -e "${YELLOW}[INFO] 直连速度: ${direct_speed}ms  最快镜像: ${best_ms}ms"
       local speedup=$(( direct_speed - best_ms ))
-      echo -e "[INFO] 使用镜像加速可提速约 ${speedup}ms。${NC}"
+      echo -e "${YELLOW}[INFO] 直连: ${direct_speed}ms  最快镜像: ${best_ms}ms，可提速约 ${speedup}ms。${NC}"
     fi
   fi
-
   echo ""
   read -r -p "是否将可达镜像源（按速度排序）写入 daemon.json？(y/n): " DO_WRITE
   if [[ "$DO_WRITE" == "y" ]]; then
     _apply_speed_test_to_daemon
   else
-    echo -e "${YELLOW}[INFO] 已跳过配置，测速结果保留供本次会话使用。${NC}"
+    echo -e "${YELLOW}[INFO] 已跳过配置。${NC}"
   fi
 }
-
 _apply_speed_test_to_daemon() {
   local reachable_mirrors=()
   for entry in "${SPEED_TEST_RESULTS[@]}"; do
@@ -388,7 +340,6 @@ _apply_speed_test_to_daemon() {
     (( ms >= 8000 )) && continue
     reachable_mirrors+=("$label")
   done
-
   if [[ -n "$PROXY_MIRROR_URL" ]]; then
     local exists="false"
     for m in "${reachable_mirrors[@]}"; do
@@ -396,29 +347,15 @@ _apply_speed_test_to_daemon() {
     done
     if [[ "$exists" == "false" ]]; then
       reachable_mirrors+=("$PROXY_MIRROR_URL")
-      echo -e "${YELLOW}[INFO] 已追加代理镜像源作为后备：${PROXY_MIRROR_URL}${NC}"
     fi
   fi
-
   if [[ ${#reachable_mirrors[@]} -eq 0 ]]; then
     echo -e "${RED}[WARN] 没有可达的镜像源，daemon.json 未修改。${NC}"
     return
   fi
-
-  echo -e "\n[INFO] 将按以下顺序写入镜像源（已按速度排序）:"
-  for i in "${!reachable_mirrors[@]}"; do
-    local ms_show
-    ms_show=$(printf '%s\n' "${SPEED_TEST_RESULTS[@]}" | grep "|${reachable_mirrors[$i]}|" | head -n1 | cut -d'|' -f1)
-    [[ -z "$ms_show" ]] && ms_show="(后备)"
-    printf "  %d. %-42s %s\n" "$((i+1))" "${reachable_mirrors[$i]}" "${ms_show}ms"
-  done
-  echo ""
-
   backup_daemon_json
-  mkdir -p /etc/docker
   local mirrors_json
   mirrors_json=$(printf '%s\n' "${reachable_mirrors[@]}" | jq -R . | jq -s .)
-
   if [[ -f /etc/docker/daemon.json ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
     local tmp
     tmp=$(mktemp)
@@ -426,29 +363,23 @@ _apply_speed_test_to_daemon() {
       '. + {"registry-mirrors": $mirrors}' \
       /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
   else
-    _write_default_daemon_json "$mirrors_json"
+    _write_daemon_json "$mirrors_json"
   fi
-
-  echo -e "[INFO] ${GREEN}Docker 镜像源已配置完成。${NC}"
-  read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DO_RESTART
+  echo -e "[INFO] ${GREEN}镜像源已配置完成。${NC}"
+  read -r -p "是否立即重启 Docker？(y/n): " DO_RESTART
   [[ "$DO_RESTART" == "y" ]] && _restart_docker
 }
 _check_module() {
   local mod="$1"
-  # 已加载
-  if lsmod 2>/dev/null | grep -q "^${mod//-/_}\b"; then
+  local mod_safe="${mod//-/_}"
+  if lsmod 2>/dev/null | awk '{print $1}' | grep -qx "$mod_safe"; then
     return 0
   fi
-  # 尝试加载
   if modprobe "$mod" 2>/dev/null; then
     return 0
   fi
   return 1
 }
-
-# -----------------------------------------------------------------------
-# 检测 IPv6 是否可用
-# -----------------------------------------------------------------------
 _check_ipv6_available() {
   if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
     local v
@@ -471,16 +402,50 @@ _detect_iptables_backend() {
   elif echo "$ver" | grep -qi 'legacy'; then
     echo "legacy"
   else
-    # 无版本信息时，尝试通过符号链接判断
     local real_iptables
     real_iptables=$(readlink -f "$(command -v iptables)" 2>/dev/null || true)
     if echo "$real_iptables" | grep -q 'nft'; then
       echo "nft"
-    elif echo "$real_iptables" | grep -q 'legacy'; then
-      echo "legacy"
     else
-      echo "legacy"  # 保守默认
+      echo "legacy"
     fi
+  fi
+}
+_detect_virt_env() {
+  IS_LXC="false"
+  IS_OPENVZ="false"
+  if [[ -f /proc/user_beancounters ]] || grep -qi 'openvz\|virtuozzo' /proc/version 2>/dev/null; then
+    IS_OPENVZ="true"
+    echo -e "  ${YELLOW}⚠${NC}  检测到 OpenVZ/Virtuozzo 虚拟化环境"
+    return
+  fi
+  if grep -qa 'lxc' /proc/1/environ 2>/dev/null || \
+     [[ -f /run/container_type ]] && grep -qi 'lxc' /run/container_type 2>/dev/null || \
+     systemd-detect-virt --container 2>/dev/null | grep -qi 'lxc'; then
+    IS_LXC="true"
+    echo -e "  ${CYAN}[INFO]${NC} 检测到 LXC 容器环境"
+    return
+  fi
+  if grep -qa 'docker\|podman' /proc/1/environ 2>/dev/null || \
+     [[ -f /.dockerenv ]]; then
+    echo -e "  ${YELLOW}⚠${NC}  检测到 Docker-in-Docker 环境，部分功能受限"
+    return
+  fi
+  echo -e "  ${GREEN}✓${NC}  KVM/裸金属环境，完全兼容"
+}
+_check_apparmor() {
+  APPARMOR_RESTRICTED="false"
+  if ! command -v aa-status >/dev/null 2>&1 && \
+     ! [[ -d /sys/kernel/security/apparmor ]]; then
+    return 0
+  fi
+  if [[ ! -r /sys/kernel/security/apparmor/profiles ]]; then
+    echo -e "  ${YELLOW}⚠${NC}  AppArmor 受限（无法读取 profiles），这是 Docker 29+ 在 LXC 中的已知问题"
+    APPARMOR_RESTRICTED="true"
+    return 0
+  fi
+  if aa-status >/dev/null 2>&1; then
+    echo -e "  ${GREEN}✓${NC}  AppArmor 可访问"
   fi
 }
 ensure_docker_prereqs() {
@@ -488,331 +453,278 @@ ensure_docker_prereqs() {
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}${CYAN}║      Docker 运行环境兼容性检测           ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
-
   FORCE_LEGACY_DOCKER="false"
   local compat_issues=()
-
-  # ── 第一步：加载基础模块 ──────────────────────
-  echo -e "\n[1/5] 加载基础内核模块..."
+  echo -e "\n[1/6] 检测虚拟化环境..."
+  _detect_virt_env
+  if [[ "$IS_OPENVZ" == "true" ]]; then
+    echo -e "  ${RED}✗${NC}  OpenVZ 6 不支持 Docker，OpenVZ 7 支持有限"
+    echo -e "  ${YELLOW}    如为 OpenVZ 7，脚本将尝试安装兼容版本${NC}"
+    FORCE_LEGACY_DOCKER="true"
+    compat_issues+=("OpenVZ 环境，降级至兼容版本")
+  fi
+  echo -e "\n[2/6] 加载基础内核模块..."
   for mod in overlay br_netfilter; do
     if _check_module "$mod"; then
       echo -e "  ${GREEN}✓${NC} $mod"
     else
-      echo -e "  ${RED}✗${NC} $mod (无法加载，容器存储/网桥功能受限)"
-      compat_issues+=("模块 $mod 不可用")
+      if [[ "$mod" == "overlay" ]] && grep -qw overlay /proc/filesystems 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} $mod (宿主机内核已提供)"
+      elif [[ "$mod" == "br_netfilter" ]] && \
+           [[ -f /proc/sys/net/bridge/bridge-nf-call-iptables ]]; then
+        echo -e "  ${GREEN}✓${NC} $mod (宿主机内核已提供)"
+      else
+        echo -e "  ${YELLOW}⚠${NC}  $mod 无法加载 (容器环境由宿主机提供，继续)"
+      fi
     fi
   done
-
-  # ── 第二步：检测 iptables 后端并处理 ──────────
-  echo -e "\n[2/5] 检测 iptables 后端..."
+  echo -e "\n[3/6] 检测 iptables 后端..."
   local backend
   backend=$(_detect_iptables_backend)
-  echo -e "  当前后端: ${YELLOW}${backend}${NC}"
-
-  local iptables_ok="false"
-
+  echo -e "  当前后端: ${CYAN}${backend}${NC}"
+  local iptables_ok="true"
   if [[ "$backend" == "nft" ]]; then
-    # nft 兼容层模式：iptables-nft 通过 nf_tables 工作，ip_tables 传统模块不存在也没关系
-    # Docker 28 在 nft 模式下可以正常工作（通过 iptables-nft 兼容层）
-    echo -e "  ${CYAN}[INFO]${NC} 系统使用 nftables 后端 (iptables-nft 兼容层)"
-    echo -e "  ${CYAN}[INFO]${NC} Docker 28+ 与 iptables-nft 兼容层可正常配合工作"
-    echo -e "  ${CYAN}[INFO]${NC} 将在 daemon.json 中关闭 ip6tables（若 IPv6 不可用）"
-    iptables_ok="true"
-
+    echo -e "  ${GREEN}✓${NC} iptables-nft 兼容层 (Docker 28+ 支持)"
   elif [[ "$backend" == "legacy" ]]; then
-    # 传统 iptables 模式：需要检测 raw/nat/filter 表
-    echo -e "  ${CYAN}[INFO]${NC} 系统使用 iptables-legacy 后端"
-
-    # 加载 iptable_nat
-    if _check_module "iptable_nat" && _check_module "nf_nat"; then
-      echo -e "  ${GREEN}✓${NC} iptable_nat / nf_nat"
+    echo -e "  ${CYAN}[INFO]${NC} iptables-legacy，检测 raw/nat 表..."
+    _check_module "iptable_nat" 2>/dev/null || true
+    _check_module "nf_nat"      2>/dev/null || true
+    _check_module "iptable_raw" 2>/dev/null || true
+    if iptables -t raw -L >/dev/null 2>&1; then
+      echo -e "  ${GREEN}✓${NC} raw 表可用"
     else
-      echo -e "  ${RED}✗${NC} iptable_nat / nf_nat (Docker 端口映射将无法使用)"
-      compat_issues+=("iptable_nat 不可用")
-    fi
-
-    # 检测 raw 表（Docker 28 强依赖）
-    if _check_module "iptable_raw"; then
-      if iptables -t raw -L >/dev/null 2>&1; then
-        echo -e "  ${GREEN}✓${NC} iptable_raw (raw 表可用)"
-        iptables_ok="true"
-      else
-        echo -e "  ${RED}✗${NC} iptable_raw 模块加载但 raw 表仍不可用"
-        compat_issues+=("iptables raw 表不可用（Docker 28 强依赖）")
-      fi
-    else
-      echo -e "  ${RED}✗${NC} iptable_raw 模块无法加载"
-      compat_issues+=("iptable_raw 内核模块缺失（Docker 28 强依赖）")
-    fi
-
-    # 检测 filter/nat 表
-    if ! iptables -t filter -L >/dev/null 2>&1; then
-      echo -e "  ${RED}✗${NC} iptables filter 表不可用"
-      compat_issues+=("iptables filter 表不可用")
-    else
-      echo -e "  ${GREEN}✓${NC} iptables filter 表"
+      echo -e "  ${RED}✗${NC} raw 表不可用"
+      compat_issues+=("iptables raw 表不可用（Docker 28 强依赖）")
+      iptables_ok="false"
     fi
     if ! iptables -t nat -L >/dev/null 2>&1; then
-      echo -e "  ${YELLOW}⚠${NC}  iptables nat 表不可用（端口映射受限）"
+      echo -e "  ${YELLOW}⚠${NC}  nat 表不可用（端口映射受限）"
     else
-      echo -e "  ${GREEN}✓${NC} iptables nat 表"
+      echo -e "  ${GREEN}✓${NC} nat 表可用"
     fi
-
   else
-    # iptables 完全不存在
-    echo -e "  ${RED}✗${NC} iptables 未找到"
-    # 检查是否有 nft 命令可以直接使用
-    if command -v nft >/dev/null 2>&1; then
-      echo -e "  ${CYAN}[INFO]${NC} 检测到 nft 命令，但 iptables 兼容层不存在"
-      echo -e "  ${YELLOW}[FIX]${NC}  尝试安装 iptables..."
-      case "$PKG_MANAGER" in
-        apt-get) apt-get install -y --no-install-recommends iptables 2>/dev/null || true ;;
-        dnf|yum) "${PKG_MANAGER}" install -y iptables 2>/dev/null || true ;;
-      esac
-      if command -v iptables >/dev/null 2>&1; then
-        echo -e "  ${GREEN}✓${NC} iptables 安装成功"
-        backend=$(_detect_iptables_backend)
-        iptables_ok="true"
-      else
-        compat_issues+=("iptables 完全不可用")
-      fi
-    else
-      compat_issues+=("iptables 及 nft 均不可用")
-    fi
-  fi
-
-  # ── 第三步：【★ 关键】检测 ipset（Docker 28 新增强依赖）───
-  echo -e "\n[3/5] 检测 ipset 内核支持（Docker 28+ 强依赖）..."
-  local ipset_ok="false"
-
-  # 先尝试加载模块
-  for mod in ip_set ip_set_hash_net; do
-    _check_module "$mod" 2>/dev/null || true
-  done
-
-  if command -v ipset >/dev/null 2>&1; then
-    if ipset list >/dev/null 2>&1; then
-      echo -e "  ${GREEN}✓${NC} ipset 可用"
-      ipset_ok="true"
-    else
-      echo -e "  ${YELLOW}⚠${NC}  ipset 命令存在但内核支持不足，尝试安装..."
-    fi
-  fi
-
-  if [[ "$ipset_ok" == "false" ]]; then
-    # 尝试安装 ipset
-    echo -e "  ${YELLOW}[FIX]${NC}  正在尝试安装 ipset..."
+    echo -e "  ${YELLOW}[FIX]${NC}  iptables 未找到，尝试安装..."
     case "$PKG_MANAGER" in
-      apt-get)
-        apt-get install -y --no-install-recommends ipset 2>/dev/null || true ;;
-      dnf|yum)
-        "${PKG_MANAGER}" install -y ipset 2>/dev/null || true ;;
+      apt-get) apt-get install -y --no-install-recommends iptables 2>/dev/null || true ;;
+      dnf|yum) "${PKG_MANAGER}" install -y iptables 2>/dev/null || true ;;
     esac
-    # 再次加载模块
-    _check_module "ip_set" 2>/dev/null || true
+    backend=$(_detect_iptables_backend)
+    if [[ "$backend" == "none" ]]; then
+      compat_issues+=("iptables 完全不可用")
+      iptables_ok="false"
+    else
+      echo -e "  ${GREEN}✓${NC} iptables 安装成功，后端: ${backend}"
+    fi
+  fi
+  echo -e "\n[4/6] 检测 ipset 内核支持（Docker 28+ 强依赖）..."
+  local ipset_ok="false"
+  _check_module "ip_set"          2>/dev/null || true
+  _check_module "ip_set_hash_net" 2>/dev/null || true
+  if command -v ipset >/dev/null 2>&1 && ipset list >/dev/null 2>&1; then
+    echo -e "  ${GREEN}✓${NC} ipset 可用"
+    ipset_ok="true"
+  else
+    echo -e "  ${YELLOW}[FIX]${NC}  ipset 不可用，尝试安装..."
+    case "$PKG_MANAGER" in
+      apt-get) apt-get install -y --no-install-recommends ipset 2>/dev/null || true ;;
+      dnf|yum) "${PKG_MANAGER}" install -y ipset 2>/dev/null || true ;;
+    esac
+    _check_module "ip_set"          2>/dev/null || true
     _check_module "ip_set_hash_net" 2>/dev/null || true
-
     if command -v ipset >/dev/null 2>&1 && ipset list >/dev/null 2>&1; then
       echo -e "  ${GREEN}✓${NC} ipset 安装并验证成功"
       ipset_ok="true"
     else
-      echo -e "  ${RED}✗${NC} ipset 不可用（内核缺少 ip_set 模块支持）"
-      echo -e "  ${YELLOW}    Docker 28+ 在此系统上无法运行。${NC}"
+      echo -e "  ${RED}✗${NC} ipset 不可用（内核缺少 ip_set 模块）"
       compat_issues+=("ipset/ip_set 内核模块不可用（Docker 28 强依赖）")
     fi
   fi
-
-  # ── 第四步：检测 IPv6 ──────────────────────────
-  echo -e "\n[4/5] 检测 IPv6 支持..."
-  local ipv6_available="false"
+  echo -e "\n[5/6] 检测 IPv6 与 AppArmor..."
   if _check_ipv6_available; then
     echo -e "  ${GREEN}✓${NC} IPv6 可用"
-    ipv6_available="true"
-    # 尝试加载 ip6tables 相关模块
-    for mod in ip6_tables ip6table_filter ip6table_nat; do
-      _check_module "$mod" 2>/dev/null || true
-    done
+    IPV6_AVAILABLE="true"
   else
-    echo -e "  ${YELLOW}⚠${NC}  IPv6 不可用或已禁用"
-    echo -e "  ${CYAN}[INFO]${NC} 将在 daemon.json 中设置 \"ip6tables\": false 以避免启动报错"
-    ipv6_available="false"
+    echo -e "  ${YELLOW}⚠${NC}  IPv6 不可用，daemon.json 将设置 ip6tables: false"
+    IPV6_AVAILABLE="false"
   fi
-
-  # ── 第五步：综合判断是否需要降级 ──────────────
-  echo -e "\n[5/5] 兼容性综合判断..."
-
-  # 核心降级条件：ipset 不可用 OR raw 表不可用（legacy 模式）
+  _check_apparmor
+  echo -e "\n[6/6] 兼容性综合判断..."
   local need_downgrade="false"
-  if [[ "$ipset_ok" == "false" ]]; then
-    need_downgrade="true"
-    echo -e "  ${RED}✗${NC} ipset 不可用 → 需要降级"
-  fi
-  if [[ "$backend" == "legacy" && "$iptables_ok" == "false" ]]; then
-    need_downgrade="true"
-    echo -e "  ${RED}✗${NC} iptables raw 表不可用（legacy 模式）→ 需要降级"
-  fi
-
+  [[ "$ipset_ok" == "false" ]] && need_downgrade="true"
+  [[ "$backend" == "legacy" && "$iptables_ok" == "false" ]] && need_downgrade="true"
+  [[ "$FORCE_LEGACY_DOCKER" == "true" ]] && need_downgrade="true"
   if [[ "$need_downgrade" == "true" ]]; then
     FORCE_LEGACY_DOCKER="true"
     echo ""
     echo -e "${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}║  ⚠  系统兼容性不满足 Docker 28+ 要求                ║${NC}"
-    echo -e "${YELLOW}║                                                      ║${NC}"
+    echo -e "${YELLOW}║  ⚠  系统不满足 Docker 28+ 要求，将安装兼容版本      ║${NC}"
     for issue in "${compat_issues[@]}"; do
       printf "${YELLOW}║  • %-50s║${NC}\n" "$issue"
     done
-    echo -e "${YELLOW}║                                                      ║${NC}"
-    echo -e "${YELLOW}║  → 将自动安装兼容版本 Docker ${RECOMMENDED_LEGACY_DOCKER_VERSION}          ║${NC}"
-    echo -e "${YELLOW}║  → 该版本无 ipset/raw 表依赖，可在此环境稳定运行    ║${NC}"
+    echo -e "${YELLOW}║  → 将自动安装 Docker ${RECOMMENDED_LEGACY_DOCKER_VERSION}（无 ipset/raw 依赖）  ║${NC}"
     echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
   else
     echo -e "  ${GREEN}✓${NC} 系统满足 Docker 28+ 所有运行条件"
   fi
-
-  # ── 配置内核模块持久化 ──────────────────────────
-  echo ""
-  echo "配置内核模块持久化加载..."
-  local modules_conf="/etc/modules-load.d/docker.conf"
-  if [[ "$FORCE_LEGACY_DOCKER" == "false" ]]; then
-    printf "overlay\nbr_netfilter\nip_set\nip_set_hash_net\n" > "$modules_conf"
-    if [[ "$backend" == "legacy" ]]; then
-      printf "iptable_filter\niptable_nat\niptable_raw\n" >> "$modules_conf"
-      [[ "$ipv6_available" == "true" ]] && printf "ip6_tables\nip6table_filter\nip6table_nat\n" >> "$modules_conf"
+  {
+    echo "overlay"
+    echo "br_netfilter"
+    if [[ "$FORCE_LEGACY_DOCKER" == "false" ]]; then
+      echo "ip_set"
+      echo "ip_set_hash_net"
+      [[ "$backend" == "legacy" ]] && printf "iptable_filter\niptable_nat\niptable_raw\n"
+    else
+      [[ "$backend" == "legacy" ]] && printf "iptable_filter\niptable_nat\n"
     fi
-  else
-    # 降级版本不依赖 ipset 和 raw
-    printf "overlay\nbr_netfilter\n" > "$modules_conf"
-    if [[ "$backend" == "legacy" ]]; then
-      printf "iptable_filter\niptable_nat\n" >> "$modules_conf"
-    fi
-  fi
-
-  # ── 配置 sysctl ─────────────────────────────────
+  } > /etc/modules-load.d/docker.conf
   cat > /etc/sysctl.d/99-docker.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
-
-  # ── 处理 iptables-nft 后端切换（legacy 模式下）────
-  if [[ "$backend" == "nft" ]]; then
-    # nft 模式下不需要切换，保持 iptables-nft 即可
-    echo -e "${GREEN}[INFO] iptables-nft 兼容层模式，无需切换，保持当前设置。${NC}"
-  elif [[ "$backend" == "legacy" ]]; then
-    echo -e "${GREEN}[INFO] iptables legacy 模式，与 Docker 兼容性良好。${NC}"
-  fi
-
-  # 保存 IPv6 可用状态供 daemon.json 生成使用
-  IPV6_AVAILABLE="$ipv6_available"
-
   echo -e "\n${GREEN}Docker 运行环境检测完成。${NC}"
 }
-
-#====================== 【重写】daemon.json 生成 ======================#
-
-# 统一的 daemon.json 写入函数
-# 参数：$1 = mirrors_json (jq array 格式字符串)
-_write_default_daemon_json() {
+_write_daemon_json() {
   local mirrors_json="$1"
-
-  # IPv6 可用性（由 ensure_docker_prereqs 设置）
   local ip6tables_val="true"
-  if [[ "${IPV6_AVAILABLE:-true}" == "false" ]]; then
-    ip6tables_val="false"
+  [[ "${IPV6_AVAILABLE}" == "false" ]] && ip6tables_val="false"
+  local extra_opts="[]"
+  if [[ "${APPARMOR_RESTRICTED}" == "true" ]]; then
+    extra_opts='["apparmor=unconfined"]'
+    echo -e "${YELLOW}[INFO] 检测到 AppArmor 受限（LXC/Docker 29 兼容），已注入 default-security-opt${NC}"
   fi
-
-  # 检测存储驱动
-  local storage_driver="overlay2"
+  local storage_driver_kv=""
   if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+    case "$PKG_MANAGER" in
+      apt-get) apt-get install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
+      dnf|yum) "${PKG_MANAGER}" install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
+    esac
     if command -v fuse-overlayfs >/dev/null 2>&1; then
-      storage_driver="fuse-overlayfs"
+      storage_driver_kv='"storage-driver": "fuse-overlayfs",'
+      echo -e "${YELLOW}[INFO] overlay 不可用，已设置 storage-driver: fuse-overlayfs${NC}"
     fi
   fi
-
-  local daemon_json
-  if [[ "$storage_driver" == "fuse-overlayfs" ]]; then
-    daemon_json=$(cat <<EOF
-{
-  "iptables": true,
-  "ip6tables": ${ip6tables_val},
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "storage-driver": "fuse-overlayfs",
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-file": "3" },
-  "registry-mirrors": ${mirrors_json}
-}
-EOF
-)
-  else
-    daemon_json=$(cat <<EOF
-{
-  "iptables": true,
-  "ip6tables": ${ip6tables_val},
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-file": "3" },
-  "registry-mirrors": ${mirrors_json}
-}
-EOF
-)
-  fi
-
   mkdir -p /etc/docker
+  local daemon_json
+  daemon_json=$(jq -n \
+    --argjson mirrors "$mirrors_json" \
+    --argjson ip6t "$ip6tables_val" \
+    --argjson secopt "$extra_opts" \
+    '{
+      "iptables": true,
+      "ip6tables": $ip6t,
+      "exec-opts": ["native.cgroupdriver=systemd"],
+      "log-driver": "json-file",
+      "log-opts": {"max-size": "10m", "max-file": "3"},
+      "registry-mirrors": $mirrors,
+      "default-security-opt": $secopt
+    }')
+  if [[ -n "$storage_driver_kv" ]]; then
+    daemon_json=$(echo "$daemon_json" | jq '. + {"storage-driver": "fuse-overlayfs"}')
+  fi
+  if [[ "$extra_opts" == "[]" ]]; then
+    daemon_json=$(echo "$daemon_json" | jq 'del(."default-security-opt")')
+  fi
   echo "$daemon_json" > /etc/docker/daemon.json
-  echo -e "${GREEN}daemon.json 已写入 (ip6tables: ${ip6tables_val}, storage: ${storage_driver})${NC}"
+  echo -e "${GREEN}daemon.json 已写入 (ip6tables: ${ip6tables_val})${NC}"
 }
-
 ensure_daemon_json() {
   mkdir -p /etc/docker
   if [[ ! -s /etc/docker/daemon.json ]]; then
     local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
     if [[ -n "$PROXY_MIRROR_URL" ]]; then
       local exists="false"
-      for m in "${mirrors[@]}"; do
-        [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
-      done
+      for m in "${mirrors[@]}"; do [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break; done
       [[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
     fi
     local mirrors_json
     mirrors_json=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
-    _write_default_daemon_json "$mirrors_json"
+    _write_daemon_json "$mirrors_json"
   else
-    # ── 检查并修正已存在 daemon.json 的 ip6tables 字段 ──
-    if [[ "${IPV6_AVAILABLE:-true}" == "false" ]]; then
-      if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
-        local cur_ip6
-        cur_ip6=$(jq -r '."ip6tables" // "true"' /etc/docker/daemon.json)
-        if [[ "$cur_ip6" == "true" ]]; then
-          echo -e "${YELLOW}[FIX] 系统无 IPv6，自动修正 daemon.json 中的 ip6tables 为 false${NC}"
-          backup_daemon_json
-          local tmp
-          tmp=$(mktemp)
-          jq '. + {"ip6tables": false}' /etc/docker/daemon.json > "$tmp" \
-            && mv "$tmp" /etc/docker/daemon.json
-        fi
+    if [[ "${IPV6_AVAILABLE}" == "false" ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+      local cur_ip6
+      cur_ip6=$(jq -r '."ip6tables" // "true"' /etc/docker/daemon.json)
+      if [[ "$cur_ip6" == "true" ]]; then
+        echo -e "${YELLOW}[FIX] 系统无 IPv6，自动修正 ip6tables 为 false${NC}"
+        backup_daemon_json
+        local tmp; tmp=$(mktemp)
+        jq '. + {"ip6tables": false}' /etc/docker/daemon.json > "$tmp" \
+          && mv "$tmp" /etc/docker/daemon.json
       fi
     fi
-
-    # ── 检查 fuse-overlayfs ──
+    if [[ "${APPARMOR_RESTRICTED}" == "true" ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+      local cur_secopt
+      cur_secopt=$(jq -r '."default-security-opt" // []' /etc/docker/daemon.json)
+      if ! echo "$cur_secopt" | grep -q 'apparmor=unconfined'; then
+        echo -e "${YELLOW}[FIX] 注入 apparmor=unconfined 到 default-security-opt${NC}"
+        backup_daemon_json
+        local tmp; tmp=$(mktemp)
+        jq '. + {"default-security-opt": ["apparmor=unconfined"]}' \
+          /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+      fi
+    fi
     if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
       case "$PKG_MANAGER" in
         apt-get) apt-get install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
         dnf|yum) "${PKG_MANAGER}" install -y fuse-overlayfs >/dev/null 2>&1 || true ;;
       esac
-      if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
-        local tmp
-        tmp=$(mktemp)
-        jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" \
-          && mv "$tmp" /etc/docker/daemon.json
-        echo -e "${YELLOW}[FIX] 已设置 storage-driver: fuse-overlayfs${NC}"
+      if command -v fuse-overlayfs >/dev/null 2>&1 && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+        local cur_storage
+        cur_storage=$(jq -r '."storage-driver" // ""' /etc/docker/daemon.json)
+        if [[ -z "$cur_storage" ]]; then
+          local tmp; tmp=$(mktemp)
+          jq '. + {"storage-driver":"fuse-overlayfs"}' /etc/docker/daemon.json > "$tmp" \
+            && mv "$tmp" /etc/docker/daemon.json
+          echo -e "${YELLOW}[FIX] 已设置 storage-driver: fuse-overlayfs${NC}"
+        fi
       fi
     fi
   fi
 }
-
-#====================== 版本获取/选择 ======================#
-
+_write_docker_service() {
+  cat > /etc/systemd/system/docker.service <<'EOF'
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target firewalld.service
+Wants=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+[Install]
+WantedBy=multi-user.target
+EOF
+  echo -e "${GREEN}docker.service 已写入（静态二进制版，无 containerd 依赖）${NC}"
+}
+_write_docker_socket() {
+  cat > /etc/systemd/system/docker.socket <<'EOF'
+[Unit]
+Description=Docker Socket for the API
+PartOf=docker.service
+[Socket]
+ListenStream=/var/run/docker.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=docker
+[Install]
+WantedBy=sockets.target
+EOF
+  echo -e "${GREEN}docker.socket 已写入${NC}"
+}
 fetch_docker_versions() {
   local CACHE_FILE="/tmp/docker_versions_cache"
   if [[ -f "$CACHE_FILE" && \
@@ -830,7 +742,6 @@ fetch_docker_versions() {
   echo "$VERSIONS" > "$CACHE_FILE"
   echo "$VERSIONS"
 }
-
 select_version() {
   local VERSIONS=("$@")
   if command -v fzf >/dev/null 2>&1; then
@@ -845,24 +756,22 @@ select_version() {
       echo "${VERSIONS[0]}"; return
     fi
   fi
-
   echo "可用版本列表:" >&2
-  PS3="请选择版本 (默认 1 为最新): "
-  select VERSION in "${VERSIONS[@]}" "取消"; do
-    case $REPLY in
-      ''|1) echo "${VERSIONS[0]}"; return ;;
-      *)
-        if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 2 && REPLY <= ${#VERSIONS[@]} )); then
-          echo "${VERSIONS[$((REPLY-1))]}"; return
-        else
-          echo -e "${YELLOW}无效选择，使用最新版本...${NC}" >&2
-          echo "${VERSIONS[0]}"; return
-        fi
-        ;;
-    esac
+  local i=1
+  for v in "${VERSIONS[@]}"; do
+    printf "  %3d) %s\n" "$i" "$v" >&2
+    ((i++))
   done
+  read -r -p "请输入序号 (回车默认选 1 最新版): " REPLY
+  if [[ -z "$REPLY" || "$REPLY" == "1" ]]; then
+    echo "${VERSIONS[0]}"
+  elif [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= ${#VERSIONS[@]} )); then
+    echo "${VERSIONS[$((REPLY-1))]}"
+  else
+    echo -e "${YELLOW}无效选择，使用最新版本...${NC}" >&2
+    echo "${VERSIONS[0]}"
+  fi
 }
-
 fetch_docker_compose_versions() {
   local VERSIONS
   VERSIONS=$(curl -s --connect-timeout 15 "$COMPOSE_RELEASES_URL" \
@@ -872,9 +781,6 @@ fetch_docker_compose_versions() {
   fi
   echo "$VERSIONS"
 }
-
-#====================== daemon.json 备份与回滚 ======================#
-
 backup_daemon_json() {
   [[ -f /etc/docker/daemon.json ]] || return 0
   mkdir -p "$DAEMON_BACKUP_DIR"
@@ -885,48 +791,39 @@ backup_daemon_json() {
     echo -e "${RED}备份失败${NC}"
   fi
 }
-
 restore_daemon_json() {
   mkdir -p "$DAEMON_BACKUP_DIR"
   local backups=()
   while IFS= read -r -d '' f; do
     backups+=("$f")
   done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
-
   if [[ ${#backups[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}暂无备份文件，请先执行备份操作。${NC}"; return
+    echo -e "${YELLOW}暂无备份文件。${NC}"; return
   fi
-
   echo -e "${CYAN}可用的备份列表：${NC}"
   local i=1
   for f in "${backups[@]}"; do
     echo "  $i) $(basename "$f")  ($(stat -c %y "$f" 2>/dev/null | cut -d. -f1))"
     ((i++))
   done
-
   read -r -p "请输入要回滚的备份编号 (回车取消): " IDX
-  [[ -z "$IDX" ]] && { echo -e "${YELLOW}已取消回滚。${NC}"; return; }
+  [[ -z "$IDX" ]] && { echo -e "${YELLOW}已取消。${NC}"; return; }
   if ! [[ "$IDX" =~ ^[0-9]+$ ]] || (( IDX < 1 || IDX > ${#backups[@]} )); then
     echo -e "${RED}无效编号。${NC}"; return
   fi
-
   local selected="${backups[$((IDX-1))]}"
   backup_daemon_json
-  if cp "$selected" /etc/docker/daemon.json; then
-    echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}"
-  else
-    echo -e "${RED}回滚失败${NC}"; return
-  fi
-
+  cp "$selected" /etc/docker/daemon.json && \
+    echo -e "${GREEN}已回滚至: $(basename "$selected")${NC}" || \
+    { echo -e "${RED}回滚失败${NC}"; return; }
   if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
     echo -e "${GREEN}daemon.json 格式校验通过。${NC}"
-    read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
+    read -r -p "是否立即重启 Docker？(y/n): " DORESTART
     [[ "$DORESTART" == "y" ]] && _restart_docker
   else
-    echo -e "${RED}警告：回滚后的 daemon.json 格式不正确，请检查！${NC}"
+    echo -e "${RED}警告：回滚后的 daemon.json 格式不正确！${NC}"
   fi
 }
-
 manage_daemon_json() {
   while true; do
     echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
@@ -942,13 +839,11 @@ manage_daemon_json() {
       1) backup_daemon_json ;;
       2)
         local backups=()
-        while IFS= read -r -d '' f; do
-          backups+=("$f")
+        while IFS= read -r -d '' f; do backups+=("$f")
         done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
         if [[ ${#backups[@]} -eq 0 ]]; then
           echo -e "${YELLOW}暂无备份。${NC}"
         else
-          echo -e "${CYAN}现有备份：${NC}"
           for f in "${backups[@]}"; do
             echo "  - $(basename "$f")  ($(stat -c %y "$f" 2>/dev/null | cut -d. -f1))"
           done
@@ -957,74 +852,58 @@ manage_daemon_json() {
       3) restore_daemon_json ;;
       4)
         local backups=()
-        while IFS= read -r -d '' f; do
-          backups+=("$f")
+        while IFS= read -r -d '' f; do backups+=("$f")
         done < <(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" -print0 2>/dev/null | sort -z)
         if [[ ${#backups[@]} -eq 0 ]]; then
           echo -e "${YELLOW}暂无备份。${NC}"
         else
           local i=1
-          for f in "${backups[@]}"; do
-            echo "  $i) $(basename "$f")"; ((i++))
-          done
+          for f in "${backups[@]}"; do echo "  $i) $(basename "$f")"; ((i++)); done
           read -r -p "请输入要删除的编号 (回车取消): " DIDX
           if [[ "$DIDX" =~ ^[0-9]+$ ]] && (( DIDX >= 1 && DIDX <= ${#backups[@]} )); then
             rm -f "${backups[$((DIDX-1))]}" && \
-              echo -e "${GREEN}已删除备份。${NC}" || echo -e "${RED}删除失败。${NC}"
+              echo -e "${GREEN}已删除。${NC}" || echo -e "${RED}删除失败。${NC}"
           else
             echo -e "${YELLOW}已取消。${NC}"
           fi
         fi
         ;;
       0) break ;;
-      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+      *) echo -e "${RED}无效选择。${NC}" ;;
     esac
   done
 }
-
-#====================== Docker 服务管理 ======================#
-
 _start_docker() {
   echo -e "${CYAN}正在启动 Docker 服务...${NC}"
   if systemctl start docker; then
     echo -e "${GREEN}Docker 服务已启动。${NC}"
   else
-    echo -e "${RED}Docker 服务启动失败，正在输出详细日志...${NC}"
-    journalctl -u docker -n 30 --no-pager 2>/dev/null || true
-    echo -e "${YELLOW}提示：若为 iptables/ipset 相关错误，请通过主菜单选项 1 重新安装 Docker。${NC}"
+    echo -e "${RED}Docker 服务启动失败，输出近期日志：${NC}"
+    journalctl -u docker -n 40 --no-pager 2>/dev/null || true
   fi
 }
-
 _stop_docker() {
-  echo -e "${CYAN}正在停止 Docker 服务...${NC}"
-  read -r -p "停止 Docker 会中断所有运行中容器，确认继续？(y/n): " CONFIRM
+  read -r -p "停止 Docker 会中断所有运行中容器，确认？(y/n): " CONFIRM
   [[ "$CONFIRM" != "y" ]] && { echo -e "${YELLOW}已取消。${NC}"; return; }
-  if systemctl stop docker; then
-    echo -e "${GREEN}Docker 服务已停止。${NC}"
-  else
-    echo -e "${RED}Docker 服务停止失败。${NC}"
-  fi
+  systemctl stop docker && echo -e "${GREEN}已停止。${NC}" || echo -e "${RED}停止失败。${NC}"
 }
-
 _restart_docker() {
   echo -e "${CYAN}正在重启 Docker 服务...${NC}"
   if systemctl restart docker; then
     echo -e "${GREEN}Docker 服务已重启。${NC}"
   else
-    echo -e "${RED}Docker 服务重启失败，正在输出详细日志...${NC}"
-    journalctl -u docker -n 30 --no-pager 2>/dev/null || true
+    echo -e "${RED}重启失败，输出近期日志：${NC}"
+    journalctl -u docker -n 40 --no-pager 2>/dev/null || true
   fi
 }
-
 manage_docker_service() {
   if ! command -v docker >/dev/null 2>&1; then
     echo -e "${RED}Docker 未安装，无法进行服务管理。${NC}"; return
   fi
   while true; do
     local svc_status svc_enabled
-    svc_status=$(systemctl is-active docker 2>/dev/null)
-    svc_enabled=$(systemctl is-enabled docker 2>/dev/null)
-
+    svc_status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
+    svc_enabled=$(systemctl is-enabled docker 2>/dev/null || echo "disabled")
     echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║          Docker 服务管理                 ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
@@ -1039,7 +918,7 @@ manage_docker_service() {
     echo "  3. 重启 Docker"
     echo "  4. 开启开机自启"
     echo "  5. 关闭开机自启"
-    echo "  6. 查看实时日志（最近 50 行）"
+    echo "  6. 查看服务日志（最近 50 行）"
     echo "  0. 返回主菜单"
     echo -e "${CYAN}──────────────────────────────────────────${NC}"
     read -r -p "请选择操作: " SCHOICE
@@ -1051,24 +930,17 @@ manage_docker_service() {
            echo -e "${GREEN}已开启开机自启。${NC}" || echo -e "${RED}操作失败。${NC}" ;;
       5) systemctl disable docker >/dev/null 2>&1 && \
            echo -e "${GREEN}已关闭开机自启。${NC}" || echo -e "${RED}操作失败。${NC}" ;;
-      6)
-        echo -e "${CYAN}--- Docker 服务日志（最近 50 行）---${NC}"
-        journalctl -u docker -n 50 --no-pager 2>/dev/null || \
-          echo -e "${RED}无法读取 Docker 日志。${NC}"
-        ;;
+      6) journalctl -u docker -n 50 --no-pager 2>/dev/null || \
+           echo -e "${RED}无法读取 Docker 日志。${NC}" ;;
       0) break ;;
-      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+      *) echo -e "${RED}无效选择。${NC}" ;;
     esac
   done
 }
-
-#====================== Docker 状态仪表盘 ======================#
-
 show_docker_status() {
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}${CYAN}║           Docker 状态仪表盘              ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
-
   echo -e "\n${BOLD}[ 安装状态 ]${NC}"
   if command -v docker >/dev/null 2>&1; then
     echo -e "  Docker:         ${GREEN}已安装 $(docker --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
@@ -1085,23 +957,30 @@ show_docker_status() {
   else
     echo -e "  Compose 插件:   ${YELLOW}未安装${NC}"
   fi
-
-  echo -e "\n${BOLD}[ 内核兼容性速览 ]${NC}"
-  local ipset_ok="✗ 不可用"
+  echo -e "\n${BOLD}[ 环境速览 ]${NC}"
+  echo -e "  虚拟化环境: LXC=${IS_LXC} / OpenVZ=${IS_OPENVZ}"
+  echo -e "  AppArmor 受限: ${APPARMOR_RESTRICTED}"
   if command -v ipset >/dev/null 2>&1 && ipset list >/dev/null 2>&1; then
-    ipset_ok="✓ 可用"
+    echo -e "  ipset (Docker 28+): ${GREEN}✓ 可用${NC}"
+  else
+    echo -e "  ipset (Docker 28+): ${RED}✗ 不可用${NC}"
   fi
-  echo -e "  ipset (Docker 28+): $ipset_ok"
-  local raw_ok="✗ 不可用"
   if iptables -t raw -L >/dev/null 2>&1; then
-    raw_ok="✓ 可用"
+    echo -e "  iptables raw 表:    ${GREEN}✓ 可用${NC}"
+  else
+    echo -e "  iptables raw 表:    ${YELLOW}⚠ 不可用${NC}"
   fi
-  echo -e "  iptables raw 表:    $raw_ok"
-  echo -e "  iptables 后端:      $(_detect_iptables_backend)"
-  local ipv6_status="不可用"
-  _check_ipv6_available && ipv6_status="可用"
-  echo -e "  IPv6:               $ipv6_status"
-
+  echo -e "  iptables 后端:      ${CYAN}$(_detect_iptables_backend)${NC}"
+  if _check_ipv6_available; then
+    echo -e "  IPv6:               ${GREEN}可用${NC}"
+  else
+    echo -e "  IPv6:               ${YELLOW}不可用${NC}"
+  fi
+  if grep -qw overlay /proc/filesystems 2>/dev/null; then
+    echo -e "  overlay 文件系统:   ${GREEN}✓ 可用${NC}"
+  else
+    echo -e "  overlay 文件系统:   ${YELLOW}⚠ 不可用${NC}"
+  fi
   echo -e "\n${BOLD}[ 服务状态 ]${NC}"
   local svc_status svc_enabled
   svc_status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
@@ -1112,7 +991,6 @@ show_docker_status() {
   [[ "$svc_enabled" == "enabled" ]] \
     && echo -e "  开机自启: ${GREEN}已开启${NC}" \
     || echo -e "  开机自启: ${YELLOW}${svc_enabled}${NC}"
-
   if [[ "$svc_status" == "active" ]] && command -v docker >/dev/null 2>&1; then
     echo -e "\n${BOLD}[ 运行时资源 ]${NC}"
     local total_c running_c stopped_c
@@ -1123,10 +1001,8 @@ show_docker_status() {
     echo -e "  镜像: $(docker images -q 2>/dev/null | wc -l) 个"
     echo -e "  数据卷: $(docker volume ls -q 2>/dev/null | wc -l) 个"
     echo -e "  网络: $(docker network ls -q 2>/dev/null | wc -l) 个"
-
     echo -e "\n${BOLD}[ 磁盘占用 ]${NC}"
     docker system df 2>/dev/null | while IFS= read -r line; do echo "  $line"; done
-
     local running_list
     running_list=$(docker ps --format \
       "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
@@ -1135,90 +1011,53 @@ show_docker_status() {
       echo "$running_list" | while IFS= read -r line; do echo "  $line"; done
     fi
   fi
-
-  echo -e "\n${BOLD}[ 镜像加速源 ]${NC}"
-  echo -e "  ${CYAN}脚本内置默认源（共 ${#REGISTRY_MIRRORS_DEFAULT[@]} 个，2026-08 更新）:${NC}"
-  for m in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
-    echo -e "    ${CYAN}• ${m}${NC}"
-  done
-  echo -e "  ${CYAN}代理后备源:${NC} ${YELLOW}${PROXY_MIRROR_URL:-未配置}${NC}"
-
   echo -e "\n${BOLD}[ daemon.json 配置 ]${NC}"
   if [[ -f /etc/docker/daemon.json ]]; then
     if jq . /etc/docker/daemon.json >/dev/null 2>&1; then
-      echo -e "  状态:     ${GREEN}存在，格式合法${NC}"
-      local mirrors storage log_driver data_root ip6tables_val
+      echo -e "  状态: ${GREEN}存在，格式合法${NC}"
+      local mirrors storage log_driver ip6t secopt
       mirrors=$(jq -r '.["registry-mirrors"][]? // empty' /etc/docker/daemon.json 2>/dev/null)
       storage=$(jq -r '."storage-driver" // "overlay2 (默认)"' /etc/docker/daemon.json 2>/dev/null)
       log_driver=$(jq -r '."log-driver" // "json-file (默认)"' /etc/docker/daemon.json 2>/dev/null)
-      data_root=$(jq -r '."data-root" // "/var/lib/docker (默认)"' /etc/docker/daemon.json 2>/dev/null)
-      ip6tables_val=$(jq -r '."ip6tables" // "true (默认)"' /etc/docker/daemon.json 2>/dev/null)
-      if [[ -n "$mirrors" ]]; then
+      ip6t=$(jq -r '."ip6tables" // "true (默认)"' /etc/docker/daemon.json 2>/dev/null)
+      secopt=$(jq -r '."default-security-opt" // [] | join(",")' /etc/docker/daemon.json 2>/dev/null)
+      [[ -n "$mirrors" ]] && {
         echo -e "  镜像加速:"
         while IFS= read -r m; do echo -e "    ${CYAN}• ${m}${NC}"; done <<< "$mirrors"
-      else
-        echo -e "  镜像加速: ${YELLOW}未配置${NC}"
-      fi
+      } || echo -e "  镜像加速: ${YELLOW}未配置${NC}"
       echo -e "  存储驱动: ${CYAN}${storage}${NC}"
       echo -e "  日志驱动: ${CYAN}${log_driver}${NC}"
-      echo -e "  数据目录: ${CYAN}${data_root}${NC}"
-      echo -e "  ip6tables: ${CYAN}${ip6tables_val}${NC}"
+      echo -e "  ip6tables: ${CYAN}${ip6t}${NC}"
+      [[ -n "$secopt" ]] && echo -e "  default-security-opt: ${CYAN}${secopt}${NC}"
     else
-      echo -e "  状态:     ${RED}存在，但 JSON 格式错误！${NC}"
+      echo -e "  状态: ${RED}存在，但 JSON 格式错误！${NC}"
     fi
-    local bak_count
-    bak_count=$(find "$DAEMON_BACKUP_DIR" -maxdepth 1 -name "daemon.json.*" 2>/dev/null | wc -l)
-    echo -e "  备份数量: ${bak_count} 个（目录: ${DAEMON_BACKUP_DIR}）"
   else
-    echo -e "  状态:     ${YELLOW}daemon.json 不存在${NC}"
+    echo -e "  状态: ${YELLOW}daemon.json 不存在${NC}"
   fi
-
   echo -e "\n${BOLD}[ 系统信息 ]${NC}"
-  echo -e "  架构:   $(uname -m)"
-  echo -e "  内核:   $(uname -r)"
-  echo -e "  系统:   $(get_os_version 2>/dev/null)"
+  echo -e "  架构: $(uname -m)  |  内核: $(uname -r)"
+  echo -e "  系统: $(get_os_version 2>/dev/null)"
   local mem_total mem_free
   mem_total=$(free -m 2>/dev/null | awk '/^Mem/{print $2}')
   mem_free=$(free -m 2>/dev/null | awk '/^Mem/{print $4}')
-  echo -e "  内存:   已用 $((mem_total - mem_free))MB / 共 ${mem_total}MB"
-  echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | \
-    awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
-
-  echo -e "\n${BOLD}[ 日志信息 ]${NC}"
-  if [[ -f "$LOG_FILE" ]]; then
-    local log_size log_bak
-    log_size=$(du -sh "$LOG_FILE" 2>/dev/null | awk '{print $1}')
-    log_bak=$(find "$LOG_DIR" -maxdepth 1 -name "*.gz" 2>/dev/null | wc -l)
-    echo -e "  当前日志: ${log_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
-    echo -e "  历史备份: ${log_bak} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
-    echo -e "  日志路径: ${LOG_FILE}"
-  else
-    echo -e "  ${YELLOW}日志文件不存在${NC}"
-  fi
-
+  echo -e "  内存: 已用 $((mem_total - mem_free))MB / 共 ${mem_total}MB"
+  echo -e "  根分区: $(df -h / 2>/dev/null | tail -1 | awk '{print "已用 "$3" / 共 "$2" ("$5" used)"}')"
   echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
 }
-
-#====================== 日志管理菜单 ======================#
-
 _human_size() {
   du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "未知"
 }
-
 manage_logs() {
   while true; do
-    local current_size="N/A" total_size="N/A" backup_count=0
+    local current_size="N/A" backup_count=0 total_size="N/A"
     [[ -f "$LOG_FILE" ]] && current_size=$(_human_size "$LOG_FILE")
     backup_count=$(find "$LOG_DIR" -maxdepth 1 -name "*.gz" 2>/dev/null | wc -l)
     [[ -d "$LOG_DIR" ]] && total_size=$(_human_size "$LOG_DIR")
-
     echo -e "\n${CYAN}╔══════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              日志管理                    ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
-    echo -e "  日志目录:   ${LOG_DIR}"
-    echo -e "  当前日志:   ${current_size}  (上限: ${LOG_MAX_SIZE_MB}MB)"
-    echo -e "  历史备份:   ${backup_count} 个  (上限: ${LOG_MAX_BACKUPS} 个)"
-    echo -e "  目录总占用: ${total_size}"
+    echo -e "  日志目录: ${LOG_DIR}  当前: ${current_size}  备份: ${backup_count} 个  总计: ${total_size}"
     echo -e "${CYAN}──────────────────────────────────────────${NC}"
     echo "  1. 查看当前日志（最后 50 行）"
     echo "  2. 查看所有历史备份"
@@ -1226,137 +1065,101 @@ manage_logs() {
     echo "  4. 清空当前日志"
     echo "  5. 删除所有历史备份（保留当前）"
     echo "  6. 删除全部日志（当前 + 历史）"
-    echo "  7. 修改日志策略（大小上限 / 保留数量）"
+    echo "  7. 修改日志策略"
     echo "  0. 返回主菜单"
     echo -e "${CYAN}──────────────────────────────────────────${NC}"
     read -r -p "请选择操作: " LCHOICE
-
     case "$LCHOICE" in
       1)
-        if [[ ! -f "$LOG_FILE" ]]; then
-          echo -e "${YELLOW}当前日志文件不存在。${NC}"
-        else
-          echo -e "${CYAN}── 当前日志（最后 50 行）──${NC}"
-          tail -n 50 "$LOG_FILE"
-          echo -e "${CYAN}────────────────────────────${NC}"
-        fi
+        [[ ! -f "$LOG_FILE" ]] && { echo -e "${YELLOW}日志文件不存在。${NC}"; continue; }
+        tail -n 50 "$LOG_FILE"
         ;;
       2)
         local backups=()
-        while IFS= read -r -d '' f; do
-          backups+=("$f")
+        while IFS= read -r -d '' f; do backups+=("$f")
         done < <(find "$LOG_DIR" -maxdepth 1 -name "*.gz" -print0 2>/dev/null | sort -z)
         if [[ ${#backups[@]} -eq 0 ]]; then
           echo -e "${YELLOW}暂无历史备份。${NC}"
         else
-          echo -e "${CYAN}历史备份列表：${NC}"
           local i=1
           for f in "${backups[@]}"; do
             printf "  %2d) %-45s  %s\n" "$i" "$(basename "$f")" "$(_human_size "$f")"
             ((i++))
           done
-          read -r -p "是否查看某个备份内容？输入编号（回车跳过）: " BIDX
+          read -r -p "输入编号查看内容（回车跳过）: " BIDX
           if [[ "$BIDX" =~ ^[0-9]+$ ]] && (( BIDX >= 1 && BIDX <= ${#backups[@]} )); then
-            echo -e "${CYAN}── 备份内容（最后 50 行）──${NC}"
             zcat "${backups[$((BIDX-1))]}" 2>/dev/null | tail -n 50
           fi
         fi
         ;;
       3)
         local old_max=$LOG_MAX_SIZE_MB
-        LOG_MAX_SIZE_MB=0
-        rotate_log
-        LOG_MAX_SIZE_MB=$old_max
+        LOG_MAX_SIZE_MB=0; rotate_log; LOG_MAX_SIZE_MB=$old_max
         echo -e "${GREEN}手动轮转完成。${NC}"
         ;;
       4)
-        read -r -p "确认清空当前日志内容？操作不可恢复 (y/n): " CONFIRM
+        read -r -p "确认清空当前日志？(y/n): " CONFIRM
         if [[ "$CONFIRM" == "y" ]]; then
           : > "$LOG_FILE"
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日志已手动清空。" >> "$LOG_FILE"
-          echo -e "${GREEN}当前日志已清空。${NC}"
-        else
-          echo -e "${YELLOW}已取消。${NC}"
+          echo -e "${GREEN}已清空。${NC}"
         fi
         ;;
       5)
         local gz_files=()
-        while IFS= read -r -d '' f; do
-          gz_files+=("$f")
+        while IFS= read -r -d '' f; do gz_files+=("$f")
         done < <(find "$LOG_DIR" -maxdepth 1 -name "*.gz" -print0 2>/dev/null)
         if [[ ${#gz_files[@]} -eq 0 ]]; then
-          echo -e "${YELLOW}没有历史备份文件。${NC}"
+          echo -e "${YELLOW}没有历史备份。${NC}"
         else
           read -r -p "确认删除 ${#gz_files[@]} 个历史备份？(y/n): " CONFIRM
-          [[ "$CONFIRM" == "y" ]] && rm -f "${gz_files[@]}" && \
-            echo -e "${GREEN}已删除所有历史备份。${NC}" || echo -e "${YELLOW}已取消。${NC}"
+          [[ "$CONFIRM" == "y" ]] && rm -f "${gz_files[@]}" && echo -e "${GREEN}已删除。${NC}"
         fi
         ;;
       6)
-        read -r -p "确认删除所有日志（含当前 + 历史）？操作不可恢复 (y/n): " CONFIRM
+        read -r -p "确认删除全部日志？不可恢复 (y/n): " CONFIRM
         if [[ "$CONFIRM" == "y" ]]; then
           find "$LOG_DIR" -maxdepth 1 -name "*.gz" -delete 2>/dev/null
           : > "$LOG_FILE"
-          echo "[$(date '+%Y-%m-%d %H:%M:%S')] 所有日志已清除。" >> "$LOG_FILE"
-          echo -e "${GREEN}所有日志已清除。${NC}"
-        else
-          echo -e "${YELLOW}已取消。${NC}"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] 全部日志已清除。" >> "$LOG_FILE"
+          echo -e "${GREEN}已清除。${NC}"
         fi
         ;;
       7)
-        echo -e "${CYAN}当前策略: 单文件上限 ${LOG_MAX_SIZE_MB}MB，保留 ${LOG_MAX_BACKUPS} 个备份${NC}"
-        read -r -p "新的单文件大小上限 MB（当前 ${LOG_MAX_SIZE_MB}，回车不改）: " NEW_SIZE
-        if [[ "$NEW_SIZE" =~ ^[0-9]+$ ]] && (( NEW_SIZE > 0 )); then
-          LOG_MAX_SIZE_MB=$NEW_SIZE
-          echo -e "${GREEN}大小上限已更新为 ${LOG_MAX_SIZE_MB}MB${NC}"
-        elif [[ -n "$NEW_SIZE" ]]; then
-          echo -e "${RED}无效输入，保持原值 ${LOG_MAX_SIZE_MB}MB${NC}"
-        fi
-        read -r -p "新的历史备份保留数量（当前 ${LOG_MAX_BACKUPS}，回车不改）: " NEW_BACKUPS
-        if [[ "$NEW_BACKUPS" =~ ^[0-9]+$ ]] && (( NEW_BACKUPS >= 1 )); then
-          LOG_MAX_BACKUPS=$NEW_BACKUPS
-          echo -e "${GREEN}保留数量已更新为 ${LOG_MAX_BACKUPS} 个${NC}"
-        elif [[ -n "$NEW_BACKUPS" ]]; then
-          echo -e "${RED}无效输入，保持原值 ${LOG_MAX_BACKUPS} 个${NC}"
-        fi
-        echo -e "${YELLOW}注意：策略修改仅对本次会话有效。如需永久生效，请修改脚本顶部变量。${NC}"
+        echo -e "${CYAN}当前: 单文件上限 ${LOG_MAX_SIZE_MB}MB，保留 ${LOG_MAX_BACKUPS} 个${NC}"
+        read -r -p "新大小上限 MB（回车不改）: " NEW_SIZE
+        [[ "$NEW_SIZE" =~ ^[1-9][0-9]*$ ]] && LOG_MAX_SIZE_MB=$NEW_SIZE && \
+          echo -e "${GREEN}已更新为 ${LOG_MAX_SIZE_MB}MB${NC}"
+        read -r -p "新保留数量（回车不改）: " NEW_BACKUPS
+        [[ "$NEW_BACKUPS" =~ ^[1-9][0-9]*$ ]] && LOG_MAX_BACKUPS=$NEW_BACKUPS && \
+          echo -e "${GREEN}已更新为 ${LOG_MAX_BACKUPS} 个${NC}"
+        echo -e "${YELLOW}注意：仅本次会话有效，永久生效请修改脚本顶部变量。${NC}"
         ;;
       0) break ;;
-      *) echo -e "${RED}无效的选择，请重试。${NC}" ;;
+      *) echo -e "${RED}无效选择。${NC}" ;;
     esac
   done
 }
-
-#====================== 核心：安装/卸载 ======================#
-
 install_docker() {
   if check_docker_installed; then
     read -r -p "Docker 已安装，是否重新安装？(y/n): " REINSTALL
     [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker 安装。${NC}"; return; }
   fi
-
-  # ── 前置环境检测（含 ipset、raw 表、IPv6、iptables 后端）──
   ensure_docker_prereqs
   ARCH=$(get_architecture)
   check_and_set_install_dir
-
   local VERSION
   if [[ "$FORCE_LEGACY_DOCKER" == "true" ]]; then
     echo ""
-    echo -e "${YELLOW}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}║  将安装兼容版本 Docker ${RECOMMENDED_LEGACY_DOCKER_VERSION}                 ║${NC}"
-    echo -e "${YELLOW}║  原因: 系统内核不满足 Docker 28+ 要求            ║${NC}"
-    echo -e "${YELLOW}║  此版本无 ipset/raw 表依赖，可稳定运行           ║${NC}"
-    echo -e "${YELLOW}╚══════════════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}将安装兼容版本 Docker ${RECOMMENDED_LEGACY_DOCKER_VERSION}${NC}"
     VERSION="$RECOMMENDED_LEGACY_DOCKER_VERSION"
     local available_versions
     available_versions=$(fetch_docker_versions)
-    if ! echo "$available_versions" | grep -q "^${VERSION}$"; then
-      echo -e "${YELLOW}推荐版本 ${VERSION} 不在列表中，尝试查找最近可用版本...${NC}"
-      # 找到最接近的 27.x 版本
+    if ! echo "$available_versions" | grep -qx "${VERSION}"; then
+      echo -e "${YELLOW}${VERSION} 不在列表中，查找最近的 27.x 版本...${NC}"
       VERSION=$(echo "$available_versions" | grep "^27\." | head -1)
       if [[ -z "$VERSION" ]]; then
-        echo -e "${RED}无法找到兼容版本，安装中止。${NC}"; exit 1
+        echo -e "${RED}无法找到兼容的 27.x 版本，安装中止。${NC}"; exit 1
       fi
       echo -e "${YELLOW}将使用: ${VERSION}${NC}"
     fi
@@ -1366,152 +1169,93 @@ install_docker() {
     VERSION=$(select_version "${VERSIONS_ARR[@]}")
     [[ -z "$VERSION" ]] && { echo -e "${RED}未获得版本号${NC}"; exit 1; }
   fi
-
   echo -e "${GREEN}选择的 Docker 版本：$VERSION${NC}"
   DOCKER_URL="${DOCKER_VERSIONS_URL}${ARCH}/docker-${VERSION}.tgz"
-
   if ! download_with_fallback "$DOCKER_URL" "$DOCKER_INSTALL_DIR/docker.tgz"; then
-    echo -e "${RED}所有下载方式均失败，请检查网络后重试。${NC}"
-    rm -rf "$DOCKER_INSTALL_DIR"; exit 1
+    echo -e "${RED}所有下载方式均失败。${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1
   fi
-
   echo "解压 Docker 包..."
   tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || {
     echo -e "${RED}解压失败${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; exit 1; }
-
   echo "安装 Docker 二进制到 /usr/local/bin ..."
   chown root:root "$DOCKER_INSTALL_DIR/docker/"*
   mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ || {
     echo -e "${RED}移动文件失败${NC}"; exit 1; }
-
   groupadd -f docker
   CURRENT_USER="${SUDO_USER:-$USER}"
   if [[ -n "$CURRENT_USER" && "$CURRENT_USER" != "root" ]]; then
     gpasswd -a "$CURRENT_USER" docker >/dev/null 2>&1 || true
   fi
-
-  # ── 生成适配当前系统的 daemon.json ──
   ensure_daemon_json
-
-  # ── 写入 systemd service 文件 ──────────────────
-  cat > /etc/systemd/system/docker.service <<'EOF'
-[Unit]
-Description=Docker Application Container Engine
-Documentation=https://docs.docker.com
-After=network-online.target firewalld.service containerd.service
-Wants=network-online.target
-Requires=docker.socket containerd.service
-
-[Service]
-Type=notify
-ExecStart=/usr/local/bin/dockerd
-ExecReload=/bin/kill -s HUP $MAINPID
-TimeoutStartSec=0
-RestartSec=2
-Restart=always
-StartLimitBurst=3
-StartLimitInterval=60s
-LimitNOFILE=infinity
-LimitNPROC=infinity
-LimitCORE=infinity
-TasksMax=infinity
-Delegate=yes
-KillMode=process
-OOMScoreAdjust=-500
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  # ── 写入 docker.socket ────────────────────────
-  cat > /etc/systemd/system/docker.socket <<'EOF'
-[Unit]
-Description=Docker Socket for the API
-PartOf=docker.service
-
-[Socket]
-ListenStream=/var/run/docker.sock
-SocketMode=0660
-SocketUser=root
-SocketGroup=docker
-
-[Install]
-WantedBy=sockets.target
-EOF
-
+  _write_docker_service
+  _write_docker_socket
   systemctl daemon-reload
   systemctl enable docker.socket >/dev/null 2>&1 || true
   systemctl enable docker >/dev/null 2>&1 || true
-
+  systemctl start docker.socket 2>/dev/null || true
   echo ""
-  echo -e "${CYAN}正在启动 Docker（首次启动可能需要数秒）...${NC}"
+  echo -e "${CYAN}正在启动 Docker...${NC}"
   if ! systemctl start docker; then
-    echo -e "${RED}Docker 启动失败！正在获取详细错误信息...${NC}"
-    echo ""
-    echo -e "${YELLOW}=== journalctl 错误日志 ===${NC}"
+    echo -e "${RED}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  Docker 启动失败！详细错误如下：         ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}=== systemctl 状态 ===${NC}"
+    systemctl status docker --no-pager -l 2>/dev/null || true
+    echo -e "${YELLOW}=== journalctl 日志 ===${NC}"
     journalctl -u docker -n 50 --no-pager 2>/dev/null || true
-    echo ""
-    echo -e "${YELLOW}=== daemon.json 当前内容 ===${NC}"
+    echo -e "${YELLOW}=== daemon.json ===${NC}"
     cat /etc/docker/daemon.json 2>/dev/null || true
-    echo ""
     echo -e "${YELLOW}排查建议：${NC}"
-    echo -e "  1. 若日志含 'ipset' 错误  → 内核不支持 ipset，请联系 VPS 提供商升级内核"
-    echo -e "  2. 若日志含 'raw table'   → 运行此脚本选项 1 重新安装，将自动降级至 ${RECOMMENDED_LEGACY_DOCKER_VERSION}"
-    echo -e "  3. 若日志含 'ip6tables'   → daemon.json 中将 ip6tables 改为 false"
-    echo -e "  4. 若日志含 'overlay'     → 运行 'modprobe overlay'，或联系提供商开启"
+    echo -e "  1. 日志含 'ipset'            → 内核不支持 ipset，请联系 VPS 提供商"
+    echo -e "  2. 日志含 'raw table'         → 选择菜单 1 重新安装，将自动降级"
+    echo -e "  3. 日志含 'ip6tables'         → daemon.json 中将 ip6tables 改为 false"
+    echo -e "  4. 日志含 'apparmor/profiles' → daemon.json 中加入 default-security-opt: [apparmor=unconfined]"
+    echo -e "  5. 日志含 'overlay'           → 联系 VPS 提供商开启 overlay 支持"
     exit 1
   fi
-
-  # ── 验证安装 ──────────────────────────────────
   sleep 1
   if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║  ✓ Docker 安装并启动成功！               ║${NC}"
-    echo -e "${GREEN}║    版本: $(docker --version | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)${NC}"
+    local ver_str
+    ver_str=$(docker --version | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    echo -e "${GREEN}║    版本: ${ver_str}${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
-    echo -e "${YELLOW}若需要无 sudo 运行，请重新登录以应用用户组变更。${NC}"
-
-    # ── 快速拉取测试（验证镜像源是否正常）──────
+    echo -e "${YELLOW}若需无 sudo 运行 docker，请重新登录以应用用户组变更。${NC}"
     echo ""
-    echo -e "${CYAN}正在验证镜像源可用性（拉取 hello-world）...${NC}"
+    echo -e "${CYAN}验证镜像源（拉取 hello-world）...${NC}"
     if docker pull hello-world >/dev/null 2>&1; then
       echo -e "${GREEN}✓ 镜像拉取成功，镜像源配置正常。${NC}"
       docker rmi hello-world >/dev/null 2>&1 || true
     else
-      echo -e "${YELLOW}⚠ hello-world 拉取失败，请通过菜单选项 14 进行测速并重新配置镜像源。${NC}"
+      echo -e "${YELLOW}⚠ hello-world 拉取失败，请通过菜单选项 14 测速并重新配置镜像源。${NC}"
     fi
   else
-    echo -e "${RED}Docker 安装或启动失败，请查看上方日志。${NC}"; exit 1
+    echo -e "${RED}Docker 二进制存在但无法通信，请查看上方日志。${NC}"; exit 1
   fi
-
   echo ""
   echo "清理临时文件..."
   rm -rf "$DOCKER_INSTALL_DIR"
 }
-
 install_docker_compose() {
   if check_docker_compose_installed; then
     read -r -p "Docker Compose 已安装，是否重新安装？(y/n): " REINSTALL
-    [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过 Docker Compose 安装。${NC}"; return; }
+    [[ "$REINSTALL" != "y" ]] && { echo -e "${YELLOW}跳过。${NC}"; return; }
   fi
-
   echo "获取 Docker Compose 版本列表..."
   mapfile -t COMPOSE_ARR <<< "$(fetch_docker_compose_versions)"
   local COMPOSE_VERSION
   COMPOSE_VERSION=$(select_version "${COMPOSE_ARR[@]}")
   if [[ -z "$COMPOSE_VERSION" ]]; then
-    echo -e "${YELLOW}未选择，将安装最新版本...${NC}"
     COMPOSE_VERSION=$(curl -s --connect-timeout 15 \
       https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
   else
     COMPOSE_VERSION=$(echo "$COMPOSE_VERSION" | tr -d '[:space:]')
   fi
   echo -e "${GREEN}选择的 Docker Compose 版本：$COMPOSE_VERSION${NC}"
-
   local os_name arch_name compose_file
-  os_name=$(uname -s)
-  arch_name=$(uname -m)
+  os_name=$(uname -s); arch_name=$(uname -m)
   case "$os_name" in
     Linux)
       case "$arch_name" in
@@ -1519,7 +1263,7 @@ install_docker_compose() {
         aarch64) compose_file="docker-compose-linux-aarch64" ;;
         armv7l)  compose_file="docker-compose-linux-armv7" ;;
         armv6l)  compose_file="docker-compose-linux-armv6" ;;
-        *) echo -e "${RED}不支持的 Linux 架构: $arch_name${NC}"; exit 1 ;;
+        *) echo -e "${RED}不支持的架构: $arch_name${NC}"; exit 1 ;;
       esac ;;
     Darwin)
       case "$arch_name" in
@@ -1529,17 +1273,15 @@ install_docker_compose() {
       esac ;;
     *) echo -e "${RED}不支持的操作系统: $os_name${NC}"; exit 1 ;;
   esac
-
   local COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${compose_file}"
   if ! download_with_fallback "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
-    echo -e "${RED}Docker Compose 下载失败，请检查网络后重试。${NC}"; exit 1
+    echo -e "${RED}Docker Compose 下载失败。${NC}"; exit 1
   fi
   chmod +x /usr/local/bin/docker-compose
   mkdir -p /usr/local/lib/docker/cli-plugins
   cp /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
   echo -e "${GREEN}Docker Compose 安装完成（支持 docker compose 与 docker-compose）。${NC}"
 }
-
 uninstall_docker() {
   echo "正在卸载 Docker..."
   if systemctl is-active --quiet docker 2>/dev/null; then
@@ -1549,12 +1291,10 @@ uninstall_docker() {
   systemctl stop docker.service docker.socket 2>/dev/null || true
   systemctl disable docker.service docker.socket 2>/dev/null || true
   case "$PKG_MANAGER" in
-    apt-get)
-      apt-get remove -y --purge docker docker-engine docker.io \
-        containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
-    dnf|yum)
-      "${PKG_MANAGER}" remove -y docker docker-engine docker.io \
-        containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
+    apt-get) apt-get remove -y --purge docker docker-engine docker.io \
+               containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
+    dnf|yum) "${PKG_MANAGER}" remove -y docker docker-engine docker.io \
+               containerd runc docker-ce docker-ce-cli 2>/dev/null || true ;;
   esac
   rm -rf /var/lib/docker /etc/docker /usr/local/bin/docker* \
     /usr/bin/docker* /usr/sbin/docker* /opt/docker
@@ -1567,133 +1307,115 @@ uninstall_docker() {
   systemctl reset-failed 2>/dev/null || true
   echo -e "${GREEN}Docker 已卸载并清理。${NC}"
 }
-
 uninstall_docker_compose() {
   echo "正在卸载 Docker Compose..."
   rm -f /usr/local/bin/docker-compose
   rm -f /usr/local/lib/docker/cli-plugins/docker-compose
   rm -rf ~/.docker/compose 2>/dev/null || true
-  rm -rf /opt/docker-compose 2>/dev/null || true
   echo -e "${GREEN}Docker Compose 已卸载。${NC}"
 }
-
 generate_daemon_config() {
   echo "正在生成 Docker daemon.json 配置文件..."
   backup_daemon_json
-
   local DEFAULT_DATA_ROOT="/var/lib/docker"
   read -r -p "请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
   local DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
-
-  echo ""
-  read -r -p "是否先进行镜像源测速，自动选择最快的源？(y/n，默认使用全部内置源): " DO_SPEEDTEST
-  local REGISTRY_MIRRORS_JSON
+  read -r -p "是否先进行镜像源测速？(y/n，默认使用全部内置源): " DO_SPEEDTEST
   if [[ "$DO_SPEEDTEST" == "y" ]]; then
-    run_mirror_speed_test
-    return
-  else
-    local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
-    if [[ -n "$PROXY_MIRROR_URL" ]]; then
-      local exists="false"
-      for m in "${mirrors[@]}"; do
-        [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
-      done
-      [[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
-    fi
-    REGISTRY_MIRRORS_JSON=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
+    run_mirror_speed_test; return
   fi
-
-  # 检测 IPv6
+  local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
+  if [[ -n "$PROXY_MIRROR_URL" ]]; then
+    local exists="false"
+    for m in "${mirrors[@]}"; do [[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break; done
+    [[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
+  fi
+  local mirrors_json
+  mirrors_json=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
   local ip6tables_val="true"
   if ! _check_ipv6_available; then
     ip6tables_val="false"
-    echo -e "${YELLOW}[INFO] 检测到 IPv6 不可用，已自动设置 ip6tables: false${NC}"
+    echo -e "${YELLOW}[INFO] IPv6 不可用，已设置 ip6tables: false${NC}"
   fi
-
+  local secopt_json="null"
+  if [[ "${APPARMOR_RESTRICTED}" == "true" ]]; then
+    secopt_json='["apparmor=unconfined"]'
+  fi
   local DAEMON_CONFIG
-  DAEMON_CONFIG=$(cat <<EOF
-{
-  "iptables": true,
-  "ip6tables": ${ip6tables_val},
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "registry-mirrors": ${REGISTRY_MIRRORS_JSON},
-  "data-root": "${DATA_ROOT}",
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOF
-)
-
+  DAEMON_CONFIG=$(jq -n \
+    --argjson mirrors "$mirrors_json" \
+    --arg data_root "$DATA_ROOT" \
+    --argjson ip6t "$ip6tables_val" \
+    '{
+      "iptables": true,
+      "ip6tables": $ip6t,
+      "exec-opts": ["native.cgroupdriver=systemd"],
+      "registry-mirrors": $mirrors,
+      "data-root": $data_root,
+      "log-driver": "json-file",
+      "log-opts": {"max-size": "10m", "max-file": "3"}
+    }')
+  if [[ "$secopt_json" != "null" ]]; then
+    DAEMON_CONFIG=$(echo "$DAEMON_CONFIG" | \
+      jq --argjson secopt "$secopt_json" '. + {"default-security-opt": $secopt}')
+  fi
   echo "daemon.json 内容："
   echo "$DAEMON_CONFIG"
-
-  if ! echo "$DAEMON_CONFIG" | jq . >/dev/null 2>&1; then
-    echo -e "${RED}生成的 JSON 格式不正确。${NC}"; exit 1
-  fi
-
   mkdir -p /etc/docker
-  if echo "$DAEMON_CONFIG" > /etc/docker/daemon.json; then
-    echo -e "${GREEN}/etc/docker/daemon.json 生成成功。${NC}"
-    read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DORESTART
-    [[ "$DORESTART" == "y" ]] && _restart_docker
-  else
-    echo -e "${RED}写入 /etc/docker/daemon.json 失败。${NC}"
-  fi
+  echo "$DAEMON_CONFIG" > /etc/docker/daemon.json && \
+    echo -e "${GREEN}/etc/docker/daemon.json 生成成功。${NC}" || \
+    { echo -e "${RED}写入失败。${NC}"; return; }
+  read -r -p "是否立即重启 Docker？(y/n): " DORESTART
+  [[ "$DORESTART" == "y" ]] && _restart_docker
 }
-
 check_iptables_mode() {
-  echo "正在检测 iptables 后端模式..."
-  if ! command -v iptables >/dev/null 2>&1; then
-    echo -e "${RED}系统中未找到 iptables 命令。${NC}"; return
-  fi
+  echo "正在检测 iptables / ipset / AppArmor 状态..."
   local backend
   backend=$(_detect_iptables_backend)
-  local iptables_version
-  iptables_version=$(iptables -V 2>/dev/null)
-
+  echo -e "\niptables 后端: ${CYAN}${backend}${NC}"
   case "$backend" in
     nft)
-      echo -e "当前 iptables 后端为: ${CYAN}nf_tables（iptables-nft 兼容层）${NC}"
-      echo -e "版本信息: $iptables_version"
-      echo -e "${CYAN}提示: 系统使用 nftables，Docker 28+ 通过 iptables-nft 兼容层工作。${NC}"
-      echo -e "${GREEN}无需切换后端，保持当前模式即可。${NC}"
-      ;;
+      echo -e "${GREEN}✓ iptables-nft 兼容层，Docker 28+ 可正常工作。${NC}" ;;
     legacy)
-      echo -e "当前 iptables 后端为: ${GREEN}legacy${NC}"
-      echo -e "版本信息: $iptables_version"
-      echo -e "${GREEN}提示: 此模式与 Docker 兼容性良好。${NC}"
-      # 检测 raw 表
+      echo -e "${GREEN}✓ iptables-legacy，与 Docker 兼容性良好。${NC}"
       if iptables -t raw -L >/dev/null 2>&1; then
-        echo -e "${GREEN}raw 表: 可用（满足 Docker 28 要求）${NC}"
+        echo -e "${GREEN}✓ raw 表可用（满足 Docker 28 要求）${NC}"
       else
-        echo -e "${RED}raw 表: 不可用（Docker 28 将报错，建议降级至 ${RECOMMENDED_LEGACY_DOCKER_VERSION}）${NC}"
-      fi
-      ;;
+        echo -e "${RED}✗ raw 表不可用（Docker 28 会报错）${NC}"
+      fi ;;
     *)
-      echo -e "${YELLOW}无法明确识别 iptables 后端模式。${NC}"
-      echo -e "版本信息: $iptables_version"
-      ;;
+      echo -e "${RED}✗ iptables 未找到${NC}" ;;
   esac
-
-  # ipset 状态
   echo ""
   echo -e "ipset 状态（Docker 28+ 必需）:"
   if command -v ipset >/dev/null 2>&1 && ipset list >/dev/null 2>&1; then
     echo -e "  ${GREEN}✓ ipset 可用${NC}"
   else
-    echo -e "  ${RED}✗ ipset 不可用（运行安装选项 1 将自动处理）${NC}"
+    echo -e "  ${RED}✗ ipset 不可用${NC}"
+    echo -e "  ${YELLOW}提示：通过菜单选项 1 重新安装 Docker，脚本将自动处理。${NC}"
   fi
+  echo ""
+  echo -e "IPv6:"
+  if _check_ipv6_available; then
+    echo -e "  ${GREEN}✓ 可用${NC}"
+  else
+    echo -e "  ${YELLOW}⚠ 不可用（daemon.json 应设置 ip6tables: false）${NC}"
+  fi
+  echo ""
+  echo -e "AppArmor（Docker 29 LXC 已知问题）:"
+  if [[ ! -r /sys/kernel/security/apparmor/profiles ]]; then
+    echo -e "  ${YELLOW}⚠ profiles 不可读，Docker 29 在此环境需要 default-security-opt: apparmor=unconfined${NC}"
+  else
+    echo -e "  ${GREEN}✓ AppArmor profiles 可访问${NC}"
+  fi
+  echo ""
+  echo -e "虚拟化环境:"
+  _detect_virt_env
 }
-
-#====================== 主菜单 ======================#
-
 print_menu() {
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║    Docker / Compose 智能管理脚本 v2      ║${NC}"
-  echo -e "${BOLD}${CYAN}║          适配 Docker 28/29               ║${NC}"
+  echo -e "${BOLD}${CYAN}║    Docker / Compose 智能管理脚本 v2.2    ║${NC}"
+  echo -e "${BOLD}${CYAN}║    静态二进制 · AppArmor · 2026-08       ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
   echo -e "  架构: ${ARCH}  |  系统: ${OS}  |  包管理: ${PKG_MANAGER}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
@@ -1705,7 +1427,7 @@ print_menu() {
   echo -e "  ${RED}6.${NC}  卸载 Docker 和 Docker Compose"
   echo -e "  ${YELLOW}7.${NC}  查询安装状态"
   echo -e "  ${YELLOW}8.${NC}  生成 daemon.json 配置文件"
-  echo -e "  ${YELLOW}9.${NC}  查看当前 iptables / ipset 状态"
+  echo -e "  ${YELLOW}9.${NC}  查看 iptables / ipset / AppArmor 状态"
   echo -e "  ${BLUE}10.${NC} Docker 服务管理（启动 / 停止 / 重启）"
   echo -e "  ${BLUE}11.${NC} Docker 状态仪表盘"
   echo -e "  ${BLUE}12.${NC} daemon.json 备份与回滚"
@@ -1715,28 +1437,23 @@ print_menu() {
   echo -e "  ${RED}0.${NC}  退出脚本"
   echo -e "  日志: ${LOG_FILE}"
 }
-
 main() {
   check_sudo
   detect_package_manager
   init_log
   install_dependencies
-
   echo "检测系统信息..."
   ARCH=$(get_architecture)
   OS=$(get_os_version)
-
   while true; do
     print_menu
     read -r -p "请输入数字 (0-15): " CHOICE
-
     if [[ -z "$CHOICE" ]]; then
       echo -e "${RED}请输入有效数字。${NC}"; continue
     fi
     if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
       echo -e "${RED}无效的选择，请输入数字。${NC}"; continue
     fi
-
     case "$CHOICE" in
       1)  install_docker ;;
       2)  install_docker_compose ;;
@@ -1755,14 +1472,11 @@ main() {
       15) configure_proxy_mirror ;;
       0)
         echo -e "${GREEN}退出脚本。日志已保存至: ${LOG_FILE}${NC}"
-        break
-        ;;
+        break ;;
       *)
         echo -e "${RED}无效的选择，请输入 0-15 之间的数字。${NC}"; continue ;;
     esac
-
     [[ "$CHOICE" -ne 0 ]] && read -n 1 -s -r -p $'\n按任意键返回主菜单...'
   done
 }
-
 main
