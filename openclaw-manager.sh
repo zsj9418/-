@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -o pipefail
-readonly SCRIPT_VERSION="1.2.9"
+readonly SCRIPT_VERSION="1.3.8"
 readonly SCRIPT_NAME="OpenClaw Manager"
 readonly CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 readonly CONFIG_FILE="$CONFIG_DIR/openclaw.json"
@@ -298,12 +298,82 @@ setup_docker_mirrors() {
         ok "Docker 加速器已配置"
     fi
 }
+ensure_path() {
+    local p="$1"
+    [[ -d "$p" ]] || return 0
+    case ":$PATH:" in
+        *":$p:"*) return 0 ;;
+    esac
+    export PATH="$p:$PATH"
+}
+resolve_openclaw_bin() {
+    command -v openclaw 2>/dev/null && return 0
+    local try_dirs=(
+        "$HOME/.npm-global/bin"
+        "$HOME/.local/bin"
+        "/usr/local/bin"
+        "/usr/bin"
+    )
+    if [[ -d "$HOME/.nvm/versions/node" ]]; then
+        local nd=""
+        nd=$(ls -d "$HOME/.nvm/versions/node/"v* 2>/dev/null | sort -V | tail -1) || true
+        [[ -n "$nd" ]] && try_dirs=("${nd}/bin" "${try_dirs[@]}")
+    fi
+    for d in "${try_dirs[@]}"; do
+        if [[ -x "$d/openclaw" ]]; then
+            ensure_path "$d"
+            return 0
+        fi
+    done
+    if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+        export NVM_DIR="$HOME/.nvm"
+        source "$NVM_DIR/nvm.sh" 2>/dev/null || true
+        command -v openclaw 2>/dev/null && return 0
+    fi
+    local npm_prefix=""
+    npm_prefix=$(npm prefix -g 2>/dev/null) || true
+    if [[ -n "$npm_prefix" && -x "$npm_prefix/bin/openclaw" ]]; then
+        ensure_path "$npm_prefix/bin"
+        return 0
+    fi
+    return 1
+}
+find_openclaw_container() {
+    has_cmd docker || return 1
+    local cid=""
+    cid=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -m1 "^${DOCKER_CONTAINER}$") || true
+    if [[ -z "$cid" ]]; then
+        cid=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -m1 -i 'openclaw') || true
+    fi
+    if [[ -z "$cid" ]]; then
+        cid=$(docker ps -a --filter "ancestor=${DOCKER_IMAGE}:latest" --format '{{.Names}}' 2>/dev/null | head -1) || true
+    fi
+    if [[ -z "$cid" ]]; then
+        cid=$(docker ps -a --filter "ancestor=${DOCKER_IMAGE_MIRROR}:latest" --format '{{.Names}}' 2>/dev/null | head -1) || true
+    fi
+    if [[ -z "$cid" ]]; then
+        cid=$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -i 'openclaw' | head -1 | awk '{print $1}') || true
+    fi
+    [[ -n "$cid" ]] && echo "$cid"
+}
 is_docker_mode() {
-    if has_cmd openclaw; then return 1; fi
-    docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER"
+    resolve_openclaw_bin 2>/dev/null && return 1
+    local c=""
+    c=$(find_openclaw_container 2>/dev/null) || true
+    [[ -n "$c" ]]
 }
 is_installed() {
-    has_cmd openclaw || docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER"
+    resolve_openclaw_bin 2>/dev/null && return 0
+    local c=""
+    c=$(find_openclaw_container 2>/dev/null) || true
+    [[ -n "$c" ]] && return 0
+    check_gateway_health 2>/dev/null && return 0
+    return 1
+}
+get_docker_container_name() {
+    local c=""
+    c=$(find_openclaw_container 2>/dev/null) || true
+    echo "${c:-$DOCKER_CONTAINER}"
 }
 get_config_path() {
     if is_docker_mode; then
@@ -427,10 +497,10 @@ config_rollback() {
     return 0
 }
 oc_cmd() {
-    if has_cmd openclaw; then
+    if resolve_openclaw_bin 2>/dev/null; then
         openclaw "$@"
-    elif docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
-        docker exec "$DOCKER_CONTAINER" openclaw "$@"
+    elif docker ps 2>/dev/null | grep -q "$(get_docker_container_name)"; then
+        docker exec "$(get_docker_container_name)" openclaw "$@"
     else
         err "OpenClaw 未安装"
         return 1
@@ -612,8 +682,8 @@ check_gateway_health() {
     return 1
 }
 get_service_status() {
-    if ! is_installed; then echo "未安装"; return 1; fi
     if check_gateway_health; then echo "运行中"; return 0; fi
+    if ! is_installed; then echo "未安装"; return 1; fi
     echo "已停止"; return 1
 }
 service_start() {
@@ -628,12 +698,12 @@ service_start() {
     fi
     if is_docker_mode; then
         info "启动 Docker 容器..."
-        docker start "$DOCKER_CONTAINER" >/dev/null 2>&1
+        docker start "$(get_docker_container_name)" >/dev/null 2>&1
         sleep 2
         if ! docker_cfg_readable_by_node; then
             warn "容器内 node 用户仍无法读取配置,再次修复权限..."
             fix_cfg_perms
-            docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+            docker restart "$(get_docker_container_name)" >/dev/null 2>&1 || true
         fi
     else
         pkill -9 -f "openclaw.*gateway" 2>/dev/null || true
@@ -669,7 +739,7 @@ service_start() {
     err "启动超时"
     local fail_log=""
     if is_docker_mode; then
-        fail_log=$(docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1)
+        fail_log=$(docker logs --tail 20 "$(get_docker_container_name)" 2>&1)
     else
         fail_log=$(tail -20 "$LOG_DIR/gateway.out" 2>/dev/null)
     fi
@@ -680,7 +750,7 @@ service_start() {
         if is_docker_mode; then
             local data_dir="${DOCKER_DATA_DIR}"
             fix_docker_state_perms "$data_dir"
-            docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
+            docker restart "$(get_docker_container_name)" >/dev/null 2>&1
         fi
         sleep 5
         if check_gateway_health; then
@@ -695,7 +765,7 @@ service_start() {
             config_rollback
             fix_cfg_perms
             if is_docker_mode; then
-                docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
+                docker restart "$(get_docker_container_name)" >/dev/null 2>&1
             else
                 pkill -9 -f "openclaw.*gateway" 2>/dev/null || true
                 sleep 1
@@ -715,7 +785,7 @@ service_start() {
 service_stop() {
     step "停止服务..."
     if is_docker_mode; then
-        docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1 && ok "已停止"
+        docker stop "$(get_docker_container_name)" >/dev/null 2>&1 && ok "已停止"
     else
         for svc in "${SERVICE_CANDIDATES[@]}"; do
             systemctl --user stop "$svc" 2>/dev/null || sudo systemctl stop "$svc" 2>/dev/null || true
@@ -734,14 +804,14 @@ service_status() {
     line
     local status="" mode=""
     status=$(get_service_status 2>/dev/null) || true
-    if is_docker_mode; then mode="Docker"; elif has_cmd openclaw; then mode="本地"; else mode="-"; fi
+    if is_docker_mode; then mode="Docker"; elif resolve_openclaw_bin 2>/dev/null; then mode="本地"; else mode="-"; fi
     out "  状态: ${CB}${status}${C}"
     out "  模式: ${mode}"
     out "  端口: ${DEFAULT_PORT}"
     if is_docker_mode; then
         out "  容器: $(docker ps --filter name=$DOCKER_CONTAINER --format '{{.Status}}' 2>/dev/null)"
     fi
-    if has_cmd openclaw; then
+    if resolve_openclaw_bin 2>/dev/null; then
         out "  版本: $(openclaw --version 2>/dev/null)"
     fi
     line
@@ -768,15 +838,9 @@ show_access_info() {
     line
 }
 refresh_node_path() {
-    local nd=""
-    if [[ -d "$HOME/.nvm/versions/node" ]]; then
-        nd=$(ls -d "$HOME/.nvm/versions/node/"v* 2>/dev/null | sort -V | tail -1) || true
-    fi
-    [[ -n "$nd" ]] && [[ -d "${nd}/bin" ]] && export PATH="${nd}/bin:$PATH"
-    [[ -d "$HOME/.npm-global/bin" ]] && export PATH="$HOME/.npm-global/bin:$PATH"
-    [[ -d "$HOME/.local/bin" ]] && export PATH="$HOME/.local/bin:$PATH"
-    export NVM_DIR="$HOME/.nvm"
-    [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" 2>/dev/null || true
+    resolve_openclaw_bin 2>/dev/null || true
+    ensure_path "$HOME/.npm-global/bin"
+    ensure_path "$HOME/.local/bin"
 }
 install_nodejs() {
     step "安装 Node.js..."
@@ -876,7 +940,7 @@ install_build_deps() {
 install_local() {
     local arg_lan="${1:-}" arg_token="${2:-}"
     step "本地安装 OpenClaw"
-    if has_cmd openclaw; then
+    if resolve_openclaw_bin 2>/dev/null; then
         warn "已安装: $(openclaw --version 2>/dev/null)"
         confirm "重新安装" || return 0
     fi
@@ -910,7 +974,7 @@ install_local() {
             ;;
     esac
     refresh_node_path
-    if ! has_cmd openclaw; then
+    if ! resolve_openclaw_bin 2>/dev/null; then
         err "安装失败,日志: $SCRIPT_LOG"
         $CN_MODE && out "  手动: npm install -g openclaw@latest --registry=$NPM_MIRROR"
         return 1
@@ -969,9 +1033,9 @@ install_docker() {
         fi
     fi
     $CN_MODE && setup_docker_mirrors
-    if docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
+    if docker ps -a 2>/dev/null | grep -q "$(get_docker_container_name)"; then
         local cs=""
-        cs=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null) || true
+        cs=$(docker inspect --format='{{.State.Status}}' "$(get_docker_container_name)" 2>/dev/null) || true
         warn "容器已存在 (${cs:-unknown})"
         out "  [1] 启动    [2] 停止    [3] 重启"
         out "  [4] 删除重建    [5] 日志"
@@ -980,16 +1044,16 @@ install_docker() {
         local choice=""
         read_input choice "0"
         case "$choice" in
-            1) docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && ok "已启动" || err "启动失败" ;;
-            2) docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1 && ok "已停止" || err "停止失败" ;;
-            3) docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 && ok "已重启" || err "重启失败" ;;
+            1) docker start "$(get_docker_container_name)" >/dev/null 2>&1 && ok "已启动" || err "启动失败" ;;
+            2) docker stop "$(get_docker_container_name)" >/dev/null 2>&1 && ok "已停止" || err "停止失败" ;;
+            3) docker restart "$(get_docker_container_name)" >/dev/null 2>&1 && ok "已重启" || err "重启失败" ;;
             4)
                 if confirm "确认删除并重建"; then
-                    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+                    docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
                     docker_deploy_new "$arg_lan" "$arg_token"
                 fi
                 ;;
-            5) docker logs --tail 30 "$DOCKER_CONTAINER" 2>&1 ;;
+            5) docker logs --tail 30 "$(get_docker_container_name)" 2>&1 ;;
             *) return 0 ;;
         esac
         return 0
@@ -1070,10 +1134,10 @@ PYEOF
     fi
     sleep 3
     local st=""
-    st=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null) || true
+    st=$(docker inspect --format='{{.State.Status}}' "$(get_docker_container_name)" 2>/dev/null) || true
     if [[ "$st" != "running" ]]; then
         err "容器异常退出 (${st:-unknown})"
-        docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
+        docker logs --tail 20 "$(get_docker_container_name)" 2>&1 | sed 's/^/  /'
         return 1
     fi
     step "等待服务就绪..."
@@ -1100,7 +1164,7 @@ PYEOF
         i=$((i + 1))
     done
     warn "服务未响应 (${HEALTH_TIMEOUT}s 超时)"
-    docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
+    docker logs --tail 20 "$(get_docker_container_name)" 2>&1 | sed 's/^/  /'
     return 1
 }
 configure_api() {
@@ -1299,6 +1363,84 @@ menu_network() {
         6) setup_external_access ;;
     esac
 }
+get_pending_device_request_ids() {
+    local out=""
+    out=$(oc_cmd devices list 2>&1 || true)
+    printf '%s\n' "$out" | awk '
+        /^Pending[[:space:]]*\(/ {inp=1; next}
+        /^Paired[[:space:]]*\(/ && inp==1 {exit}
+        /^Node approval pending/ {next}
+        inp {print}
+    ' | grep -oE '[0-9a-f-]{36}' | sort -u
+}
+get_pending_node_request_ids() {
+    local out=""
+    out=$(oc_cmd nodes pending 2>&1 || true)
+    local ids=""
+    ids=$(printf '%s\n' "$out" | grep -oE '[0-9a-f-]{36}' | sort -u) || true
+    if [[ -n "$ids" ]]; then
+        printf '%s\n' "$ids"
+        return 0
+    fi
+    out=$(oc_cmd nodes status 2>&1 || true)
+    printf '%s\n' "$out" | grep 'Node approval pending' | grep -oE '[0-9a-f-]{36}' | sort -u
+}
+approve_pending_devices_all() {
+    local ids=""
+    ids=$(get_pending_device_request_ids)
+    if [[ -z "$ids" ]]; then
+        warn "无待批准设备配对请求"
+        return 0
+    fi
+    while IFS= read -r rid; do
+        [[ -z "$rid" ]] && continue
+        oc_cmd devices approve "$rid" 2>&1 && ok "设备已批准: ${rid:0:8}..." || warn "设备批准失败: ${rid:0:8}..."
+    done <<< "$ids"
+}
+approve_pending_nodes_all() {
+    local ids=""
+    ids=$(get_pending_node_request_ids)
+    if [[ -z "$ids" ]]; then
+        warn "无待批准节点授权请求"
+        return 0
+    fi
+    while IFS= read -r rid; do
+        [[ -z "$rid" ]] && continue
+        oc_cmd nodes approve "$rid" 2>&1 && ok "节点已批准: ${rid:0:8}..." || warn "节点批准失败: ${rid:0:8}..."
+    done <<< "$ids"
+}
+approve_all_pairing_requests() {
+    step "一键批准"
+    info "第 1 步: 处理设备配对请求..."
+    local device_ids=""
+    device_ids=$(get_pending_device_request_ids)
+    if [[ -n "$device_ids" ]]; then
+        approve_pending_devices_all
+        out ""
+        warn "设备配对批准后,手机 App 不会自动继续"
+        out "  请在手机上点击 Retry/重新连接,然后按回车继续处理节点授权"
+        wait_key
+    else
+        warn "当前无待批准设备配对请求"
+    fi
+    info "第 2 步: 检查节点授权请求..."
+    local node_ids=""
+    node_ids=$(get_pending_node_request_ids)
+    if [[ -z "$node_ids" ]]; then
+        out "  当前没有发现节点授权请求"
+        out "  如果手机仍显示等待批准,请先在手机上点一次 Retry/重新连接"
+        out "  然后回到本菜单再次执行一键批准"
+    else
+        approve_pending_nodes_all
+    fi
+    out ""
+    info "当前状态:"
+    oc_cmd devices list 2>&1 || true
+    out ""
+    oc_cmd nodes status 2>&1 || true
+    out ""
+    warn "如果手机仍未进入已连接状态,请在手机 App 再点一次 Retry/重新连接"
+}
 mobile_pair() {
     step "手机配对"
     if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
@@ -1307,7 +1449,9 @@ mobile_pair() {
     out "  1. 确保 Gateway 运行中且 bind=lan"
     out "  2. 手机安装 OpenClaw App"
     out "  3. 生成配对二维码 → 手机扫码"
-    out "  4. 服务器批准配对请求"
+    out "  4. 先批准设备配对"
+    out "  5. 手机点 Retry/重新连接"
+    out "  6. 再批准节点授权"
     line
     local bind=""
     bind=$(config_get "gateway.bind" 2>/dev/null) || true
@@ -1326,52 +1470,65 @@ mobile_pair() {
     out ""
     out "  [1] 生成配对二维码"
     out "  [2] 仅显示 Setup Code"
-    out "  [3] 查看待批准设备"
-    out "  [4] 批准所有待配对"
+    out "  [3] 查看待批准设备/节点"
+    out "  [4] 一键批准全部 (设备+节点)"
     out "  [0] 返回"
     echo -ne "选择: "
     local choice=""
     read_input choice "0"
     case "$choice" in
-        1) oc_cmd qr 2>&1 || err "生成失败,尝试: openclaw qr" ;;
-        2) oc_cmd qr --setup-code-only 2>&1 || err "生成失败" ;;
-        3) oc_cmd devices list 2>&1 || err "无法列出" ;;
-        4)
-            info "批准所有待配对设备..."
-            oc_cmd devices approve --all 2>&1 && ok "已批准" || {
-                info "尝试逐个批准..."
-                local ids=""
-                ids=$(oc_cmd devices list 2>&1 | grep -i pending | grep -oE '[0-9a-f-]{36}') || true
-                if [[ -n "$ids" ]]; then
-                    while IFS= read -r rid; do
-                        oc_cmd devices approve "$rid" 2>&1 && ok "已批准: ${rid:0:8}..." || true
-                    done <<< "$ids"
-                else
-                    warn "无待批准设备"
-                fi
-            }
+        1)
+            oc_cmd qr 2>&1 || err "生成失败,尝试: openclaw qr"
+            out ""
+            info "扫码后如果手机仍等待批准,再执行 [4] 一键批准全部"
             ;;
+        2) oc_cmd qr --setup-code-only 2>&1 || err "生成失败" ;;
+        3)
+            oc_cmd devices list 2>&1 || err "无法列出"
+            out ""
+            oc_cmd nodes status 2>&1 || true
+            ;;
+        4) approve_all_pairing_requests ;;
     esac
 }
 device_manage() {
     step "设备管理"
     if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
     out "  [1] 列出所有设备"
-    out "  [2] 批准待配对设备"
-    out "  [3] 查看节点状态"
+    out "  [2] 批准设备配对"
+    out "  [3] 查看节点状态/待授权"
+    out "  [4] 批准节点授权"
+    out "  [5] 一键批准全部"
     out "  [0] 返回"
     echo -ne "选择: "
     local choice=""
     read_input choice "0"
     case "$choice" in
-        1) oc_cmd devices list 2>&1 || err "无法列出" ;;
+        1)
+            oc_cmd devices list 2>&1 || err "无法列出"
+            out ""
+            oc_cmd nodes status 2>&1 || true
+            out ""
+            oc_cmd nodes pending 2>&1 || true
+            ;;
         2)
-            echo -ne "Request ID: "
+            echo -ne "设备 Request ID: "
             local rid=""
             read_input rid ""
             [[ -n "$rid" ]] && oc_cmd devices approve "$rid" 2>&1 || err "批准失败"
             ;;
-        3) oc_cmd nodes status 2>&1 || err "无法查询" ;;
+        3)
+            oc_cmd nodes status 2>&1 || err "无法查询"
+            out ""
+            oc_cmd nodes pending 2>&1 || true
+            ;;
+        4)
+            echo -ne "节点 Request ID: "
+            local nid=""
+            read_input nid ""
+            [[ -n "$nid" ]] && oc_cmd nodes approve "$nid" 2>&1 || err "批准失败"
+            ;;
+        5) approve_all_pairing_requests ;;
     esac
 }
 enable_lan_access() {
@@ -1479,7 +1636,7 @@ diagnose() {
         substep "Docker 预检修复..."
         docker_preflight_repair || true
         docker_env_token_check
-        if docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
+        if docker ps 2>/dev/null | grep -q "$(get_docker_container_name)"; then
             if docker_cfg_readable_by_node; then
                 ok "容器内配置可读"
             else
@@ -1584,7 +1741,7 @@ view_logs() {
             info "Ctrl+C 退出"
             trap 'out ""; info "已退出"' INT
             if is_docker_mode; then
-                docker logs -f "$DOCKER_CONTAINER" 2>&1
+                docker logs -f "$(get_docker_container_name)" 2>&1
             else
                 tail -f "$LOG_DIR/gateway.out" 2>/dev/null ||
                 oc_cmd logs --follow 2>/dev/null || err "无日志可用"
@@ -1593,7 +1750,7 @@ view_logs() {
             ;;
         2)
             if is_docker_mode; then
-                docker logs --tail 50 "$DOCKER_CONTAINER" 2>&1
+                docker logs --tail 50 "$(get_docker_container_name)" 2>&1
             else
                 tail -50 "$LOG_DIR/gateway.out" 2>/dev/null ||
                 oc_cmd logs 2>/dev/null | tail -50 || err "无日志"
@@ -1611,7 +1768,7 @@ show_system_info() {
     out "  Docker:   $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo '未安装')"
     out "  OpenClaw: $(oc_cmd --version 2>/dev/null || echo '未安装')"
     local mode="-"
-    if is_docker_mode; then mode="Docker"; elif has_cmd openclaw; then mode="本地"; fi
+    if is_docker_mode; then mode="Docker"; elif resolve_openclaw_bin 2>/dev/null; then mode="本地"; fi
     out "  模式:     ${mode}"
     out "  配置:     $(get_config_path)"
     if $CN_MODE; then
@@ -1637,7 +1794,7 @@ check_update() {
             if is_docker_mode; then
                 info "更新镜像..."
                 docker_pull_ghcr "$DOCKER_IMAGE" "latest" || return 1
-                docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+                docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
                 docker_deploy_new
             else
                 info "升级中..."
@@ -2070,15 +2227,15 @@ uninstall() {
     warn "将删除 OpenClaw 及相关配置!"
     confirm "确认卸载" || return 0
     service_stop 2>/dev/null || true
-    if docker ps -a 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
-        docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+    if docker ps -a 2>/dev/null | grep -q "$(get_docker_container_name)"; then
+        docker rm -f "$(get_docker_container_name)" >/dev/null 2>&1
         confirm "删除 Docker 镜像" && {
             docker rmi "${DOCKER_IMAGE}:latest" 2>/dev/null || true
             docker rmi "${DOCKER_IMAGE_MIRROR}:latest" 2>/dev/null || true
         }
         confirm "删除数据目录 (${DOCKER_DATA_DIR})" && rm -rf "$DOCKER_DATA_DIR"
     fi
-    has_cmd openclaw && npm uninstall -g openclaw >> "$SCRIPT_LOG" 2>&1 || true
+    resolve_openclaw_bin 2>/dev/null && npm uninstall -g openclaw >> "$SCRIPT_LOG" 2>&1 || true
     confirm "删除配置 (${CONFIG_DIR})" && rm -rf "$CONFIG_DIR"
     ok "卸载完成"
 }
@@ -2088,7 +2245,7 @@ show_header() {
     line
     local status="" mode="" bind="" net=""
     status=$(get_service_status 2>/dev/null) || true
-    if is_docker_mode; then mode="Docker"; elif has_cmd openclaw; then mode="本地"; else mode="-"; fi
+    if is_docker_mode; then mode="Docker"; elif resolve_openclaw_bin 2>/dev/null; then mode="本地"; elif [[ "$status" == "运行中" ]]; then mode="检测中"; else mode="-"; fi
     bind=$(config_get "gateway.bind" 2>/dev/null) || true
     [[ -z "$bind" ]] && bind="-"
     $CN_MODE && net="CN" || net="INT"
@@ -2227,6 +2384,7 @@ menu_system() {
 }
 main_menu() {
     while true; do
+        refresh_node_path 2>/dev/null
         show_header
         show_menu
         echo -ne "选择: "
@@ -2271,6 +2429,7 @@ show_help() {
 main() {
     detect_system
     mkdir -p "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
+    refresh_node_path 2>/dev/null
     detect_china_network
     ensure_dependencies || exit 1
     case "${1:-}" in
