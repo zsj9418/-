@@ -3,10 +3,10 @@ set -o pipefail
 REQ_DEPS=("curl" "wget" "jq")
 OPT_DEPS=("fzf")
 DOCKER_BINARY_MIRRORS=(
-"https://download.docker.com/linux/static/stable"
 "https://mirrors.aliyun.com/docker-ce/linux/static/stable"
-"https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable"
 "https://mirrors.ustc.edu.cn/docker-ce/linux/static/stable"
+"https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable"
+"https://download.docker.com/linux/static/stable"
 )
 DOCKER_VERSIONS_URL="https://download.docker.com/linux/static/stable/"
 COMPOSE_RELEASES_URL="https://api.github.com/repos/docker/compose/releases"
@@ -51,6 +51,7 @@ IS_OPENVZ="false"
 APPARMOR_RESTRICTED="false"
 SPEED_TEST_RESULTS=()
 BEST_DOCKER_MIRROR=""
+PULL_TIMEOUT=60
 LOG_DIR="/var/log/docker_manager"
 LOG_FILE="${LOG_DIR}/docker_manager.log"
 LOG_MAX_SIZE_MB=5
@@ -205,6 +206,22 @@ elapsed=$(curl -o /dev/null -s -w "%{time_total}" \
 --connect-timeout "$timeout" --max-time "$timeout" "$url" 2>/dev/null || echo "9.999")
 awk "BEGIN{printf \"%.0f\", ${elapsed} * 1000}"
 }
+_filter_reachable_registry_mirrors() {
+local reachable=()
+for mirror in "${REGISTRY_MIRRORS_DEFAULT[@]}"; do
+local ms
+ms=$(_probe_url "${mirror}/v2/" 5)
+(( ms < 5000 )) && reachable+=("$mirror")
+done
+if [[ -n "$PROXY_MIRROR_URL" ]]; then
+local exists="false"
+for m in "${reachable[@]}"; do
+[[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
+done
+[[ "$exists" == "false" ]] && reachable+=("$PROXY_MIRROR_URL")
+fi
+printf '%s\n' "${reachable[@]}"
+}
 detect_best_docker_mirror() {
 section "Docker 下载源测速"
 echo -e "  正在探测各下载源速度，请稍候...\n"
@@ -223,20 +240,20 @@ result=$(curl -o "$tmp_probe" -s \
 http_code=$(echo "$result" | awk '{print $1}')
 dl_speed=$(echo "$result" | awk '{printf "%.0f", $2/1024}')
 if [[ "$http_code" =~ ^(200|206)$ ]] && (( dl_speed > 0 )); then
-printf "  ${GREEN}✓${NC}  %-60s %s KB/s\n" "$mirror" "$dl_speed"
+printf "  ${GREEN}✓${NC}  %-62s %s KB/s\n" "$mirror" "$dl_speed"
 if (( dl_speed > best_speed )); then
 best_speed=$dl_speed
 BEST_DOCKER_MIRROR="$mirror"
 fi
 else
-printf "  ${RED}✗${NC}  %-60s (不可达或无数据)\n" "$mirror"
+printf "  ${RED}✗${NC}  %-62s (不可达)\n" "$mirror"
 fi
 done
 rm -f "$tmp_probe"
 echo ""
 if [[ -z "$BEST_DOCKER_MIRROR" ]]; then
 echo -e "  ${RED}警告：所有下载源均不可达，将使用官方源（可能较慢）。${NC}"
-BEST_DOCKER_MIRROR="${DOCKER_BINARY_MIRRORS[0]}"
+BEST_DOCKER_MIRROR="https://download.docker.com/linux/static/stable"
 else
 echo -e "  ${GREEN}最快下载源: ${BEST_DOCKER_MIRROR} (${best_speed} KB/s)${NC}"
 fi
@@ -248,6 +265,8 @@ curl -L \
 --retry 2 \
 --connect-timeout 15 \
 --max-time 600 \
+--speed-limit 10240 \
+--speed-time 20 \
 -o "$dest" \
 "$url"
 return $?
@@ -651,13 +670,14 @@ echo -e "  ${GREEN}daemon.json 已写入 (ip6tables: ${ip6tables_val})${NC}"
 ensure_daemon_json() {
 mkdir -p /etc/docker
 if [[ ! -s /etc/docker/daemon.json ]]; then
-local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
-if [[ -n "$PROXY_MIRROR_URL" ]]; then
-local exists="false"
-for m in "${mirrors[@]}"; do
-[[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
-done
-[[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
+echo -e "  ${CYAN}探测可达的镜像仓库源...${NC}"
+local mirrors=()
+mapfile -t mirrors < <(_filter_reachable_registry_mirrors)
+if [[ ${#mirrors[@]} -eq 0 ]]; then
+echo -e "  ${YELLOW}[WARN] 无可达镜像源，写入全部内置源作为后备${NC}"
+mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
+else
+echo -e "  ${GREEN}可达镜像源: ${#mirrors[@]} 个${NC}"
 fi
 local mirrors_json
 mirrors_json=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
@@ -750,9 +770,14 @@ cat "$CACHE_FILE"
 return
 fi
 ARCH=$(get_architecture)
-local VERSIONS
-VERSIONS=$(curl -s --connect-timeout 15 "${DOCKER_VERSIONS_URL}${ARCH}/" \
+local VERSIONS=""
+local list_sources=("${BEST_DOCKER_MIRROR}" "${DOCKER_BINARY_MIRRORS[@]}")
+for src in "${list_sources[@]}"; do
+[[ -z "$src" ]] && continue
+VERSIONS=$(curl -s --connect-timeout 10 --max-time 20 "${src}/${ARCH}/" \
 | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr | uniq)
+[[ -n "$VERSIONS" ]] && break
+done
 if [[ -z "$VERSIONS" ]]; then
 echo -e "${RED}无法获取 Docker 版本列表，请检查网络。${NC}" >&2
 exit 1
@@ -1124,6 +1149,22 @@ echo -e "  ${YELLOW}注意：仅本次会话有效，永久生效请修改脚本
 esac
 done
 }
+verify_registry_pull() {
+echo -e "  ${CYAN}验证镜像源（拉取 hello-world，最长 ${PULL_TIMEOUT} 秒）...${NC}"
+if timeout "$PULL_TIMEOUT" docker pull hello-world >/dev/null 2>&1; then
+echo -e "  ${GREEN}✓ 镜像拉取成功，镜像源配置正常。${NC}"
+docker rmi hello-world >/dev/null 2>&1 || true
+return 0
+fi
+local rc=$?
+if (( rc == 124 )); then
+echo -e "  ${YELLOW}⚠ 拉取超时（${PULL_TIMEOUT}s），镜像源可能失效。${NC}"
+else
+echo -e "  ${YELLOW}⚠ 拉取失败。${NC}"
+fi
+echo -e "  ${YELLOW}  请通过菜单选项 14 测速并重新配置镜像源。${NC}"
+return 1
+}
 install_docker() {
 if check_docker_installed; then
 read -r -p "  Docker 已安装，是否重新安装？(y/n): " REINSTALL
@@ -1203,13 +1244,7 @@ echo ""
 echo -e "  ${GREEN}✓ Docker 安装并启动成功！版本: ${ver_str}${NC}"
 echo -e "  ${YELLOW}若需无 sudo 运行 docker，请重新登录以应用用户组变更。${NC}"
 echo ""
-echo -e "  ${CYAN}验证镜像源（拉取 hello-world）...${NC}"
-if docker pull hello-world >/dev/null 2>&1; then
-echo -e "  ${GREEN}✓ 镜像拉取成功，镜像源配置正常。${NC}"
-docker rmi hello-world >/dev/null 2>&1 || true
-else
-echo -e "  ${YELLOW}⚠ hello-world 拉取失败，请通过菜单选项 14 测速并重新配置镜像源。${NC}"
-fi
+verify_registry_pull || true
 else
 echo -e "  ${RED}Docker 二进制存在但无法通信，请查看上方日志。${NC}"
 exit 1
@@ -1301,18 +1336,17 @@ backup_daemon_json
 local DEFAULT_DATA_ROOT="/var/lib/docker"
 read -r -p "  请输入 Docker data-root 路径 (默认: ${DEFAULT_DATA_ROOT}): " DATA_ROOT_INPUT
 local DATA_ROOT="${DATA_ROOT_INPUT:-${DEFAULT_DATA_ROOT}}"
-read -r -p "  是否先进行镜像源测速？(y/n，默认使用全部内置源): " DO_SPEEDTEST
+read -r -p "  是否先进行镜像源测速？(y/n，默认使用可达源): " DO_SPEEDTEST
 if [[ "$DO_SPEEDTEST" == "y" ]]; then
 run_mirror_speed_test
 return
 fi
-local mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
-if [[ -n "$PROXY_MIRROR_URL" ]]; then
-local exists="false"
-for m in "${mirrors[@]}"; do
-[[ "$m" == "$PROXY_MIRROR_URL" ]] && exists="true" && break
-done
-[[ "$exists" == "false" ]] && mirrors+=("$PROXY_MIRROR_URL")
+echo -e "  ${CYAN}探测可达的镜像仓库源...${NC}"
+local mirrors=()
+mapfile -t mirrors < <(_filter_reachable_registry_mirrors)
+if [[ ${#mirrors[@]} -eq 0 ]]; then
+echo -e "  ${YELLOW}[WARN] 无可达镜像源，写入全部内置源作为后备${NC}"
+mirrors=("${REGISTRY_MIRRORS_DEFAULT[@]}")
 fi
 local mirrors_json; mirrors_json=$(printf '%s\n' "${mirrors[@]}" | jq -R . | jq -s .)
 local ip6tables_val="true"
@@ -1380,7 +1414,7 @@ _detect_virt_env
 }
 print_menu() {
 echo ""
-echo -e "${BOLD}${CYAN}  Docker / Compose 智能管理脚本 v2.2${NC}"
+echo -e "${BOLD}${CYAN}  Docker / Compose 智能管理脚本 v2.3${NC}"
 echo -e "  架构: ${ARCH}  |  系统: ${OS}  |  包管理: ${PKG_MANAGER}"
 hr
 echo -e "  ${GREEN}1.${NC}  安装 Docker"
