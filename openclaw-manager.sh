@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -o pipefail
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="1.2.8"
 readonly SCRIPT_NAME="OpenClaw Manager"
 readonly CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 readonly CONFIG_FILE="$CONFIG_DIR/openclaw.json"
@@ -1110,8 +1110,19 @@ enable_lan_access() {
     ensure_config || return 1
     warn "将允许局域网设备访问,请勿暴露至公网!"
     confirm "继续" || return 0
+    local existing_token=""
+    existing_token=$(config_get "gateway.auth.token" 2>/dev/null) || true
     local token=""
-    token=$(openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 48) || true
+    if [[ -n "$existing_token" ]]; then
+        out "当前令牌: ${CY}${existing_token}${C}"
+        if confirm "保留当前令牌"; then
+            token="$existing_token"
+        else
+            token=$(openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 48) || true
+        fi
+    else
+        token=$(openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 48) || true
+    fi
     local cfg=""
     cfg=$(get_config_path)
     if has_cmd python3; then
@@ -1138,15 +1149,16 @@ PYEOF
         chmod 600 "$cfg"
     fi
     ok "局域网已启用"
+    out "  令牌: ${CY}${token}${C}"
+    local ip=""
+    ip=$(get_local_ip)
+    out "  地址: ${CG}http://${ip}:${DEFAULT_PORT}?token=${token}${C}"
     if is_docker_mode; then
         chown -R "${DOCKER_UID}:${DOCKER_UID}" "$(dirname "$cfg")" 2>/dev/null ||
         sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$(dirname "$cfg")" 2>/dev/null || true
     fi
-    is_installed && oc_cmd doctor --fix >> "$SCRIPT_LOG" 2>&1 || true
     if confirm "重启服务"; then
         service_restart
-    else
-        show_access_info
     fi
 }
 manage_token() {
@@ -1353,6 +1365,316 @@ check_update() {
         ok "已是最新"
     fi
 }
+gen_token() {
+    openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 48 || echo "$(date +%s%N)$(date +%s%N)"
+}
+plugin_install() {
+    local pkg="$1" display="$2"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    step "安装 ${display}..."
+    if oc_cmd plugins install "$pkg" --force 2>&1 | tee -a "$SCRIPT_LOG"; then
+        ok "${display} 安装成功"
+        return 0
+    else
+        err "${display} 安装失败"
+        return 1
+    fi
+}
+plugin_enable() {
+    local entry_name="$1"
+    oc_cmd config set "plugins.entries.${entry_name}.enabled" true >> "$SCRIPT_LOG" 2>&1
+}
+plugin_setup_weixin() {
+    step "微信 (个人) 接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @tencent-weixin/openclaw-weixin"
+    out "  安装后需用手机微信扫码绑定"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@tencent-weixin/openclaw-weixin" "微信插件" || return 1
+    step "启用插件..."
+    plugin_enable "openclaw-weixin"
+    ok "已启用"
+    step "重启 Gateway..."
+    service_restart 2>/dev/null
+    sleep 3
+    step "扫码登录..."
+    info "终端将显示二维码,请用微信扫码"
+    oc_cmd channels login --channel openclaw-weixin </dev/tty 2>&1 || warn "登录未完成,稍后可重试"
+    out ""
+    step "验证状态..."
+    oc_cmd channels status 2>&1 | head -10 || true
+    out ""
+    ok "微信配置完成"
+    out "  重新登录: openclaw channels login --channel openclaw-weixin"
+    out "  查看状态: openclaw channels status"
+}
+plugin_setup_feishu() {
+    step "飞书接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @m1heng-clawd/feishu"
+    out "  需准备: 飞书开放平台的 App ID 和 App Secret"
+    out "  创建地址: https://open.feishu.cn/app"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@m1heng-clawd/feishu" "飞书插件" || return 1
+    step "配置飞书凭证..."
+    echo -ne "飞书 App ID (cli_xxx): "
+    local app_id=""
+    read_input app_id ""
+    [[ -z "$app_id" ]] && { warn "跳过配置,稍后手动设置"; return 0; }
+    echo -ne "飞书 App Secret: "
+    local app_secret=""
+    read_secret app_secret ""
+    [[ -z "$app_secret" ]] && { warn "跳过配置"; return 0; }
+    oc_cmd config set channels.feishu.appId "$app_id" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.feishu.appSecret "$app_secret" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.feishu.enabled true >> "$SCRIPT_LOG" 2>&1
+    ok "飞书凭证已配置"
+    step "重启 Gateway..."
+    service_restart 2>/dev/null
+    out ""
+    ok "飞书配置完成"
+    out "  飞书后台需配置:"
+    out "    事件订阅 → 请求地址: http://<服务器IP>:${DEFAULT_PORT}/webhook/feishu"
+    out "    权限: im:message:receive, im:message:send 等"
+}
+plugin_setup_dingtalk() {
+    step "钉钉接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw-china/dingtalk"
+    out "  需准备: 钉钉开放平台的 Client ID 和 Client Secret"
+    out "  创建地址: https://open-dev.dingtalk.com"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@openclaw-china/dingtalk" "钉钉插件" || return 1
+    step "配置钉钉凭证..."
+    echo -ne "钉钉 Client ID: "
+    local client_id=""
+    read_input client_id ""
+    [[ -z "$client_id" ]] && { warn "跳过配置"; return 0; }
+    echo -ne "钉钉 Client Secret: "
+    local client_secret=""
+    read_secret client_secret ""
+    [[ -z "$client_secret" ]] && { warn "跳过配置"; return 0; }
+    oc_cmd config set channels.dingtalk.clientid "$client_id" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.dingtalk.clientsecret "$client_secret" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.dingtalk.dmPolicy "open" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.dingtalk.groupPolicy "open" >> "$SCRIPT_LOG" 2>&1
+    ok "钉钉凭证已配置"
+    step "重启 Gateway..."
+    service_restart 2>/dev/null
+    out ""
+    ok "钉钉配置完成"
+}
+plugin_setup_wecom() {
+    step "企业微信接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw-china/wecom"
+    out "  需准备: 企业微信的 Corp ID, Corp Secret, Agent ID"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@openclaw-china/wecom" "企业微信插件" || return 1
+    step "配置凭证..."
+    echo -ne "Corp ID: "
+    local corp_id=""
+    read_input corp_id ""
+    [[ -z "$corp_id" ]] && { warn "跳过配置"; return 0; }
+    echo -ne "Corp Secret: "
+    local corp_secret=""
+    read_secret corp_secret ""
+    echo -ne "Agent ID: "
+    local agent_id=""
+    read_input agent_id ""
+    oc_cmd config set channels.wecom.corpId "$corp_id" >> "$SCRIPT_LOG" 2>&1
+    [[ -n "$corp_secret" ]] && oc_cmd config set channels.wecom.corpSecret "$corp_secret" >> "$SCRIPT_LOG" 2>&1
+    [[ -n "$agent_id" ]] && oc_cmd config set channels.wecom.agentId "$agent_id" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.wecom.enabled true >> "$SCRIPT_LOG" 2>&1
+    ok "企业微信已配置"
+    service_restart 2>/dev/null
+}
+plugin_setup_qq() {
+    step "QQ 接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw-china/qqbot"
+    out "  需先部署 NapCat 框架"
+    out "  参考: https://github.com/NapNeko/NapCatQQ"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@openclaw-china/qqbot" "QQ插件" || {
+        info "尝试备选包..."
+        plugin_install "@izhimu/qq" "QQ插件" || return 1
+    }
+    step "配置 QQ..."
+    echo -ne "NapCat WebSocket 地址 (ws://127.0.0.1:3001): "
+    local ws_url=""
+    read_input ws_url "ws://127.0.0.1:3001"
+    oc_cmd config set channels.qq.wsUrl "$ws_url" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.qq.enabled true >> "$SCRIPT_LOG" 2>&1
+    ok "QQ 已配置"
+    service_restart 2>/dev/null
+}
+plugin_setup_discord() {
+    step "Discord 接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw/discord"
+    out "  需准备: Discord Bot Token"
+    out "  创建: https://discord.com/developers/applications"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@openclaw/discord" "Discord插件" || return 1
+    step "配置 Discord..."
+    echo -ne "Bot Token: "
+    local bot_token=""
+    read_secret bot_token ""
+    [[ -z "$bot_token" ]] && { warn "跳过配置"; return 0; }
+    oc_cmd config set channels.discord.token "$bot_token" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.discord.enabled true >> "$SCRIPT_LOG" 2>&1
+    ok "Discord 已配置"
+    service_restart 2>/dev/null
+}
+plugin_setup_slack() {
+    step "Slack 接入"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw/slack"
+    out "  需准备: Slack Bot Token 和 App Token"
+    out ""
+    confirm "开始安装" || return 0
+    plugin_install "@openclaw/slack" "Slack插件" || return 1
+    step "配置 Slack..."
+    echo -ne "Bot Token (xoxb-xxx): "
+    local bot_token=""
+    read_secret bot_token ""
+    echo -ne "App Token (xapp-xxx): "
+    local app_token=""
+    read_secret app_token ""
+    [[ -n "$bot_token" ]] && oc_cmd config set channels.slack.botToken "$bot_token" >> "$SCRIPT_LOG" 2>&1
+    [[ -n "$app_token" ]] && oc_cmd config set channels.slack.appToken "$app_token" >> "$SCRIPT_LOG" 2>&1
+    oc_cmd config set channels.slack.enabled true >> "$SCRIPT_LOG" 2>&1
+    ok "Slack 已配置"
+    service_restart 2>/dev/null
+}
+plugin_setup_china_all() {
+    step "中国 IM 全家桶"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "包名: @openclaw-china/channels"
+    out "  包含: 飞书 + 钉钉 + QQ + 企业微信"
+    out ""
+    confirm "一键安装" || return 0
+    plugin_install "@openclaw-china/channels" "中国IM全家桶" || return 1
+    ok "安装完成,请到各平台菜单分别配置凭证"
+}
+plugin_setup_telegram() {
+    step "Telegram 配置"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    info "Telegram 通常内置,无需安装插件"
+    out "  需准备: Telegram Bot Token (从 @BotFather 获取)"
+    out ""
+    echo -ne "Bot Token: "
+    local bot_token=""
+    read_secret bot_token ""
+    [[ -z "$bot_token" ]] && { warn "跳过"; return 0; }
+    local cfg=""
+    cfg=$(get_config_path)
+    config_set "channels.telegram.botToken" "$bot_token"
+    config_set "channels.telegram.dmPolicy" "open"
+    config_set "channels.telegram.groupPolicy" "open"
+    ok "Telegram 已配置"
+    confirm "重启服务" && service_restart
+}
+setup_external_access() {
+    step "外网/手机访问"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    local ip=""
+    ip=$(get_local_ip)
+    local token=""
+    token=$(config_get "gateway.auth.token" 2>/dev/null) || true
+    local bind=""
+    bind=$(config_get "gateway.bind" 2>/dev/null) || true
+    out "${CB}当前状态${C}"
+    line
+    out "  bind:  ${bind:-loopback}"
+    out "  令牌:  ${token:-未设置}"
+    out "  LAN:   http://${ip}:${DEFAULT_PORT}"
+    line
+    out ""
+    out "${CB}Android/iOS 连接方式${C}"
+    out ""
+    out "  ${CC}方式1: 同一局域网 (推荐)${C}"
+    out "    1. 确保 bind=lan 且有令牌"
+    out "    2. 手机打开 OpenClaw App → Connect"
+    out "    3. Manual 模式填入:"
+    out "       Host: ${CG}${ip}${C}"
+    out "       Port: ${CG}${DEFAULT_PORT}${C}"
+    if [[ -n "$token" ]]; then
+        out "       Token: ${CY}${token}${C}"
+    fi
+    out ""
+    out "  ${CC}方式2: Tailscale (跨网络)${C}"
+    out "    1. 服务器和手机都安装 Tailscale"
+    out "    2. openclaw gateway --tailscale serve"
+    out "    3. 手机用 wss:// 地址连接"
+    out ""
+    out "  ${CC}方式3: SSH 隧道${C}"
+    local pub_ip=""
+    pub_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) || true
+    out "    ssh -L ${DEFAULT_PORT}:localhost:${DEFAULT_PORT} user@${pub_ip:-服务器IP}"
+    out "    然后手机连 127.0.0.1:${DEFAULT_PORT}"
+    out ""
+    if [[ "$bind" != "lan" ]]; then
+        if confirm "现在启用局域网访问"; then
+            enable_lan_access
+        fi
+    fi
+}
+menu_plugins() {
+    step "插件管理"
+    if ! is_installed; then
+        err "请先安装 OpenClaw (主菜单 [1])"
+        return 1
+    fi
+    out "${CB}通道插件${C}"
+    out "  [1] 微信 (个人)           @tencent-weixin/openclaw-weixin"
+    out "  [2] 飞书                  @m1heng-clawd/feishu"
+    out "  [3] 钉钉                  @openclaw-china/dingtalk"
+    out "  [4] 企业微信              @openclaw-china/wecom"
+    out "  [5] QQ                    @openclaw-china/qqbot"
+    out "  [6] Telegram              内置"
+    out "  [7] Discord               @openclaw/discord"
+    out "  [8] Slack                 @openclaw/slack"
+    out "  [9] 中国 IM 全家桶        @openclaw-china/channels"
+    out ""
+    out "${CB}工具${C}"
+    out "  [L] 已安装插件    [S] 渠道状态"
+    out "  [U] 卸载插件      [E] 外网/手机访问"
+    out "  [0] 返回"
+    out ""
+    echo -ne "选择: "
+    local choice=""
+    read_input choice "0"
+    case "$choice" in
+        1) plugin_setup_weixin ;;
+        2) plugin_setup_feishu ;;
+        3) plugin_setup_dingtalk ;;
+        4) plugin_setup_wecom ;;
+        5) plugin_setup_qq ;;
+        6) plugin_setup_telegram ;;
+        7) plugin_setup_discord ;;
+        8) plugin_setup_slack ;;
+        9) plugin_setup_china_all ;;
+        l|L) oc_cmd plugins list 2>&1 || err "无法列出" ;;
+        s|S) oc_cmd channels status 2>&1 || err "无法查询" ;;
+        u|U)
+            echo -ne "包名: "
+            local pkg=""
+            read_input pkg ""
+            [[ -n "$pkg" ]] && confirm "卸载 ${pkg}" && oc_cmd plugins uninstall "$pkg" 2>&1
+            ;;
+        e|E) setup_external_access ;;
+        0) return 0 ;;
+        *) warn "无效" ;;
+    esac
+}
 uninstall() {
     step "卸载 OpenClaw"
     warn "将删除 OpenClaw 及相关配置!"
@@ -1396,6 +1718,7 @@ show_menu() {
     out "  ${CC}[4]${C} 网络设置      ${CD}局域网/令牌${C}"
     out "  ${CY}[5]${C} 诊断工具      ${CD}检查/修复/日志${C}"
     out "  ${CD}[6]${C} 系统信息      ${CD}版本/升级/卸载${C}"
+    out "  ${CC}[7]${C} 插件管理      ${CD}微信/飞书/钉钉/...${C}"
     out "  ${CD}[0]${C} 退出"
     out ""
 }
@@ -1512,6 +1835,7 @@ main_menu() {
             2) menu_service ;;
             3) configure_api; wait_key ;;
             4) configure_network; wait_key ;;
+            7) menu_plugins; wait_key ;;
             5) menu_diagnose ;;
             6) menu_system ;;
             0|q|Q) out ""; out "再见!"; exit 0 ;;
@@ -1532,6 +1856,7 @@ show_help() {
     out "  status      查看状态"
     out "  config      配置 API"
     out "  lan         启用局域网"
+    out "  plugins     插件管理"
     out "  diagnose    诊断修复"
     out "  logs        查看日志"
     out "  update      检查更新"
@@ -1552,6 +1877,7 @@ main() {
         status) service_status ;;
         config) configure_api ;;
         lan) enable_lan_access ;;
+        plugins) menu_plugins ;;
         diagnose) diagnose ;;
         logs) view_logs ;;
         update) check_update ;;
