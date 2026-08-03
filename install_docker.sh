@@ -16,12 +16,6 @@ PROXY_PREFIXES=(
   "https://gitdl.cn/"
   "https://gh.llkk.cc/"
 )
-
-# ========================================================
-# 【2026-08 更新】国内可用镜像加速源
-# 来源：腾讯云开发者社区 2026-08-01 实测 + dongyubin/DockerHub
-# 注意：免费源稳定性不保证，晚高峰可能限速，建议多配几个
-# ========================================================
 REGISTRY_MIRRORS_DEFAULT=(
   "https://docker.1ms.run"
   "https://docker.xuanyuan.me"
@@ -55,11 +49,6 @@ DOCKER_INSTALL_DIR=""
 ARCH=""
 OS=""
 PKG_MANAGER=""
-
-# ============================================================
-# 【核心修复】降级版本更新为 27.5.1（Docker 28 之前最后稳定版）
-# Docker 28+ 要求 ipset 内核支持，27.5.1 无此依赖
-# ============================================================
 FORCE_LEGACY_DOCKER="false"
 RECOMMENDED_LEGACY_DOCKER_VERSION="27.5.1"
 
@@ -444,13 +433,6 @@ _apply_speed_test_to_daemon() {
   read -r -p "是否立即重启 Docker 以应用配置？(y/n): " DO_RESTART
   [[ "$DO_RESTART" == "y" ]] && _restart_docker
 }
-
-#====================== 【核心重写】Docker 前置环境检测 ======================#
-
-# -----------------------------------------------------------------------
-# 检测内核模块是否可用（已加载 或 可以 modprobe 加载）
-# 返回 0=可用，1=不可用
-# -----------------------------------------------------------------------
 _check_module() {
   local mod="$1"
   # 已加载
@@ -478,10 +460,6 @@ _check_ipv6_available() {
   fi
   return 1
 }
-
-# -----------------------------------------------------------------------
-# 检测 iptables 后端：返回 "legacy" / "nft" / "none"
-# -----------------------------------------------------------------------
 _detect_iptables_backend() {
   if ! command -v iptables >/dev/null 2>&1; then
     echo "none"; return
@@ -505,16 +483,6 @@ _detect_iptables_backend() {
     fi
   fi
 }
-
-# -----------------------------------------------------------------------
-# 【关键函数】全面检测系统是否兼容 Docker 28+
-# 设置全局 FORCE_LEGACY_DOCKER，收集不兼容原因列表
-# Docker 28+ 要求：
-#   1. ip_tables / iptable_filter / iptable_nat / iptable_raw
-#   2. ip6_tables / ip6table_filter / ip6table_nat（IPv6 启用时）
-#   3. br_netfilter / overlay
-#   4. ipset（★ Docker 28 新增强依赖，27.x 无此要求）
-# -----------------------------------------------------------------------
 ensure_docker_prereqs() {
   echo ""
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
@@ -1725,7 +1693,7 @@ check_iptables_mode() {
 print_menu() {
   echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}${CYAN}║    Docker / Compose 智能管理脚本 v2      ║${NC}"
-  echo -e "${BOLD}${CYAN}║    适配 Docker 28/29 · 2026-08 镜像源    ║${NC}"
+  echo -e "${BOLD}${CYAN}║          适配 Docker 28/29               ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
   echo -e "  架构: ${ARCH}  |  系统: ${OS}  |  包管理: ${PKG_MANAGER}"
   echo -e "${CYAN}──────────────────────────────────────────${NC}"
