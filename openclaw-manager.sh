@@ -314,12 +314,82 @@ get_config_path() {
 }
 fix_cfg_perms() {
     local cfg="${1:-$(get_config_path)}"
-    fix_cfg_perms "$cfg" || true
+    [[ -f "$cfg" ]] && chmod 600 "$cfg" 2>/dev/null || true
+    local cfg_dir=""
+    cfg_dir=$(dirname "$cfg")
+    chmod 755 "$cfg_dir" 2>/dev/null || true
     if is_docker_mode; then
-        local cfg_dir=""
-        cfg_dir=$(dirname "$cfg")
-        chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_dir" 2>/dev/null ||
-        sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_dir" 2>/dev/null || true
+        chmod 755 "$DOCKER_DATA_DIR" "$DOCKER_DATA_DIR/.openclaw" "$DOCKER_DATA_DIR/workspace" 2>/dev/null || true
+        chown -R "${DOCKER_UID}:${DOCKER_UID}" "$DOCKER_DATA_DIR" 2>/dev/null ||
+        sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$DOCKER_DATA_DIR" 2>/dev/null || true
+    fi
+}
+docker_preflight_repair() {
+    if ! is_docker_mode; then return 0; fi
+    local cfg="${DOCKER_DATA_DIR}/.openclaw/openclaw.json"
+    mkdir -p "${DOCKER_DATA_DIR}/.openclaw" "${DOCKER_DATA_DIR}/workspace"
+    if [[ ! -s "$cfg" ]]; then
+        warn "Docker 配置缺失或为空,重建最小配置"
+        create_minimal_config "$cfg"
+    elif ! json_valid "$cfg"; then
+        warn "Docker 配置损坏,尝试回滚"
+        config_rollback "$cfg" >/dev/null 2>&1 || true
+        [[ ! -s "$cfg" ]] && create_minimal_config "$cfg"
+    fi
+    if has_cmd python3 && [[ -f "$cfg" ]]; then
+        python3 -c "
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as f: c = json.load(f)
+except:
+    c = {}
+gw = c.setdefault('gateway', {})
+if not gw.get('mode'):
+    gw['mode'] = 'local'
+if gw.get('bind') not in ('auto','lan','loopback','custom','tailnet'):
+    gw['bind'] = 'loopback'
+models = c.setdefault('models', {})
+models.setdefault('mode', 'merge')
+models.setdefault('providers', {})
+agents = c.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+defaults.setdefault('workspace', '~/.openclaw/workspace')
+model_cfg = defaults.get('model')
+if isinstance(model_cfg, str) and model_cfg:
+    defaults['model'] = {'primary': model_cfg}
+elif not isinstance(model_cfg, dict):
+    defaults.setdefault('model', {'primary': 'openai/gpt-4o'})
+agents.setdefault('list', [{'id': 'main', 'default': True}])
+with open(p, 'w') as f:
+    json.dump(c, f, indent=2, ensure_ascii=False)
+" "$cfg" 2>>"$SCRIPT_LOG" || true
+    fi
+    fix_cfg_perms "$cfg"
+}
+docker_cfg_readable_by_node() {
+    if ! is_docker_mode; then return 0; fi
+    local cid=""
+    cid=$(docker ps -aqf "name=^${DOCKER_CONTAINER}$" 2>/dev/null | head -1)
+    [[ -z "$cid" ]] && return 1
+    local state=""
+    state=$(docker inspect --format='{{.State.Running}}' "$cid" 2>/dev/null) || true
+    [[ "$state" != "true" ]] && return 1
+    docker exec --user 1000 "$cid" sh -lc 'test -r /home/node/.openclaw/openclaw.json && test -x /home/node/.openclaw && test -x /home/node/workspace' >/dev/null 2>&1
+}
+docker_env_token_check() {
+    if ! is_docker_mode; then return 0; fi
+    local cid=""
+    cid=$(docker ps -aqf "name=^${DOCKER_CONTAINER}$" 2>/dev/null | head -1)
+    [[ -z "$cid" ]] && return 0
+    local env_token=""
+    env_token=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null | grep '^OPENCLAW_GATEWAY_TOKEN=' | tail -1 | cut -d= -f2-) || true
+    local cfg_token=""
+    cfg_token=$(config_get "gateway.auth.token" 2>/dev/null) || true
+    if [[ -n "$env_token" && -n "$cfg_token" && "$env_token" != "$cfg_token" ]]; then
+        warn "检测到 OPENCLAW_GATEWAY_TOKEN 与配置文件令牌不一致"
+        out "  env: ${CY}${env_token}${C}"
+        out "  cfg: ${CY}${cfg_token}${C}"
     fi
 }
 config_backup() {
@@ -540,8 +610,18 @@ service_start() {
     sanitize_config || true
     fix_cfg_perms
     if is_docker_mode; then
+        docker_preflight_repair
+        docker_env_token_check
+    fi
+    if is_docker_mode; then
         info "启动 Docker 容器..."
         docker start "$DOCKER_CONTAINER" >/dev/null 2>&1
+        sleep 2
+        if ! docker_cfg_readable_by_node; then
+            warn "容器内 node 用户仍无法读取配置,再次修复权限..."
+            fix_cfg_perms
+            docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1 || true
+        fi
     else
         pkill -9 -f "openclaw.*gateway" 2>/dev/null || true
         sleep 1
@@ -1380,6 +1460,19 @@ diagnose() {
         err "未安装"
         issues=$((issues + 1))
     fi
+    if is_docker_mode; then
+        substep "Docker 预检修复..."
+        docker_preflight_repair || true
+        docker_env_token_check
+        if docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER"; then
+            if docker_cfg_readable_by_node; then
+                ok "容器内配置可读"
+            else
+                warn "容器内配置仍不可读"
+                issues=$((issues + 1))
+            fi
+        fi
+    fi
     substep "配置文件..."
     local cfg=""
     cfg=$(get_config_path)
@@ -2079,16 +2172,27 @@ menu_diagnose() {
     step "诊断工具"
     out "  [1] 系统诊断    [2] 查看日志"
     out "  [3] 修复配置    [4] 运行 doctor"
-    out "  [5] 清理字段    [0] 返回"
+    out "  [5] 清理字段    [6] Docker 急救"
+    out "  [0] 返回"
     echo -ne "选择: "
     local choice=""
     read_input choice "0"
     case "$choice" in
         1) diagnose ;;
         2) view_logs ;;
-        3) ensure_config && ok "配置有效" ;;
+        3) ensure_config && { sanitize_config || true; fix_cfg_perms; is_docker_mode && docker_preflight_repair; ok "配置已修复"; } ;;
         4) is_installed && oc_cmd doctor --fix || err "未安装" ;;
         5) sanitize_config && ok "已清理" || warn "清理异常,已跳过" ;;
+        6)
+            if is_docker_mode; then
+                docker_preflight_repair
+                fix_cfg_perms
+                ok "Docker 急救完成"
+                confirm "立即重启服务" && service_restart
+            else
+                warn "当前不是 Docker 模式"
+            fi
+            ;;
     esac
     wait_key
 }
