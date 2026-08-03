@@ -312,6 +312,37 @@ get_config_path() {
         echo "$CONFIG_FILE"
     fi
 }
+fix_cfg_perms() {
+    local cfg="${1:-$(get_config_path)}"
+    fix_cfg_perms "$cfg" || true
+    if is_docker_mode; then
+        local cfg_dir=""
+        cfg_dir=$(dirname "$cfg")
+        chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_dir" 2>/dev/null ||
+        sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "$cfg_dir" 2>/dev/null || true
+    fi
+}
+config_backup() {
+    local cfg="${1:-$(get_config_path)}"
+    [[ ! -f "$cfg" ]] && return 0
+    local bak="${cfg}.bak.$(date +%s)"
+    cp "$cfg" "$bak" 2>/dev/null && echo "$bak" || echo ""
+}
+config_rollback() {
+    local cfg="${1:-$(get_config_path)}"
+    local latest_bak=""
+    latest_bak=$(ls -t "${cfg}".bak.* 2>/dev/null | head -1) || true
+    if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
+        cp "$latest_bak" "$cfg"
+        fix_cfg_perms "$cfg"
+        ok "已回滚到: $(basename "$latest_bak")"
+        return 0
+    fi
+    warn "无备份可回滚,重建最小配置"
+    create_minimal_config "$cfg"
+    fix_cfg_perms "$cfg"
+    return 0
+}
 oc_cmd() {
     if has_cmd openclaw; then
         openclaw "$@"
@@ -354,7 +385,7 @@ create_minimal_config() {
     ]
   }
 }' > "$cfg"
-    chmod 600 "$cfg"
+    fix_cfg_perms "$cfg"
 }
 ensure_config() {
     local cfg=""
@@ -421,7 +452,7 @@ target[keys[-1]] = value
 with open(cfg_path, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 PYEOF
-    chmod 600 "$cfg"
+    fix_cfg_perms "$cfg"
 }
 sanitize_config() {
     local cfg="${1:-$(get_config_path)}"
@@ -461,13 +492,26 @@ if isinstance(providers, dict):
         if isinstance(p, dict) and not p.get("api"):
             p["api"] = "openai-completions"
             changed = True
+agents = cfg.get("agents", {})
+if isinstance(agents, dict):
+    defaults = agents.get("defaults", {})
+    if isinstance(defaults, dict):
+        model_cfg = defaults.get("model", {})
+        if isinstance(model_cfg, dict):
+            bad_keys = [k for k in model_cfg if k not in ("primary",)]
+            for k in bad_keys:
+                del model_cfg[k]
+                changed = True
+        elif isinstance(model_cfg, str) and model_cfg:
+            defaults["model"] = {"primary": model_cfg}
+            changed = True
 if changed:
     tmp = cfg_path + ".tmp"
     with open(tmp, 'w') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.replace(tmp, cfg_path)
 PYEOF
-    chmod 600 "$cfg" 2>/dev/null
+    fix_cfg_perms "$cfg"
 }
 check_gateway_health() {
     local port="${1:-$DEFAULT_PORT}"
@@ -485,6 +529,7 @@ service_start() {
     if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
     ensure_config || return 1
     sanitize_config
+    fix_cfg_perms
     if is_docker_mode; then
         info "启动 Docker 容器..."
         docker start "$DOCKER_CONTAINER" >/dev/null 2>&1
@@ -520,10 +565,49 @@ service_start() {
         i=$((i + 1))
     done
     err "启动超时"
+    local fail_log=""
     if is_docker_mode; then
-        docker logs --tail 15 "$DOCKER_CONTAINER" 2>&1 | sed 's/^/  /'
+        fail_log=$(docker logs --tail 20 "$DOCKER_CONTAINER" 2>&1)
     else
-        tail -15 "$LOG_DIR/gateway.out" 2>/dev/null | sed 's/^/  /'
+        fail_log=$(tail -20 "$LOG_DIR/gateway.out" 2>/dev/null)
+    fi
+    echo "$fail_log" | sed 's/^/  /'
+    if echo "$fail_log" | grep -qi "EACCES\|permission denied\|not readable"; then
+        warn "检测到权限问题,自动修复..."
+        fix_cfg_perms
+        if is_docker_mode; then
+            local data_dir="${DOCKER_DATA_DIR}"
+            chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null ||
+            sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
+            docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
+        fi
+        sleep 5
+        if check_gateway_health; then
+            ok "权限修复后启动成功"
+            show_access_info
+            return 0
+        fi
+    fi
+    if echo "$fail_log" | grep -qi "Invalid config\|Invalid input\|missing gateway.mode"; then
+        warn "检测到配置错误"
+        if confirm "回滚到上次备份"; then
+            config_rollback
+            fix_cfg_perms
+            if is_docker_mode; then
+                docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1
+            else
+                pkill -9 -f "openclaw.*gateway" 2>/dev/null || true
+                sleep 1
+                nohup openclaw gateway run > "$LOG_DIR/gateway.out" 2>&1 &
+            fi
+            sleep 5
+            if check_gateway_health; then
+                ok "回滚后启动成功"
+                show_access_info
+                return 0
+            fi
+            err "回滚后仍失败"
+        fi
     fi
     return 1
 }
@@ -758,7 +842,7 @@ ui["dangerouslyDisableDeviceAuth"] = True
 with open(cfg_path, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 PYEOF
-            chmod 600 "$cfg"
+            fix_cfg_perms "$cfg"
         fi
         ok "局域网已配置"
     fi
@@ -853,7 +937,7 @@ c.setdefault("agents", {"defaults": {"workspace": "~/.openclaw/workspace"}, "lis
 with open(p, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 PYEOF
-        chmod 600 "$cfg"
+        fix_cfg_perms "$cfg"
     fi
     chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null ||
     sudo chown -R "${DOCKER_UID}:${DOCKER_UID}" "${data_dir}" 2>/dev/null || true
@@ -972,6 +1056,7 @@ configure_custom_api() {
     info "保存配置..."
     local cfg=""
     cfg=$(get_config_path)
+    config_backup "$cfg" >/dev/null 2>&1
     if has_cmd python3; then
         python3 - "$cfg" "$name" "$url" "$key" "$api_type" "$models" "$default_model" << 'PYEOF'
 import json, sys, os
@@ -999,7 +1084,7 @@ c["agents"]["defaults"]["model"] = {"primary": f"{name}/{default_model}"}
 with open(cfg_path, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 PYEOF
-        chmod 600 "$cfg"
+        fix_cfg_perms "$cfg"
     fi
     ok "配置已保存"
     if is_installed; then
@@ -1092,10 +1177,12 @@ PYEOF
     fi
     substep "已同步: $name"
 }
-configure_network() {
+menu_network() {
     step "网络设置"
-    out "  [1] 启用局域网    [2] 管理令牌"
-    out "  [3] 访问信息      [0] 返回"
+    out "  [1] 启用局域网      [2] 管理令牌"
+    out "  [3] 访问信息        [4] 手机配对 (Android/iOS)"
+    out "  [5] 设备管理        [6] 外网/手机指南"
+    out "  [0] 返回"
     echo -ne "选择: "
     local choice=""
     read_input choice "0"
@@ -1103,6 +1190,84 @@ configure_network() {
         1) enable_lan_access ;;
         2) manage_token ;;
         3) show_access_info ;;
+        4) mobile_pair ;;
+        5) device_manage ;;
+        6) setup_external_access ;;
+    esac
+}
+mobile_pair() {
+    step "手机配对"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    out "${CB}配对流程${C}"
+    line
+    out "  1. 确保 Gateway 运行中且 bind=lan"
+    out "  2. 手机安装 OpenClaw App"
+    out "  3. 生成配对二维码 → 手机扫码"
+    out "  4. 服务器批准配对请求"
+    line
+    local bind=""
+    bind=$(config_get "gateway.bind" 2>/dev/null) || true
+    if [[ "$bind" != "lan" ]]; then
+        warn "当前 bind=${bind:-loopback},手机无法连接"
+        if confirm "启用局域网访问"; then
+            enable_lan_access
+        else
+            return 0
+        fi
+    fi
+    if ! check_gateway_health; then
+        warn "Gateway 未运行"
+        if confirm "启动服务"; then service_start; else return 0; fi
+    fi
+    out ""
+    out "  [1] 生成配对二维码"
+    out "  [2] 仅显示 Setup Code"
+    out "  [3] 查看待批准设备"
+    out "  [4] 批准所有待配对"
+    out "  [0] 返回"
+    echo -ne "选择: "
+    local choice=""
+    read_input choice "0"
+    case "$choice" in
+        1) oc_cmd qr 2>&1 || err "生成失败,尝试: openclaw qr" ;;
+        2) oc_cmd qr --setup-code-only 2>&1 || err "生成失败" ;;
+        3) oc_cmd devices list 2>&1 || err "无法列出" ;;
+        4)
+            info "批准所有待配对设备..."
+            oc_cmd devices approve --all 2>&1 && ok "已批准" || {
+                info "尝试逐个批准..."
+                local ids=""
+                ids=$(oc_cmd devices list 2>&1 | grep -i pending | grep -oE '[0-9a-f-]{36}') || true
+                if [[ -n "$ids" ]]; then
+                    while IFS= read -r rid; do
+                        oc_cmd devices approve "$rid" 2>&1 && ok "已批准: ${rid:0:8}..." || true
+                    done <<< "$ids"
+                else
+                    warn "无待批准设备"
+                fi
+            }
+            ;;
+    esac
+}
+device_manage() {
+    step "设备管理"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    out "  [1] 列出所有设备"
+    out "  [2] 批准待配对设备"
+    out "  [3] 查看节点状态"
+    out "  [0] 返回"
+    echo -ne "选择: "
+    local choice=""
+    read_input choice "0"
+    case "$choice" in
+        1) oc_cmd devices list 2>&1 || err "无法列出" ;;
+        2)
+            echo -ne "Request ID: "
+            local rid=""
+            read_input rid ""
+            [[ -n "$rid" ]] && oc_cmd devices approve "$rid" 2>&1 || err "批准失败"
+            ;;
+        3) oc_cmd nodes status 2>&1 || err "无法查询" ;;
     esac
 }
 enable_lan_access() {
@@ -1146,7 +1311,7 @@ ui["dangerouslyDisableDeviceAuth"] = True
 with open(cfg_path, 'w') as f:
     json.dump(c, f, indent=2, ensure_ascii=False)
 PYEOF
-        chmod 600 "$cfg"
+        fix_cfg_perms "$cfg"
     fi
     ok "局域网已启用"
     out "  令牌: ${CY}${token}${C}"
@@ -1363,6 +1528,113 @@ check_update() {
         fi
     else
         ok "已是最新"
+    fi
+}
+menu_context_window() {
+    step "上下文窗口配置"
+    if ! is_installed; then err "OpenClaw 未安装"; return 1; fi
+    local cfg=""
+    cfg=$(get_config_path)
+    out "${CB}当前模型上下文${C}"
+    line
+    if [[ -f "$cfg" ]] && has_cmd python3; then
+        python3 - "$cfg" << 'PYEOF'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    for name, p in c.get("models", {}).get("providers", {}).items():
+        if not isinstance(p, dict): continue
+        for m in p.get("models", []):
+            if isinstance(m, dict):
+                cw = m.get("contextWindow", "默认")
+                mt = m.get("maxTokens", "默认")
+                print(f"  {name}/{m.get('id','?')}: context={cw} maxTokens={mt}")
+except: print("  无法读取")
+PYEOF
+    fi
+    line
+    out ""
+    out "预设:"
+    out "  [1] 128K  (128000)   通用默认"
+    out "  [2] 200K  (200000)   Claude 标准"
+    out "  [3] 1M    (1000000)  Claude/GPT 大上下文"
+    out "  [4] 自定义数值"
+    out "  [0] 返回"
+    echo -ne "选择: "
+    local choice=""
+    read_input choice "0"
+    local ctx_value=0
+    case "$choice" in
+        1) ctx_value=128000 ;;
+        2) ctx_value=200000 ;;
+        3) ctx_value=1000000 ;;
+        4)
+            echo -ne "上下文窗口大小 (token数): "
+            read_input ctx_value "128000"
+            ;;
+        0) return 0 ;;
+        *) warn "无效"; return 0 ;;
+    esac
+    [[ "$ctx_value" -lt 1024 ]] && { err "数值太小"; return 1; }
+    echo -ne "maxTokens (输出上限, 默认 8192): "
+    local max_tokens=""
+    read_input max_tokens "8192"
+    local enable_1m=false
+    if [[ "$ctx_value" -ge 1000000 ]]; then
+        out ""
+        warn "1M 上下文注意事项:"
+        out "  • Anthropic 模型需启用 context1m 参数 (beta)"
+        out "  • 仅 Claude Opus/Sonnet 支持"
+        out "  • 费用按实际使用 token 计算"
+        out "  • OpenAI 兼容 API 取决于后端是否支持"
+        out ""
+        confirm "启用 Anthropic context1m beta" && enable_1m=true
+    fi
+    info "备份当前配置..."
+    local bak=""
+    bak=$(config_backup "$cfg")
+    [[ -n "$bak" ]] && substep "备份: $(basename "$bak")"
+    info "更新所有已配置模型..."
+    if has_cmd python3; then
+        python3 - "$cfg" "$ctx_value" "$max_tokens" "$enable_1m" << 'PYEOF'
+import json, sys
+cfg_path = sys.argv[1]
+ctx = int(sys.argv[2])
+mt = int(sys.argv[3])
+c1m = sys.argv[4] == "true"
+try:
+    with open(cfg_path) as f: c = json.load(f)
+except: c = {}
+providers = c.get("models", {}).get("providers", {})
+updated = 0
+model_ids = []
+for name, p in providers.items():
+    if not isinstance(p, dict): continue
+    for m in p.get("models", []):
+        if isinstance(m, dict):
+            m["contextWindow"] = ctx
+            m["maxTokens"] = mt
+            updated += 1
+            mid = m.get("id", "")
+            if mid:
+                model_ids.append(f"{name}/{mid}")
+if c1m and model_ids:
+    agents = c.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    models_overrides = defaults.setdefault("models", {})
+    for full_id in model_ids:
+        override = models_overrides.setdefault(full_id, {})
+        params = override.setdefault("params", {})
+        params["context1m"] = True
+with open(cfg_path, 'w') as f:
+    json.dump(c, f, indent=2, ensure_ascii=False)
+print(f"  已更新 {updated} 个模型")
+PYEOF
+        fix_cfg_perms "$cfg"
+    fi
+    ok "上下文窗口已设为 ${ctx_value}"
+    if is_installed; then
+        confirm "重启服务" && service_restart
     fi
 }
 gen_token() {
@@ -1715,10 +1987,11 @@ show_menu() {
     out "  ${CG}[1]${C} 快速部署      ${CD}安装 OpenClaw${C}"
     out "  ${CC}[2]${C} 服务管理      ${CD}启动/停止/重启${C}"
     out "  ${CC}[3]${C} API 配置      ${CD}添加/修改 Provider${C}"
-    out "  ${CC}[4]${C} 网络设置      ${CD}局域网/令牌${C}"
-    out "  ${CY}[5]${C} 诊断工具      ${CD}检查/修复/日志${C}"
-    out "  ${CD}[6]${C} 系统信息      ${CD}版本/升级/卸载${C}"
-    out "  ${CC}[7]${C} 插件管理      ${CD}微信/飞书/钉钉/...${C}"
+    out "  ${CC}[4]${C} 网络设置      ${CD}局域网/令牌/手机连接${C}"
+    out "  ${CC}[5]${C} 插件管理      ${CD}微信/飞书/钉钉/...${C}"
+    out "  ${CC}[6]${C} 上下文窗口    ${CD}128K/200K/1M${C}"
+    out "  ${CY}[7]${C} 诊断工具      ${CD}检查/修复/日志${C}"
+    out "  ${CD}[8]${C} 系统信息      ${CD}版本/升级/卸载${C}"
     out "  ${CD}[0]${C} 退出"
     out ""
 }
@@ -1834,10 +2107,11 @@ main_menu() {
             1) menu_deploy ;;
             2) menu_service ;;
             3) configure_api; wait_key ;;
-            4) configure_network; wait_key ;;
-            7) menu_plugins; wait_key ;;
-            5) menu_diagnose ;;
-            6) menu_system ;;
+            4) menu_network; wait_key ;;
+            5) menu_plugins; wait_key ;;
+            6) menu_context_window; wait_key ;;
+            7) menu_diagnose ;;
+            8) menu_system ;;
             0|q|Q) out ""; out "再见!"; exit 0 ;;
             *) warn "无效"; sleep 1 ;;
         esac
@@ -1857,6 +2131,8 @@ show_help() {
     out "  config      配置 API"
     out "  lan         启用局域网"
     out "  plugins     插件管理"
+    out "  context     上下文窗口"
+    out "  pair        手机配对"
     out "  diagnose    诊断修复"
     out "  logs        查看日志"
     out "  update      检查更新"
@@ -1878,6 +2154,8 @@ main() {
         config) configure_api ;;
         lan) enable_lan_access ;;
         plugins) menu_plugins ;;
+        context) menu_context_window ;;
+        pair) mobile_pair ;;
         diagnose) diagnose ;;
         logs) view_logs ;;
         update) check_update ;;
