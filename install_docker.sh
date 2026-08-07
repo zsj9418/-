@@ -374,12 +374,24 @@ local cfg=$(jq -n \
 "log-opts": {"max-size": "10m", "max-file": "3"},
 "registry-mirrors": $mirrors
 }')
-[[ "$APPARMOR_RESTRICTED" == "true" ]] && cfg=$(echo "$cfg" | jq '. + {"default-security-opt": ["apparmor=unconfined"]}')
 echo "$cfg" > /etc/docker/daemon.json
 echo -e "  ${GREEN}daemon.json 已写入${NC}"
+if [[ "$APPARMOR_RESTRICTED" == "true" ]]; then
+echo -e "  ${YELLOW}提示: AppArmor 受限，运行容器时可添加 --security-opt apparmor=unconfined${NC}"
+fi
 }
 ensure_daemon_json() {
 mkdir -p /etc/docker
+if [[ -f /etc/docker/daemon.json ]]; then
+if ! jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+echo -e "  ${YELLOW}daemon.json 格式错误，重新生成${NC}"
+rm -f /etc/docker/daemon.json
+elif jq -e '."default-security-opt"' /etc/docker/daemon.json >/dev/null 2>&1; then
+echo -e "  ${YELLOW}修复无效配置项 default-security-opt${NC}"
+local tmp=$(mktemp)
+jq 'del(."default-security-opt")' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+fi
+fi
 if [[ ! -s /etc/docker/daemon.json ]]; then
 local mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
 _write_daemon_json "$mirrors_json"
