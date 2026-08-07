@@ -18,8 +18,8 @@ OMNIROUTE_IMAGE_BASE="diegosouzapw/omniroute"
 FREELLMAPI_COMPOSE_DIR="$HOME/freellmapi"
 COMPOSE_FALLBACK_VERSION="v2.39.1"
 GHCR_PROXIES=("ghcr.nju.edu.cn" "ghcr.chenby.cn" "ghcr.registry.cyou" "ghcr.m.daocloud.io")
-DOCKERHUB_PROXIES=("docker.1ms.run" "docker.m.daocloud.io" "dockerproxy.net" "docker.nju.edu.cn" "docker.xuanyuan.me")
-DOCKERHUB_MIRRORS=("https://docker.1ms.run" "https://docker.m.daocloud.io" "https://dockerproxy.net" "https://docker.nju.edu.cn" "https://docker.xuanyuan.me")
+DOCKERHUB_PROXIES=("docker.m.daocloud.io" "dockerproxy.net" "docker.nju.edu.cn" "docker.1ms.run" "hub.rat.dev")
+DOCKERHUB_MIRRORS=("https://docker.m.daocloud.io" "https://dockerproxy.net" "https://docker.nju.edu.cn" "https://docker.1ms.run" "https://hub.rat.dev")
 BEST_GHCR_PROXY=""
 BEST_DOCKERHUB_PROXY=""
 GHCR_DIRECT_OK=false
@@ -139,18 +139,19 @@ function _smart_pull() {
   if [[ "$pull_image" != "$image" ]]; then
     yellow "拉取镜像: $image"
     yellow "  使用代理: $pull_image"
-    if docker pull $pa "$pull_image" 2>/dev/null; then
+    yellow "  ⏳ 镜像约 250-500MB，请耐心等待..."
+    if timeout 600 docker pull $pa "$pull_image"; then
       docker tag "$pull_image" "$image" 2>/dev/null || true
       green "  ✅ 拉取成功，已标记为: $image"
       return 0
     fi
-    yellow "  代理拉取失败，尝试其他代理..."
+    yellow "  代理拉取失败或超时，尝试其他代理..."
     if _is_ghcr_image "$image"; then
       for proxy in "${GHCR_PROXIES[@]}"; do
         [[ "$proxy" == "$BEST_GHCR_PROXY" ]] && continue
         local try_image="${image/ghcr.io/$proxy}"
         yellow "  尝试: $try_image"
-        if docker pull $pa "$try_image" 2>/dev/null; then
+        if timeout 600 docker pull $pa "$try_image"; then
           docker tag "$try_image" "$image" 2>/dev/null || true
           green "  ✅ 拉取成功"; return 0
         fi
@@ -162,7 +163,7 @@ function _smart_pull() {
         if [[ "$image" != *"/"* ]]; then try_image="${proxy}/library/${image}"
         else try_image="${proxy}/${image}"; fi
         yellow "  尝试: $try_image"
-        if docker pull $pa "$try_image" 2>/dev/null; then
+        if timeout 600 docker pull $pa "$try_image"; then
           docker tag "$try_image" "$image" 2>/dev/null || true
           green "  ✅ 拉取成功"; return 0
         fi
@@ -171,19 +172,45 @@ function _smart_pull() {
     red "  ❌ 所有代理均失败"; return 1
   else
     yellow "拉取镜像: $image"
-    if docker pull $pa "$image" 2>/dev/null; then green "  ✅ 拉取成功"; return 0; fi
+    if timeout 600 docker pull $pa "$image"; then green "  ✅ 拉取成功"; return 0; fi
     red "  ❌ 拉取失败"; return 1
   fi
 }
 function pull_image_with_retry() {
   local img="$1"
   if ! _smart_pull "$img"; then
-    read -rp "拉取失败，重新检测网络并重试？(y/n，默认 y): " rp </dev/tty
-    if [[ "${rp:-y}" =~ ^[Yy]$ ]]; then
-      _detect_network
-      _smart_pull "$img" || { red "仍然失败，请检查网络。"; return 1; }
-    else red "放弃拉取: $img"; return 1; fi
+    echo ""
+    yellow "拉取失败，可选操作："
+    echo "  1. 重新检测网络并重试"
+    echo "  2. 手动选择代理重试"
+    echo "  3. 跳过代理直接拉取（需科学上网）"
+    echo "  0. 放弃"
+    read -rp "选项 (默认 1): " rp </dev/tty
+    case "${rp:-1}" in
+      1) _detect_network; _smart_pull "$img" || { red "仍然失败，请检查网络。"; return 1; } ;;
+      2) _manual_proxy_pull "$img" || return 1 ;;
+      3) yellow "直接拉取: $img"; timeout 600 docker pull "$img" || { red "直接拉取失败"; return 1; }; green "✅ 拉取成功" ;;
+      *) red "放弃拉取: $img"; return 1 ;;
+    esac
   fi
+}
+function _manual_proxy_pull() {
+  local img="$1"
+  echo "选择代理："
+  local all_proxies=("${DOCKERHUB_PROXIES[@]}")
+  local i=1
+  for p in "${all_proxies[@]}"; do echo "  $i. $p"; i=$((i+1)); done
+  read -rp "编号: " pn </dev/tty
+  if [[ "$pn" =~ ^[0-9]+$ && "$pn" -ge 1 && "$pn" -le ${#all_proxies[@]} ]]; then
+    local proxy="${all_proxies[$((pn-1))]}"
+    local pull_img="${proxy}/${img}"
+    yellow "拉取: $pull_img"
+    if timeout 600 docker pull "$pull_img"; then
+      docker tag "$pull_img" "$img" 2>/dev/null || true
+      green "✅ 拉取成功"; return 0
+    fi
+  fi
+  red "拉取失败"; return 1
 }
 function setup_logging() {
   local tmp_id=""
