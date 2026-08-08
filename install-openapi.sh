@@ -592,7 +592,7 @@ function _copy_dir_to_volume() {
 }
 function _fetch_versions_github() {
   local repo="$1" limit="${2:-8}"
-  local resp; resp=$(_http_get "https://api.github.com/repos/${repo}/releases?per_page=20" 10) || return 1
+  local resp; resp=$(_http_get "https://api.github.com/repos/${repo}/releases?per_page=100" 10) || return 1
   [[ -z "$resp" ]] && return 1
   echo "$resp" | grep '"tag_name"' | cut -d'"' -f4 | head -n"$limit"
 }
@@ -600,10 +600,24 @@ function _fetch_versions_ghcr() {
   local image_path="$1" limit="${2:-8}"
   local token; token=$(_http_get "https://ghcr.io/token?scope=repository:${image_path}:pull&service=ghcr.io" 5 | grep -o '"token":"[^"]*"' | cut -d'"' -f4 2>/dev/null || true)
   [[ -z "$token" ]] && return 1
-  local resp=""
-  command -v curl &>/dev/null && resp=$(curl -sSL --connect-timeout 8 --max-time 8 -H "Authorization: Bearer $token" "https://ghcr.io/v2/${image_path}/tags/list" 2>/dev/null || true)
-  [[ -z "$resp" ]] && return 1
-  echo "$resp" | grep -o '"[^"]*"' | tr -d '"' | grep -E '^v?[0-9]+\.[0-9]' | sort -rV | head -n"$limit"
+  local all_tags="" next_url="https://ghcr.io/v2/${image_path}/tags/list?n=1000"
+  while [[ -n "$next_url" ]]; do
+    local resp="" headers=""
+    if command -v curl &>/dev/null; then
+      headers=$(curl -sSL --connect-timeout 8 --max-time 15 -H "Authorization: Bearer $token" -D - -o /tmp/_ghcr_tags_$$.json "$next_url" 2>/dev/null || true)
+      resp=$(cat /tmp/_ghcr_tags_$$.json 2>/dev/null || true)
+      rm -f /tmp/_ghcr_tags_$$.json
+    elif command -v wget &>/dev/null; then
+      resp=$(wget -qO- --timeout=15 --header="Authorization: Bearer $token" "$next_url" 2>/dev/null || true)
+      headers=""
+    fi
+    [[ -z "$resp" ]] && break
+    all_tags+=" $resp"
+    local link_next; link_next=$(echo "$headers" | grep -i '^Link:' | grep -o '<[^>]*>' | grep 'rel="next"' | head -1 | tr -d '<>' | sed 's/;.*$//' || true)
+    [[ -n "$link_next" ]] && next_url="$link_next" || next_url=""
+  done
+  [[ -z "$all_tags" ]] && return 1
+  echo "$all_tags" | grep -o '"[^"]*"' | tr -d '"' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -n"$limit"
 }
 function _fetch_versions_dockerhub() {
   local repo="$1" limit="${2:-8}"
@@ -1007,9 +1021,15 @@ function freellmapi_restore() {
   if [[ -d "$rbase/data" ]]; then docker volume inspect freellmapi-data &>/dev/null && yellow "  覆盖已有数据卷..." || docker volume create freellmapi-data &>/dev/null
     _copy_dir_to_volume "$rbase/data" "freellmapi-data" || { red "数据卷恢复失败"; rm -rf "$rtmp"; return 1; }; green "  数据卷已恢复"
   else yellow "  备份中无数据卷，跳过"; fi
-  rm -rf "$rtmp"; yellow "5/5 启动..."
-  if [[ -f "$compose_dir/docker-compose.yml" ]]; then cd "$compose_dir" || { red "无法进入目录：$compose_dir"; return 1; }
-    docker compose up -d && cd - >/dev/null || true; sleep 10
+  rm -rf "$rtmp"; yellow "5/5 拉取镜像并启动..."
+  if [[ -f "$compose_dir/docker-compose.yml" ]]; then
+    local restore_image
+    restore_image=$(grep -oP 'image:\s*\K\S+' "$compose_dir/docker-compose.yml" 2>/dev/null | head -1 || echo "${bak_image:-}")
+    if [[ -n "$restore_image" ]]; then
+      pull_image_with_retry "$restore_image" || { red "镜像拉取失败，请检查网络后重试。"; return 1; }
+    fi
+    cd "$compose_dir" || { red "无法进入目录：$compose_dir"; return 1; }
+    docker compose up -d --no-pull 2>/dev/null || docker compose up -d && cd - >/dev/null || true; sleep 10
     if docker ps --format '{{.Names}}' | grep -q "^freellmapi$"; then local ip; ip=$(get_local_ip)
       local port; port=$(grep '^PORT=' "$compose_dir/.env" 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "3001"); [[ -z "$port" ]] && port="3001"
       echo ""; green "✅ FreeLLMAPI 恢复成功"; green "   Dashboard : http://$ip:$port"; green "   API       : http://$ip:$port/v1/chat/completions"
@@ -1169,7 +1189,6 @@ function deploy_freellmapi() {
   local sel_image="$SELECTED_IMAGE"; validate_port "$int_port" || return 1; local chosen_port="$PORT"
   local host_bind="127.0.0.1"; echo ""; echo "网络访问范围："; echo "  1. 仅本机（安全）"; echo "  2. 局域网"
   read -rp "选项 (1-2，默认 1)：" bc </dev/tty; [[ "${bc:-1}" == "2" ]] && { host_bind="0.0.0.0"; yellow "⚠️  局域网模式"; }; green "绑定：$host_bind"
-  local rpm="120"; read -rp "每分钟最大请求数（默认 120）：" ri </dev/tty; [[ "$ri" =~ ^[0-9]+$ ]] && rpm="$ri"
   local key_file="$HOME/.freellmapi_encryption_key" enc_key=""
   if [[ -f "$key_file" ]]; then enc_key=$(cat "$key_file"); green "复用已有 KEY"
   else enc_key=$(openssl rand -hex 32); echo "$enc_key" > "$key_file"; chmod 600 "$key_file"; green "已生成新 KEY：$key_file"; red "⚠️  请备份此文件！"; fi
@@ -1177,11 +1196,8 @@ function deploy_freellmapi() {
   mkdir -p "$compose_dir"
   cat > "$compose_dir/.env" << EOF
 ENCRYPTION_KEY=${enc_key}
-PORT=${chosen_port}
+PORT=3001
 HOST_BIND=${host_bind}
-PROXY_RATE_LIMIT_RPM=${rpm}
-REQUEST_ANALYTICS_RETENTION_DAYS=90
-REQUEST_ANALYTICS_MAX_ROWS=100000
 EOF
   chmod 600 "$compose_dir/.env"
   cat > "$compose_dir/docker-compose.yml" << EOF
@@ -1191,19 +1207,27 @@ services:
     container_name: freellmapi
     restart: unless-stopped
     ports:
-      - "${host_bind}:${chosen_port}:${chosen_port}"
+      - "${host_bind}:${chosen_port}:3001"
     volumes:
       - freellmapi-data:/app/server/data
     env_file:
       - .env
     environment:
       - TZ=${DEFAULT_TZ}
+      - NODE_ENV=production
+      - PORT=3001
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${chosen_port}/v1/models || exit 1"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/ping').then((res) => { if (!res.ok) process.exit(1); }).catch(() => process.exit(1));"
+        ]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
+      start_period: 15s
       retries: 3
-      start_period: 20s
 volumes:
   freellmapi-data:
     name: freellmapi-data
@@ -1302,7 +1326,7 @@ function _freellmapi_upgrade_version() {
   select_image_version "FreeLLMAPI" "$FREELLMAPI_IMAGE_BASE" "github" "tashfeenahmed/freellmapi" 8; local new_image="$SELECTED_IMAGE"
   [[ "$new_image" == "$cur" ]] && { yellow "版本相同"; read -rp "强制重拉？(y/n)：" fr </dev/tty; [[ ! "${fr:-n}" =~ ^[Yy]$ ]] && return 0; }
   pull_image_with_retry "$new_image" || return 1
-  if [[ -f "$compose_file" ]]; then sed -i "s|image:.*freellmapi.*|image: ${new_image}|" "$compose_file" || true; cd "$compose_dir" || return 1; docker compose up -d --no-deps freellmapi || true; cd - >/dev/null || true; fi
+  if [[ -f "$compose_file" ]]; then sed -i "s|image:.*freellmapi.*|image: ${new_image}|" "$compose_file" || true; cd "$compose_dir" || return 1; docker compose up -d --no-deps --no-pull freellmapi 2>/dev/null || docker compose up -d --no-deps freellmapi || true; cd - >/dev/null || true; fi
   sleep 8; docker ps --format '{{.Names}}' | grep -q "^freellmapi$" && green "✅ 切换成功" || red "容器启动异常"
 }
 function _freellmapi_show_setup_code() {
