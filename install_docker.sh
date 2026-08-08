@@ -181,57 +181,78 @@ fi
 }
 _do_curl_download() {
 local url="$1" dest="$2"
-echo "  下载: ${url}"
-curl -fL --retry 2 --connect-timeout 15 --max-time 600 -o "$dest" "$url" 2>/dev/null
+echo -e "  ${CYAN}↓${NC} ${url}"
+curl -fL --retry 2 --connect-timeout 15 --max-time 600 \
+--progress-bar \
+-o "$dest" "$url" 2>&1
 local rc=$?
 if [[ $rc -ne 0 ]]; then
+echo -e "  ${RED}✗ 连接失败 (错误码: ${rc})${NC}"
 rm -f "$dest"
 return 1
 fi
 if [[ ! -s "$dest" ]]; then
+echo -e "  ${RED}✗ 下载文件为空${NC}"
 rm -f "$dest"
 return 1
 fi
 if head -c 20 "$dest" 2>/dev/null | grep -qi '<!doctype\|<html'; then
-echo -e "  ${RED}下载到的是网页而非文件，跳过${NC}"
+echo -e "  ${RED}✗ 收到网页而非文件（代理可能不可用）${NC}"
 rm -f "$dest"
 return 1
 fi
+local filesize=$(du -h "$dest" 2>/dev/null | cut -f1)
+echo -e "  ${GREEN}✓ 下载完成 (${filesize})${NC}"
 return 0
 }
 download_with_fallback() {
 local type="$1" url="$2" dest="$3"
 rm -f "$dest" 2>/dev/null
+local tried=0 total=0
 case "$type" in
 docker)
 local suffix="$url"
-local mirrors=("$BEST_DOCKER_MIRROR" "${DOCKER_BINARY_MIRRORS[@]}")
+local -a mirrors=()
+[[ -n "$BEST_DOCKER_MIRROR" ]] && mirrors+=("$BEST_DOCKER_MIRROR")
+for m in "${DOCKER_BINARY_MIRRORS[@]}"; do
+[[ "$m" != "$BEST_DOCKER_MIRROR" ]] && mirrors+=("$m")
+done
+total=${#mirrors[@]}
 for mirror in "${mirrors[@]}"; do
 [[ -z "$mirror" ]] && continue
-echo -e "\n  ${CYAN}尝试: ${mirror}${NC}"
+tried=$((tried+1))
+echo ""
+echo -e "  ${BOLD}[${tried}/${total}]${NC} ${mirror}"
 if _do_curl_download "${mirror}${suffix}" "$dest"; then
-echo -e "  ${GREEN}下载成功${NC}"
 return 0
 fi
+echo -e "  ${YELLOW}  → 切换下一个源...${NC}"
 done
-echo -e "  ${RED}所有镜像源都失败${NC}"
+echo ""
+echo -e "  ${RED}✗ 全部 ${total} 个源均失败${NC}"
 return 1
 ;;
 github)
-echo -e "\n  ${CYAN}直连 GitHub...${NC}"
-if _do_curl_download "$url" "$dest"; then
-echo -e "  ${GREEN}下载成功${NC}"
-return 0
-fi
-echo -e "  ${YELLOW}直连失败，尝试代理...${NC}"
+local -a urls=("$url")
 for prefix in "${GITHUB_PROXY_PREFIXES[@]}"; do
-echo -e "  ${CYAN}代理: ${prefix}${NC}"
-if _do_curl_download "${prefix}${url}" "$dest"; then
-echo -e "  ${GREEN}下载成功${NC}"
+urls+=("${prefix}${url}")
+done
+total=${#urls[@]}
+local labels=("GitHub 直连")
+for prefix in "${GITHUB_PROXY_PREFIXES[@]}"; do
+labels+=("代理 ${prefix}")
+done
+for i in "${!urls[@]}"; do
+tried=$((tried+1))
+echo ""
+echo -e "  ${BOLD}[${tried}/${total}]${NC} ${labels[$i]}"
+if _do_curl_download "${urls[$i]}" "$dest"; then
 return 0
 fi
+(( tried < total )) && echo -e "  ${YELLOW}  → 切换下一个...${NC}"
 done
-echo -e "  ${RED}所有下载方式都失败${NC}"
+echo ""
+echo -e "  ${RED}✗ 全部 ${total} 种方式均失败${NC}"
 return 1
 ;;
 *)
@@ -641,42 +662,80 @@ echo -n "  已安装，重新安装？(y/n): "
 read reply </dev/tty
 [[ "$reply" != "y" ]] && return
 }
+section "安装 Docker"
+echo ""
+echo -e "  ${BOLD}[步骤 1/7]${NC} 检测系统环境"
 ensure_docker_prereqs
 ARCH=$(get_architecture)
+echo ""
+echo -e "  ${BOLD}[步骤 2/7]${NC} 准备安装目录"
 check_and_set_install_dir
+echo ""
+echo -e "  ${BOLD}[步骤 3/7]${NC} 下载源测速"
 detect_best_docker_mirror
 local VERSION
 if [[ "$FORCE_LEGACY_DOCKER" == "true" ]]; then
 VERSION="$RECOMMENDED_LEGACY_DOCKER_VERSION"
-echo -e "\n  ${YELLOW}使用兼容版本: ${VERSION}${NC}"
+echo -e "\n  ${YELLOW}环境限制，使用兼容版本: ${VERSION}${NC}"
 else
-echo -e "\n  获取可用 Docker 版本..."
+echo ""
+echo -e "  ${BOLD}[步骤 4/7]${NC} 选择版本"
 local versions_str=$(fetch_docker_versions)
 VERSION=$(select_version "$versions_str" "Docker")
 [[ -z "$VERSION" ]] && { echo -e "  ${RED}未选择版本${NC}"; return 1; }
 fi
-echo -e "\n  ${GREEN}安装 Docker ${VERSION}${NC}"
+echo ""
+echo -e "  ${BOLD}[步骤 5/7]${NC} 下载 Docker ${VERSION}"
 local suffix="/${ARCH}/docker-${VERSION}.tgz"
-download_with_fallback "docker" "$suffix" "$DOCKER_INSTALL_DIR/docker.tgz" || { echo -e "  ${RED}下载失败${NC}"; rm -rf "$DOCKER_INSTALL_DIR"; return 1; }
-echo "  解压..."
-tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" || { echo -e "  ${RED}解压失败${NC}"; return 1; }
-echo "  安装二进制..."
-mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/
-groupadd -f docker
+if ! download_with_fallback "docker" "$suffix" "$DOCKER_INSTALL_DIR/docker.tgz"; then
+rm -rf "$DOCKER_INSTALL_DIR"
+return 1
+fi
+echo ""
+echo -e "  ${BOLD}[步骤 6/7]${NC} 解压并安装"
+echo -n "  解压文件..."
+if tar -zxf "$DOCKER_INSTALL_DIR/docker.tgz" -C "$DOCKER_INSTALL_DIR" 2>/dev/null; then
+echo -e " ${GREEN}完成${NC}"
+else
+echo -e " ${RED}失败${NC}"
+rm -rf "$DOCKER_INSTALL_DIR"
+return 1
+fi
+echo -n "  安装到 /usr/local/bin..."
+mv "$DOCKER_INSTALL_DIR/docker/"* /usr/local/bin/ && echo -e " ${GREEN}完成${NC}" || { echo -e " ${RED}失败${NC}"; return 1; }
+groupadd -f docker 2>/dev/null
 [[ -n "${SUDO_USER:-}" ]] && gpasswd -a "$SUDO_USER" docker >/dev/null 2>&1
+echo -n "  配置 daemon.json..."
 ensure_daemon_json
+echo -n "  写入 systemd 服务..."
 _write_docker_service
 _write_docker_socket
+echo -e " ${GREEN}完成${NC}"
 systemctl daemon-reload
 systemctl enable docker >/dev/null 2>&1
-echo -e "  ${CYAN}启动 Docker...${NC}"
-if systemctl start docker; then
+echo ""
+echo -e "  ${BOLD}[步骤 7/7]${NC} 启动 Docker 服务"
+echo -n "  启动中..."
+if systemctl start docker 2>/dev/null; then
 sleep 1
-echo -e "\n  ${GREEN}✓ Docker ${VERSION} 安装成功！${NC}"
-echo -e "  ${YELLOW}提示: 重新登录以使用无 sudo 的 docker 命令${NC}"
+local ver_str=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+echo -e " ${GREEN}成功${NC}"
+echo ""
+hr
+echo -e "  ${GREEN}${BOLD}✓ Docker ${ver_str} 安装完成！${NC}"
+echo -e "  ${YELLOW}  提示: 重新登录以使用无 sudo 的 docker 命令${NC}"
+hr
 else
-echo -e "\n  ${RED}启动失败，查看日志:${NC}"
-journalctl -u docker -n 30 --no-pager
+echo -e " ${RED}失败${NC}"
+echo ""
+echo -e "  ${RED}Docker 启动失败，错误日志:${NC}"
+hr
+journalctl -u docker -n 20 --no-pager 2>/dev/null | head -20
+hr
+echo -e "  ${YELLOW}排查建议:${NC}"
+echo -e "  1. 检查 daemon.json: cat /etc/docker/daemon.json"
+echo -e "  2. 查看详细日志: journalctl -u docker -n 50"
+echo -e "  3. 使用菜单选项 8 重新生成 daemon.json"
 fi
 rm -rf "$DOCKER_INSTALL_DIR"
 }
@@ -686,11 +745,15 @@ echo -n "  已安装，重新安装？(y/n): "
 read reply </dev/tty
 [[ "$reply" != "y" ]] && return
 }
+section "安装 Docker Compose"
 rm -f /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose 2>/dev/null
+echo ""
+echo -e "  ${BOLD}[步骤 1/3]${NC} 选择版本"
 local versions_str=$(fetch_compose_versions)
 local VERSION=$(select_version "$versions_str" "Compose")
 [[ -z "$VERSION" ]] && { echo -e "  ${RED}未选择版本${NC}"; return 1; }
-echo -e "\n  ${GREEN}安装 Docker Compose ${VERSION}${NC}"
+echo ""
+echo -e "  ${BOLD}[步骤 2/3]${NC} 下载 Docker Compose ${VERSION}"
 local arch=$(uname -m)
 local file=""
 case "$arch" in
@@ -706,21 +769,33 @@ if ! download_with_fallback "github" "$url" "$tmp_file"; then
 rm -f "$tmp_file"
 return 1
 fi
+echo ""
+echo -e "  ${BOLD}[步骤 3/3]${NC} 安装并验证"
+echo -n "  验证文件格式..."
 if ! head -c 4 "$tmp_file" 2>/dev/null | grep -q 'ELF'; then
-echo -e "  ${RED}下载的文件不是有效的二进制文件${NC}"
+echo -e " ${RED}失败（不是有效的二进制文件）${NC}"
 rm -f "$tmp_file"
 return 1
 fi
+echo -e " ${GREEN}有效${NC}"
+echo -n "  安装到系统..."
 mv "$tmp_file" /usr/local/bin/docker-compose
 chmod +x /usr/local/bin/docker-compose
 mkdir -p /usr/local/lib/docker/cli-plugins
 cp /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+echo -e " ${GREEN}完成${NC}"
+echo -n "  运行验证..."
 if docker-compose --version >/dev/null 2>&1; then
 local installed_ver=$(docker-compose --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-echo -e "  ${GREEN}✓ Docker Compose ${installed_ver} 安装成功${NC}"
+echo -e " ${GREEN}通过${NC}"
+echo ""
+hr
+echo -e "  ${GREEN}${BOLD}✓ Docker Compose ${installed_ver} 安装完成！${NC}"
+hr
 else
-echo -e "  ${RED}安装后验证失败${NC}"
+echo -e " ${RED}失败${NC}"
+echo -e "  ${RED}文件已安装但无法执行，可能架构不匹配${NC}"
 return 1
 fi
 }
