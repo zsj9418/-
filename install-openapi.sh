@@ -683,7 +683,9 @@ function _backup_bind_service() {
   local backup_root; backup_root=$(_select_backup_root) || return 1
   _check_disk_space "$backup_root" 51200 || return 1
   local stamp; stamp=$(date +%Y%m%d_%H%M%S)
-  local bname="${backup_prefix}-${stamp}" btmp="${backup_root}/${bname}" barch="${backup_root}/${bname}.${pack_type}"
+  local bname="${backup_prefix}-${stamp}"
+  local btmp="${backup_root}/${bname}"
+  local barch="${backup_root}/${bname}.${pack_type}"
   mkdir -p "$btmp"
   yellow "1/3 暂停容器..."
   local was_running=false
@@ -763,7 +765,9 @@ function _backup_volume_service() {
   local pack_type; pack_type=$(_check_pack_tools); [[ "$pack_type" == "none" ]] && { red "未找到打包工具！"; return 1; }
   local backup_root; backup_root=$(_select_backup_root) || return 1; _check_disk_space "$backup_root" 102400 || return 1
   local stamp; stamp=$(date +%Y%m%d_%H%M%S)
-  local bname="${backup_prefix}-${stamp}" btmp="${backup_root}/${bname}" barch="${backup_root}/${bname}.${pack_type}"
+  local bname="${backup_prefix}-${stamp}"
+  local btmp="${backup_root}/${bname}"
+  local barch="${backup_root}/${bname}.${pack_type}"
   mkdir -p "$btmp/data"; yellow "1/3 暂停容器保证数据一致性..."
   local was_running=false
   if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then was_running=true; docker stop "$container_name" &>/dev/null || true; green "  容器已暂停"
@@ -945,7 +949,10 @@ function freellmapi_backup() {
   [[ ! -f "$key_file" ]] && { red "未找到 ENCRYPTION_KEY（$key_file），中止！"; return 1; }
   local pack_type; pack_type=$(_check_pack_tools); [[ "$pack_type" == "none" ]] && { red "未找到打包工具！"; return 1; }
   local backup_root; backup_root=$(_select_backup_root) || return 1; _check_disk_space "$backup_root" 51200 || return 1
-  local stamp; stamp=$(date +%Y%m%d_%H%M%S); local bname="freellmapi-backup-${stamp}" btmp="${backup_root}/${bname}" barch="${backup_root}/${bname}.${pack_type}"
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  local bname="freellmapi-backup-${stamp}"
+  local btmp="${backup_root}/${bname}"
+  local barch="${backup_root}/${bname}.${pack_type}"
   mkdir -p "$btmp"; yellow "1/4 备份 ENCRYPTION_KEY..."
   cp "$key_file" "$btmp/.freellmapi_encryption_key" || { red "复制失败"; rm -rf "$btmp"; return 1; }; chmod 600 "$btmp/.freellmapi_encryption_key"; green "  KEY 已备份"
   yellow "2/4 备份配置文件..."
