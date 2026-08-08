@@ -308,18 +308,42 @@ uninstall_one(){
   log INFO "── 开始卸载: $desc ($name)"
   local svc
   for svc in $svcs; do stop_svc "$svc"; done
-  clean_cron "$name"
-  if [[ "$name" == "php" ]] && [[ "$DRY" == "false" ]]; then
-    apt-get purge 'php*' -y 2>/dev/null || true
+  if [[ "$name" == "nfs" ]]; then
+    log INFO "NFS 特殊处理：停止全部关联服务和内核模块..."
+    local nfs_svcs="nfs-server nfs-kernel-server nfs-mountd nfs-idmapd nfs-blkmap rpcbind rpcbind.socket"
+    for svc in $nfs_svcs; do
+      systemctl stop    "$svc" 2>/dev/null || true
+      systemctl disable "$svc" 2>/dev/null || true
+      systemctl mask    "$svc" 2>/dev/null || true
+    done
+    exportfs -ua 2>/dev/null || true
+    umount -a -t nfs,nfs4 2>/dev/null || true
+    modprobe -r nfsd 2>/dev/null || true
+    modprobe -r nfs  2>/dev/null || true
+    for proc in nfsd rpcbind rpc.mountd rpc.idmapd rpc.statd nfs-idmapd; do
+      pkill -9 -x "$proc" 2>/dev/null || true
+    done
+    pkgs="nfs-kernel-server nfs-common rpcbind"
+    dirs="/etc/exports /etc/exports.d /var/lib/nfs /run/rpcbind"
+    find /etc/systemd/system /lib/systemd/system -name "*nfs*" -o -name "*rpcbind*" 2>/dev/null | \
+      grep -viE "samba|smb" | while read -r uf; do
+        systemctl stop    "$(basename "$uf")" 2>/dev/null || true
+        systemctl disable "$(basename "$uf")" 2>/dev/null || true
+        rm -f "$uf"
+        log INFO "删除 unit: $uf"
+      done
+    systemctl daemon-reload 2>/dev/null || true
   fi
+  clean_cron "$name"
+  [[ "$name" == "php" ]] && [[ "$DRY" == "false" ]] && { apt-get purge 'php*' -y 2>/dev/null || true; }
   do_purge "$pkgs"
   clean_systemd "$name"
   clean_dirs "$dirs"
-  if [[ "$DRY" == "false" ]]; then
+  [[ "$DRY" == "false" ]] && {
     find /var/log -name "*${name}*" -delete 2>/dev/null || true
     find /home -maxdepth 2 -type d -name ".${name}" -exec rm -rf {} + 2>/dev/null || true
     rm -rf "$HOME/.${name}" 2>/dev/null || true
-  fi
+  }
   log INFO "── 完成卸载: $name"
   return 0
 }
@@ -367,14 +391,16 @@ verify_one(){
   for pk in $pkgs; do
     echo "$DPKG_CACHE" | grep -qE "^rc\s+${pk}\s" && issues+=("rc残留") && break
   done
-  if pgrep -f "$name" &>/dev/null; then
-    issues+=("进程仍运行")
+  if [[ "$name" == "nfs" ]]; then
+    for proc in nfsd rpcbind rpc.mountd rpc.idmapd rpc.statd; do
+      pgrep -x "$proc" &>/dev/null && issues+=("${proc}进程仍运行") && break
+    done
+    ss -tlnp 2>/dev/null | grep -qE ":111|:2049" && issues+=("NFS端口仍监听")
+  else
+    pgrep -f "$name" &>/dev/null && issues+=("进程仍运行")
   fi
   for svc in $svcs; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      issues+=("服务未停")
-      break
-    fi
+    systemctl is-active --quiet "$svc" 2>/dev/null && issues+=("服务未停") && break
   done
   if [[ ${#issues[@]} -eq 0 ]]; then
     printf "  ${G}✓${NC}  %-18s ${G}彻底清除${NC}\n" "$name"
