@@ -43,7 +43,7 @@ detect_env() {
     elif [ -f /etc/os-release ]; then
         . /etc/os-release 2>/dev/null
         OS_ID="${ID:-unknown}"
-        if command -v systemctl >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running &>/dev/null; then
             IS_SYSTEMD=1
             SVC_START="systemctl start %s"
             SVC_STOP="systemctl stop %s"
@@ -56,7 +56,7 @@ detect_env() {
         elif command -v pacman >/dev/null 2>&1; then PKG_MANAGER="pacman"; INSTALL_CMD="pacman -S --noconfirm"
         elif command -v zypper >/dev/null 2>&1; then PKG_MANAGER="zypper"; INSTALL_CMD="zypper install -y"
         fi
-        info "检测到系统: ${PRETTY_NAME:-$OS_ID} | 架构: ${ARCH} | 内核: $(uname -r) | 包管理: ${PKG_MANAGER:-未知}"
+        info "检测到系统: ${PRETTY_NAME:-$OS_ID} | 架构: ${ARCH} | 内核: $(uname -r) | 包管理: ${PKG_MANAGER:-未知} | systemd: ${IS_SYSTEMD}"
     else
         warn "无法识别系统类型，部分功能可能受限。"
     fi
@@ -113,9 +113,9 @@ ensure_fs_support() {
             ;;
         vfat|fat|fat32|msdos)
             if [ "$IS_OPENWRT" = "1" ]; then
-                opkg list-installed | grep -q "kmod-fs-vfat"  || opkg install kmod-fs-vfat   2>/dev/null
-                opkg list-installed | grep -q "kmod-nls-utf8" || opkg install kmod-nls-utf8  2>/dev/null
-                opkg list-installed | grep -q "kmod-nls-cp437"|| opkg install kmod-nls-cp437 2>/dev/null
+                opkg list-installed | grep -q "kmod-fs-vfat"   || opkg install kmod-fs-vfat   2>/dev/null
+                opkg list-installed | grep -q "kmod-nls-utf8"  || opkg install kmod-nls-utf8  2>/dev/null
+                opkg list-installed | grep -q "kmod-nls-cp437" || opkg install kmod-nls-cp437 2>/dev/null
             else
                 ensure_pkg "" "" "dosfstools" "dosfstools" "dosfstools"
             fi
@@ -187,6 +187,14 @@ get_fs_mount_opts() {
         *)      echo "rw,defaults,nofail" ;;
     esac
 }
+get_fstab_opts() {
+    local base_opts="$1"
+    if [ "$IS_SYSTEMD" = "1" ]; then
+        echo "${base_opts},x-systemd.device-timeout=30"
+    else
+        echo "$base_opts"
+    fi
+}
 get_real_fstype() {
     local fs="$1"
     case "$fs" in
@@ -205,14 +213,121 @@ get_real_fstype() {
 make_mount_name() {
     local label="$1" uuid="$2" fs="$3"
     local name=""
-    if [ -n "$label" ] && [ "$label" != '""' ] && [ "$label" != "" ]; then
+    if [ -n "$uuid" ]; then
+        name=$(echo "$uuid" | sed 's/-//g' | rev | cut -c1-4 | rev)
+    fi
+    if [ -z "$name" ] && [ -n "$label" ] && [ "$label" != '""' ]; then
         name=$(echo "$label" | sed 's/[^A-Za-z0-9_\-]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
     fi
-    if [ -z "$name" ]; then
-        name="${uuid%%-*}"
-        [ -z "$name" ] && name="${fs}_disk"
-    fi
+    [ -z "$name" ] && name="${fs:-disk}_disk"
     echo "$name"
+}
+mount_path_to_unit() {
+    local path="$1"
+    path="${path#/}"
+    path=$(echo "$path" | sed 's|/|-|g; s| |\\x20|g; s|\\|-|g')
+    echo "${path}.mount"
+}
+do_mount_now() {
+    local dev="$1" mount_pt="$2" real_fs="$3" opts="$4"
+    local clean_opts
+    clean_opts=$(echo "$opts" | sed 's/,x-systemd\.[^,]*//g; s/^,//')
+    if mountpoint -q "$mount_pt" 2>/dev/null; then
+        info "已挂载: $mount_pt"
+        return 0
+    fi
+    info "尝试挂载 $dev -> $mount_pt ($real_fs)"
+    if mount -t "$real_fs" -o "$clean_opts" "$dev" "$mount_pt" 2>/dev/null; then
+        info "挂载成功: $mount_pt"
+        return 0
+    fi
+    warn "指定类型挂载失败，尝试自动检测..."
+    if mount -o "$clean_opts" "$dev" "$mount_pt" 2>/dev/null; then
+        info "自动检测挂载成功: $mount_pt"
+        return 0
+    fi
+    warn "自动挂载失败，尝试只读..."
+    if mount -o ro "$dev" "$mount_pt" 2>/dev/null; then
+        warn "只读挂载成功: $mount_pt（设备可能存在问题）"
+        return 0
+    fi
+    error "所有挂载方式均失败: $dev -> $mount_pt"
+    return 1
+}
+activate_systemd_mount() {
+    local mount_pt="$1"
+    if [ "$IS_SYSTEMD" != "1" ]; then
+        return 0
+    fi
+    local unit
+    unit=$(mount_path_to_unit "$mount_pt")
+    systemctl daemon-reload 2>/dev/null
+    if systemctl start "$unit" 2>/dev/null; then
+        sleep 1
+        if mountpoint -q "$mount_pt" 2>/dev/null; then
+            info "systemd mount unit 启动成功: $unit"
+            return 0
+        fi
+    fi
+    return 1
+}
+register_mount_point_tmpfiles() {
+    local mount_pt="$1"
+    if [ "$IS_SYSTEMD" = "1" ]; then
+        local tmpfiles_conf="/etc/tmpfiles.d/disk-mount-points.conf"
+        if ! grep -qF " $mount_pt " "$tmpfiles_conf" 2>/dev/null && \
+           ! grep -qF " $mount_pt" "$tmpfiles_conf" 2>/dev/null; then
+            echo "d $mount_pt 0755 root root -" >> "$tmpfiles_conf"
+            info "已注册挂载点到 tmpfiles: $mount_pt"
+        fi
+        systemd-tmpfiles --create "$tmpfiles_conf" 2>/dev/null
+    fi
+    mkdir -p "$mount_pt"
+    chmod 755 "$mount_pt"
+}
+install_boot_mount_service() {
+    if [ "$IS_SYSTEMD" != "1" ]; then
+        return 0
+    fi
+    local svc_file="/etc/systemd/system/disk-mount-retry.service"
+    cat > "$svc_file" << 'SVCEOF'
+[Unit]
+Description=Retry fstab mounts for external disks after boot
+After=local-fs.target remote-fs.target
+Wants=local-fs.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=/bin/bash -c '\
+    while IFS= read -r line; do \
+        [[ "$line" =~ ^# ]] && continue; \
+        [[ -z "$line" ]] && continue; \
+        mpt=$(echo "$line" | awk "{print \$2}"); \
+        fs=$(echo "$line" | awk "{print \$3}"); \
+        [[ "$mpt" == "/" || "$mpt" == "none" || "$mpt" == "swap" ]] && continue; \
+        [[ "$fs" == "tmpfs" || "$fs" == "swap" ]] && continue; \
+        mountpoint -q "$mpt" 2>/dev/null && continue; \
+        [ -d "$mpt" ] || mkdir -p "$mpt"; \
+        mount "$mpt" 2>/dev/null || true; \
+    done < /etc/fstab'
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable disk-mount-retry.service 2>/dev/null
+    info "开机补充挂载服务已安装/更新: disk-mount-retry.service"
+}
+reload_systemd_fstab() {
+    if [ "$IS_SYSTEMD" = "1" ]; then
+        systemctl daemon-reload 2>/dev/null
+        info "systemd 已重新加载 fstab 配置。"
+    fi
 }
 ensure_base_deps() {
     title "检查基础依赖"
@@ -238,6 +353,7 @@ ensure_base_deps() {
         ensure_pkg "mkfs.xfs"  "" "xfsprogs"      "xfsprogs"      "xfsprogs"
         ensure_pkg "mkfs.ntfs" "" "ntfs-3g"       "ntfs-3g"       "ntfs-3g"
         ensure_pkg "mkfs.vfat" "" "dosfstools"    "dosfstools"    "dosfstools"
+        install_boot_mount_service
     fi
     info "基础依赖检查完成。"
 }
@@ -316,12 +432,9 @@ ID_FS_TYPE=$(echo "$DEV_INFO" | grep "^TYPE=" | cut -d= -f2-)
 ID_FS_LABEL=$(echo "$DEV_INFO" | grep "^LABEL=" | cut -d= -f2-)
 [ -z "$ID_FS_UUID" ] && exit 0
 MNT_BASE=$(uci get fstab.@global[0].auto_mount_base 2>/dev/null || echo "/mnt")
-if [ -n "$ID_FS_LABEL" ]; then
-    CLEAN_LABEL=$(echo "$ID_FS_LABEL" | sed "s/[^A-Za-z0-9_-]/_/g;s/__*/_/g;s/^_//;s/_$//")
-    MOUNT_NAME="$CLEAN_LABEL"
-else
-    MOUNT_NAME="${ID_FS_UUID%%-*}"
-fi
+CLEAN_UUID=$(echo "$ID_FS_UUID" | sed "s/-//g")
+MOUNT_NAME=$(echo "$CLEAN_UUID" | rev | cut -c1-4 | rev)
+[ -z "$MOUNT_NAME" ] && MOUNT_NAME="${ID_FS_UUID%%-*}"
 MOUNT_POINT="${MNT_BASE}/${MOUNT_NAME}"
 DEVPATH_PARENT="${DEVPATH%/*}"
 SYS_DEV="${DEVPATH_PARENT##*/}"
@@ -368,14 +481,10 @@ DEV_INFO=$(blkid -o export "$DEVNAME" 2>/dev/null)
 [ -z "$DEV_INFO" ] && exit 0
 ID_FS_UUID=$(echo "$DEV_INFO" | grep "^UUID=" | cut -d= -f2-)
 ID_FS_TYPE=$(echo "$DEV_INFO" | grep "^TYPE=" | cut -d= -f2-)
-ID_FS_LABEL=$(echo "$DEV_INFO" | grep "^LABEL=" | cut -d= -f2-)
 [ -z "$ID_FS_UUID" ] && exit 0
-if [ -n "$ID_FS_LABEL" ]; then
-    CLEAN_LABEL=$(echo "$ID_FS_LABEL" | sed "s/[^A-Za-z0-9_-]/_/g;s/__*/_/g;s/^_//;s/_$//")
-    MOUNT_NAME="$CLEAN_LABEL"
-else
-    MOUNT_NAME="${ID_FS_UUID%%-*}"
-fi
+CLEAN_UUID=$(echo "$ID_FS_UUID" | sed "s/-//g")
+MOUNT_NAME=$(echo "$CLEAN_UUID" | rev | cut -c1-4 | rev)
+[ -z "$MOUNT_NAME" ] && MOUNT_NAME="${ID_FS_UUID%%-*}"
 MOUNT_POINT="/mnt/${MOUNT_NAME}"
 DEVPATH_PARENT="${DEVPATH%/*}"
 SYS_DEV="${DEVPATH_PARENT##*/}"
@@ -488,8 +597,7 @@ view_disk_detail() {
     read -rp "请选择硬盘 [0-$((i-1))]: " choice
     [[ "$choice" == "0" ]] && return
     if [[ "$choice" -ge 1 && "$choice" -lt "$i" ]] 2>/dev/null; then
-        local selected_disk="${disks[$((choice-1))]}"
-        show_disk_smart_detail "$selected_disk"
+        show_disk_smart_detail "${disks[$((choice-1))]}"
     else
         error "无效选项"; sleep 1
     fi
@@ -752,17 +860,11 @@ full_rebuild() {
     local real_fs
     real_fs=$(get_real_fstype "$fs_type")
     case $real_fs in
-        ext4)
-            if [[ -s "$badblocks_file" ]]; then
-                mkfs.ext4 -l "$badblocks_file" -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE"
-            else
-                mkfs.ext4 -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE"
-            fi
-            ;;
-        xfs)     mkfs.xfs   -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
-        btrfs)   mkfs.btrfs -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
-        ntfs-3g) mkfs.ntfs  -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
-        exfat)   mkfs.exfat    -n "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
+        ext4)    mkfs.ext4   -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
+        xfs)     mkfs.xfs    -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
+        btrfs)   mkfs.btrfs  -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
+        ntfs-3g) mkfs.ntfs   -f -L "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
+        exfat)   mkfs.exfat     -n "Disk_${disk}" "/dev/${disk}1" 2>&1 | tee -a "$LOG_FILE" ;;
     esac
     echo -e "${CYAN}[5/5] 验证结果...${NC}"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL "/dev/$disk"
@@ -896,11 +998,11 @@ format_target() {
     real_fs=$(get_real_fstype "$fs_type")
     case $real_fs in
         ext4|ext3) mkfs.${real_fs} -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
-        xfs)       mkfs.xfs   -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
-        btrfs)     mkfs.btrfs -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
-        ntfs-3g)   mkfs.ntfs  -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
+        xfs)       mkfs.xfs    -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
+        btrfs)     mkfs.btrfs  -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
+        ntfs-3g)   mkfs.ntfs   -f -L "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
         vfat)      mkfs.vfat -F 32 -n "${label:0:11}" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
-        exfat)     mkfs.exfat   -n "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
+        exfat)     mkfs.exfat    -n "$label" "$format_target_dev" 2>&1 | tee -a "$LOG_FILE" ;;
     esac
     info "格式化完成！"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID "/dev/$target"
@@ -1076,12 +1178,12 @@ install_auto_mount() {
         /etc/init.d/fstab enable 2>/dev/null
         /etc/init.d/fstab start  2>/dev/null
         info "OpenWrt hotplug 自动挂载安装完成。"
-        info "脚本位置: /etc/hotplug.d/block/20-auto-mount"
     else
         printf '%s' "$UDEV_BLOCK_CONTENT" > /bin/auto_block
         chmod +x /bin/auto_block
         printf '%s\n' "$UDEV_RULES_CONTENT" > /etc/udev/rules.d/10-auto_block.rules
         udevadm control --reload 2>/dev/null
+        install_boot_mount_service
         info "udev 自动挂载安装完成。"
     fi
 }
@@ -1101,7 +1203,7 @@ manage_persistent_mount() {
         }')
     else
         lsblk -o PATH,UUID,FSTYPE,LABEL,MOUNTPOINT -n -p 2>/dev/null | \
-            awk '{if($2!="" && $3!="") printf "  %-12s UUID:%-38s 类型:%-8s 标签:%-16s 挂载:%s\n",$1,$2,$3,$4,$5}'
+            awk '{if($2!="" && $3!="") printf "  %-14s UUID:%-38s 类型:%-8s 标签:%-16s 挂载:%s\n",$1,$2,$3,$4,$5}'
         PART_LIST=$(lsblk -o PATH,UUID,FSTYPE,LABEL,MOUNTPOINT -n -p 2>/dev/null | \
             awk '{if($2!="" && $3!="" && $5!="/") print $1" "$2" "$3" "$4" "$5}')
     fi
@@ -1112,7 +1214,14 @@ manage_persistent_mount() {
     for line in $PART_LIST; do
         [ -z "$(echo "$line" | tr -d ' ')" ] && continue
         IDX=$((IDX+1))
-        printf "  ${YELLOW}%2d.${NC} %s\n" $IDX "$line"
+        local p_dev p_uuid p_fs p_label p_mnt p_name
+        p_dev=$(echo "$line"   | awk '{print $1}')
+        p_uuid=$(echo "$line"  | awk '{print $2}' | sed 's/UUID=//I;s/"//g')
+        p_fs=$(echo "$line"    | awk '{print $3}' | sed 's/TYPE=//I;s/"//g')
+        p_label=$(echo "$line" | awk '{print $4}' | sed 's/LABEL=//I;s/"//g')
+        p_name=$(make_mount_name "$p_label" "$p_uuid" "$p_fs")
+        printf "  ${YELLOW}%2d.${NC} %-14s UUID: %-38s 类型: %-8s 建议挂载点: ${CYAN}/mnt/%s${NC}\n" \
+            $IDX "$p_dev" "$p_uuid" "$p_fs" "$p_name"
         PART_ARRAY="${PART_ARRAY}${IDX}:${line}
 "
     done
@@ -1130,19 +1239,21 @@ manage_persistent_mount() {
         UUID=$(echo "$PART_LINE"   | awk '{print $2}' | sed 's/UUID=//I;s/"//g')
         FSTYPE=$(echo "$PART_LINE" | awk '{print $3}' | sed 's/TYPE=//I;s/"//g')
         LABEL=$(echo "$PART_LINE"  | awk '{print $4}' | sed 's/LABEL=//I;s/"//g')
-        CURRENT_MNT=$(echo "$PART_LINE" | awk '{print $5}' | sed 's/"//g')
         ensure_fs_support "$FSTYPE"
         local REAL_FSTYPE MOUNT_NAME DEFAULT_MNT
         REAL_FSTYPE=$(get_real_fstype "$FSTYPE")
         MOUNT_NAME=$(make_mount_name "$LABEL" "$UUID" "$FSTYPE")
         DEFAULT_MNT="/mnt/${MOUNT_NAME}"
-        read -rp "为设备 ${DEV} [${FSTYPE}] 标签:'${LABEL}' 设置挂载点 (建议: ${DEFAULT_MNT}, 留空使用建议值): " USER_MNT
+        echo -e "设备: ${CYAN}$DEV${NC}  UUID末4位: ${CYAN}${MOUNT_NAME}${NC}  类型: ${CYAN}$FSTYPE${NC}"
+        read -rp "设置挂载点 (留空使用建议值 ${DEFAULT_MNT}): " USER_MNT
         local MOUNT_PT="${USER_MNT:-$DEFAULT_MNT}"
-        local DEFAULT_OPTS
-        DEFAULT_OPTS=$(get_fs_mount_opts "$FSTYPE")
-        read -rp "挂载选项 (留空使用默认: '${DEFAULT_OPTS}'): " USER_OPTS
-        local OPTS="${USER_OPTS:-$DEFAULT_OPTS}"
-        [ -d "$MOUNT_PT" ] || mkdir -p "$MOUNT_PT"
+        local BASE_OPTS
+        BASE_OPTS=$(get_fs_mount_opts "$FSTYPE")
+        local FSTAB_OPTS
+        FSTAB_OPTS=$(get_fstab_opts "$BASE_OPTS")
+        read -rp "挂载选项 (留空使用默认: '${FSTAB_OPTS}'): " USER_OPTS
+        local OPTS="${USER_OPTS:-$FSTAB_OPTS}"
+        register_mount_point_tmpfiles "$MOUNT_PT"
         if [ "$IS_OPENWRT" = "1" ]; then
             local EXIST
             EXIST=$(uci show fstab 2>/dev/null | grep "uuid='$UUID'" | head -1 | cut -d. -f1-2)
@@ -1163,22 +1274,145 @@ manage_persistent_mount() {
                 [ -n "$LABEL" ] && uci set fstab.@mount[-1].label="$LABEL"
             fi
             uci commit fstab
-            block mount 2>/dev/null || mount -t "$REAL_FSTYPE" -o "$OPTS" "$DEV" "$MOUNT_PT" 2>/dev/null
+            block mount 2>/dev/null || mount -t "$REAL_FSTYPE" -o \
+                "$(echo "$OPTS" | sed 's/,x-systemd[^,]*//g;s/^,//')" "$DEV" "$MOUNT_PT" 2>/dev/null
             chmod 777 "$MOUNT_PT" 2>/dev/null
             info "UCI fstab 已配置: $DEV ($REAL_FSTYPE) -> $MOUNT_PT"
         else
-            if grep -q "UUID=$UUID" /etc/fstab 2>/dev/null; then
-                warn "UUID=$UUID 已在 /etc/fstab 中，跳过写入。"
+            if grep -q "UUID=${UUID}" /etc/fstab 2>/dev/null; then
+                warn "UUID=$UUID 已在 /etc/fstab 中，更新配置..."
+                cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+                sed -i "/UUID=${UUID}/d" /etc/fstab
             else
-                cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M%S)
-                printf "UUID=%s\t%s\t%s\t%s\t0\t2\n" "$UUID" "$MOUNT_PT" "$REAL_FSTYPE" "$OPTS" >> /etc/fstab
-                info "已写入 /etc/fstab: UUID=$UUID ($REAL_FSTYPE) -> $MOUNT_PT"
+                cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
             fi
-            mount -a 2>/dev/null || mount -t "$REAL_FSTYPE" -o "$OPTS" "$DEV" "$MOUNT_PT" 2>/dev/null
-            chmod 777 "$MOUNT_PT" 2>/dev/null
-            info "持久挂载设置完成: $DEV -> $MOUNT_PT"
+            printf "UUID=%s\t%s\t%s\t%s\t0\t0\n" "$UUID" "$MOUNT_PT" "$REAL_FSTYPE" "$OPTS" >> /etc/fstab
+            info "已写入 /etc/fstab:"
+            grep "UUID=${UUID}" /etc/fstab
+            reload_systemd_fstab
+            info "尝试立即挂载..."
+            if activate_systemd_mount "$MOUNT_PT"; then
+                : # systemd 挂载成功
+            else
+                do_mount_now "$DEV" "$MOUNT_PT" "$REAL_FSTYPE" "$OPTS"
+            fi
+            if mountpoint -q "$MOUNT_PT" 2>/dev/null; then
+                chmod 777 "$MOUNT_PT" 2>/dev/null
+                info "${GREEN}挂载成功！${NC} $DEV -> $MOUNT_PT"
+                df -h "$MOUNT_PT"
+            else
+                warn "当前挂载未成功，但 fstab 已正确配置，重启后将自动挂载。"
+                warn "可手动执行: mount $MOUNT_PT"
+            fi
         fi
+        log "配置持久挂载: $DEV ($REAL_FSTYPE) -> $MOUNT_PT OPTS=$OPTS"
     done
+    echo ""
+    info "持久挂载配置完成，验证当前挂载状态:"
+    df -h 2>/dev/null | grep -E "^/dev|Filesystem"
+}
+fix_existing_fstab_mounts() {
+    title "修复现有 fstab 挂载条目"
+    if [ "$IS_SYSTEMD" != "1" ]; then
+        warn "此功能仅支持 systemd 系统"; pause; return
+    fi
+    local fixed=0
+    local tmpfiles_conf="/etc/tmpfiles.d/disk-mount-points.conf"
+    info "检查 /etc/fstab 中的挂载条目..."
+    local fstab_tmp
+    fstab_tmp=$(mktemp)
+    cp /etc/fstab "$fstab_tmp"
+    while IFS= read -r line; do
+        [[ "$line" =~ ^# ]] && { echo "$line" >> "$fstab_tmp.new"; continue; }
+        [[ -z "$line" ]]    && { echo "$line" >> "$fstab_tmp.new"; continue; }
+        local uuid_or_dev mount_pt fs_type opts pass5 pass6
+        uuid_or_dev=$(echo "$line" | awk '{print $1}')
+        mount_pt=$(echo "$line"    | awk '{print $2}')
+        fs_type=$(echo "$line"     | awk '{print $3}')
+        opts=$(echo "$line"        | awk '{print $4}')
+        pass5=$(echo "$line"       | awk '{print $5}')
+        pass6=$(echo "$line"       | awk '{print $6}')
+        if [[ "$mount_pt" == "/" || "$mount_pt" == "none" || "$mount_pt" == "swap" ]] || \
+           [[ "$fs_type" == "tmpfs" || "$fs_type" == "swap" ]]; then
+            echo "$line" >> "$fstab_tmp.new"
+            continue
+        fi
+        local new_opts="$opts" changed=0
+        if ! echo "$opts" | grep -q "nofail"; then
+            new_opts="${new_opts},nofail"; changed=1
+        fi
+        if ! echo "$opts" | grep -q "x-systemd.device-timeout"; then
+            new_opts="${new_opts},x-systemd.device-timeout=30"; changed=1
+        fi
+        if echo "$opts" | grep -q "x-systemd.automount"; then
+            new_opts=$(echo "$new_opts" | sed 's/,x-systemd\.automount//g; s/x-systemd\.automount,//g; s/x-systemd\.automount//g')
+            changed=1
+            info "已移除 x-systemd.automount（改为主动挂载模式）: $mount_pt"
+        fi
+        if [[ "$pass6" != "0" ]]; then
+            pass6="0"; changed=1
+        fi
+        if [ ! -d "$mount_pt" ]; then
+            mkdir -p "$mount_pt" && chmod 755 "$mount_pt"
+            if ! grep -qF " $mount_pt " "$tmpfiles_conf" 2>/dev/null && \
+               ! grep -qF " $mount_pt" "$tmpfiles_conf" 2>/dev/null; then
+                echo "d $mount_pt 0755 root root -" >> "$tmpfiles_conf"
+            fi
+            info "已创建挂载点目录: $mount_pt"
+            ((fixed++))
+        fi
+        if [[ "$changed" == "1" ]]; then
+            echo -e "${uuid_or_dev}\t${mount_pt}\t${fs_type}\t${new_opts}\t${pass5}\t${pass6}" >> "$fstab_tmp.new"
+            info "已更新 fstab 条目: $mount_pt"
+            ((fixed++))
+        else
+            echo "$line" >> "$fstab_tmp.new"
+        fi
+    done < /etc/fstab
+    if [[ "$fixed" -gt 0 ]]; then
+        cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+        mv "$fstab_tmp.new" /etc/fstab
+        systemd-tmpfiles --create "$tmpfiles_conf" 2>/dev/null
+        reload_systemd_fstab
+        install_boot_mount_service
+        info "正在尝试挂载所有条目..."
+        while IFS= read -r line; do
+            [[ "$line" =~ ^# ]] && continue
+            [[ -z "$line" ]] && continue
+            local mount_pt fs_type
+            mount_pt=$(echo "$line" | awk '{print $2}')
+            fs_type=$(echo "$line"  | awk '{print $3}')
+            [[ "$mount_pt" == "/" || "$mount_pt" == "none" || "$mount_pt" == "swap" ]] && continue
+            [[ "$fs_type" == "tmpfs" || "$fs_type" == "swap" ]] && continue
+            mountpoint -q "$mount_pt" 2>/dev/null && continue
+            mount "$mount_pt" 2>/dev/null && info "挂载成功: $mount_pt" || \
+                warn "挂载失败（设备可能未就绪，重启后将自动挂载）: $mount_pt"
+        done < /etc/fstab
+        sleep 1
+        info "当前挂载验证:"
+        while IFS= read -r line; do
+            [[ "$line" =~ ^# ]] && continue
+            [[ -z "$line" ]] && continue
+            local mount_pt fs_type
+            mount_pt=$(echo "$line" | awk '{print $2}')
+            fs_type=$(echo "$line"  | awk '{print $3}')
+            [[ "$mount_pt" == "/" || "$mount_pt" == "none" || "$mount_pt" == "swap" ]] && continue
+            [[ "$fs_type" == "tmpfs" || "$fs_type" == "swap" ]] && continue
+            if mountpoint -q "$mount_pt" 2>/dev/null; then
+                printf "  ${GREEN}[已挂载]${NC} %s\n" "$mount_pt"
+            else
+                printf "  ${YELLOW}[未挂载]${NC} %s (重启后将自动挂载)\n" "$mount_pt"
+            fi
+        done < /etc/fstab
+    else
+        rm -f "$fstab_tmp" "$fstab_tmp.new" 2>/dev/null
+        info "所有 fstab 条目配置正常，无需修复。"
+        info "尝试挂载所有未挂载条目..."
+        mount -a 2>/dev/null
+    fi
+    rm -f "$fstab_tmp" 2>/dev/null
+    log "修复 fstab 挂载条目完成，共修复 $fixed 处"
+    pause
 }
 show_persistent_mounts() {
     title "当前持久挂载配置"
@@ -1190,8 +1424,45 @@ show_persistent_mounts() {
     else
         info "/etc/fstab 内容 (非注释行):"
         grep -v "^#\|^$" /etc/fstab 2>/dev/null || printf "  (无)\n"
+        printf "\n"
+        info "挂载点目录状态:"
+        if [ -f /etc/tmpfiles.d/disk-mount-points.conf ]; then
+            while read -r tline; do
+                local mpt
+                mpt=$(echo "$tline" | awk '{print $2}')
+                if mountpoint -q "$mpt" 2>/dev/null; then
+                    printf "  ${GREEN}[已挂载]${NC} %s\n" "$mpt"
+                elif [ -d "$mpt" ]; then
+                    printf "  ${YELLOW}[目录存在未挂载]${NC} %s\n" "$mpt"
+                else
+                    printf "  ${RED}[目录缺失]${NC} %s\n" "$mpt"
+                fi
+            done < /etc/tmpfiles.d/disk-mount-points.conf
+        else
+            while IFS= read -r line; do
+                [[ "$line" =~ ^# ]] && continue; [[ -z "$line" ]] && continue
+                local mpt fs
+                mpt=$(echo "$line" | awk '{print $2}')
+                fs=$(echo "$line"  | awk '{print $3}')
+                [[ "$mpt" == "/" || "$mpt" == "none" || "$mpt" == "swap" ]] && continue
+                [[ "$fs" == "tmpfs" || "$fs" == "swap" ]] && continue
+                if mountpoint -q "$mpt" 2>/dev/null; then
+                    printf "  ${GREEN}[已挂载]${NC} %s\n" "$mpt"
+                else
+                    printf "  ${YELLOW}[未挂载]${NC} %s\n" "$mpt"
+                fi
+            done < /etc/fstab
+        fi
+        printf "\n"
         info "当前已挂载设备:"
         df -h 2>/dev/null | grep -v "tmpfs\|udev\|/dev/loop"
+        printf "\n"
+        info "开机补充挂载服务状态:"
+        if systemctl is-enabled disk-mount-retry.service 2>/dev/null | grep -q "enabled"; then
+            printf "  disk-mount-retry.service: ${GREEN}已启用${NC}\n"
+        else
+            printf "  disk-mount-retry.service: ${YELLOW}未安装${NC}\n"
+        fi
     fi
     pause
 }
@@ -1217,15 +1488,22 @@ remove_persistent_mount() {
         info "/etc/fstab 条目 (非注释):"
         grep -v "^#\|^$" /etc/fstab | nl -ba
         read -rp "输入要移除的行号 (多个用空格): " REMOVE_LINES
-        cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M%S)
+        cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
         for lnum in $(printf '%s' "$REMOVE_LINES" | tr ' ' '\n' | sort -rn); do
             local MNT_PT REAL_LINE
             MNT_PT=$(grep -v "^#\|^$" /etc/fstab | sed -n "${lnum}p" | awk '{print $2}')
             REAL_LINE=$(grep -n "" /etc/fstab | grep -v "^[0-9]*:#\|^[0-9]*:$" | sed -n "${lnum}p" | cut -d: -f1)
             sed -i "${REAL_LINE}d" /etc/fstab 2>/dev/null
+            local tmpfiles_conf="/etc/tmpfiles.d/disk-mount-points.conf"
+            if [ -f "$tmpfiles_conf" ]; then
+                local escaped_pt
+                escaped_pt=$(echo "$MNT_PT" | sed 's|/|\\/|g')
+                sed -i "/ ${escaped_pt} /d;/ ${escaped_pt}$/d" "$tmpfiles_conf" 2>/dev/null
+            fi
             umount -l "$MNT_PT" 2>/dev/null
             info "已移除行 $lnum (挂载点: $MNT_PT)"
         done
+        reload_systemd_fstab
     fi
 }
 uninstall_auto_mount() {
@@ -1247,6 +1525,12 @@ uninstall_auto_mount() {
     else
         rm -f /bin/auto_block /etc/udev/rules.d/10-auto_block.rules
         udevadm control --reload 2>/dev/null
+        if [ -f /etc/systemd/system/disk-mount-retry.service ]; then
+            systemctl disable disk-mount-retry.service 2>/dev/null
+            rm -f /etc/systemd/system/disk-mount-retry.service
+            systemctl daemon-reload 2>/dev/null
+            info "已移除开机补充挂载服务。"
+        fi
         info "udev 自动挂载已卸载。"
     fi
 }
@@ -1258,14 +1542,17 @@ mount_partition() {
         for part in $(lsblk -n -o NAME "/dev/$disk" 2>/dev/null | grep -v "^$disk$"); do
             part=$(echo "$part" | sed 's/[├└│─]//g' | xargs)
             if [[ -n "$part" ]]; then
-                local pmount pfs plabel psize
+                local pmount pfs plabel psize puuid
                 pmount=$(lsblk -n -o MOUNTPOINT "/dev/$part" 2>/dev/null)
                 pfs=$(lsblk -n -o FSTYPE "/dev/$part" 2>/dev/null)
                 if [[ -z "$pmount" && -n "$pfs" ]]; then
                     parts+=("$part")
                     psize=$(lsblk -n -o SIZE "/dev/$part")
                     plabel=$(lsblk -n -o LABEL "/dev/$part")
-                    echo "  $i) /dev/$part ($psize) $pfs ${plabel:+[$plabel]}"
+                    puuid=$(lsblk -n -o UUID "/dev/$part")
+                    local pname
+                    pname=$(make_mount_name "$plabel" "$puuid" "$pfs")
+                    echo "  $i) /dev/$part ($psize) $pfs -> 建议挂载: /mnt/${pname}"
                     ((i++))
                 fi
             fi
@@ -1279,24 +1566,22 @@ mount_partition() {
     [[ "$choice" == "0" ]] && return
     if [[ "$choice" -ge 1 && "$choice" -lt "$i" ]] 2>/dev/null; then
         local part="${parts[$((choice-1))]}"
-        local pfs plabel mpoint
+        local pfs plabel puuid mpoint
         pfs=$(lsblk -n -o FSTYPE "/dev/$part" 2>/dev/null)
         plabel=$(lsblk -n -o LABEL "/dev/$part" 2>/dev/null)
+        puuid=$(lsblk -n -o UUID "/dev/$part" 2>/dev/null)
         local MOUNT_NAME
-        MOUNT_NAME=$(make_mount_name "$plabel" "" "$pfs")
+        MOUNT_NAME=$(make_mount_name "$plabel" "$puuid" "$pfs")
         read -rp "输入挂载点 (默认 /mnt/${MOUNT_NAME}): " mpoint
         mpoint="${mpoint:-/mnt/${MOUNT_NAME}}"
         mkdir -p "$mpoint"
         ensure_fs_support "$pfs"
-        local real_fs opts
+        local real_fs base_opts
         real_fs=$(get_real_fstype "$pfs")
-        opts=$(get_fs_mount_opts "$pfs")
-        if mount -t "$real_fs" -o "$opts" "/dev/$part" "$mpoint" 2>/dev/null || mount "/dev/$part" "$mpoint"; then
+        base_opts=$(get_fs_mount_opts "$pfs")
+        if do_mount_now "/dev/$part" "$mpoint" "$real_fs" "$base_opts"; then
             chmod 777 "$mpoint" 2>/dev/null
-            info "挂载成功！挂载点: $mpoint"
             log "挂载: /dev/$part -> $mpoint"
-        else
-            error "挂载失败"
         fi
     fi
     pause
@@ -1308,7 +1593,7 @@ unmount_partition() {
     while read -r line; do
         local dev mp
         dev=$(echo "$line" | awk '{print $1}')
-        mp=$(echo "$line" | awk '{print $3}')
+        mp=$(echo "$line"  | awk '{print $3}')
         if [[ "$mp" != "/" && "$mp" != "/boot"* && "$mp" != "/home" && "$mp" != "/var" && "$mp" != "/usr" ]]; then
             mounts+=("$dev:$mp")
             echo "  $i) $dev -> $mp"
@@ -1325,7 +1610,7 @@ unmount_partition() {
         local mount_info="${mounts[$((choice-1))]}"
         local dev mp
         dev=$(echo "$mount_info" | cut -d: -f1)
-        mp=$(echo "$mount_info" | cut -d: -f2-)
+        mp=$(echo "$mount_info"  | cut -d: -f2-)
         if umount "$mp"; then
             info "卸载成功！"
             log "卸载: $dev from $mp"
@@ -1358,28 +1643,26 @@ mount_menu() {
 }
 test_current_config() {
     title "测试当前挂载配置"
-    info "系统: ${OS_ID} | 架构: ${ARCH} | 内核: $(uname -r)"
-    info "挂载脚本检查:"
+    info "系统: ${OS_ID} | 架构: ${ARCH} | 内核: $(uname -r) | systemd: ${IS_SYSTEMD}"
     if [ "$IS_OPENWRT" = "1" ]; then
-        if [ -f /etc/hotplug.d/block/20-auto-mount ]; then
-            printf "  hotplug脚本: ${GREEN}已安装${NC}\n"
-        else
+        [ -f /etc/hotplug.d/block/20-auto-mount ] && \
+            printf "  hotplug脚本: ${GREEN}已安装${NC}\n" || \
             printf "  hotplug脚本: ${RED}未安装${NC}\n"
-        fi
         info "UCI fstab 挂载条目:"
         uci show fstab 2>/dev/null | grep -A5 "@mount" || printf "  (无)\n"
         info "block 设备信息:"
         block info 2>/dev/null
     else
-        if [ -x /bin/auto_block ]; then
-            printf "  auto_block:  ${GREEN}已安装${NC}\n"
-        else
+        [ -x /bin/auto_block ] && \
+            printf "  auto_block:  ${GREEN}已安装${NC}\n" || \
             printf "  auto_block:  ${RED}未安装${NC}\n"
-        fi
-        if [ -f /etc/udev/rules.d/10-auto_block.rules ]; then
-            printf "  udev规则:    ${GREEN}已安装${NC}\n"
-        else
+        [ -f /etc/udev/rules.d/10-auto_block.rules ] && \
+            printf "  udev规则:    ${GREEN}已安装${NC}\n" || \
             printf "  udev规则:    ${RED}未安装${NC}\n"
+        if systemctl is-enabled disk-mount-retry.service 2>/dev/null | grep -q "enabled"; then
+            printf "  开机补充挂载: ${GREEN}已启用${NC}\n"
+        else
+            printf "  开机补充挂载: ${YELLOW}未安装${NC}\n"
         fi
     fi
     info "当前已挂载设备:"
@@ -1400,37 +1683,24 @@ test_current_config() {
     fi
 }
 detect_smb_backend() {
-    SMB_BACKEND=""
-    SMB_CONF=""
-    SMB_SVC=""
+    SMB_BACKEND=""; SMB_CONF=""; SMB_SVC=""
     if [ "$IS_OPENWRT" = "1" ]; then
-        if opkg list-installed 2>/dev/null | grep -q "^ksmbd-server"; then
-            SMB_BACKEND="ksmbd"; SMB_CONF="/etc/ksmbd/smb.conf"; SMB_SVC="ksmbd"
-        elif opkg list-installed 2>/dev/null | grep -q "^samba4-server"; then
-            SMB_BACKEND="samba4"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="samba4"
-        fi
+        opkg list-installed 2>/dev/null | grep -q "^ksmbd-server"  && { SMB_BACKEND="ksmbd";  SMB_CONF="/etc/ksmbd/smb.conf";  SMB_SVC="ksmbd";  return; }
+        opkg list-installed 2>/dev/null | grep -q "^samba4-server" && { SMB_BACKEND="samba4"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="samba4"; return; }
     else
-        if command -v smbd >/dev/null 2>&1; then
-            SMB_BACKEND="samba"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="smbd"
-        fi
+        command -v smbd >/dev/null 2>&1 && { SMB_BACKEND="samba"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="smbd"; }
     fi
 }
 install_smb_backend() {
-    if [ -n "$SMB_BACKEND" ]; then
-        info "SMB 后端已安装: $SMB_BACKEND"; return 0
-    fi
+    if [ -n "$SMB_BACKEND" ]; then info "SMB 后端已安装: $SMB_BACKEND"; return 0; fi
     if [ "$IS_OPENWRT" = "1" ]; then
         printf "  1. ksmbd (轻量推荐)\n  2. samba4 (功能全)\n"
         read -rp "输入选项 (默认1): " SMB_CHOICE
         case "${SMB_CHOICE:-1}" in
-            2)
-                opkg update && opkg install samba4-server luci-app-samba4 2>/dev/null || { error "samba4安装失败"; return 1; }
-                SMB_BACKEND="samba4"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="samba4"
-                ;;
-            *)
-                opkg update && opkg install ksmbd-server luci-app-ksmbd ksmbd-utils 2>/dev/null || { error "ksmbd安装失败"; return 1; }
-                SMB_BACKEND="ksmbd"; SMB_CONF="/etc/ksmbd/smb.conf"; SMB_SVC="ksmbd"
-                ;;
+            2) opkg update && opkg install samba4-server luci-app-samba4 2>/dev/null || { error "samba4安装失败"; return 1; }
+               SMB_BACKEND="samba4"; SMB_CONF="/etc/samba/smb.conf"; SMB_SVC="samba4" ;;
+            *) opkg update && opkg install ksmbd-server luci-app-ksmbd ksmbd-utils 2>/dev/null || { error "ksmbd安装失败"; return 1; }
+               SMB_BACKEND="ksmbd"; SMB_CONF="/etc/ksmbd/smb.conf"; SMB_SVC="ksmbd" ;;
         esac
     else
         ensure_pkg "smbd" "" "samba" "samba" "samba"
@@ -1450,18 +1720,12 @@ manage_smb() {
     echo "  0. 返回"
     read -rp "输入选项: " SMB_OPT
     case "$SMB_OPT" in
-        1)
-            install_smb_backend
-            detect_smb_backend
-            svc enable "$SMB_SVC" 2>/dev/null
-            svc start  "$SMB_SVC" 2>/dev/null
-            ;;
+        1) install_smb_backend; detect_smb_backend; svc enable "$SMB_SVC" 2>/dev/null; svc start "$SMB_SVC" 2>/dev/null ;;
         2)
             detect_smb_backend
             [ -z "$SMB_BACKEND" ] && { warn "SMB未安装，请先选择选项1安装。"; return; }
-            info "当前已挂载分区:"
             df -h | grep -v "tmpfs\|/dev/loop\|udev" | grep "/" | nl -ba
-            read -rp "输入挂载点路径 (如 /mnt/MyDisk): " SHARE_PATH
+            read -rp "输入挂载点路径: " SHARE_PATH
             [ -d "$SHARE_PATH" ] || { error "目录不存在: $SHARE_PATH"; return; }
             read -rp "共享名称 (默认: $(basename "$SHARE_PATH")): " SHARE_NAME
             SHARE_NAME="${SHARE_NAME:-$(basename "$SHARE_PATH")}"
@@ -1470,8 +1734,7 @@ manage_smb() {
             if [ "$NEED_PWD" = "y" ] || [ "$NEED_PWD" = "Y" ]; then
                 GUEST_OK="no"
                 read -rp "请输入访问用户名: " SMB_USER
-                read -rsp "请输入访问密码: " SMB_PASS
-                printf "\n"
+                read -rsp "请输入访问密码: " SMB_PASS; printf "\n"
                 id "$SMB_USER" >/dev/null 2>&1 || { adduser -D "$SMB_USER" 2>/dev/null || useradd -M "$SMB_USER" 2>/dev/null; }
                 printf '%s\n%s\n' "$SMB_PASS" "$SMB_PASS" | smbpasswd -a "$SMB_USER" 2>/dev/null || \
                     printf '%s\n%s\n' "$SMB_PASS" "$SMB_PASS" | ksmbd.adduser -a "$SMB_USER" 2>/dev/null
@@ -1502,16 +1765,11 @@ SMBEOF
             IP_ADDR=$(ip addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v "127.0" | head -1 | cut -d/ -f1)
             info "共享 [$SHARE_NAME] 已创建。访问地址: \\\\${IP_ADDR}\\${SHARE_NAME}"
             ;;
-        3)
-            detect_smb_backend
-            [ -z "$SMB_BACKEND" ] && { warn "SMB未安装。"; return; }
-            info "当前共享配置 ($SMB_CONF):"
-            grep -E "^\[|path|guest ok|writable" "$SMB_CONF" 2>/dev/null
-            ;;
+        3) detect_smb_backend; [ -z "$SMB_BACKEND" ] && { warn "SMB未安装。"; return; }
+           grep -E "^\[|path|guest ok|writable" "$SMB_CONF" 2>/dev/null ;;
         4)
             detect_smb_backend
             [ -z "$SMB_BACKEND" ] && { warn "SMB未安装。"; return; }
-            info "当前共享列表:"
             local SHARES
             SHARES=$(grep '^\[' "$SMB_CONF" | sed 's/^\[//;s/\]$//' | grep -v "^global$")
             printf "%s\n" "$SHARES" | nl -ba
@@ -1534,9 +1792,7 @@ SMBEOF
 }
 view_logs() {
     title "管理日志"
-    if [[ ! -d "$LOG_DIR" ]]; then
-        warn "暂无日志"; pause; return
-    fi
+    if [[ ! -d "$LOG_DIR" ]]; then warn "暂无日志"; pause; return; fi
     local -a logs
     local i=1
     while IFS= read -r -d '' log_file; do
@@ -1547,48 +1803,38 @@ view_logs() {
         echo "  $i) $(basename "$log_file") - $size - $date_info"
         ((i++))
     done < <(find "$LOG_DIR" -type f \( -name "*.txt" -o -name "*.log" \) -print0 2>/dev/null | sort -z)
-    if [[ ${#logs[@]} -eq 0 ]]; then
-        warn "暂无日志"; pause; return
-    fi
+    if [[ ${#logs[@]} -eq 0 ]]; then warn "暂无日志"; pause; return; fi
     echo "  0) 返回"
     read -rp "选择 [0-$((i-1))]: " choice
     [[ "$choice" == "0" ]] && return
-    if [[ "$choice" -ge 1 && "$choice" -lt "$i" ]] 2>/dev/null; then
-        less "${logs[$((choice-1))]}"
-    fi
+    [[ "$choice" -ge 1 && "$choice" -lt "$i" ]] 2>/dev/null && less "${logs[$((choice-1))]}"
 }
 show_help() {
     title "帮助信息"
+    echo -e "${WHITE}挂载点命名规则 (UUID优先):${NC}"
+    echo -e "  UUID末4位优先: 36086171-...-${CYAN}835c${NC} -> /mnt/${CYAN}835c${NC}"
+    echo -e "  无UUID时用卷标: Disk_sda1   -> /mnt/Disk_sda1"
+    echo -e "  都没有时用格式: ext4        -> /mnt/ext4_disk"
+    echo -e "${WHITE}重启自动挂载三重保障:${NC}"
+    echo "  1. fstab 写入 nofail + x-systemd.device-timeout=30"
+    echo "     systemd 等待设备最多30秒，设备不在时跳过不阻塞启动"
+    echo "  2. tmpfiles.d 持久化创建挂载点目录，重启后目录不丢失"
+    echo "  3. disk-mount-retry.service 启动后5秒补执行 mount 兜底"
+    echo -e "${WHITE}重要：不使用 x-systemd.automount 原因:${NC}"
+    echo "  automount 是按需挂载（访问路径才触发），不是开机即挂载"
+    echo "  本脚本改为主动挂载模式，配置后立即挂载+重启自动挂载"
     echo -e "${WHITE}文件系统选择指南:${NC}"
-    echo -e "  ${CYAN}ext4${NC}    Linux 默认，稳定可靠，推荐大多数场景"
-    echo -e "  ${CYAN}xfs${NC}     高性能，适合大文件和数据库"
-    echo -e "  ${CYAN}btrfs${NC}   支持快照、压缩、RAID"
-    echo -e "  ${CYAN}ntfs${NC}    Windows 兼容，跨平台数据交换"
-    echo -e "  ${CYAN}fat32${NC}   最大兼容性，单文件不超过 4GB"
-    echo -e "  ${CYAN}exfat${NC}   大文件支持，U盘/移动硬盘推荐"
-    echo -e "  ${CYAN}f2fs${NC}    Flash 友好，适合 eMMC/SSD"
-    echo -e "  ${CYAN}hfsplus${NC} macOS 兼容"
-    echo -e "${WHITE}SMART 指标说明:${NC}"
-    echo -e "  Reallocated_Sector_Ct   已重映射扇区（硬盘已处理）"
-    echo -e "  Current_Pending_Sector  待处理坏扇区 ${YELLOW}（需关注！）${NC}"
-    echo -e "  Offline_Uncorrectable   无法修复扇区 ${RED}（严重！）${NC}"
-    echo -e "${WHITE}修复级别说明:${NC}"
-    echo "  快速修复  仅修复已知坏扇区，数据安全"
-    echo "  标准修复  扫描+修复，尽量保留数据"
-    echo "  强力修复  破坏性修复，数据会丢失"
-    echo "  完整重建  修复+分区+格式化"
-    echo -e "${WHITE}挂载命名规则:${NC}"
-    echo "  优先使用磁盘卷标作为挂载点名称，保证重启后路径不变"
-    echo "  无卷标时使用 UUID 前8位命名，确保唯一性"
-    echo -e "${WHITE}建议:${NC}"
-    echo -e "  Pending > 0   ${YELLOW}尽快修复${NC}"
-    echo -e "  Pending > 100 ${RED}考虑更换硬盘${NC}"
-    echo -e "  硬盘异响      ${RED}立即备份数据${NC}"
+    echo -e "  ${CYAN}ext4${NC}    Linux 默认，稳定可靠"
+    echo -e "  ${CYAN}xfs${NC}     高性能，适合大文件"
+    echo -e "  ${CYAN}btrfs${NC}   快照、压缩、RAID"
+    echo -e "  ${CYAN}ntfs${NC}    Windows 兼容"
+    echo -e "  ${CYAN}fat32${NC}   最大兼容，单文件≤4GB"
+    echo -e "  ${CYAN}exfat${NC}   大文件+跨平台，U盘推荐"
     echo -e "${WHITE}日志位置:${NC} $LOG_DIR/"
     pause
 }
 show_main_menu() {
-    printf "${CYAN}硬盘智能管理与修复工具 v3.0${NC}\n"
+    printf "${CYAN}硬盘智能管理与修复工具 v3.2${NC}\n"
     printf "${WHITE}当前硬盘状态:${NC}\n"
     printf -- "------------------------------------------------------------\n"
     for disk in $(get_all_disks); do
@@ -1622,13 +1868,14 @@ show_main_menu() {
     echo "  11) 快速挂载/卸载"
     echo "  12) 卸载自动挂载功能"
     echo "  13) 测试挂载配置 & 设备监控"
+    echo -e "  ${YELLOW}17) 修复现有 fstab 挂载（解决重启不自动挂载）${NC}"
     echo -e "${GREEN}其他功能:${NC}"
     echo "  14) SMB 共享管理"
     echo "  15) 查看管理日志"
     echo "  16) 帮助信息"
     echo "   0) 退出"
     echo ""
-    read -rp "请输入选项 [0-16]: " choice
+    read -rp "请输入选项 [0-17]: " choice
     case $choice in
         1)  show_all_disks_overview ;;
         2)  view_disk_detail ;;
@@ -1646,6 +1893,7 @@ show_main_menu() {
         14) manage_smb ;;
         15) view_logs ;;
         16) show_help ;;
+        17) fix_existing_fstab_mounts ;;
         0)  info "退出程序。"; exit 0 ;;
         *)  warn "无效选项，请重试。"; sleep 1 ;;
     esac
