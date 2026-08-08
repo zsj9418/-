@@ -17,14 +17,20 @@ FREELLMAPI_IMAGE_BASE="ghcr.io/tashfeenahmed/freellmapi"
 OMNIROUTE_IMAGE_BASE="diegosouzapw/omniroute"
 FREELLMAPI_COMPOSE_DIR="$HOME/freellmapi"
 COMPOSE_FALLBACK_VERSION="v2.39.1"
-GHCR_PROXIES=("ghcr.nju.edu.cn" "ghcr.chenby.cn" "ghcr.registry.cyou" "ghcr.m.daocloud.io")
-DOCKERHUB_PROXIES=("docker.m.daocloud.io" "dockerproxy.net" "docker.nju.edu.cn" "docker.1ms.run" "hub.rat.dev")
-DOCKERHUB_MIRRORS=("https://docker.m.daocloud.io" "https://dockerproxy.net" "https://docker.nju.edu.cn" "https://docker.1ms.run" "https://hub.rat.dev")
+GHCR_PROXIES=("ghcr.chenby.cn" "ghcr.registry.cyou" "ghcr.1ms.run" "ghcr.nju.edu.cn" "ghcr.m.daocloud.io")
+DOCKERHUB_PROXIES=("docker.1ms.run" "docker.chenby.cn" "docker.m.daocloud.io" "docker.nju.edu.cn" "hub.rat.dev")
+DOCKERHUB_MIRRORS=("https://docker.1ms.run" "https://docker.chenby.cn" "https://docker.m.daocloud.io" "https://docker.nju.edu.cn" "https://hub.rat.dev")
 BEST_GHCR_PROXY=""
 BEST_DOCKERHUB_PROXY=""
 GHCR_DIRECT_OK=false
 DOCKERHUB_DIRECT_OK=false
-NET_TIMEOUT=3
+NET_TIMEOUT=4
+RUNTIME_NM=""
+RUNTIME_PT=""
+RUNTIME_BINDIP=""
+RUNTIME_MOUNTS=()
+RUNTIME_ENVS=()
+RUNTIME_CMD=()
 function green()  { echo -e "\e[32m$1\e[0m"; }
 function red()    { echo -e "\e[31m$1\e[0m"; }
 function yellow() { echo -e "\e[33m$1\e[0m"; }
@@ -70,7 +76,7 @@ function _detect_network() {
     local best_ms=9999 best_host=""
     for proxy in "${GHCR_PROXIES[@]}"; do
       printf "      测试 %-25s" "$proxy"
-      local ms; ms=$(_test_registry_ms "$proxy" 2)
+      local ms; ms=$(_test_registry_ms "$proxy" 3)
       if [[ "$ms" -lt 9000 ]]; then
         printf "\e[32m%dms\e[0m\n" "$ms"
         [[ "$ms" -lt "$best_ms" ]] && { best_ms="$ms"; best_host="$proxy"; }
@@ -94,7 +100,7 @@ function _detect_network() {
     local best_ms=9999 best_host=""
     for proxy in "${DOCKERHUB_PROXIES[@]}"; do
       printf "      测试 %-25s" "$proxy"
-      local ms; ms=$(_test_registry_ms "$proxy" 2)
+      local ms; ms=$(_test_registry_ms "$proxy" 3)
       if [[ "$ms" -lt 9000 ]]; then
         printf "\e[32m%dms\e[0m\n" "$ms"
         [[ "$ms" -lt "$best_ms" ]] && { best_ms="$ms"; best_host="$proxy"; }
@@ -189,23 +195,31 @@ function pull_image_with_retry() {
     case "${rp:-1}" in
       1) _detect_network; _smart_pull "$img" || { red "仍然失败，请检查网络。"; return 1; } ;;
       2) _manual_proxy_pull "$img" || return 1 ;;
-      3) yellow "直接拉取: $img"; timeout 600 docker pull "$img" || { red "直接拉取失败"; return 1; }; green "✅ 拉取成功" ;;
+      3) local pa=""; [[ -n "${PLATFORM:-}" ]] && pa="--platform $PLATFORM"; yellow "直接拉取: $img"; timeout 600 docker pull $pa "$img" || { red "直接拉取失败"; return 1; }; green "✅ 拉取成功" ;;
       *) red "放弃拉取: $img"; return 1 ;;
     esac
   fi
 }
 function _manual_proxy_pull() {
   local img="$1"
+  local proxies=()
+  if _is_ghcr_image "$img"; then proxies=("${GHCR_PROXIES[@]}")
+  else proxies=("${DOCKERHUB_PROXIES[@]}"); fi
   echo "选择代理："
-  local all_proxies=("${DOCKERHUB_PROXIES[@]}")
   local i=1
-  for p in "${all_proxies[@]}"; do echo "  $i. $p"; i=$((i+1)); done
+  for p in "${proxies[@]}"; do echo "  $i. $p"; i=$((i+1)); done
   read -rp "编号: " pn </dev/tty
-  if [[ "$pn" =~ ^[0-9]+$ && "$pn" -ge 1 && "$pn" -le ${#all_proxies[@]} ]]; then
-    local proxy="${all_proxies[$((pn-1))]}"
-    local pull_img="${proxy}/${img}"
+  if [[ "$pn" =~ ^[0-9]+$ && "$pn" -ge 1 && "$pn" -le ${#proxies[@]} ]]; then
+    local proxy="${proxies[$((pn-1))]}"
+    local pull_img="" pa=""
+    [[ -n "${PLATFORM:-}" ]] && pa="--platform $PLATFORM"
+    if _is_ghcr_image "$img"; then pull_img="${img/ghcr.io/$proxy}"
+    else
+      if [[ "$img" != *"/"* ]]; then pull_img="${proxy}/library/${img}"
+      else pull_img="${proxy}/${img}"; fi
+    fi
     yellow "拉取: $pull_img"
-    if timeout 600 docker pull "$pull_img"; then
+    if timeout 600 docker pull $pa "$pull_img"; then
       docker tag "$pull_img" "$img" 2>/dev/null || true
       green "✅ 拉取成功"; return 0
     fi
@@ -631,6 +645,21 @@ function _prompt_backup_before_action() {
   yellow "⚠️  建议在${action}前先备份（主菜单 → 备份/恢复）"
   read -rp "继续${action}？(y/n，默认 y)：" pc </dev/tty; [[ ! "${pc:-y}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 1; }; return 0
 }
+function _capture_container_runtime() {
+  local cname="$1"
+  RUNTIME_NM=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cname" 2>/dev/null || echo "bridge")
+  RUNTIME_PT=$(docker inspect "$cname" --format '{{range $p, $c := .HostConfig.PortBindings}}{{range $c}}{{.HostPort}}{{end}}{{end}}' 2>/dev/null | head -n1)
+  RUNTIME_BINDIP=$(docker inspect "$cname" --format '{{range $p, $c := .HostConfig.PortBindings}}{{range $c}}{{.HostIp}}{{end}}{{end}}' 2>/dev/null | head -n1)
+  RUNTIME_MOUNTS=()
+  while IFS= read -r line; do [[ -n "$line" ]] && RUNTIME_MOUNTS+=("$line"); done < <(docker inspect "$cname" --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}:{{.Destination}}{{println}}{{end}}' 2>/dev/null)
+  RUNTIME_ENVS=()
+  while IFS= read -r line; do
+    case "$line" in PATH=*|HOSTNAME=*|HOME=*|TZ=*) continue ;; esac
+    [[ -n "$line" ]] && RUNTIME_ENVS+=("$line")
+  done < <(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
+  RUNTIME_CMD=()
+  while IFS= read -r line; do [[ -n "$line" ]] && RUNTIME_CMD+=("$line"); done < <(docker inspect "$cname" --format '{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null)
+}
 function _backup_bind_service() {
   local svc_label="$1" container_name="$2" data_dir="$3" backup_prefix="$4"
   echo ""; cyan "备份：$svc_label"
@@ -1012,11 +1041,6 @@ function deploy_service_sqlite() {
   local ip; ip=$(get_local_ip); local ap=$PORT; [[ "$NETWORK_MODE" == "host" ]] && ap=$int_port
   _show_deploy_result "$cname" "$ip" "$ap" "$data_dir"
 }
-function _get_container_runtime_config() {
-  local cname="$1"; local nm; nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cname" 2>/dev/null || echo "bridge")
-  local pt; pt=$(docker inspect "$cname" 2>/dev/null | grep -A2 '"3000/tcp"' | grep 'HostPort' | head -n1 | grep -oE '[0-9]+' || echo "")
-  local ci; ci=$(docker inspect "$cname" --format '{{.Config.Image}}' 2>/dev/null || echo ""); echo "$nm|$pt|$ci"
-}
 function _upgrade_bind_service() {
   local svc_label="$1" cname="$2" int_port="$3" data_dir="$4" img_base="$5" fetch_type="$6" fetch_src="$7"
   echo ""; cyan "升级：$svc_label"
@@ -1027,12 +1051,18 @@ function _upgrade_bind_service() {
   local new_image="$SELECTED_IMAGE"
   if [[ "$new_image" == "$cur_image" ]]; then yellow "版本相同。"; read -rp "强制重新拉取并重启？(y/n，默认 n)：" fr </dev/tty; [[ ! "${fr:-n}" =~ ^[Yy]$ ]] && { yellow "已取消。"; return 0; }; fi
   pull_image_with_retry "$new_image" || return 1
-  local rc; rc=$(_get_container_runtime_config "$cname"); local old_nm; old_nm=$(echo "$rc" | cut -d'|' -f1); local old_pt; old_pt=$(echo "$rc" | cut -d'|' -f2)
+  _capture_container_runtime "$cname"
+  local nm="$RUNTIME_NM" pt="${RUNTIME_PT:-$int_port}"
   yellow "停止旧容器..."; docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true
   local cmd=(docker run -d --name "$cname" --restart unless-stopped)
-  [[ "$old_nm" == "host" ]] && cmd+=(--network host) || cmd+=(--network bridge -p "${old_pt:-$int_port}:${int_port}")
-  cmd+=(-v "$data_dir:/data" -e "TZ=$DEFAULT_TZ" "$new_image")
-  yellow "执行：${cmd[*]}"; "${cmd[@]}" && green "✅ $svc_label 已升级到：$new_image" || { red "升级后启动失败。"; return 1; }
+  [[ "$nm" == "host" ]] && cmd+=(--network host) || cmd+=(--network bridge -p "${pt}:${int_port}")
+  local m; for m in "${RUNTIME_MOUNTS[@]}"; do cmd+=(-v "$m"); done
+  [[ ${#RUNTIME_MOUNTS[@]} -eq 0 ]] && cmd+=(-v "$data_dir:/data")
+  local e; for e in "${RUNTIME_ENVS[@]}"; do cmd+=(-e "$e"); done
+  cmd+=(-e "TZ=$DEFAULT_TZ" "$new_image")
+  local c; for c in "${RUNTIME_CMD[@]}"; do cmd+=("$c"); done
+  yellow "执行：${cmd[*]//SQL_DSN=*/SQL_DSN=***}"
+  "${cmd[@]}" && green "✅ $svc_label 已升级到：$new_image" || { red "升级后启动失败。"; return 1; }
 }
 function deploy_one_api_sqlite() {
   echo ""; cyan "部署 One-API（SQLite）"; cyan "镜像：ghcr.io/songquanpeng/one-api"; echo ""
@@ -1244,10 +1274,15 @@ function manage_omniroute() {
         select_image_version "OmniRoute" "$OMNIROUTE_IMAGE_BASE" "dockerhub" "diegosouzapw/omniroute" 8; local new_image="$SELECTED_IMAGE"
         [[ "$new_image" == "$cur_image" ]] && { yellow "版本相同"; read -rp "强制重拉？(y/n)：" fr </dev/tty; [[ ! "${fr:-n}" =~ ^[Yy]$ ]] && { press_any_key; continue; }; }
         pull_image_with_retry "$new_image" || { press_any_key; continue; }
-        local old_ports; old_ports=$(docker inspect "$cname" 2>/dev/null | grep -A2 '"20128/tcp"' | grep 'HostPort' | head -n1 | grep -oE '[0-9]+' || echo "20128")
-        local old_bind; old_bind=$(docker inspect "$cname" --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostIP}}{{end}}{{end}}' 2>/dev/null | head -n1 || echo "127.0.0.1"); [[ -z "$old_bind" ]] && old_bind="127.0.0.1"
+        _capture_container_runtime "$cname"
+        local bindip="${RUNTIME_BINDIP:-127.0.0.1}" pt="${RUNTIME_PT:-20128}"
         docker stop "$cname" &>/dev/null; docker rm "$cname" &>/dev/null
-        docker run -d --name "$cname" --restart unless-stopped --stop-timeout 40 -p "${old_bind}:${old_ports}:20128" -v "${volume_name}:/app/data" -e "TZ=$DEFAULT_TZ" -e "PORT=20128" "$new_image" && green "✅ 已升级到：$new_image" || red "升级失败"; press_any_key ;;
+        local ncmd=(docker run -d --name "$cname" --restart unless-stopped --stop-timeout 40 -p "${bindip}:${pt}:20128")
+        local m; for m in "${RUNTIME_MOUNTS[@]}"; do ncmd+=(-v "$m"); done
+        [[ ${#RUNTIME_MOUNTS[@]} -eq 0 ]] && ncmd+=(-v "${volume_name}:/app/data")
+        local e; for e in "${RUNTIME_ENVS[@]}"; do ncmd+=(-e "$e"); done
+        ncmd+=(-e "TZ=$DEFAULT_TZ" "$new_image")
+        "${ncmd[@]}" && green "✅ 已升级到：$new_image" || red "升级失败"; press_any_key ;;
       6) $has_docker || { yellow "Docker 容器不存在"; press_any_key; continue; }; _prompt_backup_before_action "卸载" || { press_any_key; continue; }
         docker stop "$cname" &>/dev/null; docker rm "$cname" &>/dev/null; green "  容器已删除"
         local imgs; imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^diegosouzapw/omniroute" || true)
@@ -1333,6 +1368,46 @@ function _svc_status_tag() {
   elif docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then echo "已停止"
   else echo "未部署"; fi
 }
+function manage_services_menu() {
+  while true; do
+    echo ""; cyan "服务管理"; echo "──────────────"
+    local s1 s2 s3 s4 s5 s6
+    s1=$(_svc_status_tag "one-api"); s2=$(_svc_status_tag "one-api-mysql"); s3=$(_svc_status_tag "new-api")
+    s4=$(_svc_status_tag "new-api-horizon"); s5=$(_svc_status_tag "omniroute"); s6=$(_svc_status_tag "freellmapi")
+    echo "  1. One-API            [$s1]"
+    echo "  2. One-API (MySQL)    [$s2]"
+    echo "  3. New-API            [$s3]"
+    echo "  4. New-API Horizon ⭐ [$s4]"
+    echo "  5. OmniRoute          [$s5]"
+    echo "  6. FreeLLMAPI         [$s6]"
+    echo "  0. 返回"
+    read -rp "选项 (0-6)：" ch </dev/tty
+    case "$ch" in
+      1|2) manage_one_api || true ;;
+      3) manage_new_api || true ;;
+      4) manage_new_api_horizon || true ;;
+      5) manage_omniroute || true ;;
+      6) manage_freellmapi || true ;;
+      0) return 0 ;; *) red "无效选项。" ;;
+    esac
+  done
+}
+function system_tools_menu() {
+  while true; do
+    echo ""; cyan "系统工具"; echo "──────────────"
+    echo "  1. 查看容器状态"
+    echo "  2. 镜像加速器配置"
+    echo "  3. 重新检测网络"
+    echo "  0. 返回"
+    read -rp "选项 (0-3)：" ch </dev/tty
+    case "$ch" in
+      1) view_container_status || true; press_any_key ;;
+      2) configure_docker_mirror || true ;;
+      3) _detect_network; press_any_key ;;
+      0) return 0 ;; *) red "无效选项。" ;;
+    esac
+  done
+}
 function main_menu() {
   detect_architecture; detect_os; setup_logging; check_base_dependencies
   docker info &>/dev/null && check_docker_dependencies || yellow "Docker 未安装，部分功能不可用"
@@ -1350,12 +1425,10 @@ function main_menu() {
     echo "  系统: $OS  架构: $ARCH"; echo "  Docker: $dv  Compose: $cv"; echo "  镜像加速器: $mirror_status"; echo "  网络: $net_status"; echo ""
     echo "  One-API  (SQLite)  : $s1"; echo "  One-API  (MySQL)   : $s2"; echo "  New-API            : $s3"; echo "  New-API  Horizon ⭐: $s4"; echo "  OmniRoute          : $s5"; echo "  FreeLLMAPI         : $s6"; echo ""
     cyan "─── 操作 ──────────────────────────────────────────"
-    echo "  1. 部署新服务"; echo "  2. 管理 One-API"; echo "  3. 管理 New-API"; echo "  4. 管理 New-API Horizon  ⭐"; echo "  5. 管理 OmniRoute"; echo "  6. 管理 FreeLLMAPI"
-    echo "  7. 查看容器状态"; echo "  8. 备份/恢复"; echo "  9. 镜像加速器配置"; echo "  10. 重新检测网络"; echo "  0. 退出"; echo ""
-    read -rp "选项 (0-10): " ch </dev/tty; echo ""
+    echo "  1. 部署新服务"; echo "  2. 服务管理"; echo "  3. 备份 / 恢复"; echo "  4. 系统工具（状态/加速器/网络）"; echo "  0. 退出"; echo ""
+    read -rp "选项 (0-4): " ch </dev/tty; echo ""
     case "$ch" in
-      1) deploy_menu || true ;; 2) manage_one_api || true ;; 3) manage_new_api || true ;; 4) manage_new_api_horizon || true ;; 5) manage_omniroute || true ;; 6) manage_freellmapi || true ;;
-      7) view_container_status || true; press_any_key ;; 8) backup_restore_menu || true ;; 9) configure_docker_mirror || true ;; 10) _detect_network; press_any_key ;; 0) green "感谢使用，退出。"; exit 0 ;; *) red "无效选项，请输入 0-10。" ;;
+      1) deploy_menu || true ;; 2) manage_services_menu || true ;; 3) backup_restore_menu || true ;; 4) system_tools_menu || true ;; 0) green "感谢使用，退出。"; exit 0 ;; *) red "无效选项，请输入 0-4。" ;;
     esac
   done
 }
