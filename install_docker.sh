@@ -53,6 +53,7 @@ LOG_MAX_SIZE_MB=5
 LOG_MAX_BACKUPS=3
 DOCKER_VERSIONS_CACHE=""
 COMPOSE_VERSIONS_CACHE=""
+DEFAULT_DOCKER_DATA_ROOT="/var/lib/docker"
 section() {
 echo ""
 echo -e "${BOLD}${CYAN}── $1${NC}"
@@ -379,15 +380,31 @@ net.bridge.bridge-nf-call-ip6tables=1
 EOF
 sysctl --system >/dev/null 2>&1 || true
 }
+_get_current_data_root() {
+local current=""
+if [[ -f /etc/docker/daemon.json ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+current=$(jq -r '."data-root" // empty' /etc/docker/daemon.json 2>/dev/null)
+fi
+if [[ -n "$current" ]]; then
+echo "$current"
+else
+echo "$DEFAULT_DOCKER_DATA_ROOT"
+fi
+}
 _write_daemon_json() {
 local mirrors_json="$1"
+local data_root_input="$2"
 local ip6t="true"
+local data_root="${data_root_input:-$DEFAULT_DOCKER_DATA_ROOT}"
 [[ "$IPV6_AVAILABLE" == "false" ]] && ip6t="false"
 mkdir -p /etc/docker
+mkdir -p "$data_root" 2>/dev/null || true
 local cfg=$(jq -n \
 --argjson mirrors "$mirrors_json" \
 --argjson ip6t "$ip6t" \
+--arg data_root "$data_root" \
 '{
+"data-root": $data_root,
 "iptables": true,
 "ip6tables": $ip6t,
 "exec-opts": ["native.cgroupdriver=systemd"],
@@ -397,9 +414,45 @@ local cfg=$(jq -n \
 }')
 echo "$cfg" > /etc/docker/daemon.json
 echo -e "  ${GREEN}daemon.json 已写入${NC}"
+echo -e "  ${CYAN}data-root: ${data_root}${NC}"
 if [[ "$APPARMOR_RESTRICTED" == "true" ]]; then
 echo -e "  ${YELLOW}提示: AppArmor 受限，运行容器时可添加 --security-opt apparmor=unconfined${NC}"
 fi
+}
+_set_docker_data_root() {
+section "设置 Docker 根目录路径"
+local current_root
+current_root=$(_get_current_data_root)
+echo -e "  当前 data-root: ${CYAN}${current_root}${NC}"
+echo -e "  默认 data-root: ${CYAN}${DEFAULT_DOCKER_DATA_ROOT}${NC}"
+echo -n "  输入新的根目录路径（回车使用默认 ${DEFAULT_DOCKER_DATA_ROOT}）: "
+local input_root
+read input_root </dev/tty
+local new_root="${input_root:-$DEFAULT_DOCKER_DATA_ROOT}"
+if [[ "$new_root" != /* ]]; then
+echo -e "  ${RED}路径必须是绝对路径，例如 /data/docker${NC}"
+return 1
+fi
+if ! mkdir -p "$new_root" 2>/dev/null; then
+echo -e "  ${RED}无法创建目录: ${new_root}${NC}"
+return 1
+fi
+backup_daemon_json
+local mirrors_json
+if [[ -f /etc/docker/daemon.json ]] && jq . /etc/docker/daemon.json >/dev/null 2>&1; then
+local tmp
+tmp=$(mktemp)
+jq --arg dr "$new_root" '. + {"data-root": $dr}' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+else
+mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+_write_daemon_json "$mirrors_json" "$new_root"
+fi
+echo -e "  ${GREEN}已设置 Docker 根目录为: ${new_root}${NC}"
+echo -e "  ${YELLOW}如原目录已有数据，请自行迁移到新目录后再重启 Docker${NC}"
+echo -n "  是否立即重启 Docker？(y/n): "
+local do_restart
+read do_restart </dev/tty
+[[ "$do_restart" == "y" ]] && _restart_docker
 }
 ensure_daemon_json() {
 mkdir -p /etc/docker
@@ -409,13 +462,32 @@ echo -e "  ${YELLOW}daemon.json 格式错误，重新生成${NC}"
 rm -f /etc/docker/daemon.json
 elif jq -e '."default-security-opt"' /etc/docker/daemon.json >/dev/null 2>&1; then
 echo -e "  ${YELLOW}修复无效配置项 default-security-opt${NC}"
-local tmp=$(mktemp)
+local tmp
+local current_root
+current_root=$(_get_current_data_root)
+tmp=$(mktemp)
 jq 'del(."default-security-opt")' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+[[ -z "$current_root" ]] && current_root="$DEFAULT_DOCKER_DATA_ROOT"
+if ! jq -e '."data-root"' /etc/docker/daemon.json >/dev/null 2>&1; then
+local tmp2
+tmp2=$(mktemp)
+jq --arg dr "$current_root" '. + {"data-root": $dr}' /etc/docker/daemon.json > "$tmp2" && mv "$tmp2" /etc/docker/daemon.json
+fi
 fi
 fi
 if [[ ! -s /etc/docker/daemon.json ]]; then
-local mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
-_write_daemon_json "$mirrors_json"
+local mirrors_json
+local current_root
+current_root=$(_get_current_data_root)
+mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+_write_daemon_json "$mirrors_json" "$current_root"
+elif ! jq -e '."data-root"' /etc/docker/daemon.json >/dev/null 2>&1; then
+local tmp
+local current_root
+current_root=$(_get_current_data_root)
+tmp=$(mktemp)
+jq --arg dr "$current_root" '. + {"data-root": $dr}' /etc/docker/daemon.json > "$tmp" && mv "$tmp" /etc/docker/daemon.json
+echo -e "  ${GREEN}已补充 data-root: ${current_root}${NC}"
 fi
 }
 _write_docker_service() {
@@ -815,8 +887,21 @@ echo -e "  ${GREEN}已卸载${NC}"
 generate_daemon_config() {
 section "生成 daemon.json"
 backup_daemon_json
-local mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
-_write_daemon_json "$mirrors_json"
+local current_root
+current_root=$(_get_current_data_root)
+echo -e "  当前/默认 Docker 根目录: ${CYAN}${current_root}${NC}"
+echo -n "  输入 Docker 根目录路径（回车使用默认 ${DEFAULT_DOCKER_DATA_ROOT}）: "
+local input_root
+read input_root </dev/tty
+local data_root="${input_root:-$DEFAULT_DOCKER_DATA_ROOT}"
+if [[ "$data_root" != /* ]]; then
+echo -e "  ${RED}路径必须是绝对路径，例如 /data/docker${NC}"
+return 1
+fi
+mkdir -p "$data_root" 2>/dev/null || { echo -e "  ${RED}无法创建目录: ${data_root}${NC}"; return 1; }
+local mirrors_json
+mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
+_write_daemon_json "$mirrors_json" "$data_root"
 echo -n "  重启 Docker？(y/n): "
 read reply </dev/tty
 [[ "$reply" == "y" ]] && _restart_docker
@@ -834,7 +919,10 @@ _detect_virt_env
 manage_daemon_json() {
 while true; do
 section "daemon.json 管理"
-echo "  1. 备份    2. 恢复    3. 查看    0. 返回"
+local current_root
+current_root=$(_get_current_data_root)
+echo -e "  当前 data-root: ${CYAN}${current_root}${NC}"
+echo "  1. 备份    2. 恢复    3. 查看    4. 设置 Docker 根目录    0. 返回"
 hr
 echo -n "  选择: "
 read choice </dev/tty
@@ -842,6 +930,7 @@ case "$choice" in
 1) backup_daemon_json ;;
 2) restore_daemon_json ;;
 3) [[ -f /etc/docker/daemon.json ]] && cat /etc/docker/daemon.json || echo "  不存在" ;;
+4) _set_docker_data_root ;;
 0) break ;;
 esac
 done
@@ -870,7 +959,7 @@ echo -e "  ${GREEN}已设置${NC}"
 }
 print_menu() {
 echo ""
-echo -e "${BOLD}${CYAN}  Docker 智能管理脚本 v2.6${NC}"
+echo -e "${BOLD}${CYAN}  Docker 智能管理脚本 v2.7${NC}"
 echo -e "  架构: ${ARCH}  系统: ${OS}  包管理: ${PKG_MANAGER}"
 hr
 echo -e "  ${GREEN}1.${NC} 安装 Docker          ${GREEN}2.${NC} 安装 Compose"
