@@ -391,6 +391,45 @@ else
 echo "$DEFAULT_DOCKER_DATA_ROOT"
 fi
 }
+_prepare_data_root_dir() {
+local data_root="$1"
+mkdir -p "$data_root" 2>/dev/null || return 1
+chown root:root "$data_root" 2>/dev/null || true
+chmod 711 "$data_root" 2>/dev/null || true
+return 0
+}
+_check_data_root_fs_compat() {
+local data_root="$1"
+local fs_type mount_point
+fs_type=$(df -T "$data_root" 2>/dev/null | awk 'END{print $2}')
+mount_point=$(df -P "$data_root" 2>/dev/null | awk 'END{print $6}')
+[[ -z "$fs_type" ]] && { echo -e "  ${RED}无法识别 ${data_root} 所在文件系统${NC}"; return 1; }
+echo -e "  文件系统: ${CYAN}${fs_type}${NC}  挂载点: ${CYAN}${mount_point}${NC}"
+case "$fs_type" in
+ext4|ext3|ext2)
+echo -e "  ${GREEN}✓ 该文件系统可用于 Docker data-root${NC}"
+return 0
+;;
+xfs)
+if command -v xfs_info >/dev/null 2>&1 && xfs_info "$mount_point" 2>/dev/null | grep -q 'ftype=1'; then
+echo -e "  ${GREEN}✓ XFS 已启用 ftype=1，可用于 Docker data-root${NC}"
+return 0
+fi
+echo -e "  ${RED}✗ XFS 未检测到 ftype=1，overlay2 可能无法工作${NC}"
+return 1
+;;
+ntfs|ntfs3|exfat|vfat|fuseblk|msdos)
+echo -e "  ${RED}✗ ${fs_type} 不适合作为 Docker data-root${NC}"
+echo -e "  ${YELLOW}  原因: 不支持 Docker 需要的 overlay2/d_type/xattr 语义${NC}"
+return 1
+;;
+*)
+echo -e "  ${YELLOW}⚠ 未验证的文件系统: ${fs_type}${NC}"
+echo -e "  ${YELLOW}  建议使用 ext4 或 xfs(ftype=1)${NC}"
+return 1
+;;
+esac
+}
 _write_daemon_json() {
 local mirrors_json="$1"
 local data_root_input="$2"
@@ -398,7 +437,7 @@ local ip6t="true"
 local data_root="${data_root_input:-$DEFAULT_DOCKER_DATA_ROOT}"
 [[ "$IPV6_AVAILABLE" == "false" ]] && ip6t="false"
 mkdir -p /etc/docker
-mkdir -p "$data_root" 2>/dev/null || true
+_prepare_data_root_dir "$data_root" || { echo -e "  ${RED}无法准备 data-root 目录: ${data_root}${NC}"; return 1; }
 local cfg=$(jq -n \
 --argjson mirrors "$mirrors_json" \
 --argjson ip6t "$ip6t" \
@@ -415,6 +454,7 @@ local cfg=$(jq -n \
 echo "$cfg" > /etc/docker/daemon.json
 echo -e "  ${GREEN}daemon.json 已写入${NC}"
 echo -e "  ${CYAN}data-root: ${data_root}${NC}"
+ls -ld "$data_root" 2>/dev/null | sed 's/^/  目录权限: /'
 if [[ "$APPARMOR_RESTRICTED" == "true" ]]; then
 echo -e "  ${YELLOW}提示: AppArmor 受限，运行容器时可添加 --security-opt apparmor=unconfined${NC}"
 fi
@@ -433,9 +473,19 @@ if [[ "$new_root" != /* ]]; then
 echo -e "  ${RED}路径必须是绝对路径，例如 /data/docker${NC}"
 return 1
 fi
-if ! mkdir -p "$new_root" 2>/dev/null; then
-echo -e "  ${RED}无法创建目录: ${new_root}${NC}"
+if ! _prepare_data_root_dir "$new_root"; then
+echo -e "  ${RED}无法创建或设置目录: ${new_root}${NC}"
 return 1
+fi
+echo ""
+if ! _check_data_root_fs_compat "$new_root"; then
+echo ""
+echo -e "  ${RED}不建议把 Docker 根目录放到这个挂载盘上${NC}"
+echo -e "  ${YELLOW}建议: 把磁盘格式化为 ext4，或使用 xfs(ftype=1)${NC}"
+echo -n "  仍然强制写入该路径？(y/n): "
+local force_set
+read force_set </dev/tty
+[[ "$force_set" != "y" ]] && { echo -e "  ${YELLOW}已取消修改${NC}"; return 1; }
 fi
 backup_daemon_json
 local mirrors_json
@@ -448,7 +498,7 @@ mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s 
 _write_daemon_json "$mirrors_json" "$new_root"
 fi
 echo -e "  ${GREEN}已设置 Docker 根目录为: ${new_root}${NC}"
-echo -e "  ${YELLOW}如原目录已有数据，请自行迁移到新目录后再重启 Docker${NC}"
+echo -e "  ${YELLOW}如原目录已有数据，请先停止 Docker 后使用 rsync -aHAX 迁移数据${NC}"
 echo -n "  是否立即重启 Docker？(y/n): "
 local do_restart
 read do_restart </dev/tty
@@ -679,9 +729,17 @@ systemctl restart docker && echo -e "  ${GREEN}已重启${NC}" || journalctl -u 
 manage_docker_service() {
 command -v docker >/dev/null 2>&1 || { echo -e "  ${RED}Docker 未安装${NC}"; return; }
 while true; do
-local status=$(systemctl is-active docker 2>/dev/null || echo "inactive")
+local status
+status=$(systemctl is-active docker 2>/dev/null || true)
+[[ -z "$status" ]] && status="inactive"
 section "Docker 服务管理"
-echo -e "  状态: $([[ "$status" == "active" ]] && echo "${GREEN}运行中${NC}" || echo "${RED}${status}${NC}")"
+if [[ "$status" == "active" ]]; then
+echo -e "  状态: ${GREEN}运行中${NC}"
+elif [[ "$status" == "activating" ]]; then
+echo -e "  状态: ${YELLOW}启动中${NC}"
+else
+echo -e "  状态: ${RED}${status}${NC}"
+fi
 hr
 echo "  1. 启动    2. 停止    3. 重启    0. 返回"
 hr
@@ -710,8 +768,16 @@ echo -e "  Compose: ${GREEN}$(docker compose version 2>/dev/null | grep -oE '[0-
 else
 echo -e "  Compose: ${YELLOW}未安装${NC}"
 fi
-local svc=$(systemctl is-active docker 2>/dev/null || echo "inactive")
-echo -e "  服务: $([[ "$svc" == "active" ]] && echo "${GREEN}运行中${NC}" || echo "${RED}${svc}${NC}")"
+local svc
+svc=$(systemctl is-active docker 2>/dev/null || true)
+[[ -z "$svc" ]] && svc="inactive"
+if [[ "$svc" == "active" ]]; then
+echo -e "  服务: ${GREEN}运行中${NC}"
+elif [[ "$svc" == "activating" ]]; then
+echo -e "  服务: ${YELLOW}启动中${NC}"
+else
+echo -e "  服务: ${RED}${svc}${NC}"
+fi
 if [[ "$svc" == "active" ]]; then
 echo ""
 echo -e "  容器: $(docker ps -q 2>/dev/null | wc -l) 运行 / $(docker ps -aq 2>/dev/null | wc -l) 总计"
@@ -898,10 +964,20 @@ if [[ "$data_root" != /* ]]; then
 echo -e "  ${RED}路径必须是绝对路径，例如 /data/docker${NC}"
 return 1
 fi
-mkdir -p "$data_root" 2>/dev/null || { echo -e "  ${RED}无法创建目录: ${data_root}${NC}"; return 1; }
+if ! _prepare_data_root_dir "$data_root"; then
+ echo -e "  ${RED}无法创建或设置目录: ${data_root}${NC}"
+ return 1
+fi
+echo ""
+if ! _check_data_root_fs_compat "$data_root"; then
+ echo -n "  仍然强制写入该路径？(y/n): "
+ local force_set
+ read force_set </dev/tty
+ [[ "$force_set" != "y" ]] && { echo -e "  ${YELLOW}已取消生成${NC}"; return 1; }
+fi
 local mirrors_json
 mirrors_json=$(printf '%s\n' "${REGISTRY_MIRRORS_DEFAULT[@]}" | jq -R . | jq -s .)
-_write_daemon_json "$mirrors_json" "$data_root"
+_write_daemon_json "$mirrors_json" "$data_root" || return 1
 echo -n "  重启 Docker？(y/n): "
 read reply </dev/tty
 [[ "$reply" == "y" ]] && _restart_docker
@@ -959,7 +1035,7 @@ echo -e "  ${GREEN}已设置${NC}"
 }
 print_menu() {
 echo ""
-echo -e "${BOLD}${CYAN}  Docker 智能管理脚本 v2.7${NC}"
+echo -e "${BOLD}${CYAN}  Docker 智能管理脚本 v2.8${NC}"
 echo -e "  架构: ${ARCH}  系统: ${OS}  包管理: ${PKG_MANAGER}"
 hr
 echo -e "  ${GREEN}1.${NC} 安装 Docker          ${GREEN}2.${NC} 安装 Compose"
