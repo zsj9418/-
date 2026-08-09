@@ -116,7 +116,7 @@ update_system() {
 }
 install_common_tools() {
     echo "正在安装常用工具..."
-    local tools="git vim curl wget htop tmux unzip tar jq lsof iptables cron net-tools fzf psmisc"
+    local tools="sudo nano git vim curl wget htop tmux unzip tar jq lsof iptables cron net-tools fzf psmisc"
     case $PKG_MANAGER in
         apt)
             tools="$tools build-essential python3 python3-pip openjdk-17-jdk maven dnsutils"
