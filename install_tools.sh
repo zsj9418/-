@@ -1,6 +1,8 @@
 #!/bin/bash
 LOG_FILE="/var/log/install_tools.log"
 MAX_LOG_SIZE=$((1*1024*1024))
+BACKUP_RECORD="/var/lib/sources_backup_path"
+THIRD_PARTY_KEYWORDS="docker|nvidia|kubernetes|k8s|raspi|raspberry|armbian|mysql|mongodb|elastic|nodesource|microsoft|vscode|google|chrome|steam|epel|remi|zabbix|influx|grafana|gitlab|mariadb|proxmox|pve|orangepi|bananapi|yarn|ius|webtatic|saltstack|puppetlabs|jenkins|hashicorp|nginx|clickhouse|taobao|tencentcloud|huaweicloud"
 if [ "$EUID" -ne 0 ]; then
     echo "❌ 请使用 root 或 sudo 权限运行此脚本。"
     exit 1
@@ -101,13 +103,320 @@ EOF
     chronyc tracking
     chronyc sources -v
 }
+get_distro_info() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO_ID="${ID,,}"
+        DISTRO_VERSION="$VERSION_ID"
+        DISTRO_CODENAME="${VERSION_CODENAME:-}"
+        DISTRO_LIKE="${ID_LIKE,,}"
+    else
+        DISTRO_ID=""
+        DISTRO_VERSION=""
+        DISTRO_CODENAME=""
+        DISTRO_LIKE=""
+    fi
+}
+is_third_party_source() {
+    local filename="$1"
+    local content="$2"
+    local base
+    base=$(basename "$filename" | tr '[:upper:]' '[:lower:]')
+    if echo "$base" | grep -qEi "$THIRD_PARTY_KEYWORDS"; then
+        return 0
+    fi
+    if echo "$content" | grep -qEi "$THIRD_PARTY_KEYWORDS"; then
+        return 0
+    fi
+    return 1
+}
 backup_sources() {
-    echo "正在备份源文件..."
-    echo "源文件备份完成。"
+    get_distro_info
+    local backup_dir="/var/lib/sources_backup/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+    echo "📦 备份目录: $backup_dir"
+    case $PKG_MANAGER in
+        apt)
+            [ -f /etc/apt/sources.list ] && cp -v /etc/apt/sources.list "$backup_dir/sources.list"
+            if [ -d /etc/apt/sources.list.d ]; then
+                mkdir -p "$backup_dir/sources.list.d"
+                cp -v /etc/apt/sources.list.d/*.list "$backup_dir/sources.list.d/" 2>/dev/null
+                cp -v /etc/apt/sources.list.d/*.sources "$backup_dir/sources.list.d/" 2>/dev/null
+            fi
+            ;;
+        yum|dnf)
+            if [ -d /etc/yum.repos.d ]; then
+                mkdir -p "$backup_dir/yum.repos.d"
+                cp -v /etc/yum.repos.d/*.repo "$backup_dir/yum.repos.d/" 2>/dev/null
+            fi
+            ;;
+        apk)
+            [ -f /etc/apk/repositories ] && cp -v /etc/apk/repositories "$backup_dir/repositories"
+            ;;
+        pacman)
+            [ -f /etc/pacman.d/mirrorlist ] && cp -v /etc/pacman.d/mirrorlist "$backup_dir/mirrorlist"
+            [ -f /etc/pacman.conf ] && cp -v /etc/pacman.conf "$backup_dir/pacman.conf"
+            ;;
+    esac
+    echo "$backup_dir" > "$BACKUP_RECORD"
+    echo "✅ 源文件备份完成 → $backup_dir"
 }
 change_to_aliyun() {
-    echo "正在切换到阿里云镜像源..."
-    echo "已切换到阿里云镜像源（简化版）"
+    get_distro_info
+    echo "🔍 检测到发行版: ${DISTRO_ID} ${DISTRO_VERSION} ${DISTRO_CODENAME}"
+    case $PKG_MANAGER in
+        apt)
+            _aliyun_apt
+            ;;
+        yum|dnf)
+            _aliyun_rpm
+            ;;
+        apk)
+            _aliyun_apk
+            ;;
+        pacman)
+            _aliyun_pacman
+            ;;
+        *)
+            echo "❌ 当前包管理器暂不支持自动换源"
+            return 1
+            ;;
+    esac
+    echo "✅ 阿里云镜像源替换完成"
+}
+_aliyun_apt() {
+    local codename="$DISTRO_CODENAME"
+    local distro="$DISTRO_ID"
+    if [ -z "$codename" ]; then
+        codename=$(lsb_release -cs 2>/dev/null || echo "")
+    fi
+    if [ -z "$codename" ]; then
+        echo "❌ 无法识别系统代号，跳过换源"
+        return 1
+    fi
+    echo "📋 发行版代号: $codename"
+    if [ -d /etc/apt/sources.list.d ]; then
+        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            local content
+            content=$(cat "$f")
+            if is_third_party_source "$f" "$content"; then
+                echo "⚠️  跳过第三方源: $f"
+            else
+                echo "🗑️  移除官方源文件: $f"
+                rm -f "$f"
+            fi
+        done
+    fi
+    if [ "$distro" = "ubuntu" ]; then
+        if dpkg --print-architecture 2>/dev/null | grep -q "amd64\|i386"; then
+            cat > /etc/apt/sources.list << EOF
+deb https://mirrors.aliyun.com/ubuntu/ ${codename} main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ ${codename}-security main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ ${codename}-updates main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu/ ${codename}-backports main restricted universe multiverse
+EOF
+        else
+            cat > /etc/apt/sources.list << EOF
+deb https://mirrors.aliyun.com/ubuntu-ports/ ${codename} main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu-ports/ ${codename}-security main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu-ports/ ${codename}-updates main restricted universe multiverse
+deb https://mirrors.aliyun.com/ubuntu-ports/ ${codename}-backports main restricted universe multiverse
+EOF
+        fi
+    elif [ "$distro" = "debian" ]; then
+        cat > /etc/apt/sources.list << EOF
+deb https://mirrors.aliyun.com/debian/ ${codename} main contrib non-free non-free-firmware
+deb https://mirrors.aliyun.com/debian/ ${codename}-updates main contrib non-free non-free-firmware
+deb https://mirrors.aliyun.com/debian-security/ ${codename}-security main contrib non-free non-free-firmware
+EOF
+    elif [ "$distro" = "raspbian" ]; then
+        cat > /etc/apt/sources.list << EOF
+deb https://mirrors.aliyun.com/raspbian/raspbian/ ${codename} main contrib non-free rpi
+EOF
+        if [ -f /etc/apt/sources.list.d/raspi.list ]; then
+            echo "⚠️  检测到 Raspberry Pi 专属源 raspi.list，保留不动"
+        fi
+    else
+        echo "⚠️  未识别的 apt 发行版 ($distro)，尝试通用 debian 格式"
+        cat > /etc/apt/sources.list << EOF
+deb https://mirrors.aliyun.com/debian/ ${codename} main contrib non-free
+deb https://mirrors.aliyun.com/debian/ ${codename}-updates main contrib non-free
+deb https://mirrors.aliyun.com/debian-security/ ${codename}-security main contrib non-free
+EOF
+    fi
+    apt update -qq
+}
+_aliyun_rpm() {
+    local distro="$DISTRO_ID"
+    local version_major
+    version_major=$(echo "$DISTRO_VERSION" | cut -d. -f1)
+    echo "🗑️  分析并处理 /etc/yum.repos.d/ 中的 repo 文件..."
+    for f in /etc/yum.repos.d/*.repo; do
+        [ -f "$f" ] || continue
+        local content
+        content=$(cat "$f")
+        if is_third_party_source "$f" "$content"; then
+            echo "⚠️  跳过第三方源: $f"
+        else
+            echo "🗑️  移除官方源文件: $f"
+            rm -f "$f"
+        fi
+    done
+    if echo "$distro $DISTRO_LIKE" | grep -qi "centos"; then
+        if [ "$version_major" -ge 8 ] 2>/dev/null; then
+            cat > /etc/yum.repos.d/CentOS-aliyun.repo << EOF
+[BaseOS]
+name=CentOS-\$releasever - Base - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/BaseOS/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+[AppStream]
+name=CentOS-\$releasever - AppStream - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/AppStream/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+[Extras]
+name=CentOS-\$releasever - Extras - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/extras/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+EOF
+        else
+            cat > /etc/yum.repos.d/CentOS-aliyun.repo << EOF
+[base]
+name=CentOS-\$releasever - Base - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/os/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+[updates]
+name=CentOS-\$releasever - Updates - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/updates/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+[extras]
+name=CentOS-\$releasever - Extras - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/\$releasever/extras/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+EOF
+        fi
+    elif echo "$distro" | grep -qi "rocky"; then
+        cat > /etc/yum.repos.d/Rocky-aliyun.repo << EOF
+[BaseOS]
+name=Rocky Linux \$releasever - BaseOS - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/rockylinux/\$releasever/BaseOS/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-${version_major}
+[AppStream]
+name=Rocky Linux \$releasever - AppStream - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/rockylinux/\$releasever/AppStream/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-${version_major}
+[Extras]
+name=Rocky Linux \$releasever - Extras - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/rockylinux/\$releasever/extras/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-${version_major}
+EOF
+    elif echo "$distro" | grep -qi "alma"; then
+        cat > /etc/yum.repos.d/AlmaLinux-aliyun.repo << EOF
+[BaseOS]
+name=AlmaLinux \$releasever - BaseOS - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/almalinux/\$releasever/BaseOS/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+[AppStream]
+name=AlmaLinux \$releasever - AppStream - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/almalinux/\$releasever/AppStream/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+[Extras]
+name=AlmaLinux \$releasever - Extras - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/almalinux/\$releasever/extras/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+EOF
+    elif echo "$distro" | grep -qi "fedora"; then
+        cat > /etc/yum.repos.d/Fedora-aliyun.repo << EOF
+[fedora]
+name=Fedora \$releasever - \$basearch - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/fedora/releases/\$releasever/Everything/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-\$releasever-\$basearch
+[updates]
+name=Fedora \$releasever - \$basearch - Updates - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/fedora/updates/\$releasever/Everything/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-\$releasever-\$basearch
+EOF
+    else
+        echo "❌ 未识别的 RPM 发行版: $distro，跳过换源"
+        return 1
+    fi
+    $PKG_MANAGER makecache -q 2>/dev/null || true
+}
+_aliyun_apk() {
+    local ver
+    ver=$(cat /etc/alpine-release 2>/dev/null | cut -d. -f1-2)
+    if [ -z "$ver" ]; then
+        echo "❌ 无法获取 Alpine 版本"
+        return 1
+    fi
+    local new_repo="/etc/apk/repositories"
+    local preserved_lines=""
+    if [ -f "$new_repo" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if echo "$line" | grep -qEi "$THIRD_PARTY_KEYWORDS"; then
+                echo "⚠️  保留第三方源行: $line"
+                preserved_lines="${preserved_lines}${line}\n"
+            fi
+        done < "$new_repo"
+    fi
+    cat > "$new_repo" << EOF
+https://mirrors.aliyun.com/alpine/v${ver}/main
+https://mirrors.aliyun.com/alpine/v${ver}/community
+EOF
+    if [ -n "$preserved_lines" ]; then
+        printf "$preserved_lines" >> "$new_repo"
+    fi
+    apk update -q
+}
+_aliyun_pacman() {
+    local mirrorlist="/etc/pacman.d/mirrorlist"
+    local preserved_lines=""
+    if [ -f "$mirrorlist" ]; then
+        while IFS= read -r line; do
+            if echo "$line" | grep -qEi "$THIRD_PARTY_KEYWORDS"; then
+                echo "⚠️  保留第三方镜像行: $line"
+                preserved_lines="${preserved_lines}${line}\n"
+            fi
+        done < "$mirrorlist"
+    fi
+    cat > "$mirrorlist" << 'EOF'
+Server = https://mirrors.aliyun.com/archlinux/$repo/os/$arch
+Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirrors.ustc.edu.cn/archlinux/$repo/os/$arch
+EOF
+    if [ -n "$preserved_lines" ]; then
+        printf "$preserved_lines" >> "$mirrorlist"
+    fi
+    pacman -Syy --noconfirm
 }
 update_system() {
     echo "正在更新系统软件包..."
@@ -116,21 +425,7 @@ update_system() {
 }
 install_common_tools() {
     echo "正在安装常用工具..."
-    local tools="sudo nano git vim curl wget htop tmux unzip tar jq lsof iptables cron net-tools fzf psmisc"
-    case $PKG_MANAGER in
-        apt)
-            tools="$tools build-essential python3 python3-pip openjdk-17-jdk maven dnsutils"
-            ;;
-        yum|dnf)
-            tools="$tools gcc gcc-c++ make cmake python3 python3-pip java-17-openjdk-devel maven bind-utils"
-            ;;
-        pacman)
-            tools="$tools base-devel python python-pip jdk17-openjdk maven"
-            ;;
-        apk)
-            tools="$tools build-base python3 py3-pip openjdk17 maven"
-            ;;
-    esac
+    local tools="sudo nano git vim curl wget htop tmux unzip tar jq lsof net-tools psmisc"
     for tool in $tools; do
         install_if_not_exists "$tool" "${tool%%-*}"
     done
@@ -156,8 +451,42 @@ perform_cleanup() {
     echo "✅ 清理完成"
 }
 restore_sources() {
-    echo "正在还原源文件..."
-    echo "源文件还原完成。"
+    if [ ! -f "$BACKUP_RECORD" ]; then
+        echo "❌ 未找到备份记录，请先执行选项 1 进行备份"
+        return 1
+    fi
+    local backup_dir
+    backup_dir=$(cat "$BACKUP_RECORD")
+    if [ ! -d "$backup_dir" ]; then
+        echo "❌ 备份目录不存在: $backup_dir"
+        return 1
+    fi
+    echo "📦 正在从备份还原: $backup_dir"
+    case $PKG_MANAGER in
+        apt)
+            [ -f "$backup_dir/sources.list" ] && cp -v "$backup_dir/sources.list" /etc/apt/sources.list
+            if [ -d "$backup_dir/sources.list.d" ]; then
+                cp -v "$backup_dir/sources.list.d/"* /etc/apt/sources.list.d/ 2>/dev/null
+            fi
+            apt update -qq
+            ;;
+        yum|dnf)
+            if [ -d "$backup_dir/yum.repos.d" ]; then
+                cp -v "$backup_dir/yum.repos.d/"*.repo /etc/yum.repos.d/ 2>/dev/null
+            fi
+            $PKG_MANAGER makecache -q 2>/dev/null || true
+            ;;
+        apk)
+            [ -f "$backup_dir/repositories" ] && cp -v "$backup_dir/repositories" /etc/apk/repositories
+            apk update -q
+            ;;
+        pacman)
+            [ -f "$backup_dir/mirrorlist" ] && cp -v "$backup_dir/mirrorlist" /etc/pacman.d/mirrorlist
+            [ -f "$backup_dir/pacman.conf" ] && cp -v "$backup_dir/pacman.conf" /etc/pacman.conf
+            pacman -Syy --noconfirm
+            ;;
+    esac
+    echo "✅ 源文件还原完成"
 }
 workspace_ensure_tmux() {
     if ! command -v tmux &>/dev/null; then
@@ -434,6 +763,8 @@ while true; do
             ;;
         5)
             echo "🚀 开始一键初始化..."
+            backup_sources
+            change_to_aliyun
             update_system
             install_common_tools
             setup_time_sync
