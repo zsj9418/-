@@ -488,6 +488,388 @@ restore_sources() {
     esac
     echo "✅ 源文件还原完成"
 }
+find_main_sshd_config() {
+    local f
+    for f in /etc/ssh/sshd_config /etc/openssh/sshd_config; do
+        [ -f "$f" ] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+find_sshd_binary() {
+    if command -v sshd >/dev/null 2>&1; then
+        command -v sshd
+        return 0
+    fi
+    local f
+    for f in /usr/sbin/sshd /usr/lib/ssh/sshd /usr/local/sbin/sshd; do
+        [ -x "$f" ] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+find_sshd_include_dir() {
+    local main_conf="$1"
+    local dir
+    dir=$(awk '/^[[:space:]]*Include[[:space:]]+/ {for(i=2;i<=NF;i++){if($i ~ /sshd_config\.d\/\*\.conf$/){gsub(/\/\*\.conf$/,"",$i); print $i; exit}}}' "$main_conf")
+    [ -n "$dir" ] || return 1
+    case "$dir" in
+        /*) echo "$dir" ;;
+        *) echo "$(dirname "$main_conf")/$dir" ;;
+    esac
+}
+build_sshd_block() {
+    case "$1" in
+        full)
+            cat << 'EOF'
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+ChallengeResponseAuthentication yes
+AuthenticationMethods any
+PermitRootLogin yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+EOF
+            ;;
+        kbd)
+            cat << 'EOF'
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PermitRootLogin yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+EOF
+            ;;
+        challenge)
+            cat << 'EOF'
+PasswordAuthentication yes
+ChallengeResponseAuthentication yes
+PermitRootLogin yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+EOF
+            ;;
+        basic)
+            cat << 'EOF'
+PasswordAuthentication yes
+PermitRootLogin yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+EOF
+            ;;
+    esac
+}
+write_sshd_main_config() {
+    local main_conf="$1"
+    local mode="$2"
+    local tmp_file block_file
+    tmp_file=$(mktemp) || return 1
+    block_file=$(mktemp) || { rm -f "$tmp_file"; return 1; }
+    build_sshd_block "$mode" > "$block_file"
+    awk -v block="$block_file" '
+BEGIN{added=0; n=0; while((getline line < block) > 0){lines[++n]=line} close(block)}
+/^[[:space:]]*#/ {print; next}
+/^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AuthenticationMethods|PermitRootLogin|PubkeyAuthentication|PermitEmptyPasswords)[[:space:]]+/ {next}
+/^[[:space:]]*Match[[:space:]]/ && added==0 {for(i=1;i<=n;i++) print lines[i]; added=1}
+{print}
+END{if(added==0){for(i=1;i<=n;i++) print lines[i]}}' "$main_conf" > "$tmp_file" || { rm -f "$tmp_file" "$block_file"; return 1; }
+    cat "$tmp_file" > "$main_conf"
+    rm -f "$tmp_file" "$block_file"
+    return 0
+}
+configure_openssh_password_login() {
+    local main_conf="$1"
+    local backup="${main_conf}.bak.$(date +%Y%m%d_%H%M%S)"
+    local include_dir sshd_bin mode
+    [ -f "$main_conf" ] || return 1
+    cp -a "$main_conf" "$backup" || return 1
+    sshd_bin=$(find_sshd_binary 2>/dev/null || true)
+    for mode in full kbd challenge basic; do
+        cp -a "$backup" "$main_conf"
+        include_dir=$(find_sshd_include_dir "$main_conf" 2>/dev/null || true)
+        [ -n "$include_dir" ] && rm -f "$include_dir/zzzz-password-login.conf" 2>/dev/null
+        write_sshd_main_config "$main_conf" "$mode" || continue
+        include_dir=$(find_sshd_include_dir "$main_conf" 2>/dev/null || true)
+        if [ -n "$include_dir" ]; then
+            mkdir -p "$include_dir"
+            build_sshd_block "$mode" > "$include_dir/zzzz-password-login.conf"
+        fi
+        if [ -z "$sshd_bin" ] || "$sshd_bin" -t -f "$main_conf" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    cp -a "$backup" "$main_conf"
+    include_dir=$(find_sshd_include_dir "$main_conf" 2>/dev/null || true)
+    [ -n "$include_dir" ] && rm -f "$include_dir/zzzz-password-login.conf" 2>/dev/null
+    echo "❌ SSH配置校验失败，已恢复原配置"
+    return 1
+}
+configure_dropbear_password_login() {
+    local found=0
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    local f var current cleaned
+    for f in /etc/default/dropbear /etc/conf.d/dropbear /etc/sysconfig/dropbear; do
+        [ -f "$f" ] || continue
+        found=1
+        cp -a "$f" "$f.bak.$ts" 2>/dev/null || true
+        sed -i -E 's/^[[:space:]]*NO_START[[:space:]]*=.*/NO_START=0/' "$f" 2>/dev/null || true
+        for var in DROPBEAR_EXTRA_ARGS DROPBEAR_ARGS DROPBEAR_OPTS; do
+            if grep -Eq "^[[:space:]]*$var[[:space:]]*=" "$f"; then
+                current=$(awk -v v="$var" '$0 ~ "^[[:space:]]*"v"[[:space:]]*=" {line=$0; sub("^[[:space:]]*"v"[[:space:]]*=[[:space:]]*","",line); gsub(/^[\"\047]|[\"\047][[:space:]]*$/,"",line); print line; exit}' "$f")
+                cleaned=$(printf '%s\n' "$current" | sed -E 's/(^|[[:space:]])-s([[:space:]]|$)/ /g;s/(^|[[:space:]])-w([[:space:]]|$)/ /g;s/[[:space:]]+/ /g;s/^ //;s/ $//')
+                sed -i -E "s|^[[:space:]]*$var[[:space:]]*=.*|$var=\"$cleaned\"|" "$f"
+            fi
+        done
+    done
+    if [ "$found" -eq 0 ]; then
+        mkdir -p /etc/default 2>/dev/null || true
+        cat > /etc/default/dropbear << 'EOF'
+NO_START=0
+DROPBEAR_EXTRA_ARGS=""
+EOF
+        found=1
+    fi
+    [ "$found" -eq 1 ]
+}
+enable_and_restart_service() {
+    local svc
+    for svc in "$@"; do
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl enable "$svc" >/dev/null 2>&1 || true
+            if systemctl restart "$svc" >/dev/null 2>&1 || systemctl start "$svc" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if command -v service >/dev/null 2>&1; then
+            if service "$svc" restart >/dev/null 2>&1 || service "$svc" start >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-update add "$svc" default >/dev/null 2>&1 || true
+            if rc-service "$svc" restart >/dev/null 2>&1 || rc-service "$svc" start >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if [ -x "/etc/init.d/$svc" ]; then
+            if "/etc/init.d/$svc" restart >/dev/null 2>&1 || "/etc/init.d/$svc" start >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+ensure_user_shell() {
+    local user="$1"
+    local current_shell shell_path
+    current_shell=$(getent passwd "$user" 2>/dev/null | cut -d: -f7)
+    [ -n "$current_shell" ] || current_shell=$(grep "^$user:" /etc/passwd 2>/dev/null | cut -d: -f7)
+    case "$current_shell" in
+        */nologin|*/false|"")
+            for shell_path in /bin/bash /usr/bin/bash /bin/sh /usr/bin/sh /bin/ash /usr/bin/ash; do
+                [ -x "$shell_path" ] || continue
+                chsh -s "$shell_path" "$user" 2>/dev/null || usermod -s "$shell_path" "$user" 2>/dev/null || true
+                break
+            done
+            ;;
+    esac
+}
+unlock_user_account() {
+    local user="$1"
+    passwd -u "$user" 2>/dev/null || usermod -U "$user" 2>/dev/null || true
+}
+get_system_uid_min() {
+    local uid_min=1000
+    if [ -f /etc/login.defs ]; then
+        local val
+        val=$(awk '/^[[:space:]]*UID_MIN[[:space:]]/ {print $2}' /etc/login.defs 2>/dev/null)
+        [ -n "$val" ] && uid_min="$val"
+    fi
+    echo "$uid_min"
+}
+is_human_user() {
+    local uname="$1"
+    local uid="$2"
+    local ushell="$3"
+    local homedir="$4"
+    local uid_min="$5"
+    [ "$uid" -eq 0 ] && return 1
+    [ "$uid" -lt "$uid_min" ] 2>/dev/null && return 1
+    [ "$uid" -ge 60000 ] 2>/dev/null && return 1
+    case "$ushell" in
+        */nologin|*/false|/bin/sync|/usr/bin/sync|"") return 1 ;;
+    esac
+    case "$homedir" in
+        /home/*|/root) ;;
+        *) return 1 ;;
+    esac
+    case "$uname" in
+        nobody|nfsnobody) return 1 ;;
+    esac
+    local pw_field
+    if [ -f /etc/shadow ]; then
+        pw_field=$(awk -F: -v u="$uname" '$1==u{print $2;exit}' /etc/shadow 2>/dev/null)
+        case "$pw_field" in
+            "!"|"!!"|"*"|"!!"*) return 1 ;;
+        esac
+    fi
+    return 0
+}
+get_real_users() {
+    local uid_min
+    uid_min=$(get_system_uid_min)
+    local users=()
+    local uname uid ushell homedir
+    while IFS=: read -r uname _ uid _ _ homedir ushell; do
+        [ -z "$uname" ] && continue
+        [ "$uname" = "root" ] && continue
+        is_human_user "$uname" "$uid" "$ushell" "$homedir" "$uid_min" || continue
+        users+=("$uname")
+    done < /etc/passwd
+    printf '%s\n' "${users[@]}"
+}
+get_user_status() {
+    local uname="$1"
+    local ushell lock_status pw_status
+    ushell=$(getent passwd "$uname" 2>/dev/null | cut -d: -f7)
+    [ -z "$ushell" ] && ushell=$(awk -F: -v u="$uname" '$1==u{print $7;exit}' /etc/passwd 2>/dev/null)
+    lock_status=""
+    if [ -f /etc/shadow ]; then
+        pw_status=$(awk -F: -v u="$uname" '$1==u{print $2;exit}' /etc/shadow 2>/dev/null)
+        case "$pw_status" in
+            ""|"!"|"!!"|"*"|"!!"*) lock_status="未设密码" ;;
+        esac
+    fi
+    if [ -z "$lock_status" ] && command -v passwd >/dev/null 2>&1; then
+        if passwd -S "$uname" 2>/dev/null | awk '{print $2}' | grep -qiE "^(L|LK|locked)$"; then
+            lock_status="已锁定"
+        fi
+    fi
+    case "$ushell" in
+        */nologin|*/false) [ -z "$lock_status" ] && lock_status="Shell不可登录" ;;
+    esac
+    echo "${ushell:-未知}|${lock_status}"
+}
+select_user_for_password() {
+    local real_users=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && real_users+=("$line")
+    done < <(get_real_users)
+    while true; do
+        echo ""
+        echo "=============================================="
+        echo "       设置密码登陆模式 - 选择用户"
+        echo "=============================================="
+        echo "可用于SSH登录的用户列表："
+        echo "----------------------------------------------"
+        local idx=1
+        local u status_line display_shell display_status status_tag
+        local root_info root_shell root_status
+        root_info=$(get_user_status "root")
+        root_shell=$(echo "$root_info" | cut -d'|' -f1)
+        root_status=$(echo "$root_info" | cut -d'|' -f2)
+        status_tag=""
+        [ -n "$root_status" ] && status_tag=" [$root_status]"
+        printf "  %-4s %-20s Shell: %-18s ★ 超级用户%s\n" "1." "root" "$root_shell" "$status_tag"
+        idx=2
+        for u in "${real_users[@]}"; do
+            status_line=$(get_user_status "$u")
+            display_shell=$(echo "$status_line" | cut -d'|' -f1)
+            display_status=$(echo "$status_line" | cut -d'|' -f2)
+            status_tag=""
+            [ -n "$display_status" ] && status_tag=" [$display_status]"
+            printf "  %-4s %-20s Shell: %-18s%s\n" "${idx}." "$u" "$display_shell" "$status_tag"
+            idx=$((idx + 1))
+        done
+        local total_users=$((1 + ${#real_users[@]}))
+        if [ "$total_users" -eq 1 ]; then
+            echo "  （未检测到其他可登录用户）"
+        fi
+        echo "----------------------------------------------"
+        echo "  0.   返回上一级菜单"
+        echo "----------------------------------------------"
+        read -p "请输入编号选择用户（默认1=root）: " user_choice
+        [ -z "$user_choice" ] && user_choice=1
+        if [ "$user_choice" = "0" ]; then
+            return 1
+        fi
+        if [[ "$user_choice" =~ ^[0-9]+$ ]] && [ "$user_choice" -ge 1 ] && [ "$user_choice" -le "$total_users" ]; then
+            if [ "$user_choice" -eq 1 ]; then
+                SELECTED_USER="root"
+            else
+                SELECTED_USER="${real_users[$((user_choice - 2))]}"
+            fi
+            return 0
+        fi
+        if [ "$user_choice" = "root" ]; then
+            SELECTED_USER="root"
+            return 0
+        fi
+        local found=0
+        for u in "${real_users[@]}"; do
+            if [ "$user_choice" = "$u" ]; then
+                SELECTED_USER="$u"
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 1 ]; then
+            return 0
+        fi
+        echo ""
+        echo "❌ 输入无效，请输入列表中的编号或用户名"
+        sleep 1
+    done
+}
+setup_password_login_mode() {
+    SELECTED_USER=""
+    select_user_for_password || return 0
+    local target_user="$SELECTED_USER"
+    echo ""
+    echo "✅ 已选择用户: $target_user"
+    ensure_user_shell "$target_user"
+    local ssh_conf sshd_bin mode
+    ssh_conf=$(find_main_sshd_config 2>/dev/null || true)
+    sshd_bin=$(find_sshd_binary 2>/dev/null || true)
+    if [ -n "$ssh_conf" ] || [ -n "$sshd_bin" ]; then
+        mode="openssh"
+    elif command -v dropbear >/dev/null 2>&1 || [ -f /etc/default/dropbear ] || [ -f /etc/conf.d/dropbear ] || [ -f /etc/sysconfig/dropbear ] || [ -x /etc/init.d/dropbear ]; then
+        mode="dropbear"
+    else
+        echo "未检测到SSH服务，正在安装OpenSSH..."
+        case $PKG_MANAGER in
+            apt) $INSTALL_CMD openssh-server ;;
+            yum|dnf) $INSTALL_CMD openssh-server ;;
+            apk) $INSTALL_CMD openssh ;;
+            pacman) $INSTALL_CMD openssh ;;
+        esac || handle_error "安装OpenSSH失败"
+        ssh_conf=$(find_main_sshd_config 2>/dev/null || true)
+        sshd_bin=$(find_sshd_binary 2>/dev/null || true)
+        mode="openssh"
+    fi
+    if [ "$mode" = "openssh" ]; then
+        [ -n "$ssh_conf" ] || ssh_conf=$(find_main_sshd_config 2>/dev/null || true)
+        if [ -z "$ssh_conf" ]; then
+            echo "❌ 未找到sshd配置文件"
+            return 1
+        fi
+        configure_openssh_password_login "$ssh_conf" || return 1
+        command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -A >/dev/null 2>&1 || true
+        enable_and_restart_service sshd ssh || echo "⚠️ SSH服务重启失败，请手动检查"
+    else
+        configure_dropbear_password_login || { echo "❌ Dropbear配置失败"; return 1; }
+        enable_and_restart_service dropbear || echo "⚠️ Dropbear服务重启失败，请手动检查"
+    fi
+    echo ""
+    echo "请为用户 $target_user 设置新密码："
+    passwd "$target_user" || { echo "❌ 密码设置失败"; return 1; }
+    unlock_user_account "$target_user"
+    ensure_user_shell "$target_user"
+    echo ""
+    echo "✅ 已启用密码登录模式"
+    echo "✅ 用户 $target_user 密码已更新"
+    echo "✅ 如使用SSH登录，请使用用户名 $target_user 进行密码登录"
+}
 workspace_ensure_tmux() {
     if ! command -v tmux &>/dev/null; then
         echo "⚠️  tmux 未安装，正在自动安装..."
@@ -741,9 +1123,10 @@ show_menu() {
     echo "7.  还原源文件备份"
     echo "8.  查看当前时间状态"
     echo "$ws_label"
-    echo "10. 退出脚本"
+    echo "10. 用户密码登录模式"
+    echo "11. 退出脚本"
     echo "=============================================="
-    read -p "请输入选项 [1-10]: " CHOICE
+    read -p "请输入选项 [1-11]: " CHOICE
 }
 while true; do
     show_menu
@@ -786,6 +1169,9 @@ while true; do
             show_workspace_menu
             ;;
         10)
+            setup_password_login_mode
+            ;;
+        11)
             echo "脚本退出。再见！"
             exit 0
             ;;
