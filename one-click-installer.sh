@@ -72,6 +72,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["44"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/pve_smart_migration.sh"
     ["45"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/uninstall_histb.sh"
     ["46"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cpu-tool.sh"
+    ["47"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/Docker-image-backup.sh"
 
 )
 
@@ -122,6 +123,7 @@ DEFAULT_OPTIONS=(
     "44. PVE 智能存储迁移"
     "45. 海纳思内置卸载"
     "46. CPU频率仪表"
+    "47. docker镜像备份还原"
     "98. 快捷键管理"
 )
 
