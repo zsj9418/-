@@ -13,6 +13,7 @@ set -u
 (set -o pipefail) 2>/dev/null && set -o pipefail
 trap '_trap_int' INT
 trap '_trap_exit $?' EXIT
+
 GLOBAL_EXTRACT_DIR=""
 GLOBAL_DEPLOY_CFG_FILE=""
 GLOBAL_RESTORE_LIST=""
@@ -22,6 +23,7 @@ GLOBAL_IMAGES_TO_SAVE=""
 GLOBAL_IMAGE_COUNT=0
 GLOBAL_LAST_LOADED_IMAGES=()
 FOUND_BACKUP_FILES=()
+
 OS_NAME="unknown"
 OS_ARCH="unknown"
 HAS_SUDO=false
@@ -29,30 +31,36 @@ HAS_DOCKER=false
 HAS_GZIP=false
 HAS_TPUT=false
 HAS_CRANE=false
+
 C_GREEN=""
 C_RED=""
 C_YELLOW=""
 C_CYAN=""
 C_BOLD=""
 C_RESET=""
+
 LOG_FILE="${HOME:-/tmp}/.deploy_script.log"
 _SCRIPT_EXITING=false
+
 _trap_int() {
     printf '\n\033[31m操作被用户中断。\033[0m\n' >&2
     _SCRIPT_EXITING=true
     exit 130
 }
+
 _trap_exit() {
     local code="${1:-0}"
     if [ "$code" -ne 0 ] && [ "$code" -ne 130 ] && [ "$_SCRIPT_EXITING" = "false" ]; then
         printf '\033[31m[退出] 脚本异常退出，退出码: %s\033[0m\n' "$code" >&2
     fi
 }
+
 green()  { printf '%s%s%s\n' "$C_GREEN"  "$*" "$C_RESET" >&2; }
 red()    { printf '%s%s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
 yellow() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 cyan()   { printf '%s%s%s\n' "$C_CYAN"   "$*" "$C_RESET" >&2; }
 bold()   { printf '%s%s%s\n' "$C_BOLD"   "$*" "$C_RESET" >&2; }
+
 press_any_key() {
     printf '\n按任意键继续...' >&2
     if [ -r /dev/tty ]; then
@@ -62,6 +70,7 @@ press_any_key() {
     fi
     printf '\n' >&2
 }
+
 _read_line() {
     local _varname="$1"
     shift
@@ -77,15 +86,18 @@ _read_line() {
     fi
     printf -v "$_varname" '%s' "$_val"
 }
+
 _lower() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
+
 _trim() {
     local s="$1"
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s' "$s"
 }
+
 _get_file_size() {
     local f="$1"
     [ -f "$f" ] || { printf '0\n'; return 0; }
@@ -93,6 +105,7 @@ _get_file_size() {
     stat -f%z "$f" 2>/dev/null && return 0
     wc -c < "$f" 2>/dev/null | tr -d ' ' || printf '0\n'
 }
+
 _get_hsize() {
     local f="$1"
     local s=""
@@ -101,6 +114,7 @@ _get_hsize() {
     [ -n "$s" ] || s="未知"
     printf '%s\n' "$s"
 }
+
 _setup_colors() {
     if [ -t 2 ] && command -v tput >/dev/null 2>&1; then
         local ncolors=0
@@ -125,13 +139,11 @@ _setup_colors() {
         C_RESET=$'\033[0m'
     fi
 }
+
 setup_logging() {
     local max_size=3145728
     local cur_size=0
-    : >> "$LOG_FILE" 2>/dev/null || {
-        LOG_FILE="/tmp/.deploy_script_$$.log"
-        : >> "$LOG_FILE" 2>/dev/null || return 0
-    }
+    : >> "$LOG_FILE" 2>/dev/null || { LOG_FILE="/tmp/.deploy_script_$$.log"; : >> "$LOG_FILE" 2>/dev/null || return 0; }
     cur_size=$(_get_file_size "$LOG_FILE")
     [ "${cur_size:-0}" -gt "$max_size" ] 2>/dev/null && : > "$LOG_FILE" || true
     if command -v tee >/dev/null 2>&1 && [ "$_BASH_MAJOR" -ge 3 ]; then
@@ -140,19 +152,20 @@ setup_logging() {
         exec >> "$LOG_FILE" 2>&1
     fi
 }
+
 detect_os() {
     _setup_colors
     OS_ARCH=$(uname -m 2>/dev/null || printf 'unknown')
     case "$OS_ARCH" in
-        x86_64|amd64)                  OS_ARCH="x86_64"  ;;
-        aarch64|arm64)                 OS_ARCH="arm64"   ;;
-        armv7l|armv7|armhf)            OS_ARCH="armv7"   ;;
-        armv6l|armv6)                  OS_ARCH="armv6"   ;;
-        i386|i686)                     OS_ARCH="x86"     ;;
-        mips|mipsel|mips64*|mips64el*) OS_ARCH="mips"    ;;
-        riscv64)                       OS_ARCH="riscv64" ;;
-        s390x)                         OS_ARCH="s390x"   ;;
-        ppc64le|ppc64)                 OS_ARCH="ppc64"   ;;
+        x86_64|amd64)             OS_ARCH="x86_64"  ;;
+        aarch64|arm64)            OS_ARCH="arm64"   ;;
+        armv7l|armv7|armhf)       OS_ARCH="armv7"   ;;
+        armv6l|armv6)             OS_ARCH="armv6"   ;;
+        i386|i686)                OS_ARCH="x86"     ;;
+        mips|mipsel|mips64*|mips64el*) OS_ARCH="mips" ;;
+        riscv64)                  OS_ARCH="riscv64" ;;
+        s390x)                    OS_ARCH="s390x"   ;;
+        ppc64le|ppc64)            OS_ARCH="ppc64"   ;;
     esac
     if command -v sw_vers >/dev/null 2>&1 || uname -s 2>/dev/null | grep -qi darwin; then
         OS_NAME="macos"
@@ -196,6 +209,7 @@ detect_os() {
         "$C_CYAN" "$OS_NAME" "$OS_ARCH" "$BASH_VERSION" "$C_RESET" >&2
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
+
 self_check() {
     local missing=""
     local cmd=""
@@ -213,11 +227,13 @@ self_check() {
         }
     fi
 }
+
 _sudo_prefix() {
     [ "$(id -u)" -eq 0 ] && printf '' && return 0
     [ "$HAS_SUDO" = "true" ] && printf 'sudo' && return 0
     printf ''
 }
+
 install_dependency() {
     local dep_name="$1"
     local pkg_name="${2:-$1}"
@@ -287,6 +303,7 @@ install_dependency() {
         return 1
     fi
 }
+
 ensure_dependency() {
     local cmd="$1"
     local pkg="${2:-$1}"
@@ -296,6 +313,7 @@ ensure_dependency() {
     fi
     return 0
 }
+
 _ping_test() {
     local host="$1"
     ping -c1 -W2 "$host" >/dev/null 2>&1 && return 0
@@ -304,6 +322,7 @@ _ping_test() {
     ping -c1 "$host" >/dev/null 2>&1 && return 0
     return 1
 }
+
 _http_get() {
     local url="$1"
     local timeout="${2:-10}"
@@ -314,10 +333,11 @@ _http_get() {
         wget -qO- --timeout="$timeout" "$url" 2>/dev/null
         return $?
     else
-        red "未找到 curl 或 wget，请安装其中一个。"
+        red "未找到 curl 或 wget，请安装其中一个。" >&2
         return 1
     fi
 }
+
 _detect_network() {
     local network_status="unknown"
     local ping_ok=false
@@ -337,6 +357,7 @@ _detect_network() {
     fi
     printf '%s\n' "$network_status"
 }
+
 _sort_versions() {
     if sort -V /dev/null >/dev/null 2>&1; then
         sort -V -r
@@ -344,6 +365,7 @@ _sort_versions() {
         sort -r
     fi
 }
+
 get_image_versions() {
     local service_name="$1"
     local image_base="$2"
@@ -400,6 +422,7 @@ get_image_versions() {
     [ -n "$tag_list" ] && printf '%s\n' "$tag_list"
     printf 'manual_input\n'
 }
+
 select_image_version() {
     local service_name="$1"
     local image_base="$2"
@@ -450,9 +473,11 @@ select_image_version() {
     done
     printf '%s\n' "$selected_version"
 }
+
 select_version_menu() {
     select_image_version "$@"
 }
+
 _check_docker() {
     if [ "$HAS_DOCKER" != "true" ]; then
         red "未检测到 Docker，请先安装 Docker。"
@@ -469,6 +494,7 @@ _check_docker() {
     fi
     return 0
 }
+
 _list_local_images() {
     local filter="${1:-}"
     local result=""
@@ -480,6 +506,7 @@ _list_local_images() {
     fi
     printf '%s\n' "$result"
 }
+
 _parse_indices() {
     local input="$1"
     local max="$2"
@@ -523,6 +550,7 @@ _parse_indices() {
     [ -n "$list" ] || return 1
     printf '%s\n' "$list"
 }
+
 list_local_images_menu() {
     local filter="${1:-}"
     local images_data=""
@@ -578,82 +606,17 @@ list_local_images_menu() {
     fi
     printf '%s\n' "$result_indices"
 }
-_ask_save_dir() {
-    local default_dir="$1"
-    local user_dir=""
-    cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    cyan "  设置保存位置"
-    cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '  默认保存目录: %s%s%s\n' "$C_GREEN" "$default_dir" "$C_RESET" >&2
-    printf '  （直接回车使用默认目录，或输入自定义路径）\n\n' >&2
-    _read_line user_dir "请输入保存目录 [${default_dir}]: "
-    user_dir=$(_trim "$user_dir")
-    if [ -z "$user_dir" ]; then
-        user_dir="$default_dir"
-    fi
-    if [ "${user_dir:0:1}" != "/" ] && [ "${user_dir:0:1}" != "~" ] && [ "${user_dir:0:1}" != "." ]; then
-        user_dir="$(pwd)/${user_dir}"
-    fi
-    if [ "${user_dir:0:1}" = "~" ]; then
-        user_dir="${HOME}${user_dir:1}"
-    fi
-    if [ ! -d "$user_dir" ]; then
-        local mk_confirm=""
-        yellow "目录不存在: ${user_dir}"
-        _read_line mk_confirm "是否创建该目录？(Y/n): "
-        case "$(_lower "$mk_confirm")" in
-            n|no)
-                red "已取消，使用默认目录: ${default_dir}"
-                user_dir="$default_dir"
-                ;;
-            *)
-                mkdir -p "$user_dir" 2>/dev/null || {
-                    red "无法创建目录: ${user_dir}，使用默认目录。"
-                    user_dir="$default_dir"
-                }
-                ;;
-        esac
-    fi
-    mkdir -p "$user_dir" 2>/dev/null || {
-        red "无法创建目录: ${user_dir}"
-        return 1
-    }
-    if [ ! -w "$user_dir" ]; then
-        red "目录无写入权限: ${user_dir}"
-        return 1
-    fi
-    green "  ✓ 保存目录: ${user_dir}"
-    printf '%s\n' "$user_dir"
-}
-_ask_export_prefix() {
-    local default_prefix="$1"
-    local user_prefix=""
-    printf '  默认文件前缀: %s%s%s\n' "$C_GREEN" "$default_prefix" "$C_RESET" >&2
-    _read_line user_prefix "请输入文件前缀 [${default_prefix}]: "
-    user_prefix=$(_trim "$user_prefix")
-    if [ -z "$user_prefix" ]; then
-        user_prefix="$default_prefix"
-    fi
-    user_prefix=$(printf '%s' "$user_prefix" | tr -cs 'a-zA-Z0-9_.-' '_' | sed 's/^_//;s/_$//')
-    [ -n "$user_prefix" ] || user_prefix="$default_prefix"
-    printf '%s\n' "$user_prefix"
-}
+
 extract_images() {
     _check_docker || return 1
     ensure_dependency gzip || return 1
-    local default_dir="$(pwd)/docker_images_$(date +%Y%m%d_%H%M%S)"
-    local default_prefix="${GLOBAL_EXPORT_PREFIX:-backup_$(date +%Y%m%d_%H%M%S)}"
-    local export_dir=""
-    export_dir=$(_ask_save_dir "$default_dir") || {
+    local export_dir="${GLOBAL_EXTRACT_DIR:-$(pwd)/docker_images_$(date +%Y%m%d_%H%M%S)}"
+    local export_prefix="${GLOBAL_EXPORT_PREFIX:-backup}"
+    mkdir -p "$export_dir" 2>/dev/null || {
+        red "无法创建目录: $export_dir"
         press_any_key
         return 1
     }
-    printf '\n' >&2
-    local export_prefix=""
-    export_prefix=$(_ask_export_prefix "$default_prefix")
-    printf '\n' >&2
-    GLOBAL_EXTRACT_DIR="$export_dir"
-    GLOBAL_EXPORT_PREFIX="$export_prefix"
     local selected_items=""
     selected_items=$(list_local_images_menu "") || return 0
     [ -n "$selected_items" ] || return 0
@@ -683,19 +646,12 @@ extract_images() {
         return 0
     fi
     GLOBAL_IMAGE_COUNT="${#items_array[@]}"
-    local total_est_size=""
-    total_est_size=$(docker images --format '{{.Size}}' 2>/dev/null \
-        | head -"${#items_array[@]}" \
-        | paste -sd'+' 2>/dev/null) || total_est_size=""
-    local disk_avail=""
-    disk_avail=$(df -h "$export_dir" 2>/dev/null | awk 'NR==2{print $4; exit}') || disk_avail="未知"
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     cyan "  确认保存信息"
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '  目标目录  : %s%s%s\n' "$C_GREEN" "$export_dir" "$C_RESET" >&2
-    printf '  文件前缀  : %s%s%s\n' "$C_GREEN" "$export_prefix" "$C_RESET" >&2
-    printf '  镜像数量  : %s%s%s\n' "$C_GREEN" "$GLOBAL_IMAGE_COUNT" "$C_RESET" >&2
-    printf '  磁盘可用  : %s\n' "$disk_avail" >&2
+    printf '  目标目录: %s\n' "$export_dir" >&2
+    printf '  文件前缀: %s\n' "$export_prefix" >&2
+    printf '  镜像数量: %s\n' "$GLOBAL_IMAGE_COUNT" >&2
     printf '\n  镜像列表:\n' >&2
     for img in "${items_array[@]}"; do
         printf '    • %s\n' "$img" >&2
@@ -714,8 +670,6 @@ extract_images() {
     local total="${#items_array[@]}"
     local success_count=0
     local fail_count=0
-    yellow "开始保存镜像..."
-    printf '\n' >&2
     for i in "${!items_array[@]}"; do
         local num=$((i + 1))
         local img="${items_array[$i]}"
@@ -747,20 +701,14 @@ extract_images() {
     done
     GLOBAL_BACKUP_DIR="$export_dir"
     GLOBAL_IMAGES_TO_SAVE="${items_array[*]}"
-    printf '\n' >&2
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     green "  保存完成！成功: ${success_count}，失败: ${fail_count}"
-    printf '  文件位置: %s%s%s\n' "$C_GREEN" "$export_dir" "$C_RESET" >&2
-    printf '\n' >&2
-    printf '  %-50s %s\n' "文件名" "大小" >&2
-    printf '  %-50s %s\n' "──────────────────────────────────────────────────" "──────" >&2
-    for f in "$export_dir"/${export_prefix}_*.tar* ; do
-        [ -f "$f" ] || continue
-        printf '  %-50s %s\n' "$(basename "$f")" "$(_get_hsize "$f")" >&2
-    done
+    printf '  文件位置: %s\n' "$export_dir" >&2
+    ls -lh "$export_dir"/ 2>/dev/null || true
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     press_any_key
 }
+
 _collect_backup_files() {
     local dir="$1"
     FOUND_BACKUP_FILES=()
@@ -770,6 +718,7 @@ _collect_backup_files() {
         \( -name '*.tar' -o -name '*.tar.gz' \) \
         -print 2>/dev/null | sort)
 }
+
 verify_saved_images() {
     local dir_path="$1"
     local verified_count=0
@@ -785,13 +734,12 @@ verify_saved_images() {
         return 1
     fi
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    cyan "  正在校验备份文件 (目录: ${dir_path})"
+    cyan "  正在校验备份文件"
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '\n' >&2
     for f in "${FOUND_BACKUP_FILES[@]}"; do
         local fname=""
         fname=$(basename "$f")
-        printf '  校验: %-45s ... ' "$fname" >&2
+        printf '  校验: %s ... ' "$fname" >&2
         if docker load -i "$f" >/dev/null 2>&1; then
             verified_count=$((verified_count + 1))
             printf '%s✓ 有效%s\n' "$C_GREEN" "$C_RESET" >&2
@@ -809,6 +757,7 @@ verify_saved_images() {
     fi
     return 0
 }
+
 deploy_result() {
     local service_name="$1"
     local ip_addr="$2"
@@ -837,6 +786,7 @@ deploy_result() {
     green "  💡 建议：部署完成后请及时备份数据。"
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
+
 _append_unique_loaded_image() {
     local ref="$1"
     [ -n "$ref" ] || return 0
@@ -846,6 +796,7 @@ _append_unique_loaded_image() {
     done
     GLOBAL_LAST_LOADED_IMAGES+=("$ref")
 }
+
 _parse_load_output_images() {
     local text="$1"
     local line=""
@@ -863,6 +814,7 @@ _parse_load_output_images() {
         esac
     done <<< "$text"
 }
+
 _default_container_name() {
     local ref="$1"
     local base="$ref"
@@ -876,6 +828,7 @@ _default_container_name() {
     [ -n "$base" ] || base="container"
     printf '%s-ctr\n' "$base"
 }
+
 _quote_cmd() {
     local out=""
     local arg=""
@@ -885,19 +838,116 @@ _quote_cmd() {
     out="${out% }"
     printf '%s\n' "$out"
 }
+
+_get_exposed_ports() {
+    local image_ref="$1"
+    local raw=""
+    raw=$(docker inspect --format='{{range $p, $conf := .Config.ExposedPorts}}{{$p}} {{end}}' \
+        "$image_ref" 2>/dev/null) || true
+    [ -z "$raw" ] && return 0
+    local cp=""
+    local seen=""
+    for cp in $raw; do
+        cp="${cp%/tcp}"
+        cp="${cp%/udp}"
+        printf -v seen '%s\n' "${seen}${cp}"
+    done
+    printf '%s' "$seen" | grep -E '^[0-9]+$' | sort -un || true
+}
+
+_parse_host_port() {
+    local pp="$1"
+    case "$pp" in
+        *:*|*/*) printf '%s\n' "$pp"; return 0 ;;
+    esac
+    if printf '%s' "$pp" | grep -qE '^[0-9]+$'; then
+        printf '%s\n' "${pp}:${pp}"
+    else
+        printf '%s\n' ""
+    fi
+}
+
+_configure_port_mapping() {
+    local image_ref="$1"
+    local input_port="$2"
+    local -a cmd_arr=("${@:3}")
+    local -a exposed=()
+    local ep=""
+    while IFS= read -r ep; do
+        [ -n "$ep" ] && exposed+=("$ep")
+    done < <(_get_exposed_ports "$image_ref")
+
+    local resolved=""
+    resolved=$(_parse_host_port "$input_port")
+    if [ -n "$resolved" ]; then
+        cmd_arr+=(-p "$resolved")
+        printf '%s\n' "${cmd_arr[*]}"
+        return 0
+    fi
+
+    if [ "${#exposed[@]}" -eq 0 ]; then
+        if [ -n "$input_port" ]; then
+            cmd_arr+=(-p "$input_port")
+        fi
+        printf '%s\n' "${cmd_arr[*]}"
+        return 0
+    fi
+
+    local mapped=()
+    local hint=""
+    hint=$(printf ', ' "${exposed[@]}")
+    hint="${hint%, }"
+    printf '  %s %b 内部端口:%s\n' "${C_CYAN}" "[信息]" "$hint" >&2
+
+    if [ -z "$input_port" ]; then
+        local s=8000 i=""
+        for i in "${exposed[@]}"; do
+            mapped+=(-p "${s}:${i}")
+            s=$((s + 1))
+        done
+    elif printf '%s' "$input_port" | grep -qE '^[0-9]+-[0-9]+$'; then
+        local start="${input_port%-*}" end="${input_port#*-}"
+        local n=${#exposed[@]} range=$((end - start + 1))
+        if [ "$range" -ge "$n" ]; then
+            local ii=0 si="$start"
+            for ii in $(seq 0 $((n - 1))); do
+                mapped+=(-p "${si}:${exposed[$ii]}")
+                si=$((si + 1))
+            done
+        else
+            red "  范围 ${start}-${end} 包含 ${range} 个端口,不足容器 ${n} 个 EXPOSE 端口,跳过映射。"
+        fi
+    elif printf '%s' "$input_port" | grep -qE '^[0-9]+$'; then
+        local base="$input_port" ii=""
+        for ii in "${exposed[@]}"; do
+            mapped+=(-p "${base}:${ii}")
+            base=$((base + 1))
+        done
+    else
+        local pp=""
+        for pp in $(printf '%s\n' "$input_port" | tr ',' '\n'); do
+            pp=$(_trim "$pp")
+            resolved=$(_parse_host_port "$pp")
+            [ -n "$resolved" ] && cmd_arr+=(-p "$resolved")
+        done
+    fi
+
+    local ci=""
+    for ci in "${mapped[@]+"${mapped[@]}"}"; do
+        cmd_arr+=("$ci")
+    done
+    printf '%s\n' "${cmd_arr[*]}"
+}
+
 _get_local_ip() {
     local ip=""
     ip=$(hostname -I 2>/dev/null | awk '{print $1; exit}') || true
-    [ -n "$ip" ] || ip=$(ip route get 1.1.1.1 2>/dev/null \
-        | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
-    [ -n "$ip" ] || ip=$(ifconfig 2>/dev/null \
-        | grep -Eo 'inet (addr:)?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | grep -v '127.0.0.1' \
-        | head -1 \
-        | awk '{print $NF}') || true
+    [ -n "$ip" ] || ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
+    [ -n "$ip" ] || ip=$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '127.0.0.1' | head -1 | awk '{print $NF}') || true
     [ -n "$ip" ] || ip="localhost"
     printf '%s\n' "$ip"
 }
+
 _collect_local_unique_images() {
     GLOBAL_LAST_LOADED_IMAGES=()
     local refs_text=""
@@ -909,6 +959,7 @@ _collect_local_unique_images() {
         [ -n "$line" ] && _append_unique_loaded_image "$line"
     done <<< "$refs_text"
 }
+
 _configure_and_run_containers() {
     local images_to_use=()
     if [ "${#GLOBAL_LAST_LOADED_IMAGES[@]}" -eq 0 ]; then
@@ -950,16 +1001,12 @@ _configure_and_run_containers() {
         _read_line restart_policy "  重启策略 (always/on-failure/no) [always]: "
         restart_policy="${restart_policy:-always}"
         local cmd=()
-        cmd=(docker run -d --name "$container_name" --network "$net_mode" --restart "$restart_policy")
-        if [ -n "$host_port" ]; then
-            local port_parts=()
-            IFS=',' read -r -a port_parts <<< "$host_port"
-            local pp=""
-            for pp in "${port_parts[@]}"; do
-                pp=$(_trim "$pp")
-                [ -n "$pp" ] && cmd+=(-p "$pp")
-            done
-        fi
+        cmd=($(_configure_port_mapping \
+            "$image_ref" "$host_port" \
+            docker run -d \
+            --name "$container_name" \
+            --network "$net_mode" \
+            --restart "$restart_policy"))
         if [ -n "$env_vars" ]; then
             local env_parts=()
             IFS=',' read -r -a env_parts <<< "$env_vars"
@@ -1010,41 +1057,10 @@ _configure_and_run_containers() {
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     return 0
 }
-_ask_restore_dir() {
-    local default_dir="$1"
-    local user_dir=""
-    cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    cyan "  设置备份文件所在目录"
-    cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '  默认目录: %s%s%s\n' "$C_GREEN" "$default_dir" "$C_RESET" >&2
-    printf '  （直接回车使用默认目录，或输入备份文件所在路径）\n\n' >&2
-    _read_line user_dir "请输入备份目录路径 [${default_dir}]: "
-    user_dir=$(_trim "$user_dir")
-    if [ -z "$user_dir" ]; then
-        user_dir="$default_dir"
-    fi
-    if [ "${user_dir:0:1}" != "/" ] && [ "${user_dir:0:1}" != "~" ] && [ "${user_dir:0:1}" != "." ]; then
-        user_dir="$(pwd)/${user_dir}"
-    fi
-    if [ "${user_dir:0:1}" = "~" ]; then
-        user_dir="${HOME}${user_dir:1}"
-    fi
-    if [ ! -d "$user_dir" ]; then
-        red "目录不存在: ${user_dir}"
-        return 1
-    fi
-    green "  ✓ 备份目录: ${user_dir}"
-    printf '%s\n' "$user_dir"
-}
+
 restore_images() {
     _check_docker || return 1
-    local default_backup="${GLOBAL_BACKUP_DIR:-$(pwd)}"
-    local backup_path=""
-    backup_path=$(_ask_restore_dir "$default_backup") || {
-        press_any_key
-        return 1
-    }
-    GLOBAL_BACKUP_DIR="$backup_path"
+    local backup_path="${GLOBAL_BACKUP_DIR:-$(pwd)}"
     local restore_all=""
     local selected_raw=""
     local selected_indices=""
@@ -1056,19 +1072,26 @@ restore_images() {
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     cyan "  从备份恢复 Docker 镜像"
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ ! -d "$backup_path" ]; then
+        red "目录不存在: $backup_path"
+        _read_line backup_path "请输入备份目录路径: "
+    fi
+    [ -d "$backup_path" ] || {
+        red "目录不存在: $backup_path"
+        press_any_key
+        return 1
+    }
     _collect_backup_files "$backup_path"
     if [ "${#FOUND_BACKUP_FILES[@]}" -eq 0 ]; then
-        red "目录中没有找到 .tar 或 .tar.gz 文件: ${backup_path}"
+        red "目录中没有找到 .tar 或 .tar.gz 文件。"
         press_any_key
         return 1
     fi
-    printf '\n' >&2
     yellow "找到的备份文件:"
-    printf '\n' >&2
     idx=0
     for fp in "${FOUND_BACKUP_FILES[@]}"; do
         idx=$((idx + 1))
-        printf '  %2d. %-50s (%s)\n' "$idx" "$(basename "$fp")" "$(_get_hsize "$fp")" >&2
+        printf '  %d. %s  (%s)\n' "$idx" "$(basename "$fp")" "$(_get_hsize "$fp")" >&2
     done
     printf '\n' >&2
     _read_line restore_all "是否恢复所有文件？(y/N): "
@@ -1106,9 +1129,6 @@ restore_images() {
     fi
     GLOBAL_LAST_LOADED_IMAGES=()
     local total_chosen="${#chosen_files[@]}"
-    printf '\n' >&2
-    yellow "开始加载镜像..."
-    printf '\n' >&2
     idx=0
     for fp in "${chosen_files[@]}"; do
         idx=$((idx + 1))
@@ -1123,7 +1143,7 @@ restore_images() {
         else
             load_errors=$((load_errors + 1))
             red "  ✗ 加载失败: $fname"
-            [ -n "$load_out" ] && printf '     %s\n' "$load_out" >&2 || true
+            [ -n "$load_out" ] && printf '%s\n' "$load_out" >&2 || true
         fi
     done
     printf '\n' >&2
@@ -1138,13 +1158,6 @@ restore_images() {
     [ "$load_errors" -gt 0 ] && red "  共 ${load_errors} 个文件加载失败。" || true
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     printf '\n' >&2
-    if [ "${#GLOBAL_LAST_LOADED_IMAGES[@]}" -gt 0 ]; then
-        yellow "已导入的镜像:"
-        for img in "${GLOBAL_LAST_LOADED_IMAGES[@]}"; do
-            printf '    • %s\n' "$img" >&2
-        done
-        printf '\n' >&2
-    fi
     local start_now=""
     _read_line start_now "是否立即配置并启动容器？(y/N): "
     case "$(_lower "$start_now")" in
@@ -1157,6 +1170,7 @@ restore_images() {
     esac
     press_any_key
 }
+
 show_local_images() {
     _check_docker || return 1
     local filter_result=""
@@ -1168,32 +1182,26 @@ show_local_images() {
         red "  未找到任何镜像。请先拉取镜像后重试。"
     else
         printf '\n' >&2
-        local img_count=0
-        local total_count=0
-        total_count=$(printf '%s\n' "$filter_result" | grep -c '[^[:space:]]' 2>/dev/null) || total_count=0
-        printf '  %-4s %-45s %-15s %s\n' "编号" "仓库名称" "标签" "大小" >&2
-        printf '  %-4s %-45s %-15s %s\n' \
-            "────" \
+        printf '  %-45s %-15s %s\n' "仓库名称" "标签" "大小" >&2
+        printf '  %-45s %-15s %s\n' \
             "─────────────────────────────────────────────" \
             "───────────────" \
             "──────" >&2
         while IFS=$'\t' read -r repo _id size; do
             [ -n "$repo" ] || continue
-            img_count=$((img_count + 1))
             local r="${repo%:*}"
             local t="${repo##*:}"
             [ "$r" = "$repo" ] && t="latest"
-            printf '  %-4s %-45s %-15s %s\n' "$img_count" "$r" "$t" "$size" >&2
+            printf '  %-45s %-15s %s\n' "$r" "$t" "$size" >&2
         done <<< "$filter_result"
-        printf '\n  共 %s 个镜像\n' "$img_count" >&2
     fi
     cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     return 0
 }
+
 main_menu() {
     local choice=""
     local verify_dir=""
-    local verify_default=""
     while true; do
         printf '\n' >&2
         cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1211,20 +1219,17 @@ main_menu() {
         _read_line choice "请选择操作: "
         case "$choice" in
             1)
+                GLOBAL_EXTRACT_DIR="$(pwd)/docker_images_$(date +%Y%m%d_%H%M%S)"
                 extract_images || true
                 ;;
             2)
+                [ -n "$GLOBAL_BACKUP_DIR" ] || GLOBAL_BACKUP_DIR="$(pwd)"
                 restore_images || true
                 ;;
             3)
-                verify_default="${GLOBAL_BACKUP_DIR:-$(pwd)}"
                 _read_line verify_dir \
-                    "请输入备份目录路径 [${verify_default}]: "
-                verify_dir=$(_trim "$verify_dir")
-                [ -n "$verify_dir" ] || verify_dir="$verify_default"
-                if [ "${verify_dir:0:1}" = "~" ]; then
-                    verify_dir="${HOME}${verify_dir:1}"
-                fi
+                    "请输入备份目录路径 [${GLOBAL_BACKUP_DIR:-$(pwd)}]: "
+                [ -n "$verify_dir" ] || verify_dir="${GLOBAL_BACKUP_DIR:-$(pwd)}"
                 verify_saved_images "$verify_dir" || true
                 press_any_key
                 ;;
@@ -1243,6 +1248,7 @@ main_menu() {
         esac
     done
 }
+
 main() {
     setup_logging
     detect_os
@@ -1259,4 +1265,5 @@ main() {
     esac
     main_menu
 }
+
 main "$@"
