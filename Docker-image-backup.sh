@@ -610,8 +610,10 @@ list_local_images_menu() {
 extract_images() {
     _check_docker || return 1
     ensure_dependency gzip || return 1
-    local export_dir="${GLOBAL_EXTRACT_DIR:-$(pwd)/docker_images_$(date +%Y%m%d_%H%M%S)}"
-    local export_prefix="${GLOBAL_EXPORT_PREFIX:-backup}"
+    local default_export_dir="$(pwd)/docker_images_$(date +%Y%m%d_%H%M%S)"
+    local export_dir=""
+    _read_line export_dir "请输入备份保存目录 [${default_export_dir}]: "
+    export_dir="${export_dir:-$default_export_dir}"
     mkdir -p "$export_dir" 2>/dev/null || {
         red "无法创建目录: $export_dir"
         press_any_key
