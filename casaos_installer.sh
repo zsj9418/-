@@ -50,6 +50,7 @@ log() {
 }
 
 _have() { command -v "$1" >/dev/null 2>&1; }
+# ── Docker 安装公共函数（统一模块）──SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"[[ -f "${SCRIPT_DIR}/docker-install-common.sh" ]] && source "${SCRIPT_DIR}/docker-install-common.sh"
 
 if [[ "${EUID}" -ne 0 ]]; then
   _err "请以 root 权限运行此脚本"
@@ -157,102 +158,6 @@ select_casa_image() {
   _info "使用镜像源：$SELECTED_CASA_IMAGE"
 }
 
-install_docker() {
-  if _have docker && docker info >/dev/null 2>&1; then
-    _ok "Docker 已安装且运行中：$(docker --version 2>/dev/null | head -n1)"
-    return 0
-  fi
-
-  if _have docker && ! docker info >/dev/null 2>&1; then
-    _warn "Docker 已安装但未运行，尝试启动..."
-    if _have systemctl; then
-      systemctl start docker >/dev/null 2>&1 || true
-      sleep 2
-    fi
-    if docker info >/dev/null 2>&1; then
-      _ok "Docker 已启动"
-      return 0
-    fi
-  fi
-
-  _info "安装 Docker..."
-  eval "$PKG_UPDATE" 2>/dev/null || true
-
-  local install_ok=false
-
-  case "$PKG_MGR" in
-    apt)
-      apt-get install -y -qq ca-certificates curl gnupg lsb-release 2>/dev/null || true
-      local distro=""
-      distro=$(lsb_release -is 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "debian")
-      local codename=""
-      codename=$(lsb_release -cs 2>/dev/null || echo "")
-      if [[ -n "$codename" ]]; then
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL "https://download.docker.com/linux/${distro}/gpg" 2>/dev/null | \
-          gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null || true
-        if [[ -f /etc/apt/keyrings/docker.gpg ]]; then
-          echo "deb [arch=$(dpkg --print-architecture 2>/dev/null || echo amd64) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/${distro} ${codename} stable" \
-            > /etc/apt/sources.list.d/docker.list
-          apt-get update -qq 2>/dev/null || true
-          if apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin 2>/dev/null; then
-            install_ok=true
-          fi
-        fi
-      fi
-      ;;
-    dnf|yum)
-      eval "$PKG_INSTALL yum-utils" 2>/dev/null || true
-      yum-config-manager --add-repo \
-        https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null || true
-      if eval "$PKG_INSTALL docker-ce docker-ce-cli containerd.io" 2>/dev/null; then
-        install_ok=true
-      fi
-      ;;
-    pacman)
-      if eval "$PKG_INSTALL docker" 2>/dev/null; then
-        install_ok=true
-      fi
-      ;;
-  esac
-
-  if [[ "$install_ok" == false ]]; then
-    _warn "包管理器安装失败或不支持，尝试官方一键脚本..."
-    if curl -fsSL https://get.docker.com | sh 2>/dev/null; then
-      install_ok=true
-    else
-      _err "Docker 安装失败，请手动安装后重试"
-      return 1
-    fi
-  fi
-
-  if _have systemctl; then
-    systemctl enable docker >/dev/null 2>&1 || true
-    systemctl start docker >/dev/null 2>&1 || true
-  fi
-
-  sleep 3
-
-  if ! _have docker; then
-    _err "Docker 安装后命令不可用"
-    return 1
-  fi
-
-  local retry=0
-  while ! docker info >/dev/null 2>&1 && [[ $retry -lt 10 ]]; do
-    sleep 2
-    retry=$((retry + 1))
-  done
-
-  if ! docker info >/dev/null 2>&1; then
-    _err "Docker 守护进程无法启动，请检查：journalctl -u docker"
-    return 1
-  fi
-
-  _ok "Docker 安装完成：$(docker --version 2>/dev/null | head -n1)"
-}
 
 ensure_docker_running() {
   if ! _have docker; then

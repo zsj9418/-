@@ -117,6 +117,10 @@ cleanup() {
 trap 'red "脚本被中断，执行清理..."; cleanup; exit 130' INT TERM
 trap 'cleanup' EXIT
 
+# -- Docker installation common functions --
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+[[ -f "${SCRIPT_DIR}/docker-install-common.sh" ]] && source "${SCRIPT_DIR}/docker-install-common.sh"
+
 # ==============================================================================
 # [修复BUG2] 系统要求检查（移除 bc 依赖）
 # ==============================================================================
@@ -161,78 +165,7 @@ get_arch() {
 }
 
 # 检测 init 系统
-detect_init_system() {
-    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
-        echo "systemd"
-    elif command -v rc-service &>/dev/null; then
-        echo "openrc"
-    elif [[ -f /etc/init.d/cron ]]; then
-        echo "sysvinit"
-    else
-        echo "unknown"
-    fi
-}
-
-# ==============================================================================
-# Docker 安装和检查
-# ==============================================================================
-check_docker_service() {
-    log "检查 Docker 服务状态..."
-    local init_sys
-    init_sys=$(detect_init_system)
-
-    case "$init_sys" in
-        systemd)
-            if ! systemctl is-active --quiet docker; then
-                yellow "Docker 服务未运行，尝试启动..."
-                systemctl start docker || { red "无法启动 Docker"; exit 1; }
-            fi
-            ;;
-        openrc)
-            if ! rc-service docker status &>/dev/null; then
-                yellow "Docker 服务未运行，尝试启动..."
-                rc-service docker start || { red "无法启动 Docker"; exit 1; }
-            fi
-            ;;
-        *)
-            if ! docker info &>/dev/null; then
-                red "Docker 服务未运行且无法自动启动"
-                exit 1
-            fi
-            ;;
-    esac
-    green "Docker 服务正常运行"
-}
-
-# [修复P6] Docker 安装（使用现代 gpg 方式）
-install_docker_deps() {
-    log "检查 Docker 依赖..."
-    if command -v docker &>/dev/null; then
-        green "Docker 已安装"
-        check_docker_service
-        return 0
-    fi
-
-    log "安装 Docker..."
-    # 优先使用官方安装脚本（最可靠、跨平台）
-    if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh; then
-        sh /tmp/get-docker.sh || { red "Docker 安装失败"; exit 1; }
-        rm -f /tmp/get-docker.sh
-    else
-        red "无法下载 Docker 安装脚本，请手动安装"
-        exit 1
-    fi
-
-    local init_sys
-    init_sys=$(detect_init_system)
-    case "$init_sys" in
-        systemd) systemctl enable docker && systemctl start docker ;;
-        openrc)  rc-update add docker && rc-service docker start ;;
-    esac
-
-    green "Docker 安装完成"
-    check_docker_service
-}
+# ── Docker 安装公共函数（来自 docker-install-common.sh）──# detect_init_system / check_docker_service / install_docker_deps# 由文件顶部 source 引入
 
 # 安装 jq 和 yq
 install_jq_yq() {
