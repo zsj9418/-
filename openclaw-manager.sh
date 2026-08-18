@@ -1402,11 +1402,22 @@ configure_custom_api() {
     read_input url ""
     [[ -z "$url" ]] && { err "URL 不能为空"; return 1; }
     if is_docker_mode; then
-        if [[ "$url" =~ ^https?://(127\.|localhost|192\.168\.|10\.) ]]; then
+        # 仅当 URL 指向本机时才转换为 host.docker.internal
+        # 若用户输入的是局域网中的其他设备 (如 192.168.x.x 外部服务),保持原样
+        local local_ip=""
+        local_ip=$(get_local_ip)
+        if [[ "$url" =~ ^https?://(127\.[0-9.]+|localhost)(:[0-9]+)?/ ]]; then
             local new_url=""
-            new_url=$(echo "$url" | sed -E 's#(https?://)(127\.[0-9.]+|localhost|192\.168\.[0-9.]+|10\.[0-9.]+)#\1host.docker.internal#')
-            info "Docker 模式: URL → $new_url"
+            new_url=$(echo "$url" | sed -E 's#(https?://)(127\.[0-9.]+|localhost)#\1host.docker.internal#')
+            info "Docker 模式: URL → $new_url (本机服务)"
             url="$new_url"
+        elif [[ -n "$local_ip" ]] && [[ "$url" == *"${local_ip}"* ]]; then
+            local new_url=""
+            new_url=$(echo "$url" | sed -E "s#(https?://)${local_ip}#\1host.docker.internal#")
+            info "Docker 模式: URL → $new_url (本机局域网IP)"
+            url="$new_url"
+        else
+            info "URL 保留原样: $url"
         fi
     fi
     echo -ne "API Key (本地服务输 'local'): "
@@ -1910,14 +1921,19 @@ repair_all() {
     substep "清理不兼容字段..."
     sanitize_config "$cfg" && ok "已清理" || warn "清理异常"
     if is_docker_mode && has_cmd python3; then
-        substep "转换 Docker URL..."
-        python3 - "$cfg" << 'PYEOF'
+        substep "检查 Docker URL..."
+        local local_ip=""
+        local_ip=$(get_local_ip)
+        python3 - "$cfg" "${local_ip:-}" << 'PYEOF'
 import json, sys, os, re
 cfg_path = sys.argv[1]
+host_ip = sys.argv[2] if len(sys.argv) > 2 else ""
 try:
     with open(cfg_path) as f: c = json.load(f)
 except: sys.exit(0)
-pat = re.compile(r'^(https?://)(127\.[0-9.]+|localhost|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)')
+# Only convert loopback/localhost URLs to host.docker.internal.
+# Do NOT touch external IP addresses (e.g. user's independent API server).
+pat = re.compile(r'^(https?://)(127\.[0-9.]+|localhost)')
 changed = False
 for n, p in c.get("models", {}).get("providers", {}).items():
     if not isinstance(p, dict): continue
