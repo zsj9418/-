@@ -1703,14 +1703,7 @@ EOF
         AGGRESSIVE=1
         STATS_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
-        # 捕获异常，确保通知能发出
-        if clean_system; then
-            send_wecom_notify "success"
-        else
-            STATS_SPACE_AFTER=$(get_root_avail)
-            send_wecom_notify "failed"
-        fi
-
+        clean_system
         echo "========== $(date '+%Y-%m-%d %H:%M:%S') 完成 =========="
         exit 0
     fi
