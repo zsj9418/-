@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="2.4"
+VERSION="2.5"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -186,95 +186,75 @@ do_expand() {
     if [ "$tbytes" -gt "$CURSIZE" ]; then
         echo -e "  操作: 扩容 ${YELLOW}${CURHR}${NC} → ${GREEN}${thr}${NC}  增量: $(hr_size $((tbytes-CURSIZE)))"
     else
-        echo -e "  操作: ${YELLOW}保持 ${CURHR} 不变，仅扫描并扩展内部未分配分区${NC}"
+        echo -e "  操作: ${YELLOW}保持 ${CURHR} 不变，直接修复镜像内部未分配空间${NC}"
     fi
     line; echo ""
     confirm "确认执行?" || { pause; return; }
     echo ""
-    local LOOP="" BAK="${IMG}.bak"
-    cleanup() { [ -n "$LOOP" ] && losetup "$LOOP" &>/dev/null && losetup -d "$LOOP" 2>/dev/null; }
-    trap cleanup EXIT
-    step "1/6" "备份原始镜像..."
+    local BAK="${IMG}.bak"
+    step "1/5" "备份原始镜像..."
     if [ -f "$BAK" ]; then
         warn "备份已存在: ${BAK}"
         confirm "覆盖?" && cp "$IMG" "$BAK" && ok "已覆盖" || info "保留旧备份"
     else
         cp "$IMG" "$BAK"; ok "备份: ${BAK}"
     fi
-    step "2/6" "检测镜像格式..."
+    step "2/5" "检测镜像格式..."
     local fmt
     fmt=$(qemu-img info "$IMG" 2>/dev/null | grep "^file format:" | awk '{print $3}')
     [ -z "$fmt" ] && fmt="raw"
     ok "格式: ${fmt}"
     if [ "$tbytes" -gt "$CURSIZE" ]; then
-        step "3/6" "扩容镜像文件..."
+        step "3/5" "扩容镜像文件文件外壳..."
         local qsize
         qsize=$(echo "$tinput" | tr '[:lower:]' '[:upper:]' | sed 's/[BI]//g')
-        if qemu-img resize -f "$fmt" "$IMG" "$qsize" 2>&1; then
-            ok "镜像文件已扩容"
+        if qemu-img resize -f "$fmt" "$IMG" "$qsize" >/dev/null 2>&1; then
+            ok "镜像外壳已扩容"
         else
             err "扩容失败"
             confirm "从备份恢复?" && cp "$BAK" "$IMG" && ok "已恢复"
             pause; return
         fi
     else
-        step "3/6" "文件大小不变，跳过外壳扩容"
+        step "3/5" "文件大小不变，跳过外壳扩容"
     fi
-    step "4/6" "挂载 loop 设备..."
-    LOOP=$(losetup -fP --show "$IMG" 2>&1)
-    if [ $? -ne 0 ] || [ -z "$LOOP" ]; then
-        err "挂载失败"; pause; return
-    fi
-    ok "设备: ${LOOP}"
-    step "5/6" "修复分区表并保留 PARTUUID 扩展分区..."
-    local pt; pt=$(detect_pt_type "$LOOP")
-    info "分区表: ${pt}"
+    step "4/5" "直接对镜像文件修改分区表并同步 PARTUUID..."
+    local pt; pt=$(detect_pt_type "$IMG")
+    info "分区表类型: ${pt}"
     local lpart
-    lpart=$(parted -s "$LOOP" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
-    [ -z "$lpart" ] && lpart=$(sfdisk -d "$LOOP" 2>/dev/null | grep -oP "${LOOP}p?\K[0-9]+" | sort -n | tail -1)
+    lpart=$(parted -s "$IMG" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
+    [ -z "$lpart" ] && lpart=$(sfdisk -d "$IMG" 2>/dev/null | grep -oP "${IMG}p?\K[0-9]+" | sort -n | tail -1)
     if [ -z "$lpart" ]; then
-        err "无法检测分区"; losetup -d "$LOOP" 2>/dev/null; LOOP=""
-        pause; return
+        err "无法检测分区"; pause; return
     fi
     if [ "$pt" = "GPT" ] || [ "$pt" = "unknown" ]; then
-        local old_partuuid
-        old_partuuid=$(sgdisk -i "$lpart" "$LOOP" 2>/dev/null | grep "Partition unique GUID" | awk '{print $4}')
-        sgdisk -e "$LOOP" >/dev/null 2>&1
-        partprobe "$LOOP" 2>/dev/null
-        losetup -c "$LOOP" 2>/dev/null
-        sleep 1
-        local pstart
-        pstart=$(sgdisk -i "$lpart" "$LOOP" 2>/dev/null | grep "First sector" | awk '{print $3}')
+        local old_uuid pstart
+        old_uuid=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep "Partition unique GUID" | awk '{print $4}')
+        pstart=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep "First sector" | awk '{print $3}')
+        sgdisk -e "$IMG" >/dev/null 2>&1
         if [ -n "$pstart" ]; then
-            sgdisk -d "$lpart" "$LOOP" >/dev/null 2>&1
-            sgdisk -n "${lpart}:${pstart}:0" "$LOOP" >/dev/null 2>&1
-            if [ -n "$old_partuuid" ]; then
-                sgdisk -u "${lpart}:${old_partuuid}" "$LOOP" >/dev/null 2>&1
+            sgdisk -d "$lpart" "$IMG" >/dev/null 2>&1
+            sgdisk -n "${lpart}:${pstart}:0" "$IMG" >/dev/null 2>&1
+            if [ -n "$old_uuid" ]; then
+                sgdisk -u "${lpart}:${old_partuuid}" "$IMG" >/dev/null 2>&1
             fi
         fi
-        parted -s "$LOOP" resizepart "$lpart" 100% >/dev/null 2>&1
-        partprobe "$LOOP" 2>/dev/null
-        losetup -c "$LOOP" 2>/dev/null
-        sleep 1
+        parted -s "$IMG" resizepart "$lpart" 100% >/dev/null 2>&1
     elif [ "$pt" = "MBR" ]; then
-        echo ", +" | sfdisk -N "$lpart" "$LOOP" --no-reread --force >/dev/null 2>&1
-        partprobe "$LOOP" 2>/dev/null
-        sleep 1
+        echo ", +" | sfdisk -N "$lpart" "$IMG" --no-reread --force >/dev/null 2>&1
     fi
-    step "6/6" "校验扩展结果..."
-    local check_size
-    check_size=$(parted -s "$LOOP" unit B print 2>/dev/null | grep -E "^\s*${lpart}\s" | awk '{print $4}' | tr -d 'B')
-    if [ -n "$check_size" ] && [ "$check_size" -lt $((tbytes - 300000000)) ]; then
+    step "5/5" "校验扩展结果..."
+    local check_bytes
+    check_bytes=$(parted -s "$IMG" unit B print 2>/dev/null | grep -E "^\s*${lpart}\s" | awk '{print $4}' | grep -oE '[0-9]+')
+    if [ -n "$check_bytes" ] && [ "$check_bytes" -lt $((tbytes - 300000000)) ]; then
         err "校验失败：分区未能扩展至目标大小"
-        losetup -d "$LOOP" 2>/dev/null; LOOP=""
         cp "$BAK" "$IMG"
         info "已自动恢复备份镜像"
         pause; return
     fi
-    echo ""; echo -e "  ${WHITE}修复后分区信息:${NC}"
-    parted -s "$LOOP" print 2>/dev/null | grep -E '(^Model|^Disk|^Number|^\s+[0-9])' | sed 's/^/    /'
+    echo ""; echo -e "  ${WHITE}扩展后内部分区表:${NC}"
+    parted -s "$IMG" print 2>/dev/null | grep -E '(^Model|^Disk|^Number|^\s+[0-9])' | sed 's/^/    /'
     echo ""
-    losetup -d "$LOOP" 2>/dev/null; LOOP=""
     local fsize; fsize=$(stat -c%s "$IMG" 2>/dev/null)
     local fhr; fhr=$(hr_size "$fsize")
     echo -e "  ${GREEN}╔════════════════════════════════════════════╗${NC}"
@@ -384,11 +364,7 @@ do_detail() {
     qemu-img info "$IMG" 2>/dev/null | sed 's/^/    /'
     echo ""
     echo -e "  ${WHITE}分区表:${NC}"
-    local lp; lp=$(losetup -fP --show "$IMG" 2>/dev/null)
-    if [ -n "$lp" ]; then
-        parted -s "$lp" print 2>/dev/null | sed 's/^/    /' || sfdisk -l "$lp" 2>/dev/null | sed 's/^/    /'
-        losetup -d "$lp" 2>/dev/null
-    fi
+    parted -s "$IMG" print 2>/dev/null | sed 's/^/    /' || sfdisk -l "$IMG" 2>/dev/null | sed 's/^/    /'
     pause
 }
 do_restore() {
