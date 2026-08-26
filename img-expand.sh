@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="2.1"
+VERSION="2.3"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -21,7 +21,6 @@ print_header() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${NC}  ${WHITE}固件镜像扩容管理工具 v${VERSION}${NC}                        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${PURPLE}PVE宿主机 | 兼容所有x86固件${NC}                        ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 }
 line() { echo -e "${CYAN}──────────────────────────────────────────────────────${NC}"; }
@@ -169,21 +168,28 @@ do_expand() {
     echo -e "  大小: ${YELLOW}${CURHR}${NC}"
     echo -e "  类型: ${CYAN}${FOUND_TYPES[$idx]}${NC}"
     line; echo ""
-    echo -e "  ${WHITE}参考: 1G=轻量 2G=日常 4G=插件多 8G=Docker${NC}"; echo ""
+    echo -e "  ${WHITE}参考: 1G=轻量 2G=日常 4G=插件多 (回车=仅修复现有未分配空间)${NC}"; echo ""
     local tinput tbytes
     while true; do
-        read -rp "$(echo -e ${WHITE}"目标大小 (如 2G 4G 512M): "${NC})" tinput
-        [ -z "$tinput" ] && { err "不能为空"; continue; }
+        read -rp "$(echo -e ${WHITE}"目标大小 (如 4G 512M / 回车直接修复): "${NC})" tinput
+        if [ -z "$tinput" ]; then
+            tbytes=$CURSIZE
+            break
+        fi
         tbytes=$(parse_size "$tinput")
         [ "$tbytes" = "0" ] && { err "格式错误"; continue; }
-        [ "$tbytes" -le "$CURSIZE" ] && { err "必须大于当前 ${CURHR}"; continue; }
+        [ "$tbytes" -lt "$CURSIZE" ] && { err "目标大小不能小于当前文件大小 ${CURHR}"; continue; }
         break
     done
     local thr; thr=$(hr_size "$tbytes")
     echo ""; line
-    echo -e "  扩容: ${YELLOW}${CURHR}${NC} → ${GREEN}${thr}${NC}  增量: $(hr_size $((tbytes-CURSIZE)))"
+    if [ "$tbytes" -gt "$CURSIZE" ]; then
+        echo -e "  操作: 扩容 ${YELLOW}${CURHR}${NC} → ${GREEN}${thr}${NC}  增量: $(hr_size $((tbytes-CURSIZE)))"
+    else
+        echo -e "  操作: ${YELLOW}保持 ${CURHR} 不变，仅扫描并扩展内部未分配分区${NC}"
+    fi
     line; echo ""
-    confirm "确认扩容?" || { pause; return; }
+    confirm "确认执行?" || { pause; return; }
     echo ""
     local LOOP="" BAK="${IMG}.bak"
     cleanup() { [ -n "$LOOP" ] && losetup "$LOOP" &>/dev/null && losetup -d "$LOOP" 2>/dev/null; }
@@ -200,15 +206,19 @@ do_expand() {
     fmt=$(qemu-img info "$IMG" 2>/dev/null | grep "^file format:" | awk '{print $3}')
     [ -z "$fmt" ] && fmt="raw"
     ok "格式: ${fmt}"
-    step "3/6" "扩容镜像文件..."
-    local qsize
-    qsize=$(echo "$tinput" | tr '[:lower:]' '[:upper:]' | sed 's/[BI]//g')
-    if qemu-img resize -f "$fmt" "$IMG" "$qsize" 2>&1; then
-        ok "镜像文件已扩容"
+    if [ "$tbytes" -gt "$CURSIZE" ]; then
+        step "3/6" "扩容镜像文件..."
+        local qsize
+        qsize=$(echo "$tinput" | tr '[:lower:]' '[:upper:]' | sed 's/[BI]//g')
+        if qemu-img resize -f "$fmt" "$IMG" "$qsize" 2>&1; then
+            ok "镜像文件已扩容"
+        else
+            err "扩容失败"
+            confirm "从备份恢复?" && cp "$BAK" "$IMG" && ok "已恢复"
+            pause; return
+        fi
     else
-        err "扩容失败"
-        confirm "从备份恢复?" && cp "$BAK" "$IMG" && ok "已恢复"
-        pause; return
+        step "3/6" "文件大小不变，跳过外壳扩容"
     fi
     step "4/6" "挂载 loop 设备..."
     LOOP=$(losetup -fP --show "$IMG" 2>&1)
@@ -219,60 +229,51 @@ do_expand() {
     step "5/6" "修复分区表并扩展分区..."
     local pt; pt=$(detect_pt_type "$LOOP")
     info "分区表: ${pt}"
-    echo ""; echo -e "  ${WHITE}扩容前:${NC}"
-    parted -s "$LOOP" print 2>/dev/null | grep -E '(^Model|^Disk|^Number|^\s+[0-9])' | sed 's/^/    /'
-    echo ""
-    if [ "$pt" = "GPT" ]; then
-        info "修复 GPT 备份表..."
-        sgdisk -e "$LOOP" >/dev/null 2>&1
-        partprobe "$LOOP" 2>/dev/null; sleep 1
-        ok "GPT 备份表已修复"
-    elif [ "$pt" = "MBR" ]; then
-        info "MBR 无需修复备份表"
-        partprobe "$LOOP" 2>/dev/null; sleep 1
-    else
-        warn "未知分区表,尝试 GPT 修复..."
-        sgdisk -e "$LOOP" >/dev/null 2>&1
-        partprobe "$LOOP" 2>/dev/null; sleep 1
-    fi
     local lpart
     lpart=$(parted -s "$LOOP" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
-    if [ -z "$lpart" ]; then
-        lpart=$(sfdisk -d "$LOOP" 2>/dev/null | grep -oP "${LOOP}p?\K[0-9]+" | sort -n | tail -1)
-    fi
+    [ -z "$lpart" ] && lpart=$(sfdisk -d "$LOOP" 2>/dev/null | grep -oP "${LOOP}p?\K[0-9]+" | sort -n | tail -1)
     if [ -z "$lpart" ]; then
         err "无法检测分区"; losetup -d "$LOOP" 2>/dev/null; LOOP=""
         pause; return
     fi
-    info "扩展分区 ${lpart}..."
-    if [ "$pt" = "MBR" ]; then
-        echo ", +" | sfdisk -N "$lpart" "$LOOP" --no-reread --force >/dev/null 2>&1
-    else
-        if ! parted -s "$LOOP" resizepart "$lpart" 100% 2>/dev/null; then
-            warn "parted 失败,尝试 sgdisk..."
-            local pstart
-            pstart=$(sgdisk -i "$lpart" "$LOOP" 2>/dev/null | grep "First sector" | awk '{print $3}')
-            if [ -n "$pstart" ]; then
-                sgdisk -d "$lpart" "$LOOP" >/dev/null 2>&1
-                sgdisk -n "${lpart}:${pstart}:0" "$LOOP" >/dev/null 2>&1
-            else
-                err "所有方式均失败"
-                losetup -d "$LOOP" 2>/dev/null; LOOP=""
-                confirm "从备份恢复?" && cp "$BAK" "$IMG" && ok "已恢复"
-                pause; return
-            fi
+    if [ "$pt" = "GPT" ] || [ "$pt" = "unknown" ]; then
+        sgdisk -e "$LOOP" >/dev/null 2>&1
+        partprobe "$LOOP" 2>/dev/null
+        losetup -c "$LOOP" 2>/dev/null
+        sleep 1
+        local pstart
+        pstart=$(sgdisk -i "$lpart" "$LOOP" 2>/dev/null | grep "First sector" | awk '{print $3}')
+        if [ -n "$pstart" ]; then
+            sgdisk -d "$lpart" "$LOOP" >/dev/null 2>&1
+            sgdisk -n "${lpart}:${pstart}:0" "$LOOP" >/dev/null 2>&1
         fi
+        parted -s "$LOOP" resizepart "$lpart" 100% >/dev/null 2>&1
+        partprobe "$LOOP" 2>/dev/null
+        losetup -c "$LOOP" 2>/dev/null
+        sleep 1
+    elif [ "$pt" = "MBR" ]; then
+        echo ", +" | sfdisk -N "$lpart" "$LOOP" --no-reread --force >/dev/null 2>&1
+        partprobe "$LOOP" 2>/dev/null
+        sleep 1
     fi
-    partprobe "$LOOP" 2>/dev/null; sleep 1
-    step "6/6" "验证结果..."
-    echo ""; echo -e "  ${WHITE}扩容后:${NC}"
+    step "6/6" "校验扩展结果..."
+    local check_size
+    check_size=$(parted -s "$LOOP" unit B print 2>/dev/null | grep -E "^\s*${lpart}\s" | awk '{print $4}' | tr -d 'B')
+    if [ -n "$check_size" ] && [ "$check_size" -lt $((tbytes - 300000000)) ]; then
+        err "校验失败：分区未能扩展至目标大小"
+        losetup -d "$LOOP" 2>/dev/null; LOOP=""
+        cp "$BAK" "$IMG"
+        info "已自动恢复备份镜像"
+        pause; return
+    fi
+    echo ""; echo -e "  ${WHITE}修复后分区信息:${NC}"
     parted -s "$LOOP" print 2>/dev/null | grep -E '(^Model|^Disk|^Number|^\s+[0-9])' | sed 's/^/    /'
     echo ""
     losetup -d "$LOOP" 2>/dev/null; LOOP=""
     local fsize; fsize=$(stat -c%s "$IMG" 2>/dev/null)
     local fhr; fhr=$(hr_size "$fsize")
     echo -e "  ${GREEN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "  ${GREEN}║         ✅ 扩容成功                       ║${NC}"
+    echo -e "  ${GREEN}║         ✅ 执行成功                       ║${NC}"
     echo -e "  ${GREEN}╠════════════════════════════════════════════╣${NC}"
     echo -e "  ${GREEN}║${NC} 文件: ${WHITE}${NAME}${NC}"
     echo -e "  ${GREEN}║${NC} 大小: ${YELLOW}${CURHR}${NC} → ${GREEN}${fhr}${NC}"
@@ -453,7 +454,7 @@ main_menu() {
     while true; do
         print_header; echo ""
         echo -e "  ${WHITE}主菜单${NC}"; line; echo ""
-        echo -e "    ${GREEN}[1]${NC}  扩容固件镜像"
+        echo -e "    ${GREEN}[1]${NC}  扩容 / 修复镜像"
         echo -e "    ${GREEN}[2]${NC}  导入镜像到虚拟机"
         echo -e "    ${GREEN}[3]${NC}  查看镜像详情"
         echo -e "    ${GREEN}[4]${NC}  恢复备份"
