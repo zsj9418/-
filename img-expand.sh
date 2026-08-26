@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="2.6"
+VERSION="2.7"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -218,39 +218,32 @@ do_expand() {
     else
         step "3/5" "文件大小不变，跳过外壳扩容"
     fi
-    step "4/5" "重构内部分区表并恢复 PARTUUID..."
+    step "4/5" "精准扩展 RootFS 分区 (sda2) 并还原 PARTUUID..."
     local pt; pt=$(detect_pt_type "$IMG")
     info "分区表类型: ${pt}"
-    local lpart
-    lpart=$(sgdisk -p "$IMG" 2>/dev/null | awk '/^\s*[0-9]+/{p=$1} END{print p}')
-    [ -z "$lpart" ] && lpart=$(parted -s "$IMG" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
-    if [ -z "$lpart" ]; then
-        err "无法检测分区"; pause; return
-    fi
+    local target_part=2
     if [ "$pt" = "GPT" ] || [ "$pt" = "unknown" ]; then
-        local pguid pstart pname
-        pstart=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "First sector" | awk '{print $3}')
-        pguid=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "Partition unique GUID" | awk '{print $4}')
-        pname=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "Partition name" | cut -d"'" -f2)
         sgdisk -e "$IMG" >/dev/null 2>&1
+        local pstart pguid ptype pname
+        pstart=$(sgdisk -i $target_part "$IMG" 2>/dev/null | grep -i "First sector" | awk '{print $3}')
+        pguid=$(sgdisk -i $target_part "$IMG" 2>/dev/null | grep -i "Partition unique GUID" | awk '{print $4}')
+        ptype=$(sgdisk -i $target_part "$IMG" 2>/dev/null | grep -i "Partition GUID code" | awk '{print $4}')
+        pname=$(sgdisk -i $target_part "$IMG" 2>/dev/null | grep -i "Partition name" | cut -d"'" -f2)
         if [ -n "$pstart" ]; then
-            sgdisk -d "$lpart" "$IMG" >/dev/null 2>&1
-            sgdisk -n "${lpart}:${pstart}:0" "$IMG" >/dev/null 2>&1
-            if [ -n "$pguid" ]; then
-                sgdisk -u "${lpart}:${pguid}" "$IMG" >/dev/null 2>&1
-            fi
-            if [ -n "$pname" ]; then
-                sgdisk -c "${lpart}:${pname}" "$IMG" >/dev/null 2>&1
-            fi
+            sgdisk -d $target_part "$IMG" >/dev/null 2>&1
+            sgdisk -n "${target_part}:${pstart}:0" "$IMG" >/dev/null 2>&1
+            [ -n "$pguid" ] && sgdisk -u "${target_part}:${pguid}" "$IMG" >/dev/null 2>&1
+            [ -n "$ptype" ] && sgdisk -t "${target_part}:${ptype}" "$IMG" >/dev/null 2>&1
+            [ -n "$pname" ] && sgdisk -c "${target_part}:${pname}" "$IMG" >/dev/null 2>&1
         fi
     elif [ "$pt" = "MBR" ]; then
-        echo ", +" | sfdisk -N "$lpart" "$IMG" --no-reread --force >/dev/null 2>&1
+        echo ", +" | sfdisk -N $target_part "$IMG" --no-reread --force >/dev/null 2>&1
     fi
-    step "5/5" "校验扩展结果..."
+    step "5/5" "校验 RootFS 分区大小..."
     local check_bytes
-    check_bytes=$(parted -s "$IMG" unit B print 2>/dev/null | awk -v p="$lpart" '$1==p {print $4}' | grep -oE '[0-9]+')
+    check_bytes=$(parted -s "$IMG" unit B print 2>/dev/null | awk -v p="$target_part" '$1==p {print $4}' | grep -oE '[0-9]+')
     if [ -z "$check_bytes" ] || [ "$check_bytes" -lt $((tbytes / 2)) ]; then
-        err "校验失败：分区未能扩展至目标大小"
+        err "校验失败：sda2 分区未能成功扩展"
         cp "$BAK" "$IMG"
         info "已自动还原备份镜像"
         pause; return
@@ -422,7 +415,7 @@ do_scandirs() {
         local e=""; [ -d "${SCAN_DIRS[$i]}" ] && e="${GREEN}✔${NC}" || e="${RED}✘${NC}"
         echo -e "  ${GREEN}[$((i+1))]${NC} ${SCAN_DIRS[$i]} $e"
     done
-    echo ""; echo -e "  ${GREEN}[a]${NC} 添加  ${GREEN}[d]${NC} 删除  ${GREEN}[0]${NC} Return"; echo ""
+    echo ""; echo -e "  ${GREEN}[a]${NC} 添加  ${GREEN}[d]${NC} 删除  ${GREEN}[0]${NC} 返回"; echo ""
     local a; read -rp "$(echo -e ${WHITE}"操作: "${NC})" a
     case "$a" in
         a|A) read -rp "$(echo -e ${WHITE}"目录路径: "${NC})" nd
