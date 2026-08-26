@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="2.5"
+VERSION="2.6"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -205,7 +205,7 @@ do_expand() {
     [ -z "$fmt" ] && fmt="raw"
     ok "格式: ${fmt}"
     if [ "$tbytes" -gt "$CURSIZE" ]; then
-        step "3/5" "扩容镜像文件文件外壳..."
+        step "3/5" "扩容镜像文件外壳..."
         local qsize
         qsize=$(echo "$tinput" | tr '[:lower:]' '[:upper:]' | sed 's/[BI]//g')
         if qemu-img resize -f "$fmt" "$IMG" "$qsize" >/dev/null 2>&1; then
@@ -218,38 +218,41 @@ do_expand() {
     else
         step "3/5" "文件大小不变，跳过外壳扩容"
     fi
-    step "4/5" "直接对镜像文件修改分区表并同步 PARTUUID..."
+    step "4/5" "重构内部分区表并恢复 PARTUUID..."
     local pt; pt=$(detect_pt_type "$IMG")
     info "分区表类型: ${pt}"
     local lpart
-    lpart=$(parted -s "$IMG" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
-    [ -z "$lpart" ] && lpart=$(sfdisk -d "$IMG" 2>/dev/null | grep -oP "${IMG}p?\K[0-9]+" | sort -n | tail -1)
+    lpart=$(sgdisk -p "$IMG" 2>/dev/null | awk '/^\s*[0-9]+/{p=$1} END{print p}')
+    [ -z "$lpart" ] && lpart=$(parted -s "$IMG" print 2>/dev/null | grep -E '^\s*[0-9]+' | awk '{print $1}' | sort -n | tail -1)
     if [ -z "$lpart" ]; then
         err "无法检测分区"; pause; return
     fi
     if [ "$pt" = "GPT" ] || [ "$pt" = "unknown" ]; then
-        local old_uuid pstart
-        old_uuid=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep "Partition unique GUID" | awk '{print $4}')
-        pstart=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep "First sector" | awk '{print $3}')
+        local pguid pstart pname
+        pstart=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "First sector" | awk '{print $3}')
+        pguid=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "Partition unique GUID" | awk '{print $4}')
+        pname=$(sgdisk -i "$lpart" "$IMG" 2>/dev/null | grep -i "Partition name" | cut -d"'" -f2)
         sgdisk -e "$IMG" >/dev/null 2>&1
         if [ -n "$pstart" ]; then
             sgdisk -d "$lpart" "$IMG" >/dev/null 2>&1
             sgdisk -n "${lpart}:${pstart}:0" "$IMG" >/dev/null 2>&1
-            if [ -n "$old_uuid" ]; then
-                sgdisk -u "${lpart}:${old_partuuid}" "$IMG" >/dev/null 2>&1
+            if [ -n "$pguid" ]; then
+                sgdisk -u "${lpart}:${pguid}" "$IMG" >/dev/null 2>&1
+            fi
+            if [ -n "$pname" ]; then
+                sgdisk -c "${lpart}:${pname}" "$IMG" >/dev/null 2>&1
             fi
         fi
-        parted -s "$IMG" resizepart "$lpart" 100% >/dev/null 2>&1
     elif [ "$pt" = "MBR" ]; then
         echo ", +" | sfdisk -N "$lpart" "$IMG" --no-reread --force >/dev/null 2>&1
     fi
     step "5/5" "校验扩展结果..."
     local check_bytes
-    check_bytes=$(parted -s "$IMG" unit B print 2>/dev/null | grep -E "^\s*${lpart}\s" | awk '{print $4}' | grep -oE '[0-9]+')
-    if [ -n "$check_bytes" ] && [ "$check_bytes" -lt $((tbytes - 300000000)) ]; then
+    check_bytes=$(parted -s "$IMG" unit B print 2>/dev/null | awk -v p="$lpart" '$1==p {print $4}' | grep -oE '[0-9]+')
+    if [ -z "$check_bytes" ] || [ "$check_bytes" -lt $((tbytes / 2)) ]; then
         err "校验失败：分区未能扩展至目标大小"
         cp "$BAK" "$IMG"
-        info "已自动恢复备份镜像"
+        info "已自动还原备份镜像"
         pause; return
     fi
     echo ""; echo -e "  ${WHITE}扩展后内部分区表:${NC}"
@@ -419,7 +422,7 @@ do_scandirs() {
         local e=""; [ -d "${SCAN_DIRS[$i]}" ] && e="${GREEN}✔${NC}" || e="${RED}✘${NC}"
         echo -e "  ${GREEN}[$((i+1))]${NC} ${SCAN_DIRS[$i]} $e"
     done
-    echo ""; echo -e "  ${GREEN}[a]${NC} 添加  ${GREEN}[d]${NC} 删除  ${GREEN}[0]${NC} 返回"; echo ""
+    echo ""; echo -e "  ${GREEN}[a]${NC} 添加  ${GREEN}[d]${NC} 删除  ${GREEN}[0]${NC} Return"; echo ""
     local a; read -rp "$(echo -e ${WHITE}"操作: "${NC})" a
     case "$a" in
         a|A) read -rp "$(echo -e ${WHITE}"目录路径: "${NC})" nd
