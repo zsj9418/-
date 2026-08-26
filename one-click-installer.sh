@@ -73,6 +73,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["45"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/uninstall_histb.sh"
     ["46"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cpu-tool.sh"
     ["47"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/Docker-image-backup.sh"
+    ["48"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/img-expand.sh"
 
 )
 
@@ -124,6 +125,7 @@ DEFAULT_OPTIONS=(
     "45. 海纳思内置卸载"
     "46. CPU频率仪表"
     "47. docker镜像备份还原"
+    "48. pve中openwrt扩容"
     "98. 快捷键管理"
 )
 
