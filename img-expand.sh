@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="2.3"
+VERSION="2.4"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -226,7 +226,7 @@ do_expand() {
         err "挂载失败"; pause; return
     fi
     ok "设备: ${LOOP}"
-    step "5/6" "修复分区表并扩展分区..."
+    step "5/6" "修复分区表并保留 PARTUUID 扩展分区..."
     local pt; pt=$(detect_pt_type "$LOOP")
     info "分区表: ${pt}"
     local lpart
@@ -237,6 +237,8 @@ do_expand() {
         pause; return
     fi
     if [ "$pt" = "GPT" ] || [ "$pt" = "unknown" ]; then
+        local old_partuuid
+        old_partuuid=$(sgdisk -i "$lpart" "$LOOP" 2>/dev/null | grep "Partition unique GUID" | awk '{print $4}')
         sgdisk -e "$LOOP" >/dev/null 2>&1
         partprobe "$LOOP" 2>/dev/null
         losetup -c "$LOOP" 2>/dev/null
@@ -246,6 +248,9 @@ do_expand() {
         if [ -n "$pstart" ]; then
             sgdisk -d "$lpart" "$LOOP" >/dev/null 2>&1
             sgdisk -n "${lpart}:${pstart}:0" "$LOOP" >/dev/null 2>&1
+            if [ -n "$old_partuuid" ]; then
+                sgdisk -u "${lpart}:${old_partuuid}" "$LOOP" >/dev/null 2>&1
+            fi
         fi
         parted -s "$LOOP" resizepart "$lpart" 100% >/dev/null 2>&1
         partprobe "$LOOP" 2>/dev/null
