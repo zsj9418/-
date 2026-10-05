@@ -74,6 +74,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["46"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/cpu-tool.sh"
     ["47"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/Docker-image-backup.sh"
     ["48"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/img-expand.sh"
+    ["49"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/netiso.sh"
 
 )
 
@@ -126,6 +127,7 @@ DEFAULT_OPTIONS=(
     "46. CPU频率仪表"
     "47. docker镜像备份还原"
     "48. pve中openwrt扩容"
+    "49. openwrt设置VLAN"
     "98. 快捷键管理"
 )
 
