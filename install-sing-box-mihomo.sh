@@ -902,19 +902,15 @@ get_mihomo_latest_version() {
     fi
     echo "$latest_version"
 }
-
 install_mihomo() {
     log "开始安装 Mihomo..."
     check_network || return 1
     configure_network_forwarding_nat || return 1
-
     local latest_version
     latest_version=$(get_mihomo_latest_version) || { red "获取版本失败"; return 1; }
     green "Mihomo 最新版本: $latest_version"
-
     local local_arch
     local_arch=$(get_arch) || return 1
-
     local FILENAME=""
     case "$local_arch" in
         amd64)    FILENAME="mihomo-linux-amd64-${latest_version}.gz" ;;
@@ -929,22 +925,28 @@ install_mihomo() {
         mips64le) FILENAME="mihomo-linux-mips64le-${latest_version}.gz" ;;
         *) red "不支持的架构"; return 1 ;;
     esac
-
     local DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/download/${latest_version}/${FILENAME}"
     TEMP_DIR=$(mktemp -d)
     local GZ_PATH="$TEMP_DIR/$FILENAME"
-
     log "下载 Mihomo ${latest_version}..."
     if ! download_file_smart "$DOWNLOAD_URL" "$GZ_PATH" "binary"; then
         red "下载失败"; cleanup; return 1
     fi
-
+    if [ ! -s "$GZ_PATH" ] || ! head -c 2 "$GZ_PATH" | grep -q $'\x1f\x8b'; then
+        log "镜像下载无效，回退直连 GitHub..."
+        rm -f "$GZ_PATH"
+        if ! curl -fSL --connect-timeout 15 --max-time 120 -o "$GZ_PATH" "$DOWNLOAD_URL" 2>/dev/null; then
+            red "直连下载失败"; cleanup; return 1
+        fi
+    fi
+    if [ ! -s "$GZ_PATH" ] || ! head -c 2 "$GZ_PATH" | grep -q $'\x1f\x8b'; then
+        red "下载文件无效或非 gzip 格式"; cleanup; return 1
+    fi
     if ! gzip -d "$GZ_PATH"; then
         red "解压失败"; cleanup; return 1
     fi
     local MIHOMO_BIN="${GZ_PATH%.gz}"
     [ ! -f "$MIHOMO_BIN" ] && { red "未找到二进制"; cleanup; return 1; }
-
     manage_service_internal "mihomo" "stop" >/dev/null 2>&1 || true
     if [ "$MH_BIN_PATH" = "/usr/local/bin/mihomo" ] || [ ! -x "$MH_BIN_PATH" ]; then
         MH_BIN_PATH="/usr/local/bin/mihomo"
@@ -953,75 +955,57 @@ install_mihomo() {
     cp "$MIHOMO_BIN" "$MH_BIN_PATH"
     chmod +x "$MH_BIN_PATH"
     cleanup
-
     green "Mihomo $latest_version 安装成功！路径: $MH_BIN_PATH"
     [ ! -f "$MH_CONFIG_FILE" ] && generate_initial_mihomo_config
     setup_service "mihomo"
     manage_autostart_internal "mihomo" "enable"
     return 0
 }
-
 get_mihomo_alpha_versions() {
     local arch="$1"
-    local page=1
     local found=0
-
-    while [ "$page" -le 3 ]; do
-        local releases_info
-        releases_info=$(http_get "https://api.github.com/repos/vernesong/mihomo/releases?page=${page}&per_page=30" 10 20) || break
-
-        local count
-        count=$(echo "$releases_info" | jq 'length' 2>/dev/null)
-        [ -z "$count" ] || [ "$count" -eq 0 ] && break
-
-        while IFS= read -r release_info; do
-            local rel_published
-            rel_published=$(echo "$release_info" | jq -r '.published_at // "unknown"' | cut -d'T' -f1)
-            while IFS= read -r asset_info; do
-                local asset_name download_url commit_id
-                asset_name=$(echo "$asset_info" | jq -r '.name')
-                if echo "$asset_name" | grep -qE "mihomo-linux-${arch}(-compatible)?-alpha-smart-[0-9a-f]+\.gz"; then
-                    commit_id=$(echo "$asset_name" | grep -oE '[0-9a-f]{7,}' | head -n 1)
-                    download_url=$(echo "$asset_info" | jq -r '.browser_download_url')
-                    printf "alpha-smart-%s|%s|%s|%s\n" "$commit_id" "$rel_published" "$download_url" "$asset_name"
-                    found=$((found + 1))
-                fi
-            done < <(echo "$release_info" | jq -c '.assets[]')
-        done < <(echo "$releases_info" | jq -c '.[]')
-
-        page=$((page + 1))
-    done
-
+    local release_info
+    release_info=$(http_get "https://api.github.com/repos/vernesong/mihomo/releases/tags/Prerelease-Alpha" 10 20)
+    if [ -z "$release_info" ] || echo "$release_info" | jq -e '.message' >/dev/null 2>&1; then
+        release_info=$(http_get "https://api.github.com/repos/vernesong/mihomo/releases/latest" 10 20)
+    fi
+    [ -z "$release_info" ] && return 1
+    local rel_published
+    rel_published=$(echo "$release_info" | jq -r '.published_at // "unknown"' | cut -d'T' -f1)
+    while IFS= read -r asset_info; do
+        [ -z "$asset_info" ] && continue
+        local asset_name commit_id
+        asset_name=$(echo "$asset_info" | jq -r '.name // empty')
+        if echo "$asset_name" | grep -qE "mihomo-linux-${arch}(-compatible)?-alpha-smart-[0-9a-f]+\.gz"; then
+            commit_id=$(echo "$asset_name" | grep -oE '[0-9a-f]{7,}' | head -n 1)
+            printf "alpha-smart-%s|%s|https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/%s|%s\n" "$commit_id" "$rel_published" "$asset_name" "$asset_name"
+            found=$((found + 1))
+        fi
+    done < <(echo "$release_info" | jq -c '.assets[]?' 2>/dev/null)
     if [ "$found" -eq 0 ]; then
         red "未找到 $arch 架构的 Alpha 版本"
         return 1
     fi
     return 0
 }
-
 install_mihomo_alpha_smart() {
     log "开始安装 Mihomo Alpha with Smart Group..."
     check_network || return 1
     configure_network_forwarding_nat || return 1
-
     local local_arch
     local_arch=$(get_arch) || return 1
     if ! echo " amd64 arm64 " | grep -q " ${local_arch} "; then
         red "$local_arch 无 Alpha 版本"
         return 1
     fi
-
     log "获取 Alpha 版本列表..."
     local versions_raw
     versions_raw=$(get_mihomo_alpha_versions "$local_arch") || return 1
-
     local versions_list=()
     while IFS= read -r line; do
         [ -n "$line" ] && versions_list+=("$line")
     done <<< "$versions_raw"
-
     [ "${#versions_list[@]}" -eq 0 ] && { red "版本列表为空"; return 1; }
-
     clear
     printf "\n%b=== 选择 Mihomo Alpha 版本 ===%b\n" "$GREEN" "$NC"
     local i=1
@@ -1034,32 +1018,33 @@ install_mihomo_alpha_smart() {
     done
     printf "请输入选项 (1-%d): " "${#versions_list[@]}"
     read -r choice
-
     if ! echo "$choice" | grep -qE '^[0-9]+$' || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#versions_list[@]}" ]; then
         red "无效选项"
         return 1
     fi
-
     local selected="${versions_list[$((choice-1))]}"
     local DOWNLOAD_URL FILENAME VERSION_DISPLAY
     VERSION_DISPLAY=$(echo "$selected" | cut -d'|' -f1)
     DOWNLOAD_URL=$(echo "$selected" | cut -d'|' -f3)
     FILENAME=$(echo "$selected" | cut -d'|' -f4)
-
     TEMP_DIR=$(mktemp -d)
     local GZ_PATH="$TEMP_DIR/$FILENAME"
-
     log "下载 Mihomo Alpha ($VERSION_DISPLAY)..."
-    if ! download_file_smart "$DOWNLOAD_URL" "$GZ_PATH" "binary"; then
-        red "下载失败"; cleanup; return 1
+    if ! curl -fSL --connect-timeout 15 --max-time 300 -o "$GZ_PATH" "$DOWNLOAD_URL" 2>/dev/null; then
+        log "直连失败，尝试镜像下载..."
+        rm -f "$GZ_PATH"
+        if ! download_file_smart "$DOWNLOAD_URL" "$GZ_PATH" "binary"; then
+            red "下载失败"; cleanup; return 1
+        fi
     fi
-
+    if [ ! -s "$GZ_PATH" ] || ! head -c 2 "$GZ_PATH" | grep -q $'\x1f\x8b'; then
+        red "下载文件无效或非 gzip 格式"; cleanup; return 1
+    fi
     if ! gzip -d "$GZ_PATH"; then
         red "解压失败"; cleanup; return 1
     fi
     local MIHOMO_BIN="${GZ_PATH%.gz}"
     [ ! -f "$MIHOMO_BIN" ] && { red "未找到二进制"; cleanup; return 1; }
-
     manage_service_internal "mihomo" "stop" >/dev/null 2>&1 || true
     if [ "$MH_BIN_PATH" = "/usr/local/bin/mihomo" ] || [ ! -x "$MH_BIN_PATH" ]; then
         MH_BIN_PATH="/usr/local/bin/mihomo"
@@ -1067,19 +1052,19 @@ install_mihomo_alpha_smart() {
     mkdir -p "$(dirname "$MH_BIN_PATH")"
     cp "$MIHOMO_BIN" "$MH_BIN_PATH"
     chmod +x "$MH_BIN_PATH"
-
     local MODEL_BIN_PATH="$MH_BASE_DIR/model.bin"
     local FIXED_MODEL_URL="https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/model.bin"
     mkdir -p "$MH_BASE_DIR"
-
     log "下载 LightGBM Model..."
-    if download_file_smart "$FIXED_MODEL_URL" "$MODEL_BIN_PATH" "binary"; then
+    if curl -fSL --connect-timeout 15 --max-time 120 -o "$MODEL_BIN_PATH" "$FIXED_MODEL_URL" 2>/dev/null && [ -s "$MODEL_BIN_PATH" ]; then
+        chmod 644 "$MODEL_BIN_PATH"
+        green "model.bin 下载成功"
+    elif download_file_smart "$FIXED_MODEL_URL" "$MODEL_BIN_PATH" "binary" && [ -s "$MODEL_BIN_PATH" ]; then
         chmod 644 "$MODEL_BIN_PATH"
         green "model.bin 下载成功"
     else
         yellow "model.bin 下载失败，Smart Group 功能受限"
     fi
-
     cleanup
     green "Mihomo Alpha ($VERSION_DISPLAY) 安装成功！路径: $MH_BIN_PATH"
     [ ! -f "$MH_CONFIG_FILE" ] && generate_initial_mihomo_config
