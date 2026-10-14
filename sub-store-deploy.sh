@@ -335,6 +335,10 @@ install_dependencies() {
     start_docker_service
   fi
   ensure_tool jq jq
+  if [[ "$OS" == "openwrt" ]] && command -v opkg >/dev/null 2>&1; then
+    [ -d /sys/module/veth ] || opkg install kmod-veth >/dev/null 2>&1 || true
+    [ -d /sys/module/br_netfilter ] || opkg install kmod-br-netfilter >/dev/null 2>&1 || true
+  fi
 }
 check_network() {
   local test_urls=(
@@ -719,6 +723,95 @@ deploy_container() {
   docker_cmd+=("$image_ref")
   "${docker_cmd[@]}"
 }
+docker_bridge_ok() {
+  if [[ "$OS" == "macos" ]]; then
+    return 0
+  fi
+  if docker info 2>/dev/null | grep -qi "rootless"; then
+    return 0
+  fi
+  if [ -d /sys/class/net/docker0 ]; then
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip link show docker0 >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  docker network inspect bridge >/dev/null 2>&1
+}
+repair_docker_bridge() {
+  log "WARN" "检测到 Docker bridge 网桥 (docker0) 缺失，尝试自动修复..."
+  if [[ "$OS" == "openwrt" ]] && command -v opkg >/dev/null 2>&1; then
+    opkg update >/dev/null 2>&1
+    [ -d /sys/module/veth ] || opkg install kmod-veth >/dev/null 2>&1
+    [ -d /sys/module/br_netfilter ] || opkg install kmod-br-netfilter >/dev/null 2>&1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart docker >/dev/null 2>&1
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service docker restart >/dev/null 2>&1
+  elif [ -x /etc/init.d/dockerd ]; then
+    /etc/init.d/dockerd restart >/dev/null 2>&1
+  elif command -v service >/dev/null 2>&1; then
+    service docker restart >/dev/null 2>&1
+  fi
+  local i
+  for i in $(seq 1 15); do
+    if docker info >/dev/null 2>&1 && docker_bridge_ok; then
+      log "INFO" "Docker bridge 网桥已恢复"
+      return 0
+    fi
+    sleep 2
+  done
+  docker_bridge_ok
+}
+switch_to_host_confirm() {
+  if is_interactive; then
+    local answer=""
+    read -p "bridge 网络不可用，是否改用 host 模式继续？(y/n) [默认: y]: " answer
+    answer=${answer:-y}
+    [[ "$answer" =~ ^[yY]$ ]]
+    return $?
+  fi
+  log "WARN" "非交互模式，自动回退为 host 网络模式"
+  return 0
+}
+deploy_with_fallback() {
+  local image_ref=$1
+  local port=$2
+  local sub_path=$3
+  local nmode=$4
+  local origin=$5
+  if deploy_container "$image_ref" "$port" "$sub_path" "$nmode" "$origin"; then
+    return 0
+  fi
+  if [[ "$nmode" == "bridge" ]]; then
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    log "WARN" "bridge 模式容器启动失败（OpenWrt 常见原因为 docker0 网桥缺失或 kmod-veth 未加载）"
+    if ! docker_bridge_ok; then
+      repair_docker_bridge
+    fi
+    if docker_bridge_ok; then
+      log "INFO" "重试 bridge 模式部署..."
+      if deploy_container "$image_ref" "$port" "$sub_path" "$nmode" "$origin"; then
+        return 0
+      fi
+      docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    fi
+    if switch_to_host_confirm; then
+      local host_origin
+      host_origin=$(build_cors_origin "$BACKEND_API_PORT")
+      log "WARN" "已切换为 host 网络模式重新部署"
+      NETWORK_MODE="host"
+      if deploy_container "$image_ref" "$port" "$sub_path" "host" "$host_origin"; then
+        return 0
+      fi
+      docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+      log "ERROR" "host 模式部署同样失败"
+    fi
+  fi
+  return 1
+}
 health_check() {
   local port=$1
   local sub_path=$2
@@ -777,6 +870,9 @@ install_substore() {
   else
     NETWORK_MODE="bridge"
   fi
+  if [[ "$NETWORK_MODE" == "bridge" ]] && ! docker_bridge_ok; then
+    repair_docker_bridge || true
+  fi
   local preset_path=${OPT_PATH:-${SUBSTORE_PATH:-}}
   if [[ -n "$preset_path" ]]; then
     SUB_STORE_FRONTEND_BACKEND_PATH=$(sanitize_path "$preset_path")
@@ -799,9 +895,12 @@ install_substore() {
   fi
   local cors_origin
   cors_origin=$(build_cors_origin "$HOST_PORT")
-  if ! deploy_container "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" "$HOST_PORT" "$MAGIC_PATH" "$NETWORK_MODE" "$cors_origin"; then
+  if ! deploy_with_fallback "$SUB_STORE_IMAGE_NAME:$SUB_STORE_VERSION" "$HOST_PORT" "$MAGIC_PATH" "$NETWORK_MODE" "$cors_origin"; then
     log "ERROR" "容器启动失败"
     return 1
+  fi
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+    HOST_PORT=$BACKEND_API_PORT
   fi
   if health_check "$HOST_PORT" "$MAGIC_PATH" "$NETWORK_MODE"; then
     log "INFO" "Sub-Store 容器启动成功，健康检查通过"
@@ -879,12 +978,17 @@ upgrade_substore() {
   docker rm "$CONTAINER_NAME" >/dev/null 2>&1
   local cors_origin
   cors_origin=$(build_cors_origin "$port")
-  if ! deploy_container "$SUB_STORE_IMAGE_NAME:$target" "$port" "$sub_path" "$nmode" "$cors_origin"; then
+  NETWORK_MODE="$nmode"
+  if ! deploy_with_fallback "$SUB_STORE_IMAGE_NAME:$target" "$port" "$sub_path" "$nmode" "$cors_origin"; then
     log "ERROR" "新版本容器启动失败，尝试回滚到 $prev_image_ref"
     if [[ -n "$prev_image_ref" ]]; then
-      deploy_container "$prev_image_ref" "$port" "$sub_path" "$nmode" "$cors_origin" && log "INFO" "已回滚到原版本" || log "ERROR" "回滚失败，请手动检查"
+      deploy_with_fallback "$prev_image_ref" "$port" "$sub_path" "$nmode" "$cors_origin" && log "INFO" "已回滚到原版本" || log "ERROR" "回滚失败，请手动检查"
     fi
     return 1
+  fi
+  nmode="$NETWORK_MODE"
+  if [[ "$nmode" == "host" ]]; then
+    port=$BACKEND_API_PORT
   fi
   if health_check "$port" "$sub_path" "$nmode"; then
     NETWORK_MODE="$nmode"
@@ -903,7 +1007,11 @@ upgrade_substore() {
   docker stop "$CONTAINER_NAME" >/dev/null 2>&1
   docker rm "$CONTAINER_NAME" >/dev/null 2>&1
   if [[ -n "$prev_image_ref" ]]; then
-    deploy_container "$prev_image_ref" "$port" "$sub_path" "$nmode" "$cors_origin" >/dev/null 2>&1
+    deploy_with_fallback "$prev_image_ref" "$port" "$sub_path" "$nmode" "$cors_origin" >/dev/null 2>&1
+    nmode="$NETWORK_MODE"
+    if [[ "$nmode" == "host" ]]; then
+      port=$BACKEND_API_PORT
+    fi
     if health_check "$port" "$sub_path" "$nmode"; then
       log "INFO" "回滚成功，服务保持原版本运行"
     else
