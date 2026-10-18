@@ -17,9 +17,9 @@ FREELLMAPI_IMAGE_BASE="ghcr.io/tashfeenahmed/freellmapi"
 OMNIROUTE_IMAGE_BASE="diegosouzapw/omniroute"
 FREELLMAPI_COMPOSE_DIR="$HOME/freellmapi"
 COMPOSE_FALLBACK_VERSION="v2.39.1"
-GHCR_PROXIES=("ghcr.chenby.cn" "ghcr.registry.cyou" "ghcr.1ms.run" "ghcr.nju.edu.cn" "ghcr.m.daocloud.io")
-DOCKERHUB_PROXIES=("docker.1ms.run" "docker.chenby.cn" "docker.m.daocloud.io" "docker.nju.edu.cn" "hub.rat.dev")
-DOCKERHUB_MIRRORS=("https://docker.1ms.run" "https://docker.chenby.cn" "https://docker.m.daocloud.io" "https://docker.nju.edu.cn" "https://hub.rat.dev")
+GHCR_PROXIES=("ghcr.nju.edu.cn" "ghcr.m.daocloud.io" "ghcr.1ms.run" "ghcr.chenby.cn" "ghcr.registry.cyou")
+DOCKERHUB_PROXIES=("docker.m.daocloud.io" "docker.1ms.run" "dockerhub.icu" "hub.rat.dev" "docker.nju.edu.cn")
+DOCKERHUB_MIRRORS=("https://docker.m.daocloud.io" "https://docker.1ms.run" "https://dockerhub.icu" "https://hub.rat.dev" "https://docker.nju.edu.cn")
 BEST_GHCR_PROXY=""
 BEST_DOCKERHUB_PROXY=""
 GHCR_DIRECT_OK=false
@@ -1157,10 +1157,60 @@ function deploy_new_api_horizon() {
   select_image_version "New-API Horizon" "$NEW_API_HORIZON_IMAGE_BASE" "dockerhub" "calciumion/new-api-horizon" 8
   _deploy_new_api_common "new-api-horizon" "$SELECTED_IMAGE" 3000 "new-api-horizon-data" "New-API Horizon"
 }
+function _omniroute_show_setup_token(){
+local cname="$1"
+local host_bind="$2"
+local port="$3"
+local token=""
+local tries=0
+local max_tries=15
+curl -s -o /dev/null -H "User-Agent: Mozilla/5.0" "http://127.0.0.1:${port}/" 2>/dev/null
+while [ $tries -lt $max_tries ]; do
+token=$(docker exec "$cname" sh -c 'grep -oE "Paste this ONE-TIME bootstrap token into the onboarding wizard to continue:[[:space:]]*[A-Za-z0-9_-]+" /app/data/logs/application/app.log 2>/dev/null' | tail -n1 | awk '{print $NF}')
+if [ -z "$token" ]; then
+token=$(docker logs "$cname" 2>&1 | grep -oE "Paste this ONE-TIME bootstrap token into the onboarding wizard to continue:[[:space:]]*[A-Za-z0-9_-]+" | tail -n1 | awk '{print $NF}')
+fi
+if [ -z "$token" ]; then
+token=$(docker exec "$cname" sh -c 'grep -oiE "bootstrap token[[:space:]]*:[[:space:]]*[A-Za-z0-9_-]+" /app/data/logs/application/app.log 2>/dev/null' | tail -n1 | awk '{print $NF}')
+fi
+[ -n "$token" ] && break
+tries=$((tries+1))
+sleep 1
+done
+echo ""
+echo "┌──────────────────────────────────────────────────┐"
+if [ -n "$token" ]; then
+echo "│  Setup Token 已提取:"
+echo "│"
+echo "│    $token"
+echo "│"
+echo "│  缓存文件: \$HOME/.omniroute_setup_token"
+printf '%s' "$token" > "$HOME/.omniroute_setup_token"
+chmod 600 "$HOME/.omniroute_setup_token" 2>/dev/null
+else
+echo "│  ⚠ 未能自动提取 Token，请打开浏览器访问一次页面后"
+echo "│  执行以下命令手动查看:"
+echo "│"
+echo "│  docker exec $cname grep -oE 'bootstrap token.*' /app/data/logs/application/app.log"
+fi
+echo "└──────────────────────────────────────────────────┘"
+echo ""
+if [ "$host_bind" = "127.0.0.1" ] || [ "$host_bind" = "localhost" ]; then
+echo "远程访问请在本地执行 SSH 隧道:"
+echo "  ssh -L ${port}:localhost:${port} user@服务器IP"
+echo "然后浏览器打开: http://localhost:${port}"
+else
+local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -z "$ip" ] && ip="服务器IP"
+echo "浏览器访问: http://${ip}:${port}"
+fi
+echo ""
+}
 function deploy_omniroute() {
   local cname="omniroute" int_port="20128" volume_name="omniroute-data"
   echo ""; cyan "部署 OmniRoute（Docker）"; cyan "镜像：diegosouzapw/omniroute（Docker Hub）"
-  yellow "· 支持 268+ AI 提供商 / 500+ 模型，智能路由自动降级"; yellow "· Token 压缩节省 15-95%，MCP Server，100% 本地运行"; echo ""
+  yellow "· 支持 268+ AI 提供商 / 500+ 模型，智能路由自动降级"; yellow "· Token 压缩节省 15-95%，MCP Server，100% 本地运行"
+  red "· ⚠️  OmniRoute 从非 localhost 访问时需要一次性引导令牌（Setup Token）"; echo ""
   check_existing_container "$cname" || return 1
   select_image_version "OmniRoute" "$OMNIROUTE_IMAGE_BASE" "dockerhub" "diegosouzapw/omniroute" 8
   local sel_image="$SELECTED_IMAGE" sug_port; sug_port=$(find_available_port "$int_port"); green "建议端口：$sug_port"
@@ -1173,19 +1223,59 @@ function deploy_omniroute() {
     if [[ -n "$ck" ]] && $ck | grep -Eq "[:.\[]${PORT}[[:space:]]+"; then red "端口 $PORT 已被占用。"; continue; fi
     green "使用端口：$PORT"; break
   done
-  local host_bind="127.0.0.1"; echo ""; echo "网络访问范围："; echo "  1. 仅本机（127.0.0.1：安全，推荐）"; echo "  2. 局域网（0.0.0.0：共享访问）"
-  read -rp "选项 (1-2，默认 1)：" bc </dev/tty; [[ "${bc:-1}" == "2" ]] && { host_bind="0.0.0.0"; yellow "⚠️  局域网模式"; }; green "绑定地址：$host_bind"
+  echo ""
+  cyan "网络访问模式（⚠️  OmniRoute 特殊说明）："
+  echo "  1. 本机 + SSH 转发（127.0.0.1，最安全，推荐）"
+  echo "  2. 局域网直接访问（0.0.0.0，首次需手动输入 Setup Token）"
+  echo "  3. 自动初始化模式（0.0.0.0 但自动在本机完成 setup，推荐远程部署）"
+  echo ""
+  yellow "💡 模式3 会在容器启动后自动用 curl 本地请求以降低令牌触发概率"
+  echo ""
+  read -rp "选项 (1-3，默认 3)：" bc </dev/tty
+  local host_bind="127.0.0.1"
+  local auto_init=false
+  case "${bc:-3}" in
+    1) host_bind="127.0.0.1"; yellow "⚠️  仅本机模式：远程访问需 SSH 端口转发" ;;
+    2) host_bind="0.0.0.0"; yellow "⚠️  局域网模式：首次访问需输入 Setup Token（部署完成后会显示）" ;;
+    3) host_bind="0.0.0.0"; auto_init=true; green "✓ 自动初始化模式（推荐）" ;;
+    *) host_bind="0.0.0.0"; auto_init=true; green "✓ 使用默认：自动初始化模式" ;;
+  esac
+  green "绑定地址：$host_bind"
   pull_image_with_retry "$sel_image" || return 1
   if ! docker volume inspect "$volume_name" &>/dev/null; then yellow "创建数据卷 $volume_name..."; docker volume create "$volume_name" &>/dev/null && green "  数据卷已创建" || { red "数据卷创建失败！"; return 1; }
   else yellow "  数据卷 $volume_name 已存在，复用。"; fi
   local cmd=(docker run -d --name "$cname" --restart unless-stopped --stop-timeout 40 -p "${host_bind}:${PORT}:${int_port}" -v "${volume_name}:/app/data" -e "TZ=$DEFAULT_TZ" -e "PORT=${int_port}" "$sel_image")
   yellow "执行：${cmd[*]}"; if ! "${cmd[@]}"; then red "启动失败！"; docker rm "$cname" &>/dev/null || true; return 1; fi
-  yellow "等待服务启动（8 秒）..."; sleep 8
+  yellow "等待服务启动（15 秒，首次初始化较慢）..."; sleep 15
   if ! docker ps --format '{{.Names}}' | grep -q "^${cname}$"; then red "容器启动后异常退出："; docker logs --tail=30 "$cname" 2>/dev/null || true; return 1; fi
+  if [[ "$auto_init" == true ]]; then
+    yellow "执行自动初始化（本机 curl 请求以预热 setup）..."
+    local init_retries=0 init_ok=false
+    while [[ "$init_retries" -lt 5 ]]; do
+      if command -v curl &>/dev/null; then
+        if curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:${PORT}/dashboard" 2>/dev/null; then
+          init_ok=true; break
+        fi
+        curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:${PORT}/" 2>/dev/null && { init_ok=true; break; }
+      elif command -v wget &>/dev/null; then
+        if wget -q -O /dev/null --timeout=10 "http://127.0.0.1:${PORT}/dashboard" 2>/dev/null; then
+          init_ok=true; break
+        fi
+      fi
+      init_retries=$((init_retries + 1))
+      sleep 3
+    done
+    $init_ok && green "✓ 自动初始化请求已发送" || yellow "⚠️  自动初始化请求未成功，可能仍需手动 Setup Token"
+    sleep 3
+  fi
   local ip; ip=$(get_local_ip); local display_host; [[ "$host_bind" == "0.0.0.0" ]] && display_host="$ip" || display_host="localhost"
-  echo ""; green "✅ OmniRoute (Docker) 部署成功"; green "   Dashboard  : http://${display_host}:${PORT}/dashboard"
-  green "   API 端点   : http://${display_host}:${PORT}/v1/chat/completions"; green "   模型列表   : http://${display_host}:${PORT}/v1/models"; green "   数据卷     : $volume_name"
-  yellow "   ⚠️  首次访问 Dashboard 配置 Provider API Key 后即可使用"; echo ""
+  echo ""; green "✅ OmniRoute (Docker) 部署成功"
+  green "   Dashboard  : http://${display_host}:${PORT}/dashboard"
+  green "   API 端点   : http://${display_host}:${PORT}/v1/chat/completions"
+  green "   模型列表   : http://${display_host}:${PORT}/v1/models"
+  green "   数据卷     : $volume_name"
+  echo ""
+  _omniroute_show_setup_token "$cname" "$host_bind" "$PORT"
 }
 function deploy_freellmapi() {
   local cname="freellmapi" int_port="3001" compose_dir="$FREELLMAPI_COMPOSE_DIR"
@@ -1294,10 +1384,20 @@ function manage_omniroute() {
   while true; do
     echo ""; cyan "管理：OmniRoute"; echo ""
     $has_docker && { docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAMES|^${cname}" || true; echo ""; }
-    echo "  Docker 容器操作："; echo "  1. 实时日志  2. 停止  3. 启动  4. 重启  5. 升级  6. 卸载"; echo ""; echo "  通用操作："; echo "  7. 查看数据卷信息"; echo ""; echo "  0. 返回"
-    read -rp "选项：" mc </dev/tty; echo ""
+    echo "  Docker 容器操作："
+    echo "  1. 实时日志  2. 停止  3. 启动  4. 重启  5. 升级  6. 卸载"
+    echo ""
+    echo "  OmniRoute 特殊操作："
+    echo "  7. 查看数据卷信息"
+    echo "  8. 查看/重新获取 Setup Token"
+    echo "  9. 重置初始化状态（清除 setup 标记）"
+    echo "  10. 本机 curl 预初始化（降低令牌触发概率）"
+    echo ""
+    echo "  0. 返回"
+    read -rp "选项 (0-10)：" mc </dev/tty; echo ""
     case "$mc" in
-      1) $has_docker && docker logs -f "$cname" || yellow "Docker 容器不存在" ;; 2) $has_docker && { docker stop "$cname" && green "✅ 已停止"; } || yellow "Docker 容器不存在"; press_any_key ;;
+      1) $has_docker && docker logs -f "$cname" || yellow "Docker 容器不存在" ;;
+      2) $has_docker && { docker stop "$cname" && green "✅ 已停止"; } || yellow "Docker 容器不存在"; press_any_key ;;
       3) $has_docker && { docker start "$cname" && green "✅ 已启动"; } || yellow "Docker 容器不存在"; press_any_key ;;
       4) $has_docker && { docker stop "$cname" &>/dev/null; sleep 2; docker start "$cname" && green "✅ 已重启"; } || yellow "Docker 容器不存在"; press_any_key ;;
       5) $has_docker || { yellow "Docker 容器不存在"; press_any_key; continue; }; _prompt_backup_before_action "升级" || { press_any_key; continue; }
@@ -1319,8 +1419,65 @@ function manage_omniroute() {
         local imgs; imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "^diegosouzapw/omniroute" || true)
         [[ -n "$imgs" ]] && { echo "$imgs" | while read -r i; do echo "  镜像：$i"; done; read -rp "删除镜像？(y/n)：" di </dev/tty; [[ "${di:-n}" =~ ^[Yy]$ ]] && echo "$imgs" | xargs docker rmi 2>/dev/null; }
         docker volume inspect "$volume_name" &>/dev/null && { red "  ⚠️  删除数据卷将丢失所有配置！"; read -rp "删除数据卷？(y/n)：" dv </dev/tty; [[ "${dv:-n}" =~ ^[Yy]$ ]] && docker volume rm "$volume_name"; }
+        [[ -f "$HOME/.omniroute_setup_token" ]] && rm -f "$HOME/.omniroute_setup_token"
         has_docker=false; green "✅ Docker 卸载完成"; press_any_key ;;
-      7) cyan "Docker 数据卷："; docker volume inspect "$volume_name" 2>/dev/null || yellow "未找到"; press_any_key ;; 0) return 0 ;; *) red "无效选项。" ;;
+      7) cyan "Docker 数据卷："; docker volume inspect "$volume_name" 2>/dev/null || yellow "未找到"; press_any_key ;;
+      8) if ! $has_docker; then yellow "Docker 容器不存在"; press_any_key; continue; fi
+         _capture_container_runtime "$cname"
+         local bindip="${RUNTIME_BINDIP:-127.0.0.1}" pt="${RUNTIME_PT:-20128}"
+         _omniroute_show_setup_token "$cname" "$bindip" "$pt"
+         press_any_key ;;
+      9) if ! $has_docker; then yellow "Docker 容器不存在"; press_any_key; continue; fi
+         red "⚠️  此操作将尝试清除 OmniRoute 初始化状态标记文件"
+         yellow "   注意：如果重置失败，可能需要恢复备份或重新部署"
+         read -rp "   确认重置？(输入 yes 继续)：" rc </dev/tty
+         if [[ "$rc" == "yes" ]]; then
+           docker stop "$cname" &>/dev/null
+           local vol_path
+           vol_path=$(docker volume inspect "$volume_name" --format '{{.Mountpoint}}' 2>/dev/null)
+           if [[ -n "$vol_path" && -d "$vol_path" ]]; then
+             local rm_cmd="rm -f \"$vol_path\"/.setup_complete \"$vol_path\"/setup.lock \"$vol_path\"/initialized \"$vol_path\"/.initialized \"$vol_path\"/setup_done"
+             [[ "$EUID" -ne 0 ]] && command -v sudo &>/dev/null && rm_cmd="sudo $rm_cmd"
+             eval "$rm_cmd" 2>/dev/null || true
+             green "   setup 标记文件已尝试清除"
+           else
+             yellow "   无法访问数据卷路径，尝试通过辅助容器清除..."
+             local helper=""
+             for c in "alpine:latest" "alpine" "busybox:latest" "busybox"; do docker image inspect "$c" &>/dev/null && { helper="$c"; break; }; done
+             if [[ -n "$helper" ]]; then
+               docker run --rm -v "${volume_name}:/data" "$helper" sh -c "rm -f /data/.setup_complete /data/setup.lock /data/initialized /data/.initialized /data/setup_done 2>/dev/null || true"
+               green "   setup 标记文件已通过辅助容器清除"
+             else
+               red "   无可用辅助镜像，请先手动拉取 alpine"
+             fi
+           fi
+           docker start "$cname" &>/dev/null
+           sleep 10
+           green "✅ 容器已重启"
+           _capture_container_runtime "$cname"
+           local bindip="${RUNTIME_BINDIP:-127.0.0.1}" pt="${RUNTIME_PT:-20128}"
+           _omniroute_show_setup_token "$cname" "$bindip" "$pt"
+         else
+           yellow "已取消"
+         fi
+         press_any_key ;;
+      10) if ! $has_docker; then yellow "Docker 容器不存在"; press_any_key; continue; fi
+          _capture_container_runtime "$cname"
+          local pt="${RUNTIME_PT:-20128}"
+          yellow "执行本机 curl 预初始化请求（端口 $pt）..."
+          local ok=false
+          for try in 1 2 3 4 5; do
+            if command -v curl &>/dev/null; then
+              if curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:${pt}/dashboard" 2>/dev/null; then ok=true; break; fi
+              curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:${pt}/" 2>/dev/null && { ok=true; break; }
+            elif command -v wget &>/dev/null; then
+              wget -q -O /dev/null --timeout=10 "http://127.0.0.1:${pt}/dashboard" 2>/dev/null && { ok=true; break; }
+            fi
+            sleep 2
+          done
+          $ok && green "✅ 预初始化请求成功，现在可从远程访问 Dashboard" || red "❌ 预初始化失败，请手动获取 Setup Token"
+          press_any_key ;;
+      0) return 0 ;; *) red "无效选项。" ;;
     esac
   done
 }
