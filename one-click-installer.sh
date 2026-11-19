@@ -75,6 +75,7 @@ declare -A DEFAULT_SCRIPTS=(
     ["47"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/Docker-image-backup.sh"
     ["48"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/img-expand.sh"
     ["49"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/netiso.sh"
+    ["50"]="https://raw.githubusercontent.com/zsj9418/-/refs/heads/main/install-yingshi.sh"
 
 )
 
@@ -128,6 +129,7 @@ DEFAULT_OPTIONS=(
     "47. docker镜像备份还原"
     "48. pve中openwrt扩容"
     "49. openwrt设置VLAN"
+    "50. 部署影视服务器"
     "98. 快捷键管理"
 )
 
