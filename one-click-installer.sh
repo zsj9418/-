@@ -17,7 +17,7 @@ CUSTOM_MENU_FILE="$SCRIPT_DIR/custom_menu.conf"
 FIRST_RUN_FLAG="$SCRIPT_DIR/.initialized"
 SYMLINK_NAME="a"
 PROXY_PREFIXES=(
-    "https://un.ax18.ggff.net/"
+    "https://ghproxy.net/"
     "https://cdn.yyds9527.nyc.mn/"
 )
 if [[ -t 1 ]]; then
