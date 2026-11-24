@@ -1,149 +1,157 @@
 #!/bin/sh
 
-echo "================================================"
-echo "      光猫信息导出工具（兼容旧版 BusyBox）"
-echo "================================================"
-echo
-echo "本工具不会格式化 U 盘，也不会修改 PON 配置。"
-echo "导出文件可能包含密码等敏感信息，请勿公开分享。"
-echo
+echo "========== 自动查找 U 盘 =========="
 
-if [ ! -r /proc/partitions ] || [ ! -r /proc/mounts ]; then
-    echo "失败：系统没有提供必要的磁盘信息。"
+if [ ! -r /proc/mounts ] || [ ! -r /proc/partitions ]; then
+    echo "失败：系统缺少磁盘或挂载信息。"
     exit 1
 fi
 
-echo "【系统识别到的 sd 磁盘及分区】"
-echo "名称             大小（KB）"
-awk '
-    $4 ~ /^sd[a-z]+[0-9]*$/ {
-        printf "%-16s %s\n", $4, $3
-    }
-' /proc/partitions
-
-echo
-echo "【当前已挂载的 sd 设备】"
-awk '
-    $1 ~ /^\/dev\/sd[a-z]+[0-9]*$/ {
-        print $1 " -> " $2 "  文件系统：" $3 "  选项：" $4
-    }
-' /proc/mounts
-
-echo
-echo "请输入 U 盘分区名称，例如 sda1。"
-echo "不要输入 /dev/，不要输入 mtdblock、loop 或其他非 U 盘设备。"
-echo "请结合 U 盘容量和上面的挂载信息判断。"
-echo "不确定时输入 q 退出，并把上面的输出发给我。"
-printf "U 盘分区名称："
-read NAME
-
-case "$NAME" in
-    q|Q|"")
-        echo "已退出，没有修改磁盘。"
-        exit 0
-        ;;
-    *[!a-z0-9]*)
-        echo "失败：名称包含不允许的字符。"
-        exit 1
-        ;;
-esac
-
-# 只允许 /proc/partitions 中列出的 sd 分区或磁盘。
-if ! awk -v n="$NAME" '
-    $4 == n && $4 ~ /^sd[a-z]+[0-9]*$/ { found=1 }
-    END { exit !found }
-' /proc/partitions; then
-    echo "失败：系统磁盘列表中没有这个 sd 设备：$NAME"
-    exit 1
-fi
-
-DEV="/dev/$NAME"
-
-if [ ! -b "$DEV" ]; then
-    echo "失败：设备节点 $DEV 不存在或不是块设备。"
-    echo "请提供 ls -l /dev 和 cat /proc/partitions 的输出。"
-    exit 1
-fi
-
-echo
-echo "你选择的是：$DEV"
-echo "请再次确认它是你的 U 盘，而不是其他磁盘。"
-printf "确认请输入 YES，其他任何输入都会退出："
-read CONFIRM
-
-if [ "$CONFIRM" != "YES" ]; then
-    echo "已取消。"
-    exit 0
-fi
-
+DEV=""
 MNT=""
+COUNT=0
 
+# 优先查找已挂载、挂载目录明显标记为 USB 的 sd 分区。
 while read device dir fstype options rest; do
-    if [ "$device" = "$DEV" ]; then
-        MNT="$dir"
-        break
-    fi
-done < /proc/mounts
-
-if [ -n "$MNT" ]; then
-    case "$MNT" in
-        *\\*)
-            echo "失败：挂载路径包含空格或特殊字符，无法可靠处理。"
-            echo "请提供 mount 的输出。"
-            exit 1
+    case "$device" in
+        /dev/sd*)
+            case "$dir" in
+                /mnt/usb*|/media/usb*|/mnt/USB*|/media/USB*)
+                    case "$dir" in
+                        *\\*) continue ;;
+                    esac
+                    DEV="$device"
+                    MNT="$dir"
+                    COUNT=$((COUNT + 1))
+                    ;;
+            esac
             ;;
     esac
-    echo "使用已有挂载：$DEV -> $MNT"
+done < /proc/mounts
+
+if [ "$COUNT" -gt 1 ]; then
+    echo "失败：发现多个已挂载的 USB 候选设备，无法安全确定使用哪一个。"
+    echo "请只保留一个 U 盘后重新运行。"
+    exit 1
+fi
+
+if [ "$COUNT" -eq 1 ]; then
+    echo "找到已挂载的 U 盘候选：$DEV -> $MNT"
 else
-    MNT="/tmp/pon_usb_$$"
+    # 根据 sysfs 路径确认 USB 磁盘，避免仅凭 sda 猜测。
+    DISK=""
+    DISK_COUNT=0
 
-    if [ -e "$MNT" ]; then
-        echo "失败：临时挂载目录已存在：$MNT"
+    for P in /sys/block/sd*; do
+        [ -e "$P" ] || continue
+
+        PATH_INFO="$(readlink -f "$P/device" 2>/dev/null)"
+        case "$PATH_INFO" in
+            *usb*)
+                DISK="${P##*/}"
+                DISK_COUNT=$((DISK_COUNT + 1))
+                ;;
+        esac
+    done
+
+    if [ "$DISK_COUNT" -eq 0 ]; then
+        echo "失败：没有可靠识别到 U 盘。"
+        echo "可能是旧版系统不支持所需的 USB 路径查询，或 U 盘未识别。"
+        echo "请检查 U 盘连接；不要格式化。"
         exit 1
     fi
 
-    if ! mkdir "$MNT"; then
-        echo "失败：无法创建临时挂载目录。"
+    if [ "$DISK_COUNT" -gt 1 ]; then
+        echo "失败：发现多个 USB 磁盘，无法安全自动选择。"
+        echo "请只保留一个 U 盘后重新运行。"
         exit 1
     fi
 
-    echo "正在尝试挂载 $DEV ..."
-    if mount "$DEV" "$MNT" 2>/dev/null; then
-        echo "挂载成功：$MNT"
-    elif mount -t vfat "$DEV" "$MNT" 2>/dev/null; then
-        echo "按 FAT 文件系统挂载成功：$MNT"
+    PART_COUNT=0
+    for P in /sys/block/"$DISK"/"$DISK"[0-9]*; do
+        [ -e "$P" ] || continue
+        PART="${P##*/}"
+        [ -b "/dev/$PART" ] || continue
+        DEV="/dev/$PART"
+        PART_COUNT=$((PART_COUNT + 1))
+    done
+
+    if [ "$PART_COUNT" -gt 1 ]; then
+        echo "失败：U 盘有多个分区，无法安全自动选择。"
+        exit 1
+    fi
+
+    if [ "$PART_COUNT" -eq 0 ]; then
+        DEV="/dev/$DISK"
+    fi
+
+    if [ ! -b "$DEV" ]; then
+        echo "失败：找不到块设备 $DEV。"
+        exit 1
+    fi
+
+    # 检查该设备是否已经挂载到其他位置。
+    while read device dir fstype options rest; do
+        if [ "$device" = "$DEV" ]; then
+            case "$dir" in
+                *\\*)
+                    echo "失败：挂载路径包含特殊字符，无法安全处理。"
+                    exit 1
+                    ;;
+            esac
+            MNT="$dir"
+            break
+        fi
+    done < /proc/mounts
+
+    if [ -n "$MNT" ]; then
+        echo "找到已挂载的 U 盘：$DEV -> $MNT"
     else
-        echo "失败：无法挂载该设备。"
-        echo "可能是文件系统不受支持、权限不足或 U 盘异常。"
-        echo "请勿格式化；请提供以下命令输出："
-        echo "mount"
-        echo "cat /proc/partitions"
-        echo "dmesg | tail -50"
-        rmdir "$MNT" 2>/dev/null
-        exit 1
+        MNT="/tmp/pon_usb_$$"
+
+        if [ -e "$MNT" ] || ! mkdir "$MNT"; then
+            echo "失败：无法创建临时挂载目录。"
+            exit 1
+        fi
+
+        echo "正在挂载 $DEV ..."
+        if mount "$DEV" "$MNT" 2>/dev/null; then
+            :
+        elif mount -t vfat "$DEV" "$MNT" 2>/dev/null; then
+            :
+        else
+            echo "失败：无法挂载 U 盘。"
+            echo "可能是不支持该文件系统，或权限不足。"
+            rmdir "$MNT" 2>/dev/null
+            exit 1
+        fi
+
+        echo "挂载成功：$DEV -> $MNT"
     fi
 fi
 
 OUT="$MNT/pon_report_$$.txt"
 MATCHES="/tmp/pon_matches_$$.txt"
 
-if [ -e "$OUT" ]; then
-    echo "失败：目标文件已存在，为避免覆盖而退出：$OUT"
+if [ -e "$OUT" ] || [ -e "$MATCHES" ]; then
+    echo "失败：目标文件已存在，为避免覆盖而退出。"
     exit 1
 fi
 
 if ! (umask 077; : > "$OUT") 2>/dev/null; then
-    echo "失败：无法写入 $MNT，可能是只读或空间不足。"
+    echo "失败：U 盘无法写入，可能是只读或空间不足。"
     exit 1
 fi
 
-echo
-echo "正在查找配置，可能需要一些时间，请不要拔出 U 盘……"
+if ! (umask 077; : > "$MATCHES") 2>/dev/null; then
+    echo "失败：无法创建临时文件。"
+    exit 1
+fi
 
-# 只搜索有限目录中的常见小型文本配置文件。
-# 不扫描 U 盘、不读取原始 Flash 分区。
-: > "$MATCHES"
+echo "========== 自动查找光猫配置 =========="
+echo "正在搜索，请稍候，不要拔出 U 盘……"
 
+# 仅搜索部分常见文本配置；不读取原始 Flash 分区。
 for DIR in /flash /data /etc /rom /usr/local; do
     [ -d "$DIR" ] || continue
 
@@ -167,66 +175,69 @@ for DIR in /flash /data /etc /rom /usr/local; do
     done >> "$MATCHES"
 done
 
+MODEL=""
+MODEL_SOURCE=""
+
+for F in /proc/device-tree/model /sys/firmware/devicetree/base/model; do
+    if [ -r "$F" ]; then
+        VALUE="$(tr -d '\000' < "$F" 2>/dev/null)"
+        if [ -n "$VALUE" ]; then
+            MODEL="$VALUE"
+            MODEL_SOURCE="$F"
+            break
+        fi
+    fi
+done
+
 {
     echo "================================================"
-    echo "            PONWRT 填写信息报告"
+    echo "             PONWRT 参数整理报告"
     echo "================================================"
     echo
-    echo "重要：本文件可能含密码、SN、MAC 等敏感信息。"
-    echo "候选原文不一定属于本机 PON 注册配置，须核对后使用。"
-    echo "找不到不代表设备没有该参数，可能存放在其他位置。"
+    echo "重要：本文件可能包含密码、SN、MAC 等敏感信息。"
+    echo "候选原文需要确认来源和含义，不能盲目填入。"
     echo
 
     echo "【原光猫型号：自动查找】"
-    MODEL_FOUND=0
-
-    for F in /proc/device-tree/model /sys/firmware/devicetree/base/model; do
-        if [ -r "$F" ]; then
-            MODEL="$(tr -d '\000' < "$F" 2>/dev/null)"
-            if [ -n "$MODEL" ]; then
-                echo "设备树型号候选：$MODEL"
-                echo "来源：$F"
-                echo "注意：可能是板卡或芯片型号，不一定是商品型号。"
-                MODEL_FOUND=1
-                break
-            fi
-        fi
-    done
-
-    if [ "$MODEL_FOUND" -eq 0 ]; then
-        echo "设备树型号：未找到。请查看本报告末尾的候选配置。"
+    if [ -n "$MODEL" ]; then
+        echo "设备树型号候选：$MODEL"
+        echo "来源：$MODEL_SOURCE"
+        echo "注意：这可能是板卡型号，不一定是商品型号。"
+    else
+        echo "设备树型号：未找到"
     fi
+    echo "其他型号候选：请查看本报告末尾的配置原文。"
     echo
 
     echo "【一、线路配置 -> 光链路】"
     echo
     echo "启用光链路：按实际需求启用"
-    echo "线路协议：待确认"
+    echo "线路协议：未确认"
     echo
 
     echo "【二、线路配置 -> 运营商认证】"
     echo
-    echo "ONU MAC 地址：待确认"
-    echo "LOID：待确认"
-    echo "LOID 密码：待确认"
-    echo "ONU 序列号（SN）：待确认"
-    echo "SN 十六进制格式：待确认"
-    echo "PLOAM 密码：待确认"
-    echo "PLOAM 十六进制格式：待确认"
-    echo "OMCI 增强认证 PSK：待确认"
+    echo "ONU MAC 地址：未确认"
+    echo "LOID：未确认"
+    echo "LOID 密码：未确认"
+    echo "ONU 序列号（SN）：未确认"
+    echo "SN 十六进制格式：未确认"
+    echo "PLOAM 密码：未确认"
+    echo "PLOAM 十六进制格式：未确认"
+    echo "OMCI 增强认证 PSK：未确认"
     echo
-    echo "注意：普通网口 MAC 不一定是 ONU MAC。"
-    echo "PSK 不能根据其他密码推算，也不能随意填全零。"
+    echo "说明：普通网口 MAC 不一定是 ONU MAC。"
+    echo "PSK 不可由 LOID 密码推算，也不可随意填全零。"
     echo
 
     echo "【三、线路配置 -> 高级参数】"
     echo
-    echo "OMCC 版本：待确认；不确定时保留默认值"
-    echo "禁用 OMCI 增强认证：待确认；不确定时保留默认值"
+    echo "OMCC 版本：未确认；不确定时保持默认值"
+    echo "禁用 OMCI 增强认证：未确认；不确定时保持默认值"
     echo "设备型号：查看上方型号候选及下方配置原文"
-    echo "硬件版本：待确认"
-    echo "软件版本：待确认"
-    echo "OMCI 运营商 ID：待确认"
+    echo "硬件版本：未确认"
+    echo "软件版本：未确认"
+    echo "OMCI 运营商 ID：未确认"
     echo
 
     echo "【四、设备基础信息】"
@@ -265,13 +276,12 @@ done
     echo
 
     echo "【五、配置文件候选原文】"
-    echo "只搜索有限目录、常见扩展名的小型文件；结果可能不完整。"
-    echo "每个文件最多展示 20 行，每行最多 2000 字符。"
+    echo "仅搜索部分常见文本文件，结果可能不完整。"
     echo
     if [ -s "$MATCHES" ]; then
         cat "$MATCHES"
     else
-        echo "本次搜索未找到匹配内容。"
+        echo "本次没有找到匹配内容。"
     fi
     echo
     echo "报告结束。"
@@ -282,15 +292,14 @@ rm -f "$MATCHES"
 sync
 
 if [ "$RC" -ne 0 ]; then
-    echo "失败：写入报告时发生错误，请检查 U 盘空间及权限。"
+    echo "失败：写入报告时发生错误，请检查 U 盘。"
     exit 1
 fi
 
 echo
-echo "================================================"
-echo "导出完成：$OUT"
-echo "文件名：${OUT##*/}"
-echo "请关闭光猫电源后再拔出 U 盘。"
-echo "================================================"
+echo "========== 导出完成 =========="
+echo "文件：$OUT"
 ls -l "$OUT"
+echo "请关闭光猫电源后再拔出 U 盘。"
+echo "报告可能包含敏感信息，请勿公开分享。"
 PON_SCRIPT
